@@ -278,6 +278,54 @@ t.relation('definitely_not_a_relation')      // rejected
 and table *classes*, which are subject to the protected-member rule. `relations` and every
 builder call above it are checked.
 
+## Better Auth
+
+[Better Auth](https://www.better-auth.com) runs on d1zzle directly — `d1zzle/better-auth`
+is a native adapter, not a shim over the Drizzle one:
+
+```ts
+import { betterAuth } from 'better-auth';
+import { drizzle } from 'd1zzle';
+import { d1zzleAdapter } from 'd1zzle/better-auth';
+import { user, session, account, verification } from './schema';
+
+const auth = betterAuth({
+  database: d1zzleAdapter(drizzle(env.DB), {
+    schema: { user, session, account, verification },
+  }),
+});
+```
+
+Write the four tables with `sqliteTable` as you would any other — the schema in Better
+Auth's Drizzle docs ports over unchanged — and generate the migration with
+`d1zzle-migrate`. Model names map to tables through `schema`; field names map to columns
+through Better Auth's own `fields` option, so `fields: { image: 'avatarUrl' }` reaches an
+`avatar_url` column with nothing extra on our side.
+
+**Why a separate adapter rather than the Drizzle one.** Everything under *Works with the
+Drizzle ecosystem* above is about being **read**: an adapter inspects a schema, and
+d1zzle's objects answer the way Drizzle's would. Better Auth's Drizzle adapter instead
+**executes** through drizzle-orm — `db.insert(t).values(…)`, `eq()`, `and()`, its dialect
+and session layer. `asDrizzleSchema()` retypes a schema; it cannot retype a runtime, and a
+d1zzle table fails there on the first write. But Better Auth does not require that path:
+`createAdapterFactory` takes ten methods over `{ model, where, data }` and supplies the
+mapping, id generation and transforms itself. That is the seam, and it needs no Drizzle at
+all.
+
+**Single-statement `consumeOne` / `incrementOne`.** Better Auth's fallbacks for these are
+built on transactions, which [D1 does not have](./docs/02-d1-platform.md), so a fallback
+would leave a read-then-write gap in exactly the operations whose whole point is that only
+one caller wins — consuming a verification token, decrementing a guarded counter. Both are
+implemented instead as one `RETURNING` statement pinned to a single row, which D1 executes
+atomically. `test/workers/better-auth.test.ts` races them against real D1 and asserts the
+counts.
+
+`experimental.joins` is not supported (the adapter raises a named error rather than quietly
+dropping the joined models), and there is no `createSchema` for `@better-auth/cli generate`
+— in a d1zzle project the schema file is what `d1zzle-migrate` diffs against, so generating
+it from Better Auth's model list would invert the source of truth. `better-auth` is an
+optional peer; see [docs/10](./docs/10-ecosystem-interop.md#better-auth--where-the-bridge-stops-being-the-answer).
+
 ## What is different, and why
 
 **Reads are positional.** D1's `.all()` builds one keyed object per row, and silently
@@ -399,17 +447,21 @@ stays one query rather than one per parent.
 | `d1zzle/ddl` | schema → `CREATE TABLE` / `CREATE INDEX` |
 | `d1zzle/relations` | `defineRelations()`, `db.query`, the filter DSL |
 | `d1zzle/drizzle` | the bridge to `drizzle-orm`: `asDrizzleSchema`, `asDrizzleRelations` |
+| `d1zzle/better-auth` | `d1zzleAdapter()` — a Better Auth database adapter |
 
-**Zero runtime dependencies**, and `"dependencies": {}` in `package.json`. `drizzle-orm` is
-an optional peer, and the cost is confined to one entry point:
+**Zero runtime dependencies**, and `"dependencies": {}` in `package.json`. `drizzle-orm`
+and `better-auth` are optional peers, and each cost is confined to one entry point:
 
 - `d1zzle`, `d1zzle/core`, `d1zzle/sqlite-core`, `d1zzle/ddl` and `d1zzle/relations` never
-  import it, at runtime or for types. A Worker that does not do adapter interop never loads
-  it, and it can be absent from `node_modules` entirely.
-- `d1zzle/drizzle` imports its **types** for `asDrizzleSchema` / `asDrizzleTable`, and its
-  `One`/`Many` **classes** at runtime for `asDrizzleRelations`. Importing that module is
-  what makes `drizzle-orm` required, which is why nothing else re-exports it — `d1zzle`'s
-  own entry does not reach it.
+  import either one, at runtime or for types. A Worker that does not do adapter interop
+  never loads them, and they can be absent from `node_modules` entirely.
+- `d1zzle/drizzle` imports `drizzle-orm`'s **types** for `asDrizzleSchema` /
+  `asDrizzleTable`, and its `One`/`Many` **classes** at runtime for `asDrizzleRelations`.
+  Importing that module is what makes `drizzle-orm` required, which is why nothing else
+  re-exports it — `d1zzle`'s own entry does not reach it.
+- `d1zzle/better-auth` imports `createAdapterFactory` from `better-auth/adapters` at
+  runtime. Same rule: nothing else reaches it, so only a project that calls
+  `d1zzleAdapter()` needs `better-auth` installed.
 
 The peer range is `>=1.0.0-rc.1`: d1zzle presents v1's interface, and `asDrizzleRelations`
 prototypes onto v1's `OneV2`/`ManyV2` classes. On v0 it would silently prototype onto the
