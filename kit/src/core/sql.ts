@@ -12,6 +12,22 @@
  * rejected with `incomplete input` — so a migration that created any trigger
  * could not be applied at all.
  */
+/**
+ * Blank the *contents* of every quoted run — `'…'`, `"…"`, `` `…` `` — keeping
+ * the quotes so what is left still parses as SQL for keyword counting. A
+ * doubled quote is SQL's escape and closes-then-reopens, which this scan
+ * handles by treating the pair as two adjacent runs.
+ */
+const blankQuoted = (text: string): string =>
+	text.replaceAll(
+		/'(?:[^']|'')*'?|"(?:[^"]|"")*"?|`(?:[^`]|``)*`?/g,
+		(run) => {
+			const quote = run[0]!;
+			const closed = run.length > 1 && run.endsWith(quote);
+			return quote + ' '.repeat(run.length - (closed ? 2 : 1)) + (closed ? quote : '');
+		},
+	);
+
 export function splitStatements(sql: string): string[] {
 	const statements: string[] = [];
 	let current = '';
@@ -29,8 +45,15 @@ export function splitStatements(sql: string): string[] {
 		if (!/^\s*create\s+(or\s+replace\s+)?(temp\s+|temporary\s+)?trigger\b/i.test(current)) return false;
 		// The body is open until its matching END; `CASE … END` inside it is
 		// balanced by its own CASE, so counting both keeps the nesting right.
-		const opens = (current.match(/\b(begin|case)\b/gi) ?? []).length;
-		const closes = (current.match(/\bend\b/gi) ?? []).length;
+		//
+		// Counted over a copy with quoted text blanked out: the guard trigger's
+		// own abort message ends in "…is prohibited", and any message or quoted
+		// identifier containing the word `end` (or `begin`, or `case`) would
+		// otherwise close the body early and produce the same `incomplete
+		// input` this function exists to prevent.
+		const scan = blankQuoted(current);
+		const opens = (scan.match(/\b(begin|case)\b/gi) ?? []).length;
+		const closes = (scan.match(/\bend\b/gi) ?? []).length;
 		return opens > closes;
 	};
 

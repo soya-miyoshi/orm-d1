@@ -10,6 +10,9 @@
  */
 import { copyFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+// `registerHooks` is Node 22.15+, which is why the package's `engines` says so:
+// a missing named export from a builtin is a link-time SyntaxError, so an older
+// runtime would fail to load the CLI at all rather than fail on first use.
 import { registerHooks } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';

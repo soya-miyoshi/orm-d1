@@ -199,19 +199,34 @@ export const parseTableOptions = (sql: string): { strict: boolean; withoutRowid:
  * Whether a table carries the append-only guard.
  *
  * Matched on what the trigger *does*, not on its name: a `BEFORE UPDATE`
- * trigger on the table whose body raises ABORT is the guard, however it is
- * spelled. Keying on the `<table>_no_update` name alone would miss a
+ * trigger on the table whose body does nothing but abort is the guard, however
+ * it is spelled. Keying on the `<table>_no_update` name alone would miss a
  * hand-written equivalent and report drift against a database that is in fact
  * protected.
+ *
+ * But only an *unconditional* abort counts. A validation trigger that aborts
+ * on some rows — a `WHEN` clause, or a body that does anything else besides
+ * raise — leaves UPDATE working, and reading it as the guard reports a table
+ * as protected when it is not. That is the direction that costs something, so
+ * the looseness stops here: no `WHEN`, and every body statement is a raise.
  */
 export const isAppendOnlyTrigger = (sql: string, tableName: string): boolean => {
-	const text = sql.toLowerCase().replaceAll(/\s+/g, ' ');
+	const text = blankLiterals(sql).toLowerCase().replaceAll(/\s+/g, ' ');
 	const quoted = tableName.toLowerCase();
 	if (!/\bbefore\s+update\s+on\s+/.test(text)) return false;
 	if (!new RegExp(`\\bon\\s+["'\`\\[]?${quoted.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}["'\`\\]]?\\b`).test(text)) {
 		return false;
 	}
-	return /\braise\s*\(\s*abort\b/.test(text);
+
+	const begin = text.indexOf(' begin ');
+	const end = text.lastIndexOf(' end');
+	if (begin < 0 || end < begin) return false;
+	// A `WHEN` (or an `UPDATE OF <columns>`) makes the guard conditional.
+	if (/\bwhen\b|\bupdate\s+of\b/.test(text.slice(0, begin))) return false;
+
+	const body = text.slice(begin + ' begin '.length, end);
+	const parts = body.split(';').map((s) => s.trim()).filter(Boolean);
+	return parts.length > 0 && parts.every((s) => /^select\s+raise\s*\(\s*abort\b/.test(s));
 };
 
 export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): Snapshot {

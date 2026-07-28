@@ -321,7 +321,16 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		const t = before.tables[name]!;
 		if (renamed) {
 			statements.push({ sql: `alter table ${quote(name)} rename to ${quote(renamed)}`, destructive: false });
-			effectiveBefore[renamed] = { ...t, name: renamed };
+			// SQLite keeps a trigger's *name* across RENAME and only repoints its
+			// `tbl_name`, so an append-only table drags `<old>_no_update` along.
+			// Everything downstream is keyed on the new name, so it would emit
+			// `drop trigger "<new>_no_update"` — a no-op leaving UPDATE blocked
+			// on a table the schema says is writable, and drift that no
+			// generated migration can ever clear. Drop it under the name it
+			// actually has, and let the guard be re-created below if it is still
+			// wanted (that is what clearing `appendOnly` here arranges).
+			if (t.appendOnly) statements.push({ sql: dropAppendOnlyTrigger(name), destructive: false });
+			effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: false };
 		} else {
 			effectiveBefore[name] = t;
 		}

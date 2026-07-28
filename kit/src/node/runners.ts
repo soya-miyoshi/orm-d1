@@ -64,8 +64,20 @@ export async function scratchRunner(): Promise<SqlRunner> {
 
 	return {
 		all: async <T>(sql: string) => db.prepare(sql).all() as T[],
+		// Atomic like every other runner, and for one concrete reason beyond the
+		// contract: a rebuild's first statement is `pragma defer_foreign_keys =
+		// ON`, which is scoped to the current transaction. Outside one it is
+		// cleared at the next autocommit — i.e. immediately — and the drop of a
+		// still-referenced table fails.
 		batch: async (statements) => {
-			for (const statement of statements) db.exec(statement);
+			db.exec('begin');
+			try {
+				for (const statement of statements) db.exec(statement);
+				db.exec('commit');
+			} catch (error) {
+				db.exec('rollback');
+				throw error;
+			}
 		},
 	};
 }
@@ -79,12 +91,14 @@ export function findLocalDatabase(cwd: string, databaseName?: string): string {
 		);
 	}
 
-	// Miniflare names each database file after its durable-object id — 64 hex
-	// characters — and keeps its own `metadata.sqlite` bookkeeping file in the
-	// same directory. Matching on `.sqlite` alone counts that bookkeeping file
-	// as a database, so a project with exactly one real D1 binding still looked
-	// ambiguous and the command refused to run.
-	const files = readdirSync(root).filter((f) => /^[0-9a-f]{64}\.sqlite$/.test(f));
+	// Miniflare keeps its own `metadata.sqlite` bookkeeping file alongside the
+	// databases. Matching on `.sqlite` alone counted it as a database, so a
+	// project with exactly one real D1 binding still looked ambiguous and the
+	// command refused to run — so it is excluded by name. Excluded by *name*
+	// rather than by requiring the 64-hex durable-object id the files happen to
+	// be called today: that shape is Miniflare's business, and an allow-list
+	// keyed on it fails closed the day it changes.
+	const files = readdirSync(root).filter((f) => f.endsWith('.sqlite') && f !== 'metadata.sqlite');
 	if (files.length === 0) throw new Error(`No local D1 database file under ${root}.`);
 	if (files.length === 1) return join(root, files[0]!);
 

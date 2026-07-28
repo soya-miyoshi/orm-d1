@@ -14,9 +14,19 @@ import { defineConfig } from 'd1zzle-migrate';
 
 export default defineConfig({
   schema: './src/schema.ts',
+  tableOptions: './src/table-options.ts',  // optional: STRICT / WITHOUT ROWID / appendOnly
   out: './migrations',          // wrangler's layout, by default
+  d1: {
+    localFile: './.dev.db',     // optional: an explicit file for --local
+  },
 });
 ```
+
+`tableOptions` points at a module whose default export is `tableOptions([...])` from
+`d1zzle/ddl`, naming tables by object rather than by string. It is separate from the schema
+because none of `STRICT`, `WITHOUT ROWID` or the append-only trigger has a spelling in
+`drizzle-orm/sqlite-core`, and the schema DSL stays a strict subset of that so schema files
+remain readable by Drizzle's own tooling.
 
 The database is read from `wrangler.jsonc` / `wrangler.toml` unless you override it.
 Duplicated database configuration is a common source of "applied to the wrong database"
@@ -30,6 +40,8 @@ d1zzle-migrate migrate       # apply pending migrations (--local | --remote)
 d1zzle-migrate push          # diff and apply directly, no migration file (dev only)
 d1zzle-migrate pull          # introspect a live database → schema.ts + baseline snapshot
 d1zzle-migrate check         # detect drift and unapplied migrations; non-zero exit for CI
+d1zzle-migrate verify        # replay the migrations into an empty DB and compare with the
+                             #   schema; needs no database at all, so it runs in CI
 d1zzle-migrate up            # upgrade snapshot format after a kit version bump
 ```
 
@@ -65,6 +77,14 @@ restriction in the tool, and it is a property of D1, not of the kit.
 **Drift is a first-class command.** `check` introspects the live database, diffs it against
 the snapshot the migrations imply, and reports unapplied migrations, manual `ALTER`s and
 anything else that would make the next generated migration compute from a false baseline.
+
+**`verify` asks a question `check` cannot.** `check` compares the live database against
+the snapshot; `verify` replays the migrations into an empty database and compares *that*
+against the schema. Neither subsumes the other. `generate` writes two artifacts from one
+diff — the SQL and the snapshot — and nothing forces them to agree: if the renderer drops a
+constraint, both are self-consistent, `check` compares a database against the snapshot that
+shares the bug, and CI stays green while the constraint is gone. Comparing two things that
+share no code path is what closes it. `verify` needs no database, so it runs anywhere.
 
 **Wrangler stays interchangeable.** Migrations are written in wrangler's layout and
 recorded in wrangler's own `d1_migrations` table, so `d1zzle-migrate migrate` and

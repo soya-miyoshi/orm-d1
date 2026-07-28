@@ -18,8 +18,9 @@
  * `tsgo` checks this file; the runtime bodies are trivially true.
  */
 import type { BuildQueryResult, TablesRelationalConfig } from 'drizzle-orm';
-import { describe, expectTypeOf, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { PothosRelations } from '../../src/drizzle.js';
+import { pothosFindConfig } from '../../src/drizzle.js';
 import * as schema from '../schema.js';
 
 type Relations = PothosRelations<typeof schema.relations>;
@@ -90,5 +91,42 @@ describe('relation names are validated, not merely present', () => {
 		// The target name is recovered from the phantom target table, and it is
 		// what Drizzle keys the joined row shape by.
 		expectTypeOf<Relations['users']['relations']['posts']['targetTableName']>().toEqualTypeOf<'posts'>();
+	});
+});
+
+/**
+ * `pothosFindConfig` — the other half of the Pothos story, and the one that
+ * launders a type through a cast, so it is worth pinning both ways.
+ *
+ * The plugin's `query` callback declares a phantom `extras: { $pothosQueryFor:
+ * SQL<…> }` in its `.d.ts` and never constructs it. `SQL` there is Drizzle's,
+ * which renders through a different `toQuery` than ours, so threading the
+ * marker through makes the whole selection unassignable to `ExtrasArg`. This
+ * drops the marker and returns the *selection's* own type, so `where`,
+ * `columns`, `with` and `orderBy` stay checked by `findMany`'s own constraint —
+ * which is exactly what the previous `as never` gave up.
+ */
+describe('pothosFindConfig', () => {
+	it('passes the selection to the query callback and returns what it built', () => {
+		const seen: unknown[] = [];
+		const query = (selection?: never) => {
+			seen.push(selection);
+			return { ...(selection as unknown as object), extras: { $pothosQueryFor: 'phantom' } };
+		};
+
+		const config = pothosFindConfig(query, { where: { clubId: 'c1' }, columns: { id: true } });
+
+		// Identity in the sense that matters: the callback ran, on the selection.
+		expect(seen).toEqual([{ where: { clubId: 'c1' }, columns: { id: true } }]);
+		expect(config).toMatchObject({ where: { clubId: 'c1' } });
+	});
+
+	it('returns the selection’s own type, not the callback’s', () => {
+		const query = (_selection?: never): { extras: { $pothosQueryFor: symbol } } => ({ extras: {} as never });
+		const config = pothosFindConfig(query, { where: { id: 1 }, columns: { id: true } });
+
+		expectTypeOf(config).toEqualTypeOf<{ where: { id: number }; columns: { id: boolean } }>();
+		// @ts-expect-error the phantom marker is dropped, not carried through.
+		expectTypeOf(config.extras).toBeAny();
 	});
 });

@@ -934,6 +934,42 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 		expect(sql.indexOf('create trigger')).toBeGreaterThan(sql.indexOf('rename to "events"'));
 	});
 
+	// SQLite keeps a trigger's name across `ALTER TABLE … RENAME TO` and only
+	// repoints its `tbl_name`, so the guard on a renamed table is still called
+	// `<old>_no_update`. Everything downstream of the rename is keyed on the new
+	// name, so both halves of this were wrong before: the drop was a no-op that
+	// left UPDATE blocked forever, and the keep silently kept the stale name.
+	describe('the guard across a table rename', () => {
+		const renamed = sqliteTable('audit', { id: text('id').primaryKey(), at: text('at').notNull() });
+		const opts = (table: any, appendOnly: boolean): Snapshot =>
+			snapshotFromSchema([table], '', tableOptions([[table, { appendOnly }]]));
+
+		it('drops the trigger under the name it actually has', () => {
+			const diff = diffSnapshots(opts(events, true), opts(renamed, false), {
+				renamedTables: { events: 'audit' },
+			});
+			const sql = diff.statements.map((s) => s.sql);
+
+			expect(sql).toContain('alter table "events" rename to "audit"');
+			expect(sql).toContain('drop trigger if exists "events_no_update"');
+			// And never under the new name, which no trigger is called.
+			expect(sql.join('\n')).not.toMatch(/drop trigger if exists "audit_no_update"/);
+		});
+
+		it('re-creates the guard under the new name when the table stays append-only', () => {
+			const diff = diffSnapshots(opts(events, true), opts(renamed, true), {
+				renamedTables: { events: 'audit' },
+			});
+			const sql = diff.statements.map((s) => s.sql);
+
+			expect(sql).toContain('drop trigger if exists "events_no_update"');
+			expect(sql.some((s) => /create trigger "audit_no_update"/.test(s))).toBe(true);
+			// Ordering matters: the create has to follow the rename it names.
+			expect(sql.findIndex((s) => s.includes('create trigger')))
+				.toBeGreaterThan(sql.indexOf('alter table "events" rename to "audit"'));
+		});
+	});
+
 	it('reports no drift when nothing about the options changed', () => {
 		const snapshot = withOptions(events, { strict: true, withoutRowid: false, appendOnly: true });
 		expect(diffSnapshots(snapshot, snapshot).statements).toEqual([]);
@@ -968,6 +1004,28 @@ describe('reading table options back out of a CREATE TABLE', () => {
 		expect(isAppendOnlyTrigger('CREATE TRIGGER t AFTER INSERT ON "events" BEGIN SELECT 1; END', 'events'))
 			.toBe(false);
 	});
+
+	// The unsafe direction: reading a *conditional* abort as the guard reports a
+	// table as protected when UPDATE in fact still works on most rows.
+	it('does not mistake a conditional validation trigger for the guard', () => {
+		const when = 'CREATE TRIGGER validate BEFORE UPDATE ON "events" WHEN new.kind IS NULL '
+			+ "BEGIN SELECT RAISE(ABORT, 'kind required'); END";
+		expect(isAppendOnlyTrigger(when, 'events')).toBe(false);
+
+		const columns = 'CREATE TRIGGER validate BEFORE UPDATE OF "kind" ON "events" '
+			+ "BEGIN SELECT RAISE(ABORT, 'no'); END";
+		expect(isAppendOnlyTrigger(columns, 'events')).toBe(false);
+
+		// Aborts, but only down one branch of the CASE.
+		const branch = 'CREATE TRIGGER validate BEFORE UPDATE ON "events" BEGIN '
+			+ "SELECT CASE WHEN new.kind IS NULL THEN RAISE(ABORT, 'no') END; END";
+		expect(isAppendOnlyTrigger(branch, 'events')).toBe(false);
+
+		// And a guard that does something *else* as well is not the guard either.
+		const extra = 'CREATE TRIGGER g BEFORE UPDATE ON "events" BEGIN '
+			+ "INSERT INTO audit VALUES (1); SELECT RAISE(ABORT, 'no'); END";
+		expect(isAppendOnlyTrigger(extra, 'events')).toBe(false);
+	});
 });
 
 describe('table options that SQLite would reject', () => {
@@ -991,6 +1049,15 @@ describe('table options that SQLite would reject', () => {
 			b: blob('b'),
 		});
 		expect(validateTableOptions(t, { strict: true, withoutRowid: true })).toBeUndefined();
+	});
+
+	it('refuses AUTOINCREMENT on a WITHOUT ROWID table', () => {
+		// SQLite: `AUTOINCREMENT not allowed on WITHOUT ROWID tables`. Same
+		// family as the two above, and the same consequence if it slips through:
+		// a migration that reads fine and fails on apply.
+		const t = sqliteTable('log', { id: integer('id').primaryKey({ autoIncrement: true }) });
+		expect(validateTableOptions(t, { withoutRowid: true })).toMatch(/AUTOINCREMENT/);
+		expect(validateTableOptions(t, { withoutRowid: false })).toBeUndefined();
 	});
 
 	it('rejects a duplicate table in tableOptions rather than letting one win', () => {
@@ -1017,6 +1084,33 @@ describe('splitting a migration that contains a trigger', () => {
 		expect(statements[1]).toContain('raise(abort');
 		expect(statements[1]!.trimEnd().endsWith('end')).toBe(true);
 		expect(statements[2]).toMatch(/^create index/);
+	});
+
+	// The guard's own message ends in "…is prohibited", but a hand-written one
+	// need not: counting BEGIN/CASE/END over the raw text closed the body at the
+	// word `end` inside the literal and handed the applier `incomplete input` —
+	// the very failure the trigger-aware split exists to prevent.
+	it('ignores BEGIN, CASE and END inside quoted text', () => {
+		const migration = 'create trigger "x_no_update"\n'
+			+ 'before update on "x"\n'
+			+ 'begin\n'
+			+ "\tselect raise(abort, 'cannot edit an entry once the season has come to an end');\n"
+			+ 'end;\n'
+			+ 'create index "i" on "a" ("id");';
+
+		const statements = splitStatements(migration);
+		expect(statements).toHaveLength(2);
+		expect(statements[0]).toContain('come to an end');
+		expect(statements[0]!.trimEnd().endsWith('end')).toBe(true);
+		expect(statements[1]).toMatch(/^create index/);
+	});
+
+	it('ignores a quoted identifier that spells a keyword', () => {
+		const migration = 'create trigger "g" before update on "end" begin '
+			+ "select raise(abort, 'no'); end;\n"
+			+ 'create table "u" ("b" text);';
+
+		expect(splitStatements(migration)).toHaveLength(2);
 	});
 
 	it('still splits ordinary statements, and a CASE inside a trigger body', () => {

@@ -45,6 +45,8 @@ d1zzle-migrate migrate       # apply pending migrations (--local | --remote)
 d1zzle-migrate push          # diff and apply directly, no migration file (dev only)
 d1zzle-migrate pull          # introspect a live database → schema.ts + snapshot
 d1zzle-migrate check         # detect drift and unapplied migrations; exit non-zero in CI
+d1zzle-migrate verify        # replay every migration into an empty DB and compare with the
+                             #   schema; needs no database, so it belongs in CI
 d1zzle-migrate up            # upgrade snapshot format after a kit version bump
 ```
 
@@ -59,14 +61,27 @@ import { defineConfig } from 'd1zzle-migrate';
 
 export default defineConfig({
   schema: './src/schema.ts',
+  tableOptions: './src/table-options.ts',   // optional; see below
   out: './migrations',              // wrangler-compatible layout
   d1: {
     databaseName: 'my-db',          // resolved from wrangler.jsonc when omitted
     accountId: process.env.CLOUDFLARE_ACCOUNT_ID,
     token: process.env.CLOUDFLARE_API_TOKEN,
+    localFile: './.dev.db',         // optional; skips .wrangler discovery for --local
   },
 });
 ```
+
+`tableOptions` points at a module whose default export is `tableOptions([...])` from
+`d1zzle/ddl` — per-table `STRICT`, `WITHOUT ROWID` and `appendOnly`. It is a separate
+module rather than part of the schema on purpose: none of the three has a spelling in
+`drizzle-orm/sqlite-core`, and doc 08 keeps the schema DSL a strict subset of it so a
+schema file stays reverse-aliasable. Tables are named by *object*, not by string, so a
+rename is a type error.
+
+`d1.localFile` names an explicit SQLite file for `--local` instead of discovering one under
+`.wrangler/state` — for projects whose dev server and tests run in Node against a plain
+file through a D1-shaped adapter.
 
 Reading `wrangler.jsonc` for the binding and database id by default matters more than it
 sounds: duplicated database configuration is a common source of "applied to the wrong

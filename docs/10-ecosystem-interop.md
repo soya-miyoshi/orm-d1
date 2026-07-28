@@ -191,7 +191,7 @@ was not sufficient, and the next adapter deserves a real test rather than a surv
 | --- | --- | --- |
 | `drizzle-orm` core helpers (`is`, `getTableName`, `getTableColumns`) | Verified by test | Direct use needs `asDrizzleTable` |
 | Drizzle `SQL` fragments over d1zzle columns (`eq`, `inArray`, `sql`) | **Verified by test** — rendered through the bridge in `sql/drizzle-sql.ts` | n/a |
-| Pothos `plugin-drizzle` | **Verified end to end** — `test/workers/pothos.test.ts` executes GraphQL against real D1 in workerd. Needs our `getTableConfig` and `asDrizzleRelations` | Opt out with `DrizzleRelations: never`; see below |
+| Pothos `plugin-drizzle` | **Verified end to end** — `test/workers/pothos.test.ts` executes GraphQL against real D1 in workerd. Needs our `getTableConfig` and `asDrizzleRelations` | `DrizzleRelations: PothosRelations<typeof relations>`; see below |
 | Validator adapters (Zod, Valibot, TypeBox) | Read columns only; expected to work | `asDrizzleSchema` |
 | Drizzle Studio (extension) | Works — it introspects the live database and never sees our objects at all | n/a |
 
@@ -211,16 +211,23 @@ The honest gaps:
   only move its failure from a clear "unknown database instance type" to an undefined-is-
   not-a-function further in — strictly worse. **Decided: not built**, and this is the
   measurement rather than a deferral.
-- **Pothos' types — permanent, not pending.** The runtime contract is fully met and
-  tested. The *type* parameter `DrizzleRelations` slots against Drizzle's
-  `TablesRelationalConfig`, whose `table` is Drizzle's `Table` class, so the
-  protected-member rule above applies one level up. `DrizzleRelations: never` plus a cast
-  on `client` and `relations` is therefore the supported spelling, not an unfinished phase.
-  A `ToDrizzleTable`-style computed bridge would have to reproduce Drizzle's relation
-  *types* — `One`/`Many` with their own protected-member ancestry — rather than just its
-  column metadata, so it would hit the same wall it was meant to route around. What is lost
-  is autocompletion of table names inside the builder; what is kept is every runtime
-  guarantee, under test.
+- **Pothos' types — typed, not opted out of.** This entry used to read "permanent, not
+  pending": the *type* parameter `DrizzleRelations` slots against Drizzle's
+  `TablesRelationalConfig`, whose `table` is Drizzle's `Table` class, so — the reasoning
+  went — the protected-member rule applies one level up and `DrizzleRelations: never` plus
+  a cast is the supported spelling. That was wrong. The rule applies to Drizzle's
+  `Column`/`Table` *classes*, but v1's `TableRelationalConfig` asks only for
+  `{ table; name; relations }`, and its `table` is `SchemaEntry` — `Table<any> | View<…>` —
+  which `ToDrizzleTable` already produces. Nothing in that interface is compared nominally.
+
+  `PothosRelations<typeof relations>` fills the slot outright, and `asPothosRelations()`
+  supplies the value, so only `client` and `getTableConfig` still take casts — those do
+  slot against Drizzle's database and table classes. Opting out was not free: it took the
+  whole GraphQL layer off compile-time checking, so a typo'd column reached production as a
+  runtime resolver error. `test/unit/pothos-types.test.ts` pins the replacement with
+  negative controls, and `test/workers/pothos.test.ts` runs on the real generic against a
+  real D1 binding.
+
 - **`AggregatedField`.** Raised as an open question when the interface was scoped. Grepped
   again against the plugin's runtime code: it references neither `AggregatedField` nor a
   relation-count key, so `with` does not have to handle an aggregate in place of a

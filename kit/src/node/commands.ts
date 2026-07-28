@@ -547,6 +547,7 @@ export interface VerifyResult {
 	readonly differences: readonly string[];
 	/** Structural failures found by SQLite itself. */
 	readonly corruption: readonly string[];
+	/** Migrations that actually replayed — fewer than the journal if one failed. */
 	readonly applied: number;
 	readonly ok: boolean;
 }
@@ -581,18 +582,23 @@ export async function verify(ctx: CommandContext): Promise<VerifyResult> {
 	// In journal order, which is the order a new environment applies them in.
 	// Reading from the journal rather than globbing the folder also means a
 	// migration that exists on disk but was never recorded is caught here.
+	let applied = 0;
 	for (const entry of journal.entries) {
 		const sql = await readMigration(ctx.config.out, entry.tag);
 		try {
 			await runner.batch(applicableStatements(sql));
 		} catch (error) {
+			// `applied` counts what actually replayed, not what the journal
+			// lists: bailing at migration k and reporting the full length reads
+			// as a complete replay that merely disagreed with the schema.
 			return {
 				differences: [`${entry.tag} failed to apply: ${(error as Error).message}`],
 				corruption: [],
-				applied: journal.entries.length,
+				applied,
 				ok: false,
 			};
 		}
+		applied++;
 	}
 
 	const corruption: string[] = [];
@@ -621,7 +627,7 @@ export async function verify(ctx: CommandContext): Promise<VerifyResult> {
 			: `Replayed ${journal.entries.length} migration(s); the result does NOT match the schema.`,
 	);
 
-	return { differences, corruption, applied: journal.entries.length, ok };
+	return { differences, corruption, applied, ok };
 }
 
 // ------------------------------------------------------------------------ up

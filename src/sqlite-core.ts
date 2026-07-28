@@ -70,12 +70,19 @@ export type {
  * threadId: integer('thread_id').references((): AnySQLiteColumn => messages.id)
  * ```
  *
- * Our `Column` is the same type. Both names are exported because the *Drizzle*
- * name is the one a schema file has to use to stay reverse-aliasable — doc 08
+ * Our `Column` is the same type. Only the Drizzle spelling is exported: doc 08
  * requires every symbol a schema file mentions to exist in
- * `drizzle-orm/sqlite-core`, and `Column` does not.
+ * `drizzle-orm/sqlite-core`, and while `AnySQLiteColumn` does, `AnyColumn` does
+ * not — Drizzle keeps that one at the package root, so aliasing it here would
+ * hand schema authors a name that breaks reverse-aliasing.
+ *
+ * The bare spelling is what ports. Drizzle's
+ * `AnySQLiteColumn<TPartial extends Partial<ColumnBaseConfig>>` takes a partial
+ * config, where our `Column<M extends ColumnMeta>` requires `data`, `notNull`
+ * and `hasDefault` — so a parameterized `AnySQLiteColumn<{…}>` will not port
+ * even though `AnySQLiteColumn` itself does.
  */
-export type { Column as AnySQLiteColumn, Column as AnyColumn } from './index.js';
+export type { Column as AnySQLiteColumn } from './index.js';
 
 /**
  * Drizzle exposes the D1 driver from `drizzle-orm/d1`; d1zzle's `drizzle()`

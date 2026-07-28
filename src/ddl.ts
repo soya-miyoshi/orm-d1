@@ -146,6 +146,14 @@ export function validateTableOptions(t: Table, options: TableOptions): string | 
 		if (!hasComposite && !hasColumnPk) {
 			return `"${name}" is declared WITHOUT ROWID but has no primary key; SQLite rejects that outright.`;
 		}
+
+		// AUTOINCREMENT is defined in terms of the rowid, so a table without one
+		// cannot have it: `AUTOINCREMENT not allowed on WITHOUT ROWID tables`.
+		const auto = columns.find((c) => c.config.primaryKey && c.config.autoIncrement);
+		if (auto) {
+			return `"${name}" is declared WITHOUT ROWID but "${auto.name}" is AUTOINCREMENT; `
+				+ 'AUTOINCREMENT numbers rowids, which a WITHOUT ROWID table does not have.';
+		}
 	}
 
 	if (options.strict) {
