@@ -8,7 +8,7 @@ import { getTableColumns as drizzleGetTableColumns, getTableName as drizzleGetTa
 import { Column as DrizzleColumn, Table as DrizzleTable } from 'drizzle-orm';
 import { SQLiteColumn, SQLiteInteger, SQLiteTable, SQLiteText } from 'drizzle-orm/sqlite-core';
 import { describe, expect, it } from 'vitest';
-import { alias, blob, integer, sqliteTable, text } from '../../src/index.js';
+import { alias, blob, integer, query, sql, sqliteTable, text } from '../../src/index.js';
 import { postTags, posts, users } from '../schema.js';
 
 describe('drizzle entity recognition', () => {
@@ -47,6 +47,31 @@ describe('drizzle entity recognition', () => {
 			'createdAt',
 			'updatedAt',
 		]);
+	});
+
+	it('gives a subquery’s columns the same concrete classes as a table’s', () => {
+		// A subquery is a table everywhere except the `from` clause, so an
+		// adapter branching on `is(col, SQLiteInteger)` has to get the same
+		// answer from one. These were built from the base `Column` class, which
+		// fails that walk for every type — the exact check this whole module
+		// exists to satisfy, skipped in the one place the column is synthesised
+		// rather than declared.
+		const s = query.select({ id: users.id, who: users.email }).from(users).as('s');
+
+		expect(is(s.id, SQLiteInteger)).toBe(true);
+		expect(is(s.who, SQLiteText)).toBe(true);
+		expect(is(s.id, SQLiteColumn)).toBe(true);
+		expect(is(s.id, SQLiteText)).toBe(false);
+	});
+
+	it('types a projected expression as text, since nothing better is known', () => {
+		// The fallback path: an arbitrary fragment has no column to copy a class
+		// from, so it gets `SQLiteText` — and must still be *a* SQLite column
+		// rather than the bare base class.
+		const s = query.select({ n: sql<number>`count(*)` }).from(users).as('s');
+
+		expect(is(s.n, SQLiteColumn)).toBe(true);
+		expect(is(s.n, SQLiteText)).toBe(true);
 	});
 
 	it('reports an alias the way drizzle does', () => {

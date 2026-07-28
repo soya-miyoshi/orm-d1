@@ -118,3 +118,119 @@ describe('inArray against the budget directly', () => {
 		expect(rows).toHaveLength(N);
 	});
 });
+
+/**
+ * The gap between "these values *could* collapse to `json_each`" and "this call
+ * *will* collapse them".
+ *
+ * `collapsesToJsonEach` answers only the first question — it asks whether the
+ * values have a faithful JSON spelling, which every integer does. `InArray`
+ * asks a second one before switching strategy: is the list at least
+ * `jsonEachThreshold` long? Below the threshold it binds one parameter per
+ * value, exactly like a composite key.
+ *
+ * The chunker tested only the first, so a short key list disabled chunking
+ * (`maxKeys = keys.length`) while still binding one parameter each — and the
+ * budget deliberately reserved for the child's own predicates was handed back
+ * out. The statement then overflowed by exactly the reserved count, which
+ * surfaces as D1's bare `too many SQL variables`.
+ *
+ * Reachable at stock defaults only with a child filter binding >71 parameters,
+ * so this reaches it the documented way instead: a lowered `maxParams`, which
+ * is the lever for shorter statements.
+ */
+describe('a key list too short to reach json_each', () => {
+	// 9 parents against a budget of 10, with a threshold they cannot reach.
+	const tight = drizzle({ client: DB, relations, maxParams: 10, jsonEachThreshold: 10 });
+	const PARENTS = 9;
+
+	/** Three bound parameters in the child's own `where`, and no more. */
+	const childWhere = { id: { gte: 1, lte: 10_000 }, ownerId: { gte: 1 } } as const;
+
+	it('does not overflow D1’s real limit at the stock budget', async () => {
+		// The failure as it actually arrives, against the 100 D1 enforces —
+		// confirmed here rather than assumed, since our `maxParams` is a budget
+		// and not the database's own ceiling.
+		//
+		// 99 parents is one short of the threshold, so every key binds a
+		// parameter, and the child's `where` binds three more: 102 against 100.
+		// The reserved budget was computed correctly and then discarded, so this
+		// used to come back as a bare `too many SQL variables` naming nothing.
+		const raised = drizzle({ client: DB, relations, jsonEachThreshold: 100 });
+
+		const rows = await raised.query.nOwners.findMany({
+			columns: { id: true },
+			where: { id: { lte: 99 } },
+			with: { items: { columns: { id: true, ownerId: true }, where: childWhere } },
+			orderBy: { id: 'asc' },
+		});
+
+		expect(rows).toHaveLength(99);
+		for (const row of rows) expect(row.items[0]!.ownerId).toBe(row.id);
+	});
+
+	it('chunks by the remaining budget instead of binding the whole list', async () => {
+		const rows = await tight.query.nOwners.findMany({
+			columns: { id: true },
+			where: { id: { lte: PARENTS } },
+			with: { items: { columns: { id: true, ownerId: true }, where: childWhere } },
+			orderBy: { id: 'asc' },
+		});
+
+		// Every parent still gets its own child: chunking must not lose or
+		// cross-wire a bucket, which is the failure mode a naive fix invites.
+		expect(rows).toHaveLength(PARENTS);
+		for (const row of rows) {
+			expect(row.items).toHaveLength(1);
+			expect(row.items[0]!.ownerId).toBe(row.id);
+		}
+	});
+
+	it('sends more than one child statement, which is what proves it chunked', async () => {
+		// Without this the test above passes on the broken code the moment the
+		// budget happens to be generous enough — the assertion that matters is
+		// that the keys were split at all.
+		const sqls: string[] = [];
+		const counted = drizzle({
+			client: DB,
+			relations,
+			maxParams: 10,
+			jsonEachThreshold: 10,
+			onQuery: (e) => void sqls.push(e.sql),
+		});
+
+		await counted.query.nOwners.findMany({
+			columns: { id: true },
+			where: { id: { lte: PARENTS } },
+			with: { items: { columns: { id: true }, where: childWhere } },
+		});
+
+		// One for the parents, then the children split across the 7 slots the
+		// child's 3 reserved parameters leave of the 10.
+		expect(sqls).toHaveLength(3);
+		expect(sqls.filter((s) => s.includes('json_each'))).toHaveLength(0);
+	});
+
+	it('still collapses once the list is long enough to be worth it', async () => {
+		// The control: the same query over enough parents takes the json_each
+		// path and needs no chunking, so the fix narrowed the condition rather
+		// than disabling the optimisation.
+		const sqls: string[] = [];
+		const counted = drizzle({
+			client: DB,
+			relations,
+			maxParams: 10,
+			jsonEachThreshold: 10,
+			onQuery: (e) => void sqls.push(e.sql),
+		});
+
+		await counted.query.nOwners.findMany({
+			columns: { id: true },
+			where: { id: { lte: 20 } },
+			with: { items: { columns: { id: true }, where: childWhere } },
+		});
+
+		expect(sqls).toHaveLength(2);
+		expect(sqls[1]).toContain('json_each');
+	});
+});

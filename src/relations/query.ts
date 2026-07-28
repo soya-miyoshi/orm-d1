@@ -227,6 +227,14 @@ const perParentBound = (value: number | Placeholder<number> | undefined, what: s
 /** What a child level needs in order to be fetched by its parents' keys. */
 interface ChildFetch {
 	readonly matcher: Condition | undefined;
+	/**
+	 * The relation's own `where`, already compiled against the target table.
+	 *
+	 * It belongs to the relation rather than to the call, so it cannot be
+	 * derived from the child's `FindConfig` — and it is compiled by the *parent*,
+	 * in `#fetchChild`, because that is the only level holding the `Relation`.
+	 */
+	readonly declared?: Condition | undefined;
 	/** Columns each parent's page is numbered within. */
 	readonly partitionBy: readonly Column<any>[];
 	readonly window?: PerParentWindow | undefined;
@@ -421,6 +429,11 @@ export class RelationalQueryBuilder {
 		const orderBy = resolveOrderBy(config.orderBy, columns);
 		const where = and(
 			compileFilter(config.where, this.config.table, columns, this.config.relations, this.schema),
+			// The relation's declared `where` applies wherever it is traversed —
+			// the same rule `compileRelationFilter` follows when the relation
+			// appears in a filter instead. Dropping it here was silent: the rows
+			// simply came back unfiltered.
+			child?.declared,
 			child?.matcher,
 		);
 
@@ -453,6 +466,17 @@ export class RelationalQueryBuilder {
 
 		const isMany = relation.relationType === 'many';
 		const parentFieldNames = relation.sourceColumns!.map((c) => fieldNameOf(this.config.columns, c));
+
+		const targetColumns = getTableColumns(targetConfig.table) as unknown as Record<string, Column<any>>;
+
+		/**
+		 * `where` declared on the relation itself, which narrows the target rows
+		 * every time it is traversed. Compiled here rather than in `#run` because
+		 * this is the only level that has the `Relation` in hand.
+		 */
+		const declared = relation.where
+			? compileFilter(relation.where, targetConfig.table, targetColumns, targetConfig.relations, this.schema)
+			: undefined;
 
 		/**
 		 * The junction table is aliased so a self-referencing many-to-many —
@@ -518,6 +542,7 @@ export class RelationalQueryBuilder {
 		const runFor = (subset: readonly unknown[][]): Promise<Record<string, unknown>[]> =>
 			nested.#run(entry.config, childFieldNames, true, {
 				matcher: matcherFor(subset),
+				declared,
 				partitionBy: matchColumns,
 				window,
 				through,
@@ -531,23 +556,34 @@ export class RelationalQueryBuilder {
 		 * so 60 parents with a two-column key is 120 parameters against a limit
 		 * of ~100. Those are chunked, which is what `subset` was always for.
 		 *
-		 * The exception is a binary key. A `Uint8Array` has no faithful JSON
-		 * spelling, so `inArray` bindsblobs individually rather than change the
-		 * answer — which makes a single blob column the one shape that both
-		 * skips `json_each` *and* would skip chunking if this only counted
-		 * columns. A UUID-as-bytes primary key with more than ~100 parents is
-		 * a real query, and it overflowed. Ask `inArray` what it will actually
-		 * do rather than assuming; the integer path is untouched.
+		 * "Usually" hides two exceptions, and both have to be asked about rather
+		 * than assumed, or a single-column key looks free when it is not.
+		 *
+		 * A binary key. A `Uint8Array` has no faithful JSON spelling, so
+		 * `inArray` binds blobs individually rather than change the answer —
+		 * which makes a single blob column the one shape that both skips
+		 * `json_each` *and* would skip chunking if this only counted columns. A
+		 * UUID-as-bytes primary key with more than ~100 parents is a real query,
+		 * and it overflowed.
+		 *
+		 * And a key list too short to be worth collapsing. `collapsesToJsonEach`
+		 * answers only whether the values *have* a JSON spelling;
+		 * `inArray` additionally requires `jsonEachThreshold` of them before it
+		 * switches, and below that every value binds individually, exactly like
+		 * a composite key. Testing the spelling alone disabled chunking for
+		 * short lists that still bind one parameter each — which handed back the
+		 * budget reserved just below and overflowed by exactly its size.
 		 */
 		const perKey = matchColumns.length;
-		const collapses = perKey === 1 && collapsesToJsonEach(matchColumns[0], keys.map((k) => k[0]));
+		const collapses = perKey === 1
+			&& keys.length >= this.db.$jsonEachThreshold
+			&& collapsesToJsonEach(matchColumns[0], keys.map((k) => k[0]));
 
 		// The keys are not the only parameters in the child statement. A nested
-		// `where` binds, and so do the window's bounds — so a chunk sized to the
-		// whole budget leaves them nothing and overflows by exactly their count.
-		// Rendering the filter twice (here and again in `#run`) is cheap next to
-		// the round trip it protects.
-		const targetColumns = getTableColumns(targetConfig.table) as unknown as Record<string, Column<any>>;
+		// `where` binds, the relation's own `where` binds, and so do the window's
+		// bounds — so a chunk sized to the whole budget leaves them nothing and
+		// overflows by exactly their count. Rendering the filters twice (here and
+		// again in `#run`) is cheap next to the round trip it protects.
 		const childFilter = compileFilter(
 			entry.config.where,
 			targetConfig.table,
@@ -555,7 +591,10 @@ export class RelationalQueryBuilder {
 			targetConfig.relations,
 			this.schema,
 		);
-		const reserved = (childFilter ? render(childFilter, renderContextOf(this.db)).params.length : 0)
+		const paramsOf = (condition: Condition | undefined): number =>
+			condition ? render(condition, renderContextOf(this.db)).params.length : 0;
+		const reserved = paramsOf(childFilter)
+			+ paramsOf(declared)
 			+ (window?.limit !== undefined ? 1 : 0)
 			+ (window?.offset ? 1 : 0);
 

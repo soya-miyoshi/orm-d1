@@ -1,17 +1,30 @@
 import type { Column, ColumnMeta } from './columns.js';
-import type { ColumnsMap, Table, TableColumns } from './table.js';
+import type { ColumnsMap, NullableGroup, Table, TableColumns } from './table.js';
 
 /** Prettify — applied only at the public boundary, never internally. */
 export type Simplify<T> = { [K in keyof T]: T[K] } & {};
 
 type Cols<T extends Table> = T[typeof TableColumns];
 
-/** The decoded type of a column, widened by nullability. */
+/**
+ * The decoded type of a column, widened by nullability.
+ *
+ * The second branch is for subqueries only. A declared table is flat, but
+ * `.as()` over a join exposes one *group* per table — `sq.users.id` — and the
+ * runtime reads those groups back out nested. With no group branch every group
+ * inferred as `never`, so `rows[0].posts.title` was a type error on a value the
+ * query returns correctly.
+ */
 export type Out<C> = C extends Column<infer M extends ColumnMeta>
 	? M['notNull'] extends true ? M['data'] : M['data'] | null
+	: C extends ColumnsMap
+		? typeof NullableGroup extends keyof C ? InferSelectFromColumns<C> | null : InferSelectFromColumns<C>
 	: never;
 
-export type InferSelectFromColumns<C extends ColumnsMap> = Simplify<{ [K in keyof C]: Out<C[K]> }>;
+/** The marker is a phantom key, never a column: it must not become a field. */
+export type InferSelectFromColumns<C extends ColumnsMap> = Simplify<
+	{ [K in Exclude<keyof C, typeof NullableGroup>]: Out<C[K]> }
+>;
 
 export type InferSelect<T extends Table> = InferSelectFromColumns<Cols<T>>;
 

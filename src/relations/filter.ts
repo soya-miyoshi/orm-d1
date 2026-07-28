@@ -18,6 +18,7 @@
  * to `false` on a relation key meaning `not exists` and an empty `AND: []`
  * contributing nothing.
  */
+import { CompileError } from '../errors.js';
 import type { Column } from '../schema/columns.js';
 import type { Table } from '../schema/table.js';
 import { alias, getTableColumns, getTableOriginalName } from '../schema/table.js';
@@ -46,7 +47,7 @@ import {
 	or,
 } from '../sql/expressions.js';
 import type { Placeholder, SQLChunk } from '../sql/sql.js';
-import { isSQLChunk, sql } from '../sql/sql.js';
+import { isPlaceholder, isSQLChunk, sql } from '../sql/sql.js';
 import type { Relation, RelationsConfig } from './define.js';
 
 /**
@@ -104,8 +105,21 @@ export interface ColumnFilterOperators<T> {
 	gte?: Operand<T>;
 	lt?: Operand<T>;
 	lte?: Operand<T>;
-	in?: readonly T[] | Placeholder<readonly T[]>;
-	notIn?: readonly T[] | Placeholder<readonly T[]>;
+	/**
+	 * No `Placeholder` here, unlike every operator above it. `in (…)` renders
+	 * one `?` per value, so its arity is part of the SQL text and has to be
+	 * known at compile time — a placeholder filled afterwards can only ever bind
+	 * the whole array to a single `?`, which SQLite reads as a scalar. Bind the
+	 * list at build time, or match against a subquery.
+	 *
+	 * The subquery half is spelled out here rather than left to the runtime:
+	 * `assertBindableList` accepts a `SQLChunk` and the error it throws points at
+	 * exactly that escape hatch, but the type used to admit only an array — so
+	 * the alternative the message recommends needed a cast, which makes the guard
+	 * the wall it says it is not.
+	 */
+	in?: readonly T[] | SQLChunk;
+	notIn?: readonly T[] | SQLChunk;
 	like?: Operand<string>;
 	ilike?: Operand<string>;
 	notLike?: Operand<string>;
@@ -142,6 +156,43 @@ export interface RelationsFilter {
 
 // ---------------------------------------------------------------- compiling
 
+/**
+ * `in` and `notIn` take a literal list, never a placeholder.
+ *
+ * The type says so, but the type is not the only way in: a filter built from
+ * JSON, or from a `RelationsFilter` that has been widened, reaches here
+ * unchecked. Without this the placeholder was passed straight to `inArray`,
+ * which sees a `SQLChunk` and renders it as a *subquery* — `in (?)` with the
+ * whole array bound to one slot, which D1 rejects at run time with
+ * `Type 'object' not supported`. There is no spelling that would work: the
+ * number of `?` is part of the SQL text and a placeholder is filled after it.
+ */
+const assertBindableList = (
+	operator: 'in' | 'notIn',
+	column: Column<any>,
+	value: unknown,
+): readonly unknown[] | SQLChunk => {
+	// The placeholder check comes first because a placeholder is itself a chunk,
+	// and the subquery branch below would otherwise swallow it — which is
+	// exactly the confusion that produced the bug.
+	if (isPlaceholder(value)) {
+		throw new CompileError(
+			`"${operator}" on column "${column.name}" was given a placeholder. \`in (…)\` renders one bound `
+				+ 'parameter per value, so the list has to be known when the statement is compiled — a '
+				+ 'placeholder can only fill a single slot, and SQLite would read the array as one scalar. '
+				+ 'Pass the array itself, or match against a subquery.',
+		);
+	}
+	if (isSQLChunk(value)) return value;
+	if (!Array.isArray(value)) {
+		throw new CompileError(
+			`"${operator}" on column "${column.name}" expects an array of values or a subquery; received `
+				+ `${value === null ? 'null' : typeof value}.`,
+		);
+	}
+	return value as readonly unknown[];
+};
+
 const applyColumnOperator = (column: Column<any>, operator: string, value: unknown): Condition | undefined => {
 	switch (operator) {
 		case 'eq':
@@ -165,9 +216,9 @@ const applyColumnOperator = (column: Column<any>, operator: string, value: unkno
 		case 'notIlike':
 			return notIlike(column, value as string);
 		case 'in':
-			return inArray(column, value as readonly unknown[]);
+			return inArray(column, assertBindableList('in', column, value));
 		case 'notIn':
-			return notInArray(column, value as readonly unknown[]);
+			return notInArray(column, assertBindableList('notIn', column, value));
 		// `isNull: false` is not `is not null` — it is "no constraint", which is
 		// how Drizzle reads it. Only the truthy case emits anything.
 		case 'isNull':

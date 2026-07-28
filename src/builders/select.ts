@@ -1,14 +1,13 @@
 import type { CompiledQuery } from '../plan/compile.js';
-import { compileSelect } from '../plan/compile.js';
+import { compileSelect, projectedColumns, projectedNullableGroups } from '../plan/compile.js';
 import type { Join, JoinType, Selection, SelectPlan } from '../plan/plan.js';
 import { emptySelectPlan } from '../plan/plan.js';
-import type { Column, ColumnMeta } from '../schema/columns.js';
-import { Column as ColumnClass, isColumn } from '../schema/columns.js';
-import type { ColumnsMap, NameOf, Subquery, Table } from '../schema/table.js';
+import type { Column, ColumnConfig, ColumnMeta } from '../schema/columns.js';
+import { columnClassFor, isColumn } from '../schema/columns.js';
+import type { ColumnsMap, NameOf, NullableColumns, Subquery, Table } from '../schema/table.js';
 import type { InferSelect, Simplify } from '../schema/infer.js';
-import { createSubquery, getTableColumns } from '../schema/table.js';
+import { createSubquery } from '../schema/table.js';
 import type { Condition } from '../sql/expressions.js';
-import { hasDecode } from '../sql/functions.js';
 import type { Placeholder, Query, RenderContext, SQLChunk } from '../sql/sql.js';
 import { defaultRenderContext } from '../sql/sql.js';
 import { resolveContext } from './types.js';
@@ -22,12 +21,47 @@ import type { QueryExecutor, Runnable } from './types.js';
  * one of them forces a `!` on each read out of a subquery.
  */
 export type SubqueryColumns<TRow> = {
-	[K in keyof TRow]-?: Column<{
-		data: NonNullable<TRow[K]>;
-		notNull: null extends TRow[K] ? false : true;
-		hasDefault: boolean;
-	}>;
+	[K in keyof TRow]-?: unknown extends NonNullable<TRow[K]>
+		// An untyped `sql\`…\`` produces `unknown`, which is not a scalar and not
+		// an object either — left to the group branch it turned `sq.n` into a
+		// structural expansion of the `Column` class. A value the projection
+		// could not describe is still a value, so it reads as one column of
+		// unknown type rather than as a group of columns.
+		? Column<{ data: unknown; notNull: false; hasDefault: boolean }>
+		: NonNullable<TRow[K]> extends SubqueryLeaf ? Column<{
+				data: NonNullable<TRow[K]>;
+				notNull: null extends TRow[K] ? false : true;
+				hasDefault: boolean;
+			}>
+		// A group the inner join could miss stays nullable through `.as()`: the
+		// mark is what `Out<>` reads to widen it, matching the `null` the mapper
+		// now returns for it.
+		: null extends TRow[K] ? SubqueryColumns<NonNullable<TRow[K]>> & NullableColumns
+		: SubqueryColumns<NonNullable<TRow[K]>>;
 };
+
+/**
+ * Values a subquery column can hold, as opposed to a *group* of columns.
+ *
+ * A join or a nested selection produces a row of nested objects, and the
+ * subquery's surface has to nest with it — `sq.users.id`, matching what the
+ * runtime now builds. The only way to tell the two apart from the row type is
+ * to enumerate what a scalar looks like, which puts a JSON-mode column holding
+ * a plain object on the wrong side: it reads as a group. That is the narrow
+ * cost of not carrying the selection's shape into the row type, and it is
+ * visible at the call site rather than at run time.
+ *
+ * The known limitation, then, is exactly one case: a column whose decoded value
+ * is a plain object — `text({ mode: 'json' })` over an object, or a
+ * `sql<{ … }>` fragment — reads as a group of columns on a subquery surface,
+ * and has to be selected out under a cast. Everything else lands correctly:
+ * `unknown` is handled above, and the runtime half of the surface is derived
+ * from the projection (`projectedColumns`) rather than from the row, so the SQL
+ * is right either way. Closing the last case means threading the selection's
+ * *type* through `SelectState` into `.as()`, which is a larger change than the
+ * one symptom justifies.
+ */
+type SubqueryLeaf = string | number | bigint | boolean | Date | Uint8Array | ArrayBuffer | null | undefined;
 
 /** Map a user-supplied projection to its row type. */
 export type SelectionToRow<S> = Simplify<
@@ -180,6 +214,7 @@ export class SelectBuilder<S extends SelectState> implements Promise<ResultRow<S
 			name,
 			this,
 			subqueryColumns(this.plan, name),
+			projectedNullableGroups(this.plan),
 		) as unknown as Subquery<SubqueryColumns<ResultRow<S>>, TName>;
 	}
 
@@ -228,41 +263,65 @@ export class SelectBuilder<S extends SelectState> implements Promise<ResultRow<S
 	}
 }
 
-/** Columns a subquery exposes, derived from its projection. */
+/**
+ * Columns a subquery exposes, derived from the projection the compiler will
+ * actually emit.
+ *
+ * Two things make this more than a walk over `plan.selection`. `assignKeys`
+ * renames the whole projection to `c0…cN` as soon as two leaves share a name,
+ * which any nested selection or implicit join produces — so the emitted name
+ * and the name the caller reads it back under are different, and the column has
+ * to carry the former while being *keyed* by the latter. And an implicit join's
+ * selection is not `plan.selection` at all; deriving from `plan.from` alone
+ * dropped every joined table's columns from the surface.
+ *
+ * The result is nested exactly as the row is: `sq.users.id`, not `sq.id`. That
+ * is what lets a subquery be selected from again, since `flattenSelection`
+ * walks the same shape back out.
+ */
 const subqueryColumns = (plan: SelectPlan, aliasName: string): ColumnsMap => {
-	const source: Selection = plan.selection
-		?? (plan.from ? (getTableColumns(plan.from) as unknown as Selection) : {});
-	const columns: ColumnsMap = {};
+	const root: ColumnsMap = {};
 
-	for (const [key, entry] of Object.entries(source)) {
-		if (isColumn(entry)) {
-			const column = new ColumnClass({ ...entry.config, explicitName: key, fieldName: key });
-			column.tableName = aliasName;
-			columns[key] = column;
-			continue;
-		}
-		const column = new ColumnClass({
-			explicitName: key,
-			fieldName: key,
-			type: 'text',
-			columnType: 'SQLiteText',
-			notNull: false,
-			primaryKey: false,
-			autoIncrement: false,
-			hasDefault: false,
-			unique: false,
-			encode: (value) => value as never,
-			// An expression that knows how to decode itself has to keep doing so
-			// through the alias: a nested limit routes the query through
-			// `row_number()`, and without this the same extra would decode one way
-			// with a limit and another way without.
-			...(hasDecode(entry) ? { decode: entry.decode } : {}),
-		});
+	for (const { path, key, column: source, decode } of projectedColumns(plan)) {
+		// `explicitName: key` is the emitted alias — the name inside the subquery
+		// — while the map key is how the caller refers to it. Those differ under
+		// any rename, and rendering used to use the map key, which named a column
+		// the inner statement does not have.
+		const config = source
+			? { ...source.config, explicitName: key, fieldName: key }
+			: {
+				explicitName: key,
+				fieldName: key,
+				type: 'text',
+				columnType: 'SQLiteText',
+				notNull: false,
+				primaryKey: false,
+				autoIncrement: false,
+				hasDefault: false,
+				unique: false,
+				encode: (value) => value as never,
+				// An expression that knows how to decode itself has to keep doing so
+				// through the alias: a nested limit routes the query through
+				// `row_number()`, and without this the same extra would decode one
+				// way with a limit and another way without.
+				...(decode ? { decode } : {}),
+			} satisfies ColumnConfig;
+		// `columnClassFor`, not the base `Column`: adapters branch on the
+		// per-type subclass — `is(col, SQLiteInteger)` — and a subquery column
+		// built from the base class failed that walk, which is the whole reason
+		// `drizzle-entity.ts` exists.
+		const column = new (columnClassFor(config.columnType))(config);
 		column.tableName = aliasName;
-		columns[key] = column;
+
+		let target = root;
+		for (const segment of path.slice(0, -1)) {
+			const existing = target[segment];
+			target = (existing && !isColumn(existing) ? existing : (target[segment] = {})) as ColumnsMap;
+		}
+		target[path.at(-1)!] = column;
 	}
 
-	return columns;
+	return root;
 };
 
 /** `db.select()` before a table is chosen. */

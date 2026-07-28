@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createSchema } from '../../src/ddl.js';
-import { blob, drizzle, eq, integer, primaryKey, ph, sql, sqliteTable, text } from '../../src/index.js';
+import { blob, CompileError, drizzle, eq, integer, primaryKey, ph, sql, sqliteTable, text } from '../../src/index.js';
 import { defineRelations } from '../../src/relations/index.js';
 import * as schema from '../schema.js';
 
@@ -287,6 +287,33 @@ describe('the filter DSL', () => {
 			.toEqual([{ id: 10 }, { id: 12 }]);
 		expect(await db.query.posts.findMany({ columns: { id: true }, where: { id: { notIn: [10, 12] } } }))
 			.toEqual([{ id: 11 }]);
+	});
+
+	it('refuses a placeholder to in / notIn rather than binding the array to one slot', async () => {
+		// `in (…)` renders one `?` per value, so its arity is part of the SQL
+		// text and cannot be filled afterwards. The placeholder used to reach
+		// `inArray`, which sees a SQLChunk and renders it as a *subquery* — a
+		// single `?` bound to the whole array, which D1 rejects at run time with
+		// `Type 'object' not supported`. Nothing about that says which filter
+		// produced it, and the type declared it legal.
+		const run = (operator: 'in' | 'notIn') =>
+			db.query.posts.findMany({ where: { id: { [operator]: ph('ids') } } as never })
+				.execute({ ids: [10, 12] });
+
+		await expect(run('in')).rejects.toThrow(CompileError);
+		await expect(run('in')).rejects.toThrow(/"in" on column "id" was given a placeholder/);
+		await expect(run('notIn')).rejects.toThrow(/"notIn" on column "id" was given a placeholder/);
+	});
+
+	it('still takes a subquery on the same operators', async () => {
+		// The alternative the message points at has to actually work, or the
+		// guard above is just a wall.
+		const authors = db.select({ id: schema.posts.authorId }).from(schema.posts)
+			.where(eq(schema.posts.views, 50));
+
+		// No cast: the type admits the subquery the thrown message recommends.
+		expect(await db.query.users.findMany({ columns: { id: true }, where: { id: { in: authors } } }))
+			.toEqual([{ id: 1 }]);
 	});
 
 	it('handles isNull, and reads isNull: false as no constraint', async () => {
@@ -661,6 +688,36 @@ describe('many-to-many through a junction table', () => {
 		expect(one).toEqual([
 			{ id: 1, tags: [{ label: 'd1' }, { label: 'sql' }] },
 			{ id: 2, tags: [{ label: 'sql' }] },
+		]);
+	});
+
+	it('applies a where declared on the junction relation to the target rows', async () => {
+		// The `through` path builds its predicate from the *junction's* columns
+		// and joins the target in, so a declared `where` has to survive being
+		// compiled against the target while the matcher speaks about the
+		// junction. Worth its own case: this is the one traversal where the two
+		// are different tables.
+		const narrowed = defineRelations({ articles, tags, articleTags }, (r) => ({
+			articles: {
+				sqlTags: r.many.tags({
+					from: r.articles.id.through(r.articleTags.articleId),
+					to: r.tags.id.through(r.articleTags.tagId),
+					where: { label: 'sql' },
+				}),
+			},
+		}));
+		const d = drizzle({ client: DB, relations: narrowed });
+
+		const rows = await d.query.articles.findMany({
+			columns: { id: true },
+			with: { sqlTags: { columns: { label: true } } },
+			orderBy: { id: 'asc' },
+		});
+
+		// Article 1 has both tags; only `sql` may come back.
+		expect(rows).toEqual([
+			{ id: 1, sqlTags: [{ label: 'sql' }] },
+			{ id: 2, sqlTags: [{ label: 'sql' }] },
 		]);
 	});
 
@@ -1097,5 +1154,152 @@ describe('joined strategy falls back rather than failing', () => {
 		// level is deliberate — see `#useJoined`.
 		expect(await joinedStatements(withRelation(62))).toHaveLength(1);
 		expect(await joinedStatements(withRelation(63))).toHaveLength(3);
+	});
+});
+
+/**
+ * `where` declared on the relation itself, which `define.ts` documents as
+ * "applied to the target rows whenever this is traversed".
+ *
+ * It was honoured in exactly one of the two places a relation is reachable
+ * from. As a *filter* — `where: { publishedPosts: true }` — it landed in the
+ * `exists (…)` and worked. As a *traversal* — `with: { publishedPosts: true }`
+ * — neither plan ever read the field, so the predicate simply was not in the
+ * statement and the rows came back unfiltered. No error, and the two spellings
+ * of the same declaration disagreed with each other.
+ *
+ * So the assertions here are triangular rather than a single expected list:
+ * split, joined, and the filter path all have to name the same rows. Any one
+ * of them alone could be wrong in the same direction.
+ */
+describe('a relation with its own where', () => {
+	/**
+	 * Two declarations over the fixture, so the predicate has something to be
+	 * dropped from at each end: a `many` narrowed by a column, and a `one` that
+	 * can be filtered away entirely.
+	 */
+	const rel = defineRelations({ users: schema.users, posts: schema.posts }, (r) => ({
+		users: {
+			popularPosts: r.many.posts({
+				from: r.users.id,
+				to: r.posts.authorId,
+				where: { views: { gte: 50 } },
+			}),
+			allPosts: r.many.posts({ from: r.users.id, to: r.posts.authorId }),
+		},
+		posts: {
+			activeAuthor: r.one.users({
+				from: r.posts.authorId,
+				to: r.users.id,
+				where: { name: 'Ada' },
+			}),
+		},
+	}));
+
+	const split = drizzle({ client: DB, relations: rel });
+	const joined = drizzle({ client: DB, relations: rel, relationalStrategy: 'joined' });
+
+	const bothAgree = async (run: (d: typeof split) => Promise<unknown>) => {
+		const [a, b] = await Promise.all([run(split), run(joined)]);
+		expect(b).toEqual(a);
+		return a;
+	};
+
+	it('narrows a traversed many, in both plans', async () => {
+		// Ada has posts 10 (5 views) and 11 (50); Bob has 12 (1). Only 11
+		// qualifies, so an unfiltered traversal is loudly different rather than
+		// coincidentally equal.
+		const rows = await bothAgree((d) =>
+			d.query.users.findMany({
+				columns: { id: true },
+				with: { popularPosts: { columns: { id: true } } },
+				orderBy: { id: 'asc' },
+			})
+		);
+
+		expect(rows).toEqual([
+			{ id: 1, popularPosts: [{ id: 11 }] },
+			{ id: 2, popularPosts: [] },
+		]);
+	});
+
+	it('leaves an undeclared relation over the same columns alone', async () => {
+		// The control. `allPosts` joins identically and has no `where`, so if
+		// this narrowed too, the predicate would be coming from the join rather
+		// than from the declaration.
+		const rows = await bothAgree((d) =>
+			d.query.users.findMany({
+				columns: { id: true },
+				with: { allPosts: { columns: { id: true } } },
+				orderBy: { id: 'asc' },
+			})
+		);
+
+		expect(rows).toEqual([
+			{ id: 1, allPosts: [{ id: 10 }, { id: 11 }] },
+			{ id: 2, allPosts: [{ id: 12 }] },
+		]);
+	});
+
+	it('narrows a traversed one all the way to null', async () => {
+		const rows = await bothAgree((d) =>
+			d.query.posts.findMany({
+				columns: { id: true },
+				with: { activeAuthor: { columns: { name: true } } },
+				orderBy: { id: 'asc' },
+			})
+		);
+
+		// Post 12 is Bob's, and the declaration only admits Ada — so the `one`
+		// resolves to nothing even though the foreign key is intact.
+		expect(rows).toEqual([
+			{ id: 10, activeAuthor: { name: 'Ada' } },
+			{ id: 11, activeAuthor: { name: 'Ada' } },
+			{ id: 12, activeAuthor: null },
+		]);
+	});
+
+	it('conjoins with the caller\'s own where rather than replacing it', async () => {
+		// Either predicate winning outright gives a different answer: the
+		// declaration alone would keep 11, the caller's alone would keep 10.
+		const rows = await bothAgree((d) =>
+			d.query.users.findMany({
+				columns: { id: true },
+				with: { popularPosts: { columns: { id: true }, where: { title: 'first' } } },
+				orderBy: { id: 'asc' },
+			})
+		);
+
+		expect(rows).toEqual([
+			{ id: 1, popularPosts: [] },
+			{ id: 2, popularPosts: [] },
+		]);
+	});
+
+	it('agrees with the same relation used as a filter', async () => {
+		// The path that was already correct, as the third leg. `users` having a
+		// *popular* post is only user 1; having any post is both.
+		expect(await split.query.users.findMany({ columns: { id: true }, where: { popularPosts: true } }))
+			.toEqual([{ id: 1 }]);
+		expect(await split.query.users.findMany({ columns: { id: true }, where: { allPosts: true } }))
+			.toEqual([{ id: 1 }, { id: 2 }]);
+	});
+
+	it('keeps the joined plan to one statement while doing it', async () => {
+		// The predicate has to land *inside* the correlated subquery. Filtering
+		// afterwards, or falling back to split, would both satisfy every
+		// assertion above.
+		const sqls: string[] = [];
+		const d = drizzle({
+			client: DB,
+			relations: rel,
+			relationalStrategy: 'joined',
+			onQuery: (e) => void sqls.push(e.sql),
+		});
+
+		await d.query.users.findMany({ with: { popularPosts: true } });
+
+		expect(sqls).toHaveLength(1);
+		expect(sqls[0]).toMatch(/json_group_array/);
 	});
 });

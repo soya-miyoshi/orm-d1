@@ -174,7 +174,8 @@ interface QueryEvent {
   sql: string;
   kind: 'select' | 'insert' | 'update' | 'delete';
   tables: readonly string[];
-  durationMs: number;        // meta.duration — includes network
+  durationMs: number;        // measured here — includes network, serialisation, retries
+  d1DurationMs?: number;     // meta.duration — D1's own, server-side
   sqlDurationMs?: number;    // meta.timings?.sql_duration_ms — excludes network
   rowsRead: number;
   rowsWritten: number;
@@ -197,6 +198,14 @@ const db = d1zzle(env.DB, {
 
 `durationMs - sqlDurationMs` is the network share, which is usually most of it — the number
 that justifies optimizing round trips rather than string building.
+
+That subtraction only means anything because the two come from **different clocks**.
+`durationMs` is wall clock measured around the call; `sqlDurationMs` is what D1 spent
+executing. D1 also reports its own `meta.duration`, which is server-side like the second —
+so it is kept under `d1DurationMs` rather than used for the first. Preferring it there
+looked harmless (it is present on every real response, so the measurement was simply
+discarded) and quietly turned the documented network share into two server-side numbers
+being subtracted from each other.
 
 Under `__DEV__` a default heuristic warns on likely full scans (high `rows_read` relative
 to returned rows), which is the cheapest possible missing-index detector. It compiles out

@@ -415,6 +415,21 @@ Beyond the per-column operators (`eq` `ne` `gt` `gte` `lt` `lte` `in` `notIn` `l
 escape hatch, and **relation keys** — `{ posts: { views: { gt: 100 } } }` filters users by
 their posts as a correlated `exists`, in the parent's own query.
 
+Every operator takes a `ph()` placeholder except `in` and `notIn`, which take a literal
+array or a subquery. `in (…)` renders one bound parameter per value, so the arity is part
+of the SQL text and a placeholder — filled after compilation — can only ever fill one slot.
+Passing one is a `CompileError` naming the column rather than D1's `Type 'object' not
+supported`.
+
+A relation may also carry its own `where`, which narrows the target rows **wherever it is
+used** — traversed with `with:`, or matched as a relation key in a filter:
+
+```ts
+users: {
+  popularPosts: r.many.posts({ from: r.users.id, to: r.posts.authorId, where: { views: { gte: 50 } } }),
+},
+```
+
 ```ts
 const db = drizzle({ client: env.DB, relations });   // primary form
 const db = drizzle(env.DB, { relations });           // binding-first, also fine

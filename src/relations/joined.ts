@@ -203,6 +203,15 @@ export function buildLevel(
 		const filter = compileWhere(childConfig, targetConfig, childTable);
 		if (filter) predicates.push(filter);
 
+		// The relation's own `where` narrows the target rows every time it is
+		// traversed, so it belongs inside the correlated subquery alongside the
+		// caller's filter. Compiled through the same hook, which is what keeps
+		// the two plans emitting the same predicate for the same declaration.
+		if (relation.where) {
+			const declared = compileWhere({ where: relation.where }, targetConfig, childTable);
+			if (declared) predicates.push(declared);
+		}
+
 		const inner = renderInner(
 			childTable,
 			child.selection,
