@@ -29,8 +29,11 @@ export interface ApplyResult {
 }
 
 export async function introspect(runner: SqlRunner): Promise<Snapshot> {
+	// Triggers are read too: the append-only guard is a trigger, and leaving it
+	// out of `master` made every guarded table look unguarded, so `check`
+	// reported drift and `push` re-emitted the trigger on every run.
 	const master = await runner.all<MasterRow>(
-		"select type, name, tbl_name, sql from sqlite_master where type in ('table', 'index')",
+		"select type, name, tbl_name, sql from sqlite_master where type in ('table', 'index', 'trigger')",
 	);
 
 	const tableInfo: IntrospectionInput['tableInfo'] = {};

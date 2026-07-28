@@ -13,14 +13,14 @@
  * differ's notion of equality at once.
  */
 import { env } from 'cloudflare:test';
-import { createSchema } from 'd1zzle/ddl';
+import { createSchema, tableOptions } from 'd1zzle/ddl';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots } from '../../src/core/diff.js';
 import { snapshotFromSchema } from '../../src/core/snapshot.js';
 import { allTables } from '../../../test/schema.js';
-import { check, integer, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
+import { check, integer, primaryKey, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
 
 /**
  * Declared here rather than in the shared fixture, which misses this by one
@@ -94,5 +94,88 @@ describe('schema ↔ introspection round trip', () => {
 		expect(expected.origin).toBe('schema');
 		expect(diffSnapshots(live, expected).warnings).toEqual([]);
 		expect(diffSnapshots(expected, live).warnings).toEqual([]);
+	});
+});
+
+/**
+ * The same property, for the three things a schema module cannot say.
+ *
+ * `STRICT`, `WITHOUT ROWID` and the append-only trigger live in a sidecar
+ * `tableOptions()` map rather than on `table()`, because none of them has a
+ * spelling in `drizzle-orm/sqlite-core` and doc 08 keeps the schema DSL a
+ * strict subset of it. That means two *separate* sources have to agree with
+ * one live database, so the round trip matters more here than anywhere else:
+ * if introspection cannot read an option back, `check` reports drift forever
+ * and `push` rebuilds every hardened table on every run.
+ */
+describe('table options against a real D1 database', () => {
+	const ledger = sqliteTable('ledger', {
+		id: text('id').primaryKey(),
+		amount: integer('amount').notNull(),
+	});
+	// The composite key is required, not incidental: WITHOUT ROWID needs a
+	// primary key, and D1 rejects the CREATE TABLE outright without one.
+	const pairs = sqliteTable('pairs', {
+		a: text('a').notNull(),
+		b: text('b').notNull(),
+	}, (t) => [primaryKey({ columns: [t.a, t.b] })]);
+
+	const options = tableOptions([
+		[ledger, { strict: true, appendOnly: true }],
+		[pairs, { strict: true, withoutRowid: true }],
+	]);
+	const tables = [ledger, pairs];
+
+	beforeEach(async () => {
+		for (const name of ['ledger', 'pairs']) await DB.prepare(`drop table if exists "${name}"`).run();
+		for (const statement of createSchema(tables, {}, options)) await DB.prepare(statement).run();
+	});
+
+	it('D1 actually applies the options the generator emits', async () => {
+		const rows = await runner.all<{ name: string; sql: string }>(
+			"select name, sql from sqlite_master where type = 'table' and name in ('ledger', 'pairs')",
+		);
+		const byName = new Map(rows.map((r) => [r.name, r.sql.toLowerCase()]));
+		expect(byName.get('ledger')).toContain('strict');
+		expect(byName.get('pairs')).toContain('without rowid');
+	});
+
+	it('enforces STRICT — the point of asking for it', async () => {
+		await expect(
+			DB.prepare(`insert into "ledger" ("id", "amount") values ('a', 'not-an-integer')`).run(),
+		).rejects.toThrow();
+	});
+
+	it('enforces the append-only guard on UPDATE but still allows DELETE', async () => {
+		await DB.prepare(`insert into "ledger" ("id", "amount") values ('a', 1)`).run();
+
+		await expect(DB.prepare(`update "ledger" set "amount" = 2 where "id" = 'a'`).run()).rejects.toThrow();
+
+		// DELETE stays allowed on purpose: what append-only protects is that a
+		// recorded fact is never rewritten, not that rows live forever.
+		await DB.prepare(`delete from "ledger" where "id" = 'a'`).run();
+		const left = await runner.all<{ n: number }>('select count(*) as n from "ledger"');
+		expect(left[0]!.n).toBe(0);
+	});
+
+	it('reports no drift in either direction', async () => {
+		const live = await introspect(runner);
+		const expected = snapshotFromSchema(tables, '', options);
+
+		// Only the two tables this block owns — the fixture schema from the
+		// outer beforeEach is gone by now, so compare like with like.
+		const only = (s: typeof live) => ({
+			...s,
+			tables: Object.fromEntries(Object.entries(s.tables).filter(([n]) => n === 'ledger' || n === 'pairs')),
+		});
+
+		expect(diffSnapshots(only(live), only(expected)).statements).toEqual([]);
+		expect(diffSnapshots(only(expected), only(live)).statements).toEqual([]);
+	});
+
+	it('reads all three options back out of the live database', async () => {
+		const live = await introspect(runner);
+		expect(live.tables.ledger).toMatchObject({ strict: true, withoutRowid: false, appendOnly: true });
+		expect(live.tables.pairs).toMatchObject({ strict: true, withoutRowid: true, appendOnly: false });
 	});
 });

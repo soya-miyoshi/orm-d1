@@ -11,9 +11,15 @@ import type { SqlRunner } from '../core/apply.js';
  * Wrangler keeps local D1 state as SQLite files under `.wrangler/state`.
  * `node:sqlite` reads them directly — no native dependency to install.
  */
-export async function localRunner(cwd: string, databaseName?: string): Promise<SqlRunner> {
+export async function localRunner(cwd: string, databaseName?: string, localFile?: string): Promise<SqlRunner> {
 	const { DatabaseSync } = await import('node:sqlite');
-	const file = findLocalDatabase(cwd, databaseName);
+	// An explicit path wins over discovery. Miniflare's state is the usual local
+	// database, but it is not the only one: a project whose dev server and test
+	// suites run in Node — against a plain SQLite file through a D1-shaped
+	// adapter — has no `.wrangler` directory to find, and pointing the kit at
+	// the file is better than leaving it unable to migrate the database its own
+	// tests read.
+	const file = localFile ? resolve(cwd, localFile) : findLocalDatabase(cwd, databaseName);
 	const db = new DatabaseSync(file);
 
 	// SQLite defaults foreign keys *off*; D1 behaves as though every
@@ -40,6 +46,30 @@ export async function localRunner(cwd: string, databaseName?: string): Promise<S
 	};
 }
 
+/**
+ * A throwaway in-memory database, for `verify`.
+ *
+ * Deliberately not a `SqlRunner` over anything persistent: the question
+ * `verify` asks is what a *brand new* environment gets, so it has to start
+ * from nothing every time.
+ *
+ * `foreign_keys = on` matches D1, which behaves as though every transaction
+ * set it and gives no way to opt out — without it a migration with an FK
+ * violation verifies clean and then fails on deploy.
+ */
+export async function scratchRunner(): Promise<SqlRunner> {
+	const { DatabaseSync } = await import('node:sqlite');
+	const db = new DatabaseSync(':memory:');
+	db.exec('pragma foreign_keys = on');
+
+	return {
+		all: async <T>(sql: string) => db.prepare(sql).all() as T[],
+		batch: async (statements) => {
+			for (const statement of statements) db.exec(statement);
+		},
+	};
+}
+
 export function findLocalDatabase(cwd: string, databaseName?: string): string {
 	const root = resolve(cwd, '.wrangler/state/v3/d1/miniflare-D1DatabaseObject');
 	if (!existsSync(root)) {
@@ -49,7 +79,12 @@ export function findLocalDatabase(cwd: string, databaseName?: string): string {
 		);
 	}
 
-	const files = readdirSync(root).filter((f) => f.endsWith('.sqlite'));
+	// Miniflare names each database file after its durable-object id — 64 hex
+	// characters — and keeps its own `metadata.sqlite` bookkeeping file in the
+	// same directory. Matching on `.sqlite` alone counts that bookkeeping file
+	// as a database, so a project with exactly one real D1 binding still looked
+	// ambiguous and the command refused to run.
+	const files = readdirSync(root).filter((f) => /^[0-9a-f]{64}\.sqlite$/.test(f));
 	if (files.length === 0) throw new Error(`No local D1 database file under ${root}.`);
 	if (files.length === 1) return join(root, files[0]!);
 

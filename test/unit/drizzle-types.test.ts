@@ -115,3 +115,40 @@ describe('a subquery keeps its columns’ nullability', () => {
 		expectTypeOf(inner.name.$).toExtend<{ notNull: false }>();
 	});
 });
+
+describe("text({ mode: 'json' }) matches Drizzle", () => {
+	type Location = { lat: number; lon: number };
+
+	const ours = sqliteTable('places', {
+		id: integer('id').primaryKey(),
+		plain: text('plain'),
+		blob: text('blob', { mode: 'json' }),
+		typed: text('typed', { mode: 'json' }).$type<Location>(),
+	});
+
+	const theirs = drizzleSqliteTable('places', {
+		id: drizzleInteger('id').primaryKey(),
+		plain: drizzleText('plain'),
+		blob: drizzleText('blob', { mode: 'json' }),
+		typed: drizzleText('typed', { mode: 'json' }).$type<Location>(),
+	});
+
+	it('carries the narrowed type through $type, as Drizzle does', () => {
+		// The whole point: this used to be `string | null`, because the return
+		// type ignored `mode` while the runtime built a JSON column — so
+		// `$type<T>()` had nothing to narrow and `json<T>()` was needed instead.
+		expectTypeOf<InferSelect<typeof ours>['typed']>().toEqualTypeOf<Location | null>();
+		expectTypeOf<InferSelectModel<typeof theirs>['typed']>().toEqualTypeOf<Location | null>();
+	});
+
+	it('is unknown without $type, as Drizzle is', () => {
+		expectTypeOf<InferSelect<typeof ours>['blob']>().toEqualTypeOf<unknown>();
+	});
+
+	it('leaves a column with no mode as a string', () => {
+		// The conditional must not distribute over the default `'text' | 'json'`
+		// union, or a plain column comes back as both branches at once.
+		expectTypeOf<InferSelect<typeof ours>['plain']>().toEqualTypeOf<string | null>();
+		expectTypeOf<InferSelectModel<typeof theirs>['plain']>().toEqualTypeOf<string | null>();
+	});
+});

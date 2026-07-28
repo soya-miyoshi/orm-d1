@@ -9,9 +9,11 @@ import type { SelectionToRow } from './select.js';
 import type { QueryExecutor, Runnable } from './types.js';
 
 export class DeleteBuilder<T extends Table, TRow = never, THasRows extends boolean = false>
-	implements PromiseLike<THasRows extends true ? TRow[] : D1Result>, Runnable<THasRows extends true ? TRow[] : D1Result>
+	implements Promise<THasRows extends true ? TRow[] : D1Result>, Runnable<THasRows extends true ? TRow[] : D1Result>
 {
 	declare readonly __result?: THasRows extends true ? TRow[] : D1Result;
+
+	readonly [Symbol.toStringTag] = 'Promise';
 
 	#compiled: CompiledQuery<TRow> | undefined;
 
@@ -60,9 +62,19 @@ export class DeleteBuilder<T extends Table, TRow = never, THasRows extends boole
 	then<TResult1 = THasRows extends true ? TRow[] : D1Result, TResult2 = never>(
 		onfulfilled?: ((value: THasRows extends true ? TRow[] : D1Result) => TResult1 | PromiseLike<TResult1>) | null,
 		onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
-	): PromiseLike<TResult1 | TResult2> {
+	): Promise<TResult1 | TResult2> {
 		const promise = this.plan.returning ? this.all() : this.run();
 		return (promise as Promise<any>).then(onfulfilled as any, onrejected);
+	}
+
+	catch<TResult1 = never>(
+		onrejected?: ((reason: unknown) => TResult1 | PromiseLike<TResult1>) | null,
+	): Promise<(THasRows extends true ? TRow[] : D1Result) | TResult1> {
+		return this.then(undefined, onrejected);
+	}
+
+	finally(onfinally?: (() => void) | null): Promise<THasRows extends true ? TRow[] : D1Result> {
+		return this.then().finally(onfinally);
 	}
 }
 

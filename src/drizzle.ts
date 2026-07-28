@@ -33,7 +33,14 @@ import { Many as DrizzleMany, One as DrizzleOne } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTableWithColumns } from 'drizzle-orm/sqlite-core';
 import type { Column, ColumnMeta } from './schema/columns.js';
 import type { ToDrizzleDataType } from './schema/drizzle-entity.js';
-import type { TableRelationalConfig } from './relations/define.js';
+import type {
+	Many as D1Many,
+	One as D1One,
+	Relation,
+	RelationsSchema,
+	RelationsShape,
+	TableRelationalConfig,
+} from './relations/define.js';
 import type { ColumnsMap, NameOf, Table, TableColumns } from './schema/table.js';
 
 type ColumnsOf<T> = T extends { [TableColumns]: infer C extends ColumnsMap } ? C : never;
@@ -124,3 +131,132 @@ export function asDrizzleRelations<TRelations extends Record<string, unknown>>(r
 
 	return adapted as TRelations;
 }
+
+// ------------------------------------------------------- Pothos' generic slot
+
+/**
+ * The schema module a `defineRelations` result was built from, and the relation
+ * record its callback returned. Recovered from the two phantom keys the result
+ * carries; `relations/index.ts` reads the same pair to type `db.query`.
+ */
+type SchemaOf<TRelations> = TRelations extends { [RelationsSchema]?: infer TSchema } ? TSchema : never;
+type ShapeOf<TRelations> = TRelations extends { [RelationsShape]?: infer TConfig } ? TConfig : never;
+
+type RelationsFor<TRelations, K> = K extends keyof ShapeOf<TRelations>
+	? ShapeOf<TRelations>[K] extends infer R extends Record<string, Relation> ? R : {}
+	: {};
+
+/** The table a relation points at, as its phantom carries it. */
+type TargetOf<R> = R extends { $target?: infer T extends Table } ? T : Table;
+
+/**
+ * The key a relation's target is filed under in the schema.
+ *
+ * Drizzle names a relation's target by its *TypeScript* key, but our `One`/
+ * `Many` carry the target table itself, so the name is recovered by matching
+ * the table back against the schema — the same recovery `NameOfTarget` does in
+ * `relations/index.ts`.
+ */
+type TargetNameOf<TSchema, R> = {
+	[K in keyof TSchema & string]: TSchema[K] extends TargetOf<R> ? K : never;
+}[keyof TSchema & string];
+
+/**
+ * One of our relations, expressed as the Drizzle relation it behaves like.
+ *
+ * Drizzle's `One`/`Many` are referenced rather than reconstructed: both declare
+ * a `protected $relationBrand`, so — unlike `TableRelationalConfig['table']` —
+ * these two genuinely are unsatisfiable by an independent declaration, and the
+ * only assignable spelling is Drizzle's own class with our type arguments.
+ */
+type ToDrizzleRelation<TSchema, R> = R extends D1Many<any> ? DrizzleMany<TargetNameOf<TSchema, R>>
+	: R extends D1One<any, infer TOptional extends boolean> ? DrizzleOne<TargetNameOf<TSchema, R>, TOptional>
+	: never;
+
+/**
+ * A `defineRelations` result, expressed as Drizzle's `TablesRelationalConfig` —
+ * the type `@pothos/plugin-drizzle` slots into its `DrizzleRelations` generic:
+ *
+ * ```ts
+ * const builder = new SchemaBuilder<{ DrizzleRelations: PothosRelations<typeof relations> }>({
+ *   plugins: [DrizzlePlugin],
+ *   drizzle: { client: db, getTableConfig, relations: asPothosRelations(relations) },
+ * });
+ * ```
+ *
+ * The protected-member wall documented at the top of this module applies to
+ * *our* table type, not to this: Drizzle's `TableRelationalConfig` asks only for
+ * `{ table: SchemaEntry; name: string; relations: RelationsRecord }`, and
+ * `SchemaEntry` is `Table<any> | View<…>` — so `ToDrizzleTable` satisfies it
+ * outright, and no member of the interface is ever compared nominally.
+ *
+ * The typing is genuine, not vacuous: an unknown column, a mistyped resolver
+ * return and an unknown relation name are each rejected. See
+ * `test/unit/pothos-types.test.ts`, which pins all three as negative controls.
+ */
+export type PothosRelations<TRelations> = {
+	[K in keyof SchemaOf<TRelations> & string as SchemaOf<TRelations>[K] extends Table ? K : never]: {
+		table: ToDrizzleTable<SchemaOf<TRelations>[K]>;
+		name: K;
+		relations: {
+			[R in keyof RelationsFor<TRelations, K>]: ToDrizzleRelation<
+				SchemaOf<TRelations>,
+				RelationsFor<TRelations, K>[R]
+			>;
+		};
+	};
+};
+
+/**
+ * {@link asDrizzleRelations}, typed as {@link PothosRelations}.
+ *
+ * Identical at runtime — the re-prototyping is the whole job, and it is why
+ * this exists as well as the type. Separate from `asDrizzleRelations` because
+ * that one is deliberately identity-typed for adapters that read our shape
+ * back; this one is for handing the result to Pothos' builder config, where the
+ * value has to line up with the generic above.
+ */
+export const asPothosRelations = <TRelations extends Record<string, unknown>>(
+	relations: TRelations,
+): PothosRelations<TRelations> =>
+	asDrizzleRelations(relations) as unknown as PothosRelations<TRelations>;
+
+// ------------------------------------------- Pothos' resolver-side find-config
+
+/**
+ * Pothos' `query()` result, retyped as the d1zzle find-config it already is.
+ *
+ * `@pothos/plugin-drizzle` hands every drizzle-backed resolver a `query()` that
+ * merges the caller's selection with the columns and relations the GraphQL
+ * selection set needs, and the result goes straight to
+ * `db.query.<table>.findMany` / `findFirst`.
+ *
+ * The merged config is a valid d1zzle config at runtime, but not at the type
+ * level, because the plugin declares one extra key:
+ *
+ * ```ts
+ * extras: { $pothosQueryFor: SQL<'places' | undefined> }
+ * ```
+ *
+ * where `SQL` is Drizzle's. Ours renders through `toQuery(ctx?: RenderContext)`
+ * and Drizzle's through `toQuery(config: BuildQueryConfig)`, so the marker is
+ * not assignable to `ExtrasArg` and the whole config is rejected with it.
+ *
+ * The marker is **phantom**: it appears only in the plugin's `.d.ts` files and
+ * is never constructed — there are zero occurrences in its emitted JavaScript.
+ * So there is nothing to render and nothing for `ExtrasArg` to learn to accept;
+ * the type just has to stop being threaded through. This drops it, and returns
+ * the selection's own type so the config keeps being checked.
+ *
+ * ```ts
+ * ctx.db.query.places.findMany(pothosFindConfig(query, { where: { clubId } }))
+ * ```
+ *
+ * `where`, `columns`, `with` and `orderBy` are checked against the schema by
+ * `findMany`'s own `TConfig extends TypedFindConfig<…>` constraint, which is
+ * what the previous `as never` laundering gave up.
+ */
+export const pothosFindConfig = <TConfig>(
+	query: (selection?: never) => unknown,
+	selection: TConfig,
+): TConfig => (query as unknown as (s: TConfig) => TConfig)(selection);

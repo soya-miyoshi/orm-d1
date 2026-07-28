@@ -7,10 +7,18 @@
  * makes importing an existing migration history possible.
  */
 import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName } from 'd1zzle/ddl';
+import type { TableOptionsMap } from 'd1zzle/ddl';
 import type { Column, Table } from 'd1zzle';
 import { getTableColumns, getTableExtras, getTableName } from 'd1zzle';
 
-export const SNAPSHOT_VERSION = '1';
+/**
+ * `2` added `strict`, `withoutRowid` and `appendOnly` to `TableSnapshot`.
+ *
+ * A version-1 snapshot simply lacks the three fields, and they read as `false`,
+ * which is exactly what a database written before they existed looks like. So
+ * the bump is for diagnostics and `up`, not for correctness of the read path.
+ */
+export const SNAPSHOT_VERSION = '2';
 
 export interface ColumnSnapshot {
 	readonly name: string;
@@ -50,6 +58,19 @@ export interface TableSnapshot {
 	readonly compositePrimaryKeys: Record<string, { name: string; columns: readonly string[] }>;
 	readonly uniqueConstraints: Record<string, { name: string; columns: readonly string[] }>;
 	readonly checkConstraints: Record<string, { name: string; value: string }>;
+	/**
+	 * Physical-storage options and the append-only guard, from the sidecar
+	 * `tableOptions()` module (see `d1zzle/ddl`). Optional so a version-1
+	 * snapshot still parses; absent means `false`.
+	 *
+	 * `strict` and `withoutRowid` are properties of the `CREATE TABLE` itself, so
+	 * changing either forces a full table rebuild. `appendOnly` is a separate
+	 * trigger object, so it can be added or dropped in place — but it *is*
+	 * dropped along with the table, so a rebuild has to re-emit it.
+	 */
+	readonly strict?: boolean;
+	readonly withoutRowid?: boolean;
+	readonly appendOnly?: boolean;
 }
 
 export interface Snapshot {
@@ -111,8 +132,19 @@ const columnSnapshot = (column: Column<any>): ColumnSnapshot => ({
 		: undefined,
 });
 
-/** Build a snapshot from live schema objects. */
-export function snapshotFromSchema(schema: Record<string, unknown> | readonly Table[], id = ''): Snapshot {
+/**
+ * Build a snapshot from live schema objects.
+ *
+ * `options` is the sidecar `tableOptions()` map. It is separate from the schema
+ * module because `STRICT` / `WITHOUT ROWID` / triggers have no spelling in
+ * `drizzle-orm/sqlite-core`, and doc 08 keeps the schema DSL a strict subset of
+ * it — see the `TableOptions` docs in `d1zzle/ddl`.
+ */
+export function snapshotFromSchema(
+	schema: Record<string, unknown> | readonly Table[],
+	id = '',
+	options?: TableOptionsMap | undefined,
+): Snapshot {
 	const tables = Array.isArray(schema)
 		? (schema as readonly Table[])
 		: Object.values(schema as Record<string, unknown>).filter(isTableLike);
@@ -187,7 +219,19 @@ export function snapshotFromSchema(schema: Record<string, unknown> | readonly Ta
 			}
 		}
 
-		result[name] = { name, columns, indexes, foreignKeys, compositePrimaryKeys, uniqueConstraints, checkConstraints };
+		const perTable = options?.byTable[name];
+		result[name] = {
+			name,
+			columns,
+			indexes,
+			foreignKeys,
+			compositePrimaryKeys,
+			uniqueConstraints,
+			checkConstraints,
+			strict: perTable?.strict ?? false,
+			withoutRowid: perTable?.withoutRowid ?? false,
+			appendOnly: perTable?.appendOnly ?? false,
+		};
 	}
 
 	return { version: SNAPSHOT_VERSION, dialect: 'sqlite', id, prevId: '', tables: result, origin: 'schema' };
@@ -235,7 +279,15 @@ export function createTableFromSnapshot(t: TableSnapshot): string {
 		parts.push(`constraint ${quote(check.name)} check (${check.value})`);
 	}
 
-	return `create table ${quote(t.name)} (\n${parts.map((p) => `\t${p}`).join(',\n')}\n)`;
+	// Same order as `createTable` in `d1zzle/ddl`, and the same order
+	// `sqlite_master` reports back — which is what lets an introspected snapshot
+	// compare equal to a schema-derived one.
+	const suffix = [t.strict ? 'strict' : undefined, t.withoutRowid ? 'without rowid' : undefined]
+		.filter((s) => s !== undefined);
+
+	return `create table ${quote(t.name)} (\n${parts.map((p) => `\t${p}`).join(',\n')}\n)${
+		suffix.length > 0 ? ` ${suffix.join(', ')}` : ''
+	}`;
 }
 
 const referenceClause = (fk: ForeignKeySnapshot, quote: (name: string) => string): string =>
@@ -281,6 +333,11 @@ export interface CanonicalTable {
 	readonly uniques: readonly string[];
 	readonly foreignKeys: readonly string[];
 	readonly checks: readonly string[];
+	/** Part of the `CREATE TABLE`, so a change here means a rebuild. */
+	readonly strict: boolean;
+	readonly withoutRowid: boolean;
+	/** A separate trigger object; changes without touching the table. */
+	readonly appendOnly: boolean;
 }
 
 /**
@@ -410,6 +467,9 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 		checks: Object.values(table.checkConstraints)
 			.map((c) => c.value.replaceAll(/\s+/g, ' ').trim())
 			.sort(),
+		strict: table.strict ?? false,
+		withoutRowid: table.withoutRowid ?? false,
+		appendOnly: table.appendOnly ?? false,
 	};
 };
 

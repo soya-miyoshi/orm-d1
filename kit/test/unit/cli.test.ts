@@ -409,8 +409,12 @@ describe('up', () => {
 		const ctx = { cwd: dir, config: { schema: '', out, d1: {}, migrationsTable: 'd1_migrations' }, log: () => {}, now: () => 1 };
 		expect(await up(ctx)).toBe(2);
 
-		expect(await readSnapshot(out, 0)).toMatchObject({ version: '1', id: '0000_a' });
-		expect(await readSnapshot(out, 1)).toMatchObject({ version: '1', id: '0001_b' });
+		// Against the current version, not a literal: what `up` promises is
+		// "brings every snapshot to the format this kit reads", so pinning the
+		// number here just breaks the test on each bump without testing more.
+		const { SNAPSHOT_VERSION } = await import('../../src/core/snapshot.js');
+		expect(await readSnapshot(out, 0)).toMatchObject({ version: SNAPSHOT_VERSION, id: '0000_a' });
+		expect(await readSnapshot(out, 1)).toMatchObject({ version: SNAPSHOT_VERSION, id: '0001_b' });
 
 		// Current snapshots are left alone.
 		expect(await up(ctx)).toBe(0);
@@ -558,5 +562,94 @@ describe('check drift classification', () => {
 
 		expect(drift).toEqual([]);
 		expect(blocked).toEqual([]);
+	});
+});
+
+describe('verify', () => {
+	/** A project on disk with one generated migration, ready to be tampered with. */
+	const project = async (schemaBody: string) => {
+		const dir = await temp();
+		const out = join(dir, 'migrations');
+		await writeFile(
+			join(dir, 'schema.ts'),
+			`import { integer, sqliteTable, text } from '${schemaImport()}';\n${schemaBody}`,
+		);
+		const ctx = {
+			cwd: dir,
+			config: { schema: './schema.ts', out, d1: {}, migrationsTable: 'd1_migrations' },
+			log: () => {},
+			now: () => 1,
+		};
+		const { generate } = await import('../../src/node/commands.js');
+		const result = await generate(ctx);
+		return { dir, out, ctx, path: result.path! };
+	};
+
+	const SCHEMA = `export const users = sqliteTable('users', {\n`
+		+ `\tid: integer('id').primaryKey(),\n`
+		+ `\temail: text('email').notNull().unique(),\n`
+		+ `});\n`;
+
+	it('passes when the migrations replay into the schema', async () => {
+		const { ctx } = await project(SCHEMA);
+		const { verify } = await import('../../src/node/commands.js');
+
+		const result = await verify(ctx);
+		expect(result.ok).toBe(true);
+		expect(result.differences).toEqual([]);
+		expect(result.applied).toBe(1);
+	});
+
+	it('catches a constraint the migration SQL lost', async () => {
+		// The docs/35 failure mode, reproduced: the migration and its snapshot
+		// agree with each other and disagree with the schema, so a check that
+		// compares the database against the snapshot stays green. Replaying
+		// against the *schema* is what catches it.
+		const { ctx, path } = await project(SCHEMA);
+		await writeFile(path, (await readFile(path, 'utf8')).replace(' unique', ''));
+
+		const { verify } = await import('../../src/node/commands.js');
+		const result = await verify(ctx);
+
+		expect(result.ok).toBe(false);
+		expect(result.differences.join('\n')).toMatch(/unique constraint changes/);
+	});
+
+	it('catches a column the migration never created', async () => {
+		const { ctx, path } = await project(SCHEMA);
+		await writeFile(path, (await readFile(path, 'utf8')).replace(/,\n\t"email"[^\n]*\n/, '\n'));
+
+		const { verify } = await import('../../src/node/commands.js');
+		expect((await verify(ctx)).ok).toBe(false);
+	});
+
+	it('reports a migration that cannot even be applied, rather than throwing', async () => {
+		const { ctx, path } = await project(SCHEMA);
+		await writeFile(path, 'create table "users" ( this is not sql;');
+
+		const { verify } = await import('../../src/node/commands.js');
+		const result = await verify(ctx);
+
+		expect(result.ok).toBe(false);
+		expect(result.differences[0]).toMatch(/failed to apply/);
+	});
+
+	it('replays a migration containing a trigger', async () => {
+		// `verify` splits the file itself, so the trigger-body split bug would
+		// have made every append-only project unverifiable.
+		const { ctx, path } = await project(SCHEMA);
+		const sql = await readFile(path, 'utf8');
+		await writeFile(
+			path,
+			`${sql}\ncreate trigger "users_no_update"\nbefore update on "users"\nbegin\n`
+				+ `\tselect raise(abort, 'users is append-only: UPDATE is prohibited');\nend;\n`,
+		);
+
+		const { verify } = await import('../../src/node/commands.js');
+		const result = await verify(ctx);
+
+		// The trigger is not in the schema's table options, so it is extra —
+		// but it must at least have applied without a syntax error.
+		expect(result.differences.join('\n')).not.toMatch(/failed to apply/);
 	});
 });

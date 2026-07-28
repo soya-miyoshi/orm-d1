@@ -63,6 +63,21 @@ export type {
 } from './index.js';
 
 /**
+ * Drizzle's spelling for "a column of some table", used to break the type
+ * cycle a self-referencing foreign key creates:
+ *
+ * ```ts
+ * threadId: integer('thread_id').references((): AnySQLiteColumn => messages.id)
+ * ```
+ *
+ * Our `Column` is the same type. Both names are exported because the *Drizzle*
+ * name is the one a schema file has to use to stay reverse-aliasable — doc 08
+ * requires every symbol a schema file mentions to exist in
+ * `drizzle-orm/sqlite-core`, and `Column` does not.
+ */
+export type { Column as AnySQLiteColumn, Column as AnyColumn } from './index.js';
+
+/**
  * Drizzle exposes the D1 driver from `drizzle-orm/d1`; d1zzle's `drizzle()`
  * lives on the root entry and is re-exported here for convenience.
  */

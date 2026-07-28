@@ -14,6 +14,8 @@
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { isTableOptionsMap } from 'd1zzle/ddl';
+import type { TableOptionsMap } from 'd1zzle/ddl';
 import { importModule } from './import.js';
 import type { Journal } from '../core/journal.js';
 import { emptyJournal } from '../core/journal.js';
@@ -68,6 +70,56 @@ export async function writeMigration(out: string, tag: string, sql: string): Pro
 
 export async function readMigration(out: string, tag: string): Promise<string> {
 	return readFile(join(out, `${tag}.sql`), 'utf8');
+}
+
+/**
+ * Entries in `out` that look like migrations but are not in wrangler's layout.
+ *
+ * Used to tell "this project has no migrations" apart from "this project's
+ * migrations are in a layout the kit does not read" — the second must not be
+ * reported as up to date. drizzle-kit's `<tag>/migration.sql` directories are
+ * the case that actually shows up.
+ */
+export async function unreadableMigrations(out: string): Promise<string[]> {
+	if (!existsSync(out)) return [];
+	const entries = await readdir(out, { withFileTypes: true });
+	const found: string[] = [];
+
+	for (const entry of entries) {
+		if (entry.name === 'meta') continue;
+		if (entry.isDirectory()) {
+			if (existsSync(join(out, entry.name, 'migration.sql'))) found.push(`${entry.name}/migration.sql`);
+			continue;
+		}
+		// A flat `.sql` file is the kit's own layout; it would be in the journal
+		// if it were ours, so an unjournalled one still counts as unread.
+		if (entry.name.endsWith('.sql')) found.push(entry.name);
+	}
+
+	return found.sort();
+}
+
+/**
+ * Load the sidecar `tableOptions()` module.
+ *
+ * Accepts the map as the default export or as any named one, so the file can be
+ * written either way. A module that exports no map at all is an error rather
+ * than an empty map: the config named it, so silently hardening nothing is the
+ * one outcome nobody wants.
+ */
+export async function loadTableOptions(cwd: string, path: string): Promise<TableOptionsMap> {
+	const resolved = resolve(cwd, path);
+	if (!existsSync(resolved)) throw new Error(`tableOptions module not found: ${resolved}`);
+
+	const exports = await importModule(resolved);
+	for (const value of [exports.default, ...Object.values(exports)]) {
+		if (isTableOptionsMap(value)) return value;
+	}
+
+	throw new Error(
+		`${resolved} exports no tableOptions() map. Expected \`export default tableOptions([[table, {...}], ...])\` `
+			+ "from 'd1zzle/ddl'.",
+	);
 }
 
 /** Load a schema module (or several) and return their exports. */

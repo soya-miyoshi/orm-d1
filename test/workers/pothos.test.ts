@@ -23,7 +23,8 @@ import { getTableConfig as drizzleGetTableConfig } from 'drizzle-orm/sqlite-core
 import { execute, parse } from 'graphql';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createSchema } from '../../src/ddl.js';
-import { asDrizzleRelations } from '../../src/drizzle.js';
+import type { PothosRelations } from '../../src/drizzle.js';
+import { asDrizzleRelations, asPothosRelations } from '../../src/drizzle.js';
 import { drizzle, getTableConfig } from '../../src/index.js';
 import * as schema from '../schema.js';
 
@@ -37,17 +38,17 @@ const db = drizzle({
 });
 
 /**
- * `DrizzleRelations` is `never` rather than `typeof schema.relations`.
+ * `DrizzleRelations` is filled, not opted out of.
  *
- * Pothos types that slot against `drizzle-orm`'s own `TablesRelationalConfig`,
- * whose `table` is Drizzle's `Table` class — and a class with a `protected`
- * member is only ever assignable to itself, so no independent implementation
- * can satisfy it (the same wall `src/drizzle.ts` documents for schemas). The
- * *runtime* contract is fully met, which is what this file exists to prove;
- * the type-level bridge for Pothos specifically is not built yet, so the
- * generic is opted out of here rather than faked.
+ * This used to be `never`, on the reasoning that Pothos slots against Drizzle's
+ * `TablesRelationalConfig`, whose `table` carries a protected member. That is
+ * true of Drizzle's `Table` *class*, but v1's `TableRelationalConfig` asks only
+ * for `SchemaEntry` — so `PothosRelations` satisfies it, and every field below
+ * is checked rather than cast. `test/unit/pothos-types.test.ts` pins the type
+ * itself, including the negative controls; this file proves the same types
+ * drive a schema that actually executes.
  */
-const builder = new SchemaBuilder<{ DrizzleRelations: never }>({
+const builder = new SchemaBuilder<{ DrizzleRelations: PothosRelations<typeof schema.relations> }>({
 	plugins: [DrizzlePlugin],
 	drizzle: {
 		client: db as never,
@@ -57,7 +58,7 @@ const builder = new SchemaBuilder<{ DrizzleRelations: never }>({
 		// Re-prototyped onto Drizzle's One/Many. The plugin decides list-vs-object
 		// with a bare `relationField instanceof Many`, which no amount of
 		// structural matching can satisfy — see `asDrizzleRelations`.
-		relations: asDrizzleRelations(schema.relations) as never,
+		relations: asPothosRelations(schema.relations),
 	},
 });
 

@@ -79,8 +79,10 @@ type AddJoin<
  * A lazy, immutable select. Each chained call returns a new builder; nothing
  * runs until `.all()`, `.get()`, or `await`.
  */
-export class SelectBuilder<S extends SelectState> implements PromiseLike<ResultRow<S>[]>, Runnable<ResultRow<S>[]>, SQLChunk {
+export class SelectBuilder<S extends SelectState> implements Promise<ResultRow<S>[]>, Runnable<ResultRow<S>[]>, SQLChunk {
 	declare readonly __result?: ResultRow<S>[];
+
+	readonly [Symbol.toStringTag] = 'Promise';
 
 	#compiled: CompiledQuery<ResultRow<S>> | undefined;
 	#single: SelectBuilder<S> | undefined;
@@ -201,8 +203,18 @@ export class SelectBuilder<S extends SelectState> implements PromiseLike<ResultR
 	then<TResult1 = ResultRow<S>[], TResult2 = never>(
 		onfulfilled?: ((value: ResultRow<S>[]) => TResult1 | PromiseLike<TResult1>) | null,
 		onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
-	): PromiseLike<TResult1 | TResult2> {
+	): Promise<TResult1 | TResult2> {
 		return this.all().then(onfulfilled, onrejected);
+	}
+
+	catch<TResult1 = never>(
+		onrejected?: ((reason: unknown) => TResult1 | PromiseLike<TResult1>) | null,
+	): Promise<ResultRow<S>[] | TResult1> {
+		return this.then(undefined, onrejected);
+	}
+
+	finally(onfinally?: (() => void) | null): Promise<ResultRow<S>[]> {
+		return this.then().finally(onfinally);
 	}
 
 	#executor(): QueryExecutor {

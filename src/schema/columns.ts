@@ -486,19 +486,42 @@ export function integer<TMode extends 'number' | 'boolean' | 'timestamp' | 'time
 
 // ------------------------------------------------------------------- text
 
-export interface TextConfig<TEnum extends readonly string[]> {
+export interface TextConfig<TEnum extends readonly string[], TMode extends 'text' | 'json' = 'text' | 'json'> {
 	length?: number;
 	enum?: TEnum;
-	mode?: 'text' | 'json';
+	mode?: TMode;
 }
 
-export function text<TEnum extends readonly string[] = readonly string[]>(
-	name?: string | TextConfig<TEnum>,
-	config?: TextConfig<TEnum>,
-): ColumnBuilder<Meta<TEnum[number], 'SQLiteText', string, TEnum>> {
+/**
+ * The return type branches on `mode`, as Drizzle's does.
+ *
+ * It used to be fixed at `SQLiteText` with `string` data whatever the mode,
+ * while the *runtime* built a `SQLiteTextJson` with a JSON encoder/decoder
+ * pair. So `text(name, { mode: 'json' })` returned parsed objects and claimed
+ * to return strings, and `.$type<T>()` had nothing to narrow — which is what
+ * the `json<T>()` helper was invented to work around. That helper does not
+ * exist in `drizzle-orm/sqlite-core`, so reaching for it took a schema file
+ * out of the Drizzle subset (doc 08) and broke reverse-aliasing.
+ *
+ * `[TMode] extends ['json']` rather than the naked `TMode extends 'json'`: a
+ * naked type parameter distributes over unions, and the default is the union
+ * `'text' | 'json'`, so the bare form returned *both* branches for a column
+ * declared with no mode at all.
+ */
+export function text<
+	TEnum extends readonly string[] = readonly string[],
+	TMode extends 'text' | 'json' = 'text' | 'json',
+>(
+	name?: string | TextConfig<TEnum, TMode>,
+	config?: TextConfig<TEnum, TMode>,
+): [TMode] extends ['json'] ? ColumnBuilder<Meta<unknown, 'SQLiteTextJson', string>>
+	: ColumnBuilder<Meta<TEnum[number], 'SQLiteText', string, TEnum>>
+{
 	const [columnName, options] = splitArgs(name, config);
 	const json = options?.mode === 'json';
 
+	// The cast is the usual cost of a conditional return type: the body cannot
+	// prove which branch it is in, only the caller can.
 	return new ColumnBuilder(base('text', json ? 'SQLiteTextJson' : 'SQLiteText', columnName, {
 		mode: options?.mode ?? 'text',
 		length: options?.length,
@@ -506,7 +529,7 @@ export function text<TEnum extends readonly string[] = readonly string[]>(
 		...(json
 			? { encode: (v) => JSON.stringify(v), decode: (v) => JSON.parse(String(v)) as unknown }
 			: {}),
-	}));
+	})) as never;
 }
 
 // ------------------------------------------------------------------- real
@@ -598,7 +621,23 @@ export function boolean(name?: string): ColumnBuilder<Meta<boolean, 'SQLiteBoole
 	return integer(name, { mode: 'boolean' }) as ColumnBuilder<Meta<boolean, 'SQLiteBoolean', number>>;
 }
 
-/** A `text` column carrying JSON. Equivalent to `text({ mode: 'json' })`. */
+/**
+ * A `text` column carrying JSON. Equivalent to `text({ mode: 'json' })`.
+ *
+ * @deprecated **Not in `drizzle-orm/sqlite-core`.** Using it in a schema file
+ * takes that file out of the Drizzle subset doc 08 requires, which breaks
+ * reverse-aliasing and with it the `studio` delegation path. It existed
+ * because `text(name, { mode: 'json' })` used to type its data as `string`
+ * whatever the mode; that is fixed, so the portable spelling now carries the
+ * type just as well:
+ *
+ * ```ts
+ * locationData: text('location_data', { mode: 'json' }).$type<Location>()
+ * ```
+ *
+ * Kept for the query side and for existing callers; do not reach for it in a
+ * schema module.
+ */
 export function json<T = unknown>(name?: string): ColumnBuilder<Meta<T, 'SQLiteTextJson', string>> {
 	return text(name, { mode: 'json' }) as unknown as ColumnBuilder<Meta<T, 'SQLiteTextJson', string>>;
 }

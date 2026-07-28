@@ -220,12 +220,13 @@ GraphQL schema over a d1zzle database inside workerd, resolving nested lists and
 `select`-level extras. Two things it needs:
 
 ```ts
-import { asDrizzleRelations } from 'd1zzle/drizzle';
+import type { PothosRelations } from 'd1zzle/drizzle';
+import { asPothosRelations } from 'd1zzle/drizzle';
 import { getTableConfig } from 'd1zzle';           // ours, not drizzle-orm/sqlite-core's
 
-const builder = new SchemaBuilder<{ DrizzleRelations: never }>({
+const builder = new SchemaBuilder<{ DrizzleRelations: PothosRelations<typeof relations> }>({
   plugins: [DrizzlePlugin],
-  drizzle: { client: db, getTableConfig, relations: asDrizzleRelations(relations) },
+  drizzle: { client: db, getTableConfig, relations: asPothosRelations(relations) },
 });
 ```
 
@@ -234,11 +235,12 @@ const builder = new SchemaBuilder<{ DrizzleRelations: never }>({
   the columns and every other field empty — and the plugin cannot find a composite
   primary key. Ours reads our own constraint records. The plugin takes `getTableConfig`
   from its own config, so this substitution is all that is needed.
-- **`asDrizzleRelations`** re-prototypes the relations onto Drizzle's `One`/`Many`. The
+- **`asPothosRelations`** re-prototypes the relations onto Drizzle's `One`/`Many`. The
   plugin is duck-typed everywhere except `relationField instanceof Many`, which decides
   whether a field is a GraphQL list; `instanceof` consults the right-hand constructor, so
   no structural match can satisfy it. Without this, every `many` resolves as a single
-  object.
+  object. It is `asDrizzleRelations` doing the same work, typed as `PothosRelations` so the
+  value lines up with the generic.
 
 `asDrizzleSchema` / `asDrizzleTable` are **identity at runtime** — the objects already
 satisfy every check Drizzle makes of them. They exist because Drizzle's `Column` class
@@ -251,13 +253,30 @@ applied to the result match our own inference field for field.
 `asDrizzleRelations` is the exception: it is the one export that does real work and the one
 that needs `drizzle-orm`'s classes at runtime, for the `instanceof` reason above.
 
-**Pothos' types are opted out of, permanently.** `DrizzleRelations: never` plus a cast on
-`client` and `relations` is the intended way to use the plugin with d1zzle, not a rough
-edge waiting to be filed off. Pothos' generic slots against `drizzle-orm`'s own
-`TablesRelationalConfig`, whose `table` is Drizzle's `Table` class — the same
-protected-member rule, one level up — so there is nothing to fix from this side. The
-runtime contract is met in full and covered by `test/workers/pothos.test.ts`; what you lose
-is autocompletion of table names inside the builder, not correctness.
+**Pothos' types are not opted out of.** Earlier versions of this README said
+`DrizzleRelations: never` was permanent, on the grounds that Pothos' generic slots against
+`TablesRelationalConfig`, whose `table` is Drizzle's `Table` class. That was wrong. The
+protected-member rule applies to Drizzle's `Column`/`Table` *classes*, but v1's
+`TableRelationalConfig` asks only for `{ table; name; relations }`, and its `table` is
+`SchemaEntry` — `Table<any> | View<…>` — which `ToDrizzleTable` already produces. Nothing
+in that interface is ever compared nominally, so `PothosRelations<typeof relations>` fills
+the slot outright.
+
+What that buys is the whole GraphQL layer back under compile-time checking. The typing is
+genuine rather than vacuous, and `test/unit/pothos-types.test.ts` pins it with negative
+controls — an unknown column, an unknown property on a resolver's row, a resolver whose
+return type disagrees with its field, and an undeclared relation name are each rejected:
+
+```ts
+t.exposeString('nope_not_a_column')          // rejected
+t.string({ resolve: (row) => row.notAColumn })  // rejected
+t.boolean({ resolve: (row) => row.title })   // rejected — string vs boolean
+t.relation('definitely_not_a_relation')      // rejected
+```
+
+`client` and `getTableConfig` still take casts — those slot against Drizzle's own database
+and table *classes*, which are subject to the protected-member rule. `relations` and every
+builder call above it are checked.
 
 ## What is different, and why
 

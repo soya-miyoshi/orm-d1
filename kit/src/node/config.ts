@@ -17,11 +17,27 @@ export interface D1Config {
 	databaseId?: string | undefined;
 	accountId?: string | undefined;
 	token?: string | undefined;
+	/**
+	 * An explicit local SQLite file for `--local`, instead of discovering one
+	 * under `.wrangler/state`. For projects whose dev server and tests run in
+	 * Node against a plain file through a D1-shaped adapter.
+	 */
+	localFile?: string | undefined;
 }
 
 export interface Config {
 	/** Path to the schema module, or several. */
 	schema: string | string[];
+	/**
+	 * Path to a module whose default export is `tableOptions([...])` — per-table
+	 * `STRICT` / `WITHOUT ROWID` / `appendOnly`.
+	 *
+	 * A separate module rather than part of the schema on purpose: none of the
+	 * three has a spelling in `drizzle-orm/sqlite-core`, and doc 08 keeps the
+	 * schema DSL a strict subset of it so a schema file stays reverse-aliasable.
+	 * See `TableOptions` in `d1zzle/ddl`.
+	 */
+	tableOptions?: string | undefined;
 	/** Migration output folder, in wrangler's layout. */
 	out: string;
 	d1: D1Config;
@@ -191,6 +207,7 @@ export async function loadConfig(cwd: string, configPath?: string): Promise<Conf
 
 	return {
 		schema: user.schema,
+		tableOptions: user.tableOptions,
 		// Wrangler's own default layout, so `wrangler d1 migrations apply` and
 		// `d1zzle-migrate migrate` stay interchangeable.
 		out: user.out ?? wrangler?.migrations_dir ?? './migrations',
@@ -202,6 +219,7 @@ export async function loadConfig(cwd: string, configPath?: string): Promise<Conf
 			databaseId: user.d1?.databaseId ?? database?.database_id,
 			accountId: user.d1?.accountId ?? process.env['CLOUDFLARE_ACCOUNT_ID'] ?? wrangler?.account_id,
 			token: user.d1?.token ?? process.env['CLOUDFLARE_API_TOKEN'],
+			localFile: user.d1?.localFile,
 		},
 	};
 }

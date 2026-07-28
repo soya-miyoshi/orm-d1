@@ -174,11 +174,55 @@ const parseIndexWhere = (sql: string | null): string | undefined => {
 	return match ? match[1]!.trim() : undefined;
 };
 
+/**
+ * The `STRICT` / `WITHOUT ROWID` suffix, which no pragma reports.
+ *
+ * They are table options rather than constraints, so they appear *after* the
+ * closing paren of the column list and nowhere else. Scanning only the tail
+ * past the final `)` is what keeps a column called `strict` — or a check
+ * constraint mentioning the word — from being read as the option.
+ *
+ * Verified against D1: `sqlite_master` stores the `CREATE TABLE` verbatim, so
+ * the text is exactly what was written, in the order it was written.
+ */
+export const parseTableOptions = (sql: string): { strict: boolean; withoutRowid: boolean } => {
+	const close = blankLiterals(sql).lastIndexOf(')');
+	if (close < 0) return { strict: false, withoutRowid: false };
+	const tail = sql.slice(close + 1).toLowerCase();
+	return {
+		strict: /\bstrict\b/.test(tail),
+		withoutRowid: /\bwithout\s+rowid\b/.test(tail),
+	};
+};
+
+/**
+ * Whether a table carries the append-only guard.
+ *
+ * Matched on what the trigger *does*, not on its name: a `BEFORE UPDATE`
+ * trigger on the table whose body raises ABORT is the guard, however it is
+ * spelled. Keying on the `<table>_no_update` name alone would miss a
+ * hand-written equivalent and report drift against a database that is in fact
+ * protected.
+ */
+export const isAppendOnlyTrigger = (sql: string, tableName: string): boolean => {
+	const text = sql.toLowerCase().replaceAll(/\s+/g, ' ');
+	const quoted = tableName.toLowerCase();
+	if (!/\bbefore\s+update\s+on\s+/.test(text)) return false;
+	if (!new RegExp(`\\bon\\s+["'\`\\[]?${quoted.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}["'\`\\]]?\\b`).test(text)) {
+		return false;
+	}
+	return /\braise\s*\(\s*abort\b/.test(text);
+};
+
 export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): Snapshot {
 	const tables: Record<string, TableSnapshot> = {};
 	const indexSql = new Map<string, string | null>();
+	const appendOnly = new Set<string>();
 	for (const row of input.master) {
 		if (row.type === 'index') indexSql.set(row.name, row.sql);
+		if (row.type === 'trigger' && row.sql && isAppendOnlyTrigger(row.sql, row.tbl_name)) {
+			appendOnly.add(row.tbl_name);
+		}
 	}
 
 	for (const row of input.master) {
@@ -282,6 +326,8 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			compositePrimaryKeys,
 			uniqueConstraints,
 			checkConstraints: parseChecks(createSql, row.name),
+			...parseTableOptions(createSql),
+			appendOnly: appendOnly.has(row.name),
 		};
 	}
 

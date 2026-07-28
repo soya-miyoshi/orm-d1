@@ -36,7 +36,128 @@ export interface DDLOptions {
 	 * reads as the opposite of what it does; both are accepted. */
 	readonly ifExists?: boolean;
 	/** Emit `STRICT`; D1 supports it and it catches type mistakes early. */
+	readonly strict?: boolean | undefined;
+	/**
+	 * Emit `WITHOUT ROWID`. Verified on D1. Requires a primary key, and pays off
+	 * on tables whose primary key *is* the row identity — a junction table stores
+	 * its key once instead of once in the table and again in an index.
+	 */
+	readonly withoutRowid?: boolean | undefined;
+}
+
+/**
+ * Per-table physical-storage options, and the append-only guard.
+ *
+ * These live here rather than in the schema DSL on purpose. `STRICT`,
+ * `WITHOUT ROWID` and triggers have no spelling in `drizzle-orm/sqlite-core`,
+ * and doc 08 makes "every symbol a schema file uses also exists in Drizzle" a
+ * standing constraint — it is what keeps a d1zzle schema reverse-aliasable and
+ * therefore what lets `d1zzle-migrate studio` delegate to `drizzle-kit studio`.
+ * Putting them on `table()` would break that for every user.
+ *
+ * So they are declared in a **sidecar module** the schema file never imports:
+ *
+ * ```ts
+ * // src/db/table-options.ts
+ * import { tableOptions } from 'd1zzle/ddl';
+ * import { users, announcementReads } from './schema';
+ *
+ * export default tableOptions([
+ *   [users,             { strict: true }],
+ *   [announcementReads, { strict: true, withoutRowid: true, appendOnly: true }],
+ * ]);
+ * ```
+ *
+ * Keyed by the table *object*, not its name, so a rename is a compile error
+ * rather than a silently dropped flag.
+ */
+export interface TableOptions {
 	readonly strict?: boolean;
+	readonly withoutRowid?: boolean;
+	/**
+	 * Reject `UPDATE` with a `BEFORE UPDATE … RAISE(ABORT)` trigger.
+	 *
+	 * `DELETE` stays allowed: what an append-only table protects is that a
+	 * recorded fact is never rewritten, and dropping a tenant, expiring a
+	 * retention window or tearing down a test database are all legitimate.
+	 */
+	readonly appendOnly?: boolean;
+}
+
+/** Marks the value a sidecar module default-exports, so the kit can find it. */
+export const TableOptionsBrand = Symbol.for('d1zzle:TableOptions');
+
+export interface TableOptionsMap {
+	readonly [TableOptionsBrand]: true;
+	/** Keyed by SQL table name — what the snapshot and introspection both use. */
+	readonly byTable: Readonly<Record<string, TableOptions>>;
+}
+
+export function tableOptions(entries: readonly (readonly [Table, TableOptions])[]): TableOptionsMap {
+	const byTable: Record<string, TableOptions> = {};
+	for (const [table, options] of entries) {
+		const name = getTableName(table);
+		if (byTable[name]) throw new Error(`tableOptions: "${name}" is declared twice.`);
+		byTable[name] = options;
+	}
+	return { [TableOptionsBrand]: true, byTable };
+}
+
+export const isTableOptionsMap = (value: unknown): value is TableOptionsMap =>
+	typeof value === 'object' && value !== null && TableOptionsBrand in (value as Record<symbol, unknown>);
+
+/** The append-only guard's trigger name, derived so every emitter agrees. */
+export const appendOnlyTriggerName = (tableName: string): string => `${tableName}_no_update`;
+
+export const appendOnlyTrigger = (tableName: string): string =>
+	`create trigger ${quoteIdentifier(appendOnlyTriggerName(tableName))}\n`
+	+ `before update on ${quoteIdentifier(tableName)}\n`
+	+ 'begin\n'
+	+ `\tselect raise(abort, ${literal(`${tableName} is append-only: UPDATE is prohibited`)});\n`
+	+ 'end';
+
+export const dropAppendOnlyTrigger = (tableName: string): string =>
+	`drop trigger if exists ${quoteIdentifier(appendOnlyTriggerName(tableName))}`;
+
+/**
+ * SQLite's `STRICT` allow-list, verified against D1 rather than taken from the
+ * docs: a `NUMERIC` column in a strict table is rejected outright with
+ * `unknown datatype`. `numeric()` is the only d1zzle column type that produces
+ * one, so it is the only type this can catch.
+ */
+const STRICT_TYPES = new Set(['int', 'integer', 'real', 'text', 'blob', 'any']);
+
+/**
+ * Why a table cannot take the options it was given, or `undefined` if it can.
+ *
+ * Both rules were confirmed against a real D1 binding: `WITHOUT ROWID` without
+ * a primary key fails with `PRIMARY KEY missing`, and `STRICT` with a `NUMERIC`
+ * column fails with `unknown datatype`. Catching them when the migration is
+ * *written* is the whole point — the alternative is a migration that passes
+ * review and then fails halfway through applying to production.
+ */
+export function validateTableOptions(t: Table, options: TableOptions): string | undefined {
+	const name = getTableName(t);
+	const columns = Object.values(getTableColumns(t)) as Column<any>[];
+
+	if (options.withoutRowid) {
+		const hasComposite = getTableExtras(t).some((e) => e.kind === 'primaryKey');
+		const hasColumnPk = columns.some((c) => c.config.primaryKey);
+		if (!hasComposite && !hasColumnPk) {
+			return `"${name}" is declared WITHOUT ROWID but has no primary key; SQLite rejects that outright.`;
+		}
+	}
+
+	if (options.strict) {
+		const bad = columns.filter((c) => !STRICT_TYPES.has(c.config.type.toLowerCase()));
+		if (bad.length > 0) {
+			return `"${name}" is declared STRICT but ${
+				bad.map((c) => `"${c.name}" is ${c.config.type.toUpperCase()}`).join(', ')
+			}; a STRICT table allows only INT, INTEGER, REAL, TEXT, BLOB and ANY.`;
+		}
+	}
+
+	return undefined;
 }
 
 /**
@@ -188,8 +309,13 @@ export function createTable(t: Table, options: DDLOptions = {}): string {
 	}
 
 	const body = parts.map((p) => `\t${p}`).join(',\n');
+	// SQLite wants the two table-options comma-separated, and `STRICT` first is
+	// the spelling `sqlite_master` reports back, so emitting them in this order
+	// is what makes introspection compare equal to what we wrote.
+	const suffix = [options.strict ? 'strict' : undefined, options.withoutRowid ? 'without rowid' : undefined]
+		.filter((s) => s !== undefined);
 	return `create table ${options.ifNotExists ? 'if not exists ' : ''}${quoteIdentifier(name)} (\n${body}\n)${
-		options.strict ? ' strict' : ''
+		suffix.length > 0 ? ` ${suffix.join(', ')}` : ''
 	}`;
 }
 
@@ -204,8 +330,26 @@ export const dropTable = (t: Table, options: DDLOptions = {}): string =>
 	}`;
 
 /** Every statement needed to create a whole schema, tables before indexes. */
-export function createSchema(tables: readonly Table[], options: DDLOptions = {}): string[] {
-	const statements = tables.map((t) => createTable(t, options));
+export function createSchema(
+	tables: readonly Table[],
+	options: DDLOptions = {},
+	perTable?: TableOptionsMap,
+): string[] {
+	const optionsFor = (t: Table): DDLOptions => {
+		const extra = perTable?.byTable[getTableName(t)];
+		if (!extra) return options;
+		return {
+			...options,
+			strict: extra.strict ?? options.strict,
+			withoutRowid: extra.withoutRowid ?? options.withoutRowid,
+		};
+	};
+
+	const statements = tables.map((t) => createTable(t, optionsFor(t)));
 	for (const t of tables) statements.push(...createIndexes(t, options));
+	// Triggers last: they reference the table, so it has to exist first.
+	for (const t of tables) {
+		if (perTable?.byTable[getTableName(t)]?.appendOnly) statements.push(appendOnlyTrigger(getTableName(t)));
+	}
 	return statements;
 }

@@ -595,8 +595,19 @@ const fieldNameOf = (columns: Record<string, Column<any>>, column: Column<any>):
 	return column.name;
 };
 
-/** Lazy, awaitable, and re-runnable — the shape Drizzle's query builders have. */
-export class RelationalQuery<TResult> implements PromiseLike<TResult> {
+/**
+ * Lazy, awaitable, and re-runnable — the shape Drizzle's query builders have.
+ *
+ * `Promise`, not just `PromiseLike`: Drizzle's `QueryPromise` is a full
+ * `Promise<T>`, and callers rely on it. Declaring only `then` typechecks the
+ * `await` path but rejects `.catch()`, `.finally()`, and any assignment to a
+ * `Promise<T>` — including the common `const p: Promise<T> = q.findMany().then(…)`
+ * memo. `then` already returns a real promise at runtime, so this widens the
+ * declaration to match what the class always did.
+ */
+export class RelationalQuery<TResult> implements Promise<TResult> {
+	readonly [Symbol.toStringTag] = 'Promise';
+
 	constructor(private readonly runner: (input?: Record<string, unknown>) => Promise<TResult>) {}
 
 	/** @param input values for the placeholders used anywhere in the filter. */
@@ -607,7 +618,17 @@ export class RelationalQuery<TResult> implements PromiseLike<TResult> {
 	then<TResult1 = TResult, TResult2 = never>(
 		onfulfilled?: ((value: TResult) => TResult1 | PromiseLike<TResult1>) | null,
 		onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
-	): PromiseLike<TResult1 | TResult2> {
+	): Promise<TResult1 | TResult2> {
 		return this.runner().then(onfulfilled, onrejected);
+	}
+
+	catch<TResult1 = never>(
+		onrejected?: ((reason: unknown) => TResult1 | PromiseLike<TResult1>) | null,
+	): Promise<TResult | TResult1> {
+		return this.then(undefined, onrejected);
+	}
+
+	finally(onfinally?: (() => void) | null): Promise<TResult> {
+		return this.then().finally(onfinally);
 	}
 }

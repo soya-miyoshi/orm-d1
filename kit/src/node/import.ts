@@ -9,8 +9,56 @@
  * why the copy has to sit next to the original.
  */
 import { copyFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { registerHooks } from 'node:module';
 import { dirname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+/**
+ * Extension-less relative imports, which Node's ESM resolver rejects.
+ *
+ * A TypeScript project on `"moduleResolution": "bundler"` — the default for
+ * anything built with Vite, and what a Workers project almost always uses —
+ * writes `import { users } from './users'`. That is not a resolvable ES module
+ * specifier: Node requires the extension, and the schema failed to load with
+ * `Cannot find module '.../schema/users'` before any of the kit's own code ran.
+ *
+ * drizzle-kit solves this by bundling the schema with esbuild. A resolve hook
+ * is smaller and keeps "the schema is a value, not something to parse" true:
+ * only the specifier is rewritten, and Node still does the loading and the
+ * type stripping.
+ *
+ * Registered once, lazily, so importing this module has no effect on a caller
+ * that never loads a schema.
+ */
+let hooksRegistered = false;
+
+const CANDIDATE_SUFFIXES = ['.ts', '.mts', '.cts', '.js', '.mjs', '/index.ts', '/index.mts', '/index.js'];
+
+const registerResolveHook = (): void => {
+	if (hooksRegistered) return;
+	hooksRegistered = true;
+
+	registerHooks({
+		resolve(specifier, context, nextResolve) {
+			const relative = specifier.startsWith('./') || specifier.startsWith('../');
+			// Anything with an extension, and every bare specifier, is left to
+			// Node — rewriting those would shadow real packages.
+			if (!relative || /\.[cm]?[jt]sx?$/.test(specifier)) return nextResolve(specifier, context);
+
+			const parentUrl = context.parentURL;
+			if (!parentUrl?.startsWith('file:')) return nextResolve(specifier, context);
+
+			const base = join(dirname(fileURLToPath(parentUrl)), specifier);
+			for (const suffix of CANDIDATE_SUFFIXES) {
+				if (existsSync(base + suffix)) {
+					return nextResolve(pathToFileURL(base + suffix).href, context);
+				}
+			}
+			return nextResolve(specifier, context);
+		},
+	});
+};
 
 const isModuleSyntaxError = (error: unknown): boolean =>
 	error instanceof Error
@@ -19,6 +67,7 @@ const isModuleSyntaxError = (error: unknown): boolean =>
 let shimCounter = 0;
 
 export async function importModule<T = Record<string, unknown>>(path: string): Promise<T> {
+	registerResolveHook();
 	try {
 		return await import(pathToFileURL(path).href) as T;
 	} catch (error) {

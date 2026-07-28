@@ -11,7 +11,7 @@ import { resolve } from 'node:path';
 import type { DiffOptions } from './core/diff.js';
 import { loadConfig } from './node/config.js';
 import type { CommandContext, TargetFlags } from './node/commands.js';
-import { check, generate, migrate, pull, push, up } from './node/commands.js';
+import { check, generate, migrate, pull, push, up, verify } from './node/commands.js';
 
 const USAGE = `d1zzle-migrate — migrations for d1zzle on Cloudflare D1
 
@@ -21,7 +21,12 @@ Usage
   d1zzle-migrate push     [--local | --remote] [--accept-data-loss] [renames]
   d1zzle-migrate pull     [--local | --remote] [--schema-out <file>] [--force]
   d1zzle-migrate check    [--local | --remote]
+  d1zzle-migrate verify
   d1zzle-migrate up
+
+Commands
+  check     does the live database match the snapshot? (drift, unapplied)
+  verify    do the migrations still add up to the schema? (needs no database)
 
 Options
   --config <path>       config file (default: d1zzle.config.ts)
@@ -184,6 +189,11 @@ export async function run(argv: readonly string[]): Promise<number> {
 		case 'check': {
 			const result = await check(ctx, target);
 			// Non-zero so this belongs in CI.
+			return result.ok ? 0 : 1;
+		}
+		case 'verify': {
+			// Needs no database, so it runs in CI on a bare checkout.
+			const result = await verify(ctx);
 			return result.ok ? 0 : 1;
 		}
 		case 'up':

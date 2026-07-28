@@ -2,23 +2,27 @@
  * The commands. Each one is a plain async function over a `Config` plus flags,
  * so they are callable from a script as well as from the CLI.
  */
-import { configureCasing } from 'd1zzle';
+import { configureCasing, getTableName, isTable } from 'd1zzle';
+import { validateTableOptions } from 'd1zzle/ddl';
 import { appliedMigrations, applyMigrations, introspect, MAX_STATEMENTS_PER_BATCH } from '../core/apply.js';
 import type { SqlRunner } from '../core/apply.js';
-import { isPragma } from '../core/sql.js';
+import { applicableStatements, isPragma } from '../core/sql.js';
 import { diffSnapshots, renderMigration } from '../core/diff.js';
 import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
 import { snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
 import type { Snapshot } from '../core/snapshot.js';
 import type { Config } from './config.js';
-import { localRunner, remoteRunner } from './runners.js';
+import { localRunner, remoteRunner, scratchRunner } from './runners.js';
 import {
+	journalPath,
 	loadSchema,
+	loadTableOptions,
 	readJournal,
 	readLatestSnapshot,
 	readMigration,
 	readSnapshot,
+	unreadableMigrations,
 	writeJournal,
 	writeMigration,
 	writeSnapshot,
@@ -54,13 +58,39 @@ export async function resolveRunner(ctx: CommandContext, flags: TargetFlags): Pr
 		return remoteRunner({ accountId, databaseId, token });
 	}
 
-	return localRunner(ctx.cwd, ctx.config.d1.databaseName);
+	return localRunner(ctx.cwd, ctx.config.d1.databaseName, ctx.config.d1.localFile);
 }
 
 export async function snapshotOfSchema(ctx: CommandContext): Promise<Snapshot> {
 	if (ctx.config.casing) configureCasing(ctx.config.casing);
 	const schema = await loadSchema(ctx.cwd, ctx.config.schema);
-	return snapshotFromSchema(schema);
+
+	if (!ctx.config.tableOptions) return snapshotFromSchema(schema);
+
+	const options = await loadTableOptions(ctx.cwd, ctx.config.tableOptions);
+	const tables = Object.values(schema).filter(isTable);
+	const byName = new Map(tables.map((t) => [getTableName(t), t]));
+
+	// Both checks run before anything is generated. `STRICT` with a NUMERIC
+	// column and `WITHOUT ROWID` without a primary key are each rejected by D1
+	// at CREATE time, and a migration is one atomic batch — so an unvalidated
+	// option does not produce a partly-migrated database, it produces a
+	// migration file that is reviewed, committed, and then fails on apply.
+	const problems: string[] = [];
+	for (const [name, perTable] of Object.entries(options.byTable)) {
+		const table = byName.get(name);
+		if (!table) {
+			problems.push(`tableOptions names "${name}", which is not a table in the schema.`);
+			continue;
+		}
+		const problem = validateTableOptions(table, perTable);
+		if (problem) problems.push(problem);
+	}
+	if (problems.length > 0) {
+		throw new Error(`Invalid table options:\n  - ${problems.join('\n  - ')}`);
+	}
+
+	return snapshotFromSchema(schema, '', options);
 }
 
 // ------------------------------------------------------------------ generate
@@ -124,6 +154,29 @@ export async function migrate(ctx: CommandContext, flags: TargetFlags = {}): Pro
 	const pending = pendingMigrations(journal, applied);
 
 	if (pending.length === 0) {
+		// An empty journal is indistinguishable from a fully-applied one, so
+		// "nothing pending" is only trustworthy when the folder is also empty of
+		// migrations the journal does not know about. A project adopting the kit
+		// with migrations in another tool's layout — drizzle-kit writes
+		// `<tag>/migration.sql` directories rather than wrangler's flat
+		// `<tag>.sql` — would otherwise be told it was up to date while nothing
+		// had been applied at all.
+		if (journal.entries.length === 0) {
+			const unknown = await unreadableMigrations(ctx.config.out);
+			if (unknown.length > 0) {
+				throw new Error(
+					`No migrations are recorded in ${journalPath(ctx.config.out)}, but ${ctx.config.out} contains `
+						+ (unknown.length === 1
+							? '1 entry that looks like a migration:\n'
+							: `${unknown.length} entries that look like migrations:\n`)
+						+ unknown.map((f) => `  - ${f}`).join('\n')
+						+ '\n\nThe kit reads wrangler\'s flat layout (`<tag>.sql` plus `meta/_journal.json`). '
+						+ 'Run `d1zzle-migrate pull` to start from a baseline snapshot of the live database, '
+						+ 'or convert the folder to that layout. Refusing to report "up to date" for a database '
+						+ 'that may have had nothing applied.',
+				);
+			}
+		}
 		ctx.log('Already up to date.');
 		return [];
 	}
@@ -485,6 +538,90 @@ export async function check(ctx: CommandContext, flags: TargetFlags = {}): Promi
 	if (ok) ctx.log('Up to date, no drift.');
 
 	return { pending, drift, blocked, ok };
+}
+
+// -------------------------------------------------------------------- verify
+
+export interface VerifyResult {
+	/** Statements that would still be needed — empty when the replay matches. */
+	readonly differences: readonly string[];
+	/** Structural failures found by SQLite itself. */
+	readonly corruption: readonly string[];
+	readonly applied: number;
+	readonly ok: boolean;
+}
+
+/**
+ * Replay every migration into an empty database and compare the result with the
+ * schema module. Needs no database of its own, so it belongs in CI.
+ *
+ * This is a different question from {@link check}, and neither subsumes the
+ * other:
+ *
+ * - `check` asks **"does the live database match the snapshot?"** — it catches
+ *   drift: an unapplied migration, or someone running `ALTER` by hand.
+ * - `verify` asks **"do the migrations still add up to the schema?"** — it
+ *   catches a broken *history*, with no database involved at all.
+ *
+ * The gap `verify` fills is the one that hurts. `generate` writes two artifacts
+ * from one diff: the SQL, and the snapshot. Nothing forces them to agree. If
+ * the renderer drops a constraint, both artifacts are self-consistent, `check`
+ * compares the live database against the snapshot that shares the bug, and CI
+ * stays green while the constraint is silently gone. That is not hypothetical:
+ * it is exactly how drizzle-kit lost `.unique()` on three tables of a real
+ * schema while every check passed.
+ *
+ * Comparing the *replayed* database against the *schema* — two sources that
+ * share no code path with each other — is what closes it.
+ */
+export async function verify(ctx: CommandContext): Promise<VerifyResult> {
+	const journal = await readJournal(ctx.config.out);
+	const runner = await scratchRunner();
+
+	// In journal order, which is the order a new environment applies them in.
+	// Reading from the journal rather than globbing the folder also means a
+	// migration that exists on disk but was never recorded is caught here.
+	for (const entry of journal.entries) {
+		const sql = await readMigration(ctx.config.out, entry.tag);
+		try {
+			await runner.batch(applicableStatements(sql));
+		} catch (error) {
+			return {
+				differences: [`${entry.tag} failed to apply: ${(error as Error).message}`],
+				corruption: [],
+				applied: journal.entries.length,
+				ok: false,
+			};
+		}
+	}
+
+	const corruption: string[] = [];
+	const fk = await runner.all<Record<string, unknown>>('pragma foreign_key_check');
+	if (fk.length > 0) corruption.push(`${fk.length} foreign key violation(s) after replay`);
+	const integrity = await runner.all<{ integrity_check: string }>('pragma integrity_check');
+	if (integrity[0]?.integrity_check !== 'ok') {
+		corruption.push(`integrity_check: ${integrity.map((r) => r.integrity_check).join(', ')}`);
+	}
+
+	const replayed = await introspect(runner);
+	const expected = await snapshotOfSchema(ctx);
+	const diff = diffSnapshots(replayed, expected);
+
+	// Both halves count: a statement means the replay is missing something the
+	// schema has, and a refusal means the differ could not even express the gap.
+	const differences = [...diff.statements.map((s) => s.reason ?? s.sql), ...diff.errors];
+
+	for (const problem of corruption) ctx.log(`Corrupt: ${problem}`);
+	for (const difference of differences) ctx.log(`Mismatch: ${difference}`);
+
+	const ok = differences.length === 0 && corruption.length === 0;
+	ctx.log(
+		ok
+			? `Replayed ${journal.entries.length} migration(s); the result matches the schema.`
+			: `Replayed ${journal.entries.length} migration(s); the result does NOT match the schema.`,
+	);
+
+	return { differences, corruption, applied: journal.entries.length, ok };
 }
 
 // ------------------------------------------------------------------------ up

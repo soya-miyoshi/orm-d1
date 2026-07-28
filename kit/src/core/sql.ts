@@ -4,12 +4,35 @@
  * Each migration is applied as a single `batch()`, and `batch()` takes
  * statements, not a script — so the split has to be right. Semicolons inside
  * string literals, comments and quoted identifiers are the whole problem.
+ *
+ * And inside a trigger body, which is the fourth. `CREATE TRIGGER … BEGIN …
+ * END` contains statement-terminating semicolons that belong to the trigger,
+ * not to the migration: SQLite requires each body statement to end with one.
+ * Splitting on them produced a fragment ending at `BEGIN`, which the applier
+ * rejected with `incomplete input` — so a migration that created any trigger
+ * could not be applied at all.
  */
 export function splitStatements(sql: string): string[] {
 	const statements: string[] = [];
 	let current = '';
 	let quote: '"' | "'" | '`' | undefined;
 	let comment: 'line' | 'block' | undefined;
+	/**
+	 * Inside a trigger body, semicolons are part of the statement.
+	 *
+	 * Tracked by looking at what has accumulated rather than by counting
+	 * BEGIN/END keywords generally: `BEGIN` also starts a transaction, and
+	 * `END` appears in `CASE … END`, so a general counter mis-nests on ordinary
+	 * SQL. Only a statement that actually started with CREATE TRIGGER opts in.
+	 */
+	const inTriggerBody = (): boolean => {
+		if (!/^\s*create\s+(or\s+replace\s+)?(temp\s+|temporary\s+)?trigger\b/i.test(current)) return false;
+		// The body is open until its matching END; `CASE … END` inside it is
+		// balanced by its own CASE, so counting both keeps the nesting right.
+		const opens = (current.match(/\b(begin|case)\b/gi) ?? []).length;
+		const closes = (current.match(/\bend\b/gi) ?? []).length;
+		return opens > closes;
+	};
 
 	for (let i = 0; i < sql.length; i++) {
 		const char = sql[i]!;
@@ -57,6 +80,10 @@ export function splitStatements(sql: string): string[] {
 		}
 
 		if (char === ';') {
+			if (inTriggerBody()) {
+				current += char;
+				continue;
+			}
 			const trimmed = current.trim();
 			if (trimmed) statements.push(trimmed);
 			current = '';

@@ -9,6 +9,7 @@
  * from the intersection of old and new columns. `SELECT *` is the classic
  * corruption bug and never appears here.
  */
+import { appendOnlyTrigger, dropAppendOnlyTrigger } from 'd1zzle/ddl';
 import type { ColumnSnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot } from './snapshot.js';
 
@@ -143,6 +144,14 @@ const requiresRecreate = (before: TableSnapshot, after: TableSnapshot, columnRen
 	if (!sameJson(a.foreignKeys, b.foreignKeys)) return 'a foreign key changes';
 	if (!sameJson(a.uniques, b.uniques)) return 'a unique constraint changes';
 	if (!sameJson(a.checks, b.checks)) return 'a check constraint changes';
+	// `STRICT` and `WITHOUT ROWID` are part of the `CREATE TABLE` statement, not
+	// constraints, and SQLite has no ALTER for either — so changing one is a
+	// rebuild like any other. `appendOnly` is deliberately NOT here: it is a
+	// separate trigger object, added and dropped in place below.
+	if (a.strict !== b.strict) return `the table ${b.strict ? 'becomes' : 'stops being'} STRICT`;
+	if (a.withoutRowid !== b.withoutRowid) {
+		return `the table ${b.withoutRowid ? 'becomes' : 'stops being'} WITHOUT ROWID`;
+	}
 	return undefined;
 };
 
@@ -277,6 +286,13 @@ const recreateTable = (
 		statements.push({ sql: createIndexFromSnapshot(index, after.name), destructive: false });
 	}
 
+	// So is the append-only trigger. Leaving it out silently unprotected an
+	// append-only table the first time it was rebuilt for any other reason —
+	// the failure mode being that nothing fails, and UPDATEs start working.
+	if (after.appendOnly) {
+		statements.push({ sql: appendOnlyTrigger(after.name), destructive: false });
+	}
+
 	// No closing pragma: it is scoped to this transaction and, per D1's docs,
 	// turning it back off at the end is implicit.
 	return { statements, errors };
@@ -319,6 +335,7 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		for (const index of Object.values(t.indexes)) {
 			statements.push({ sql: createIndexFromSnapshot(index, name), destructive: false });
 		}
+		if (t.appendOnly) statements.push({ sql: appendOnlyTrigger(name), destructive: false });
 	}
 
 	// 3. Dropped tables, children before parents — the reverse of creation
@@ -469,6 +486,22 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		}
 
 		statements.push(...indexCreates);
+
+		// The append-only guard, for a table that survives in place. A trigger is
+		// its own object, so unlike STRICT / WITHOUT ROWID this needs no rebuild —
+		// and dropping it is destructive only in the sense that it removes a
+		// protection, which is worth saying out loud rather than doing quietly.
+		if ((previous.appendOnly ?? false) !== (next.appendOnly ?? false)) {
+			statements.push(
+				next.appendOnly
+					? { sql: appendOnlyTrigger(name), destructive: false }
+					: {
+						sql: dropAppendOnlyTrigger(name),
+						destructive: true,
+						reason: `"${name}" is no longer append-only, so UPDATE is permitted again`,
+					},
+			);
+		}
 	}
 
 	return { statements, errors, warnings };

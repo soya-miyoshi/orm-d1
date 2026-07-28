@@ -1,9 +1,10 @@
-import { check, foreignKey, index, integer, primaryKey, sql, sqliteTable, text, unique, uniqueIndex } from 'd1zzle';
+import { blob, check, foreignKey, index, integer, numeric, primaryKey, real, sql, sqliteTable, text, unique, uniqueIndex } from 'd1zzle';
+import { tableOptions, validateTableOptions } from 'd1zzle/ddl';
 import type { Column } from 'd1zzle';
 import { describe, expect, it } from 'vitest';
 import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
-import { applicableStatements } from '../../src/core/sql.js';
-import { hasAutoincrement, parseChecks, parseGenerated } from '../../src/core/introspect.js';
+import { applicableStatements, splitStatements } from '../../src/core/sql.js';
+import { hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
 import { assertRoundTrip, emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
 import type { Snapshot } from '../../src/core/snapshot.js';
 
@@ -856,4 +857,175 @@ describe('snapshot and DDL agree, table for table', () => {
 			expect(() => assertRoundTrip(table)).not.toThrow();
 		});
 	}
+});
+
+describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () => {
+	const users = sqliteTable('users', {
+		id: text('id').primaryKey(),
+		email: text('email').notNull(),
+	});
+	const events = sqliteTable('events', {
+		id: text('id').primaryKey(),
+		at: integer('at').notNull(),
+	});
+
+	const withOptions = (table: any, options: Record<string, boolean>): Snapshot =>
+		snapshotFromSchema([table], '', tableOptions([[table, options]]));
+
+	it('emits the options on CREATE TABLE, in the order sqlite_master reports them', () => {
+		const pairs = sqliteTable('pairs', {
+			a: text('a').notNull(),
+			b: text('b').notNull(),
+		}, (c) => [primaryKey({ columns: [c.a, c.b] })]);
+
+		const diff = diffSnapshots(emptySnapshot(), withOptions(pairs, { strict: true, withoutRowid: true }));
+		expect(diff.statements[0]!.sql).toMatch(/\)\s*strict, without rowid$/);
+	});
+
+	it('creates the append-only trigger with a new table', () => {
+		const diff = diffSnapshots(emptySnapshot(), withOptions(events, { appendOnly: true }));
+		const sql = diff.statements.map((s) => s.sql).join('\n');
+		expect(sql).toMatch(/create trigger "events_no_update"/);
+		expect(sql).toMatch(/before update on "events"/);
+		expect(sql).toMatch(/raise\(abort,/);
+	});
+
+	it('rebuilds the table when STRICT is turned on — SQLite has no ALTER for it', () => {
+		const diff = diffSnapshots(withOptions(users, {}), withOptions(users, { strict: true }));
+		const sql = diff.statements.map((s) => s.sql).join('\n');
+		expect(diff.errors).toEqual([]);
+		expect(sql).toMatch(/create table "__new_users"/);
+		expect(sql).toMatch(/drop table "users"/);
+		expect(diff.statements.some((s) => s.reason?.includes('becomes STRICT'))).toBe(true);
+	});
+
+	it('rebuilds the table when WITHOUT ROWID changes', () => {
+		const diff = diffSnapshots(withOptions(users, {}), withOptions(users, { withoutRowid: true }));
+		expect(diff.statements.some((s) => s.reason?.includes('becomes WITHOUT ROWID'))).toBe(true);
+	});
+
+	it('adds and drops the guard in place — a trigger needs no rebuild', () => {
+		const added = diffSnapshots(withOptions(events, {}), withOptions(events, { appendOnly: true }));
+		expect(added.statements.map((s) => s.sql).join('\n')).not.toMatch(/__new_events/);
+		expect(added.statements).toHaveLength(1);
+		expect(added.statements[0]!.sql).toMatch(/create trigger "events_no_update"/);
+
+		const removed = diffSnapshots(withOptions(events, { appendOnly: true }), withOptions(events, {}));
+		expect(removed.statements[0]!.sql).toMatch(/drop trigger if exists "events_no_update"/);
+		// Losing a protection is worth flagging, even though no data is deleted.
+		expect(removed.statements[0]!.destructive).toBe(true);
+	});
+
+	it('re-emits the guard after a rebuild, since DROP TABLE takes the trigger with it', () => {
+		// The failure this pins is silent: the table comes back unprotected and
+		// nothing errors, so UPDATEs simply start working again.
+		const before = withOptions(events, { appendOnly: true });
+		const after = snapshotFromSchema(
+			[sqliteTable('events', { id: text('id').primaryKey(), at: text('at').notNull() })],
+			'',
+			tableOptions([[events, { appendOnly: true }]]),
+		);
+
+		const diff = diffSnapshots(before, after);
+		const sql = diff.statements.map((s) => s.sql).join('\n');
+		expect(sql).toMatch(/create table "__new_events"/);
+		expect(sql).toMatch(/create trigger "events_no_update"/);
+		// And after the rename, not before it.
+		expect(sql.indexOf('create trigger')).toBeGreaterThan(sql.indexOf('rename to "events"'));
+	});
+
+	it('reports no drift when nothing about the options changed', () => {
+		const snapshot = withOptions(events, { strict: true, withoutRowid: false, appendOnly: true });
+		expect(diffSnapshots(snapshot, snapshot).statements).toEqual([]);
+	});
+});
+
+describe('reading table options back out of a CREATE TABLE', () => {
+	it('reads STRICT and WITHOUT ROWID off the tail', () => {
+		expect(parseTableOptions('create table "t" ("a" text) strict, without rowid'))
+			.toEqual({ strict: true, withoutRowid: true });
+		expect(parseTableOptions('create table "t" ("a" text) strict'))
+			.toEqual({ strict: true, withoutRowid: false });
+		expect(parseTableOptions('create table "t" ("a" text)'))
+			.toEqual({ strict: false, withoutRowid: false });
+	});
+
+	it('does not mistake a column or a literal for the option', () => {
+		// Only the tail past the final `)` is scanned, so neither of these counts.
+		expect(parseTableOptions('create table "t" ("strict" text, "without rowid" text)'))
+			.toEqual({ strict: false, withoutRowid: false });
+		expect(parseTableOptions(`create table "t" ("a" text default 'strict')`))
+			.toEqual({ strict: false, withoutRowid: false });
+	});
+
+	it('recognises the guard by what it does, not by its name', () => {
+		const guard = 'CREATE TRIGGER whatever_i_called_it BEFORE UPDATE ON "events" '
+			+ "BEGIN SELECT RAISE(ABORT, 'nope'); END";
+		expect(isAppendOnlyTrigger(guard, 'events')).toBe(true);
+
+		// A trigger on a different table, and one that does not abort.
+		expect(isAppendOnlyTrigger(guard, 'users')).toBe(false);
+		expect(isAppendOnlyTrigger('CREATE TRIGGER t AFTER INSERT ON "events" BEGIN SELECT 1; END', 'events'))
+			.toBe(false);
+	});
+});
+
+describe('table options that SQLite would reject', () => {
+	it('refuses WITHOUT ROWID on a table with no primary key', () => {
+		const t = sqliteTable('no_pk', { a: text('a').notNull() });
+		expect(validateTableOptions(t, { withoutRowid: true })).toMatch(/no primary key/);
+		expect(validateTableOptions(t, { withoutRowid: false })).toBeUndefined();
+	});
+
+	it('refuses STRICT on a table with a NUMERIC column', () => {
+		// Verified against D1: `unknown datatype ... "NUMERIC"`.
+		const t = sqliteTable('money', { id: text('id').primaryKey(), amount: numeric('amount') });
+		expect(validateTableOptions(t, { strict: true })).toMatch(/NUMERIC/);
+	});
+
+	it('accepts a table whose columns are all in the STRICT allow-list', () => {
+		const t = sqliteTable('ok', {
+			id: text('id').primaryKey(),
+			n: integer('n'),
+			r: real('r'),
+			b: blob('b'),
+		});
+		expect(validateTableOptions(t, { strict: true, withoutRowid: true })).toBeUndefined();
+	});
+
+	it('rejects a duplicate table in tableOptions rather than letting one win', () => {
+		const t = sqliteTable('dup', { id: text('id').primaryKey() });
+		expect(() => tableOptions([[t, { strict: true }], [t, { strict: false }]])).toThrow(/declared twice/);
+	});
+});
+
+describe('splitting a migration that contains a trigger', () => {
+	it('keeps the trigger body whole instead of cutting it at its semicolons', () => {
+		// The failure was total: the fragment ending at `begin` came back as its
+		// own statement and SQLite rejected it with `incomplete input`, so any
+		// migration creating a trigger could not be applied at all.
+		const migration = 'create table "t" ("a" text);\n'
+			+ 'create trigger "t_no_update"\n'
+			+ 'before update on "t"\n'
+			+ 'begin\n'
+			+ "\tselect raise(abort, 't is append-only: UPDATE is prohibited');\n"
+			+ 'end;\n'
+			+ 'create index "t_a_idx" on "t" ("a");';
+
+		const statements = splitStatements(migration);
+		expect(statements).toHaveLength(3);
+		expect(statements[1]).toContain('raise(abort');
+		expect(statements[1]!.trimEnd().endsWith('end')).toBe(true);
+		expect(statements[2]).toMatch(/^create index/);
+	});
+
+	it('still splits ordinary statements, and a CASE inside a trigger body', () => {
+		const migration = 'create trigger "g" before update on "t" begin '
+			+ "select case when 1 then raise(abort, 'no') else 1 end; end;\n"
+			+ 'create table "u" ("b" text);';
+
+		const statements = splitStatements(migration);
+		expect(statements).toHaveLength(2);
+		expect(statements[1]).toMatch(/^create table "u"/);
+	});
 });
