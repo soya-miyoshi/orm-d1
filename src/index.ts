@@ -18,6 +18,7 @@ export * from './relations/index.js';
 import type { RelationsConfig } from './relations/index.js';
 import type { QueryAPI, RelationalMeta } from './relations/index.js';
 import { withRelations } from './relations/index.js';
+import type { RelationalStrategy } from './relations/index.js';
 import type { D1zzleOptions } from './runtime/database.js';
 import { D1zzleDatabase, d1zzle as createDatabase } from './runtime/database.js';
 
@@ -83,7 +84,8 @@ export function d1zzle(
 
 	const db = createDatabase(binding, config);
 	const relations = (config as { relations?: RelationsConfig }).relations;
-	return relations ? withRelations(db, relations) : db;
+	const strategy = (config as { relationalStrategy?: RelationalStrategy }).relationalStrategy;
+	return relations ? withRelations(db, relations, strategy) : db;
 }
 
 /**

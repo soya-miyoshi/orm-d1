@@ -220,16 +220,20 @@ export interface RelationalMeta<TRelations> {
  * the relational layer stays out of the core bundle for anyone who does not
  * pass relations, and so it can be attached to an existing db after the fact.
  */
+export type { RelationalStrategy } from '../runtime/database.js';
+import type { RelationalStrategy } from '../runtime/database.js';
+
 export function withRelations<TRelations extends RelationsConfig>(
 	db: D1zzleDatabase,
 	relations: TRelations,
+	strategy: RelationalStrategy = 'split',
 ): D1zzleDatabase & { query: QueryAPI<TRelations>; _: RelationalMeta<TRelations> } {
 	const config = relations as RelationsConfig;
 	const query: Record<string, RelationalQueryBuilder> = {};
 	const fullSchema: Record<string, Table> = {};
 
 	for (const [tsName, table] of Object.entries(config)) {
-		query[tsName] = new RelationalQueryBuilder(db, config, table);
+		query[tsName] = new RelationalQueryBuilder(db, config, table, strategy);
 		fullSchema[tsName] = table.table;
 	}
 
@@ -247,7 +251,7 @@ export function withRelations<TRelations extends RelationsConfig>(
 	const attached = Object.assign(db, {
 		query,
 		_: meta,
-		$reattach: (derived: D1zzleDatabase) => void withRelations(derived, relations),
+		$reattach: (derived: D1zzleDatabase) => void withRelations(derived, relations, strategy),
 	});
 
 	return attached as unknown as

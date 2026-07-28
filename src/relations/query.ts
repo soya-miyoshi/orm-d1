@@ -14,7 +14,7 @@
  * filter DSL instead of a callback, an object form for `orderBy`, a callback
  * form for `extras` — not the executor itself.
  */
-import type { D1zzleDatabase } from '../runtime/database.js';
+import type { D1zzleDatabase, RelationalStrategy } from '../runtime/database.js';
 import type { Column } from '../schema/columns.js';
 import type { Table } from '../schema/table.js';
 import { alias, getTableColumns } from '../schema/table.js';
@@ -24,6 +24,8 @@ import { avg, count, countDistinct, max, min, sum } from '../sql/functions.js';
 import type { Placeholder, RenderContext, SQLChunk } from '../sql/sql.js';
 import { render, sql } from '../sql/sql.js';
 import type { Relation, RelationsConfig, TableRelationalConfig } from './define.js';
+import { buildLevel, decodeJoined, supportsJoined } from './joined.js';
+import { fieldNameOf, pickColumns } from './projection.js';
 import type { RelationsFilter } from './filter.js';
 import { compileFilter, filterOperators } from './filter.js';
 
@@ -146,18 +148,6 @@ const resolveExtras = (
 	return resolved;
 };
 
-/** Which columns to project: explicit `true`s win; otherwise all but the `false`s. */
-const pickColumns = (
-	all: Record<string, Column<any>>,
-	selection: Record<string, boolean | undefined> | undefined,
-): string[] => {
-	const keys = Object.keys(all);
-	if (!selection) return keys;
-	const included = keys.filter((key) => selection[key] === true);
-	if (included.length > 0) return included;
-	return keys.filter((key) => selection[key] !== false);
-};
-
 /**
  * One stitching-key component.
  *
@@ -255,7 +245,60 @@ export class RelationalQueryBuilder {
 		private readonly db: D1zzleDatabase,
 		private readonly schema: RelationsConfig,
 		private readonly config: TableRelationalConfig,
+		private readonly strategy: RelationalStrategy = 'split',
 	) {}
+
+	/**
+	 * One statement, relations as correlated subqueries — see `joined.ts`.
+	 *
+	 * Only for a top-level `find*`: a child fetch already has its parents in
+	 * hand, so there is nothing to correlate to. Falls back to the split plan
+	 * for anything the joined builder cannot express, which keeps the strategy
+	 * a performance choice rather than a restriction on what can be queried.
+	 */
+	#useJoined(config: FindConfig, child: ChildFetch | undefined): boolean {
+		return this.strategy === 'joined'
+			&& child === undefined
+			&& Object.keys(config.with ?? {}).length > 0
+			&& supportsJoined(config, this.config, this.schema);
+	}
+
+	async #runJoined(config: FindConfig, input?: Record<string, unknown>): Promise<Record<string, unknown>[]> {
+		let counter = 0;
+		const next = (): string => `d1zzle_j${counter++}`;
+
+		const root = alias(this.config.table, next()) as unknown as Table;
+		const rootColumns = getTableColumns(root) as unknown as Record<string, Column<any>>;
+
+		const level = buildLevel(
+			root,
+			this.config,
+			config,
+			this.schema,
+			next,
+			(levelConfig, tableConfig, table) =>
+				compileFilter(
+					levelConfig.where,
+					table,
+					getTableColumns(table) as unknown as Record<string, Column<any>>,
+					tableConfig.relations,
+					this.schema,
+				),
+			(levelConfig, columns) => resolveOrderBy(levelConfig.orderBy, columns),
+			(levelConfig, columns) => resolveExtras(levelConfig.extras, columns),
+		);
+
+		let builder = this.db.select(level.selection).from(root as never)
+			.where(compileFilter(config.where, root, rootColumns, this.config.relations, this.schema));
+
+		const orderBy = resolveOrderBy(config.orderBy, rootColumns);
+		if (orderBy.length > 0) builder = builder.orderBy(...orderBy) as never;
+		if (config.limit !== undefined) builder = builder.limit(config.limit as never) as never;
+		if (config.offset !== undefined) builder = builder.offset(config.offset as never) as never;
+
+		const rows = await builder.all(input) as Record<string, unknown>[];
+		return rows.map((row) => decodeJoined(row, level.shape));
+	}
 
 	/** `select … from <table> [inner join <junction> on …] where …`. */
 	#base(selection: Record<string, SQLChunk>, where: Condition | undefined, through: ThroughFetch | undefined) {
@@ -328,6 +371,8 @@ export class RelationalQueryBuilder {
 		child?: ChildFetch,
 		input?: Record<string, unknown>,
 	): Promise<Record<string, unknown>[]> {
+		if (this.#useJoined(config, child)) return this.#runJoined(config, input);
+
 		const columns = this.config.columns;
 		const requested = new Set(pickColumns(columns, config.columns));
 		const projected = new Set(requested);
@@ -468,7 +513,7 @@ export class RelationalQueryBuilder {
 			? { ...(limit !== undefined ? { limit } : {}), ...(offset !== undefined ? { offset } : {}) }
 			: undefined;
 
-		const nested = new RelationalQueryBuilder(this.db, this.schema, targetConfig);
+		const nested = new RelationalQueryBuilder(this.db, this.schema, targetConfig, this.strategy);
 
 		const runFor = (subset: readonly unknown[][]): Promise<Record<string, unknown>[]> =>
 			nested.#run(entry.config, childFieldNames, true, {
@@ -586,13 +631,6 @@ const dropKeys = <T extends Record<string, unknown>>(rows: T[], keys: readonly s
 		for (const key of keys) delete row[key];
 	}
 	return rows;
-};
-
-const fieldNameOf = (columns: Record<string, Column<any>>, column: Column<any>): string => {
-	for (const [key, candidate] of Object.entries(columns)) {
-		if (candidate.name === column.name) return key;
-	}
-	return column.name;
 };
 
 /**

@@ -420,6 +420,56 @@ const db = drizzle({ client: env.DB, relations });   // primary form
 const db = drizzle(env.DB, { relations });           // binding-first, also fine
 ```
 
+### How a `with` is executed
+
+Two plans, chosen with `relationalStrategy`. Both return identical results — the
+workers suite runs a matrix of queries through each and deep-compares them against a
+real D1 database — so this is a performance switch and nothing else.
+
+```ts
+const db = drizzle({ client: env.DB, relations });                              // 'split' (default)
+const db = drizzle({ client: env.DB, relations, relationalStrategy: 'joined' });
+```
+
+**`'split'`** runs one query per relation level and stitches the rows in JS. Levels cost
+round trips; rows do not — two parents or two thousand, a level is still one query with an
+`IN`, which collapses to `json_each` past the bound-parameter budget.
+
+```sql
+select "id", "email" from "users"
+select "id", "title" from "posts" where "author_id" in (?, ?)
+```
+
+**`'joined'`** answers the whole tree in one statement, each relation a correlated
+subquery wrapped in `json_group_array` / `json_object` — the shape Drizzle v1 produces on
+SQLite.
+
+```sql
+select "d0"."id",
+  (select json_group_array(json_object('id', "id", 'title', "title"))
+   from (select "d1"."id" as "id", "d1"."title" as "title"
+         from "posts" as "d1" where "d0"."id" = "d1"."author_id") as "t") as "posts"
+from "users" as "d0"
+```
+
+Neither dominates. Joined makes one call and runs the inner query once per outer row;
+split makes one call per level and does one index scan each. Latency and row counts decide
+it, so measure rather than assume — the default is split because its failure modes are all
+visible.
+
+Joined falls back to split, per query and silently, for anything it cannot express as a
+correlated subquery:
+
+| Falls back when | Why |
+| --- | --- |
+| a relation goes `through` a junction | needs a join inside the inner select |
+| a relation payload holds a `blob` column | `json_object` rejects binary — *JSON cannot hold BLOB values* |
+| a payload is wider than 63 keys | `json_object` costs 2 arguments per key against SQLite's 127-argument cap |
+| a nested `limit`/`offset` is a placeholder | split cannot take one, and the strategy must not change which queries are legal |
+
+Because SQLite has no `LATERAL`, this is a correlated subquery rather than the lateral
+join Drizzle emits on Postgres. The two are equivalent here.
+
 Many-to-many is declared with `.through()` on both ends:
 
 ```ts

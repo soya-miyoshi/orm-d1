@@ -247,13 +247,29 @@ stitch in JS. Simpler SQL, predictable `rows_read`, no argument cap — but `bat
 express it, because statement N cannot reference statement N−1's results. So it is
 genuinely two sequential RPCs.
 
-**Split is what shipped.** The earlier draft of this document planned JSON aggregation as
+**Split is the default.** The earlier draft of this document planned JSON aggregation as
 the default, on the reasoning that a second round trip costs more than the JSON work — and
 labelled that reasoning a hypothesis. Rule R7 says a hypothesis does not get to be the
 default. Split's failure modes are all visible: `rows_read` is predictable, no function
-argument cap constrains the projection, and the SQL in a log is readable. JSON aggregation is
-**not implemented** — there is no `strategy` option today. It stays on the table, and the
-benchmark still decides.
+argument cap constrains the projection, and the SQL in a log is readable.
+
+**JSON aggregation is now implemented too**, as `relationalStrategy: 'joined'`
+(`relations/joined.ts`). It is opt-in for exactly the reason above: it is still the
+hypothesis, and R7 has not been discharged — no benchmark has run. What has been
+established is that the two are *interchangeable*, which is what makes measuring them
+cheap: a matrix of queries is run through both plans and deep-compared against a real D1
+database, so switching cannot change results, only timing.
+
+The function-argument cap the draft worried about is real and measured: `json_object`
+costs two arguments per key against SQLite's 127, so **63 keys** is the ceiling for a
+relation payload — 63 passes on D1, 70 does not. It is a fallback rather than an error;
+so are a `blob` in a payload (`JSON cannot hold BLOB values`) and a junction relation.
+
+One thing worth writing down, because it is load-bearing and undocumented in SQLite:
+ordering inside `json_group_array` relies on the planner not flattening a subquery that
+carries `ORDER BY` into the aggregate. It holds on D1 today and Drizzle depends on it too,
+but it is not a guarantee SQLite makes in writing. If a nested `orderBy` ever comes back
+unordered under `'joined'`, this is the reason.
 
 What the implementation does do is **fetch relations at the same level concurrently**, so
 the cost is the *depth* of the `with` tree, not the number of relations in it:

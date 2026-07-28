@@ -163,6 +163,11 @@ export function remoteRunner(config: RemoteConfig): SqlRunner {
 		// and leaves earlier statements applied. Hence `/query`.)
 		// https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/
 		batch: async (statements) => {
+			// Nothing to send is not the same as sending nothing: `{ sql: '' }`
+			// is a syntax error to D1, so an empty batch — a migration or push
+			// whose statements were all pragmas, which the caller filters out —
+			// would fail instead of being the no-op it is.
+			if (statements.length === 0) return;
 			await post('/query', { sql: statements.map((s) => `${s};`).join('\n') });
 		},
 	};

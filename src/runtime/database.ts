@@ -17,6 +17,13 @@ import type { QueryEvent } from './result.js';
 import type { D1Target, ResolvedOptions } from './session.js';
 import { Executor } from './session.js';
 
+/**
+ * Spelled here rather than imported from `relations/`: that module imports this
+ * one, and a value-level cycle between them is not worth a shared alias. The
+ * canonical name is re-exported as `RelationalStrategy`.
+ */
+export type RelationalStrategy = 'split' | 'joined';
+
 export interface D1zzleOptions {
 	/** Applied to column names that don't specify one explicitly. */
 	casing?: 'preserve' | 'snake_case';
@@ -26,6 +33,24 @@ export interface D1zzleOptions {
 	maxParams?: number;
 	/** Array length at or above which `inArray` switches to `json_each`. */
 	jsonEachThreshold?: number;
+	/**
+	 * How `db.query.<table>.find*` answers a `with`.
+	 *
+	 * `'split'` (default) runs one query per relation level and stitches the
+	 * rows in JavaScript: readable SQL, `rows_read` proportional to what was
+	 * asked for, and no bound-parameter list wider than `json_each` can carry.
+	 *
+	 * `'joined'` runs one statement, with each relation as a correlated
+	 * subquery wrapped in `json_group_array` / `json_object` — the shape
+	 * Drizzle v1 produces on SQLite. One round trip instead of one per level,
+	 * which matters most on `--remote`, at the cost of running the inner query
+	 * once per outer row.
+	 *
+	 * Both return identical results; the workers suite asserts that against a
+	 * real D1 database. A query the joined plan cannot express — a
+	 * many-to-many across a junction — falls back to `'split'` on its own.
+	 */
+	relationalStrategy?: RelationalStrategy;
 	/**
 	 * Accepted and ignored. v0 took a schema module here; v1 takes the result
 	 * of `defineRelations` as `relations`, which the root `drizzle()` reads.
