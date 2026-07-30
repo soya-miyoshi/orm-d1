@@ -119,6 +119,41 @@ describe('applyMigration batching', () => {
 		}
 	});
 
+	it('does not push the record into its own trailing batch when the real statements fill the last batch exactly (gap 2)', async () => {
+		const { runner, batches } = recordingRunner();
+		// Exactly MAX_STATEMENTS_PER_BATCH real statements: greedy packing fills
+		// the (only) batch of real statements exactly, with no room left over.
+		// The record must still ride along, spilling into a second batch rather
+		// than becoming its own trailing one-statement batch.
+		const statements = Array.from({ length: MAX_STATEMENTS_PER_BATCH }, (_, i) => `create table "t${i}" ("id" integer)`);
+		await applyMigration(runner, 'm_exact', `${statements.join(';\n')};`);
+
+		expect(batches).toHaveLength(2);
+		expect(batches[0]).toHaveLength(MAX_STATEMENTS_PER_BATCH);
+		expect(batches[1]).toEqual([`insert into "d1_migrations" (name) values ('m_exact')`]);
+	});
+
+	it('keeps a rebuild group whole when it is what makes the last batch fill exactly (gap 2)', async () => {
+		const { runner, batches } = recordingRunner();
+		// 95 plain creates + a 5-statement rebuild group = exactly 100: the
+		// group must not be split to make room for the record, and the record
+		// must not silently ride into a batch that would then overflow.
+		const statements = [
+			...Array.from({ length: MAX_STATEMENTS_PER_BATCH - 5 }, (_, i) => `create table "t${i}" ("id" integer)`),
+			...rebuildGroup('orders'),
+		];
+		await applyMigration(runner, 'm_rebuild_exact', `${statements.join(';\n')};`);
+
+		expect(batches).toHaveLength(2);
+		expect(batches[0]).toHaveLength(MAX_STATEMENTS_PER_BATCH);
+		for (const batch of batches) {
+			const hasDrop = batch.some((s) => s === 'drop table "orders"');
+			const hasRename = batch.some((s) => s === 'alter table "__new_orders" rename to "orders"');
+			expect(hasDrop).toBe(hasRename);
+		}
+		expect(batches[1]).toEqual([`insert into "d1_migrations" (name) values ('m_rebuild_exact')`]);
+	});
+
 	it('keeps the record in the single batch when the migration is small', async () => {
 		const { runner, batches } = recordingRunner();
 		await applyMigration(runner, 'm_small', 'create table "t" ("id" integer);');

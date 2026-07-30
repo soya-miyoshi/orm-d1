@@ -339,6 +339,91 @@ describe('migrate refuses to silently drop a foreign trigger (finding 2, bug A)'
 	});
 });
 
+describe('a rename in the same migration cannot bypass the foreign-trigger refusal (gap 1)', () => {
+	it('resolves the rebuilt table back through the migration\'s own rename before checking for a foreign trigger', async () => {
+		const before = sqliteTable('orders', { id: integer('id').primaryKey(), amount: integer('amount') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+
+		// A hand-written trigger d1zzle did not author, on the live (pre-rename)
+		// name.
+		await DB.prepare(
+			'create trigger "orders_audit" after insert on "orders" '
+				+ "begin insert into audit_log (id) values (new.id); end",
+		).run();
+		await DB.prepare('create table "audit_log" ("id" integer)').run();
+
+		// `generate --rename-table orders=sales` plus a type change: the rename
+		// and the rebuild land in the same migration, and `tablesRebuiltIn`
+		// names the *post-rename* identity ("sales"), which is not a key
+		// `foreignTriggers` (keyed by the live `tbl_name`, "orders") has.
+		const after = sqliteTable('sales', { id: integer('id').primaryKey(), amount: text('amount') });
+		const offlineDiff = diffSnapshots(
+			snapshotFromSchema([before]),
+			snapshotFromSchema([after]),
+			{ renamedTables: { orders: 'sales' } },
+		);
+		expect(offlineDiff.errors).toEqual([]);
+		expect(offlineDiff.statements.some((s) => s.sql.includes('__new_sales'))).toBe(true);
+
+		const migrations = [{ tag: 'm_rename_and_rebuild', sql: renderMigration(offlineDiff) }];
+
+		await expect(checkForeignTriggerConflicts(runner, migrations)).rejects.toThrow(/"orders_audit"/);
+		await expect(applyMigrations(runner, migrations)).rejects.toThrow(/"orders_audit"/);
+
+		// Refused before anything ran: the trigger, and the table under its
+		// original name, are both still there.
+		const tables = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'table' and name in ('orders', 'sales')",
+		);
+		expect(tables.map((t) => t.name)).toEqual(['orders']);
+		const triggers = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'trigger' and name = 'orders_audit'",
+		);
+		expect(triggers).toHaveLength(1);
+	});
+});
+
+describe('checkForeignTriggerConflicts avoids a full introspection (gap 4)', () => {
+	it('issues no query at all when no pending migration rebuilds anything', async () => {
+		const before = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: integer('balance') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+
+		let calls = 0;
+		const countingRunner: SqlRunner = { ...runner, all: async (sql) => { calls++; return runner.all(sql); } };
+
+		// A plain `alter table … add column` never rebuilds anything, so this
+		// can never find a foreign trigger regardless of what the table carries
+		// — there is nothing for `checkForeignTriggerConflicts` to query for.
+		const migrations = [{
+			tag: 'm_add_column',
+			sql: 'alter table "accounts" add column "note" text;',
+		}];
+
+		await checkForeignTriggerConflicts(countingRunner, migrations);
+		expect(calls).toBe(0);
+	});
+
+	it('issues exactly one query (sqlite_master, not the full introspection) when a migration does rebuild a table', async () => {
+		const before = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: integer('balance') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+
+		let calls = 0;
+		const countingRunner: SqlRunner = { ...runner, all: async (sql) => { calls++; return runner.all(sql); } };
+
+		const after = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: text('balance') });
+		const offlineDiff = diffSnapshots(snapshotFromSchema([before]), snapshotFromSchema([after]));
+		expect(offlineDiff.statements.some((s) => s.sql.includes('__new_accounts'))).toBe(true);
+
+		const migrations = [{ tag: 'm_rebuild', sql: renderMigration(offlineDiff) }];
+
+		await checkForeignTriggerConflicts(countingRunner, migrations);
+		// Not the ~4+ queries per table `introspect()` would issue (one
+		// `sqlite_master` read, then three pragmas per table plus one per
+		// index) — just the one `sqlite_master` read this check actually needs.
+		expect(calls).toBe(1);
+	});
+});
+
 describe('drift detection', () => {
 	it('sees a manual ALTER that no migration accounts for', async () => {
 		const t = sqliteTable('users', { id: integer('id').primaryKey(), email: text('email') });

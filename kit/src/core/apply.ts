@@ -203,22 +203,16 @@ export async function applyMigration(
 	// fail the rename in the next, leaving the table gone. `packIntoBatches`
 	// throws outright if a single group cannot fit in one batch, rather than
 	// splitting it.
-	const batches = packIntoBatches(statements, MAX_STATEMENTS_PER_BATCH);
-
-	// The migrations-table insert is never its own trailing batch — it rides
-	// along with the last batch of real statements so a split migration still
-	// records itself in the same atomic unit as its final effect, wherever
-	// that unit's boundary falls.
-	if (batches.length === 0) {
-		batches.push([record]);
-	} else {
-		const last = batches[batches.length - 1]!;
-		if (last.length < MAX_STATEMENTS_PER_BATCH) {
-			batches[batches.length - 1] = [...last, record];
-		} else {
-			batches.push([record]);
-		}
-	}
+	//
+	// The migrations-table insert is packed in together with the real
+	// statements, not appended after batching completes — packing it
+	// separately used to push it into its own trailing one-statement batch
+	// whenever the real statements happened to fill the last batch exactly,
+	// which is a batch boundary indistinguishable from any other and defeats
+	// the whole point of riding along with the migration's own last effect.
+	// Handing it to `packIntoBatches` as one more (singleton-group) statement
+	// lets it spill into a new batch only when there truly is no room.
+	const batches = packIntoBatches([...statements, record], MAX_STATEMENTS_PER_BATCH);
 
 	if (batches.length > 1) {
 		warnings.push(
@@ -233,6 +227,36 @@ export async function applyMigration(
 }
 
 /**
+ * A migration's own SQL text carries any `alter table "A" rename to "B"` it
+ * performs on a live table — as opposed to the `alter table "__new_X" rename
+ * to "X"` that closes out a rebuild, which renames the *temporary* copy into
+ * place and says nothing about the table's live identity before this
+ * migration ran. Returns post-rename name -> live (pre-rename) name, the same
+ * shape `diffSnapshots`'s `liveTableNames` uses and for the same reason: a
+ * lookup into `foreignTriggers` (keyed by the live `tbl_name`) has to be
+ * resolved back through any rename the migration itself performs, or a
+ * `generate --rename-table` plus a rebuild in the same migration makes the
+ * rebuilt table invisible to the refusal below.
+ */
+function renamesInMigration(statements: readonly string[]): Record<string, string> {
+	const renames: Record<string, string> = {};
+	const pattern = /^\s*alter\s+table\s+"((?:[^"]|"")+)"\s+rename\s+to\s+"((?:[^"]|"")+)"\s*$/i;
+	for (const statement of statements) {
+		const match = pattern.exec(statement);
+		if (!match) continue;
+		const from = match[1]!.replaceAll('""', '"');
+		const to = match[2]!.replaceAll('""', '"');
+		// The rebuild's own closing rename (`"__new_X"` -> `"X"`) is not a live
+		// table's identity change; excluding it keeps this map limited to actual
+		// `--rename-table` renames, which is all `tablesRebuiltIn`'s post-rename
+		// names need resolving through.
+		if (from.startsWith('__new_')) continue;
+		renames[to] = from;
+	}
+	return renames;
+}
+
+/**
  * Refuse to apply any pending migration that would rebuild a table carrying
  * a foreign (non-kit-authored) trigger — the same refusal `recreateTable`
  * (`diff.ts`) applies to `push`/`check`/`verify`, but those all diff a live
@@ -243,19 +267,42 @@ export async function applyMigration(
  * caught — against a live introspection, right before applying, using the
  * same `__new_<table>` marker `packIntoBatches` already recognises to name
  * which table a flattened statement sequence rebuilds.
+ *
+ * Deliberately not exported from `index.ts` — `applyMigrations` below calls
+ * it unconditionally so every caller of the public applier gets the guard
+ * without a second public symbol to opt into it.
+ *
+ * Reads only `sqlite_master`, not the full `introspect()`: everything else
+ * `introspect` does (three pragmas per table, one per index) exists to build
+ * column/index/FK shape this check never looks at. On a pending migration
+ * that cannot rebuild anything, no query at all is issued.
  */
 export async function checkForeignTriggerConflicts(
 	runner: SqlRunner,
 	migrations: readonly { tag: string; sql: string }[],
 ): Promise<void> {
+	const parsed = migrations.map((migration) => {
+		const statements = applicableStatements(migration.sql);
+		return { tag: migration.tag, renames: renamesInMigration(statements), tables: tablesRebuiltIn(statements) };
+	});
+
+	if (parsed.every((migration) => migration.tables.length === 0)) return;
+
+	const master = await runner.all<MasterRow>(
+		"select type, name, tbl_name, sql from sqlite_master where type = 'trigger'",
+	);
 	const foreignTriggers: Record<string, string[]> = {};
-	await introspect(runner, foreignTriggers);
+	for (const row of master) {
+		if (!row.sql) continue;
+		if (isAppendOnlyTrigger(row.sql, row.tbl_name)) continue;
+		(foreignTriggers[row.tbl_name] ??= []).push(row.name);
+	}
 	if (Object.keys(foreignTriggers).length === 0) return;
 
-	for (const migration of migrations) {
-		const statements = applicableStatements(migration.sql);
-		for (const table of tablesRebuiltIn(statements)) {
-			const triggers = foreignTriggers[table];
+	for (const migration of parsed) {
+		for (const table of migration.tables) {
+			const liveName = migration.renames[table] ?? table;
+			const triggers = foreignTriggers[liveName];
 			if (!triggers || triggers.length === 0) continue;
 			throw new Error(
 				`Migration "${migration.tag}" would rebuild "${table}", but it carries trigger(s) `
@@ -268,18 +315,41 @@ export async function checkForeignTriggerConflicts(
 	}
 }
 
-/** Apply a whole set of pending migrations, in order. */
+/**
+ * Apply a whole set of pending migrations, in order.
+ *
+ * @param onWarning Called with each split-batch warning as `applyMigration`
+ * produces it, in addition to it being collected into the returned
+ * `ApplyResult.warnings`. `ApplyResult` is only seen once every migration has
+ * resolved, so a caller that only reads the return value never learns about a
+ * split on the one run where it matters most: a mid-run failure after the
+ * split but before `applyMigrations` returns. Optional so existing callers
+ * that only want the final summary are unaffected.
+ */
 export async function applyMigrations(
 	runner: SqlRunner,
 	migrations: readonly { tag: string; sql: string }[],
 	table = MIGRATIONS_TABLE,
+	onWarning?: (warning: string) => void,
 ): Promise<ApplyResult> {
 	await ensureMigrationsTable(runner, table);
+
+	// Unconditional, not opt-in: this is the applier every `applyMigrations`
+	// caller goes through (the CLI's `migrate` and any Worker calling the
+	// public `d1zzle-migrate/core` entry directly), and the guard it replaces
+	// used to be bolted onto the CLI command only, which left a direct caller
+	// with no protection and no exported symbol to ask for it.
+	await checkForeignTriggerConflicts(runner, migrations);
+
 	const applied: string[] = [];
 	const warnings: string[] = [];
 
 	for (const migration of migrations) {
-		warnings.push(...await applyMigration(runner, migration.tag, migration.sql, table));
+		const migrationWarnings = await applyMigration(runner, migration.tag, migration.sql, table);
+		for (const warning of migrationWarnings) {
+			warnings.push(warning);
+			onWarning?.(warning);
+		}
 		applied.push(migration.tag);
 	}
 

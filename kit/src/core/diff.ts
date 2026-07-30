@@ -416,6 +416,30 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		Object.entries(effectiveBefore).filter(([name]) => !dropped.includes(name)),
 	);
 
+	// The `__new_` tables excluded from `dropped` above are silently left
+	// alone for the reason stated there — but silent is only safe for the
+	// destructive half (never drop the one surviving copy of the rebuilt
+	// rows). The leftover itself is a real defect: it does not show up as
+	// drift (this diff naturally has nothing to say about a table on the
+	// `before` side it is deliberately ignoring), so `check` reports clean
+	// with the orphan still sitting there, and the next rebuild of the table
+	// it belongs to fails on `create table "__new_<table>" already exists`
+	// with nothing in any command's output explaining why. Naming it here, as
+	// a warning rather than an error, keeps this diff's own statements
+	// unblocked (nothing about applying *this* diff is unsafe) while telling
+	// the operator what to do before the next rebuild finds it.
+	for (const name of Object.keys(effectiveBefore)) {
+		if (!name.startsWith('__new_') || after.tables[name]) continue;
+		const original = name.slice('__new_'.length);
+		warnings.push(
+			`"${name}" looks like a leftover table from an interrupted rebuild of "${original}" (a rebuild whose `
+				+ 'temporary copy was committed but never renamed into place). It is left alone because it may be '
+				+ `the only surviving copy of that table's rows. Drop it by hand once you've confirmed it isn't `
+				+ `needed, or bring it into the schema under its own name — otherwise the next migration that `
+				+ `rebuilds "${original}" will fail with \`table "${name}" already exists\`.`,
+		);
+	}
+
 	for (const name of orderByDependency({ ...before, tables: effectiveBefore }, dropped).reverse()) {
 		// Ordering only helps among the tables being dropped together. A table
 		// that *survives* and still references this one keeps its foreign key

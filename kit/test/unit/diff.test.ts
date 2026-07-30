@@ -175,6 +175,22 @@ describe('diffing snapshots', () => {
 		expect(errors[0]).toMatch(/"child" still references it/);
 	});
 
+	it('never drops a leftover "__new_X" from an interrupted rebuild, but warns about it by name (gap 3)', () => {
+		const orders = sqliteTable('orders', { id: integer('id').primaryKey() });
+		// Stands in for a live database left with both the original table and an
+		// uncommitted-rename leftover from a split rebuild that never made it
+		// past `alter table "__new_orders" rename to "orders"`.
+		const leftover = sqliteTable('__new_orders', { id: integer('id').primaryKey() });
+
+		const { statements, errors, warnings } = diffSnapshots(snapshotOf(orders, leftover), snapshotOf(orders));
+
+		expect(errors).toEqual([]);
+		expect(statements.map((s) => s.sql)).not.toContain('drop table "__new_orders"');
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toMatch(/"__new_orders"/);
+		expect(warnings[0]).toMatch(/"orders"/);
+	});
+
 	it('adds a nullable column in place', () => {
 		const before = sqliteTable('users', { id: integer('id').primaryKey() });
 		const after = sqliteTable('users', {

@@ -7,7 +7,6 @@ import { validateTableOptions } from 'd1zzle/ddl';
 import {
 	appliedMigrations,
 	applyMigrations,
-	checkForeignTriggerConflicts,
 	introspect,
 	MAX_STATEMENTS_PER_BATCH,
 } from '../core/apply.js';
@@ -191,10 +190,16 @@ export async function migrate(ctx: CommandContext, flags: TargetFlags = {}): Pro
 		pending.map(async (entry) => ({ tag: entry.tag, sql: await readMigration(ctx.config.out, entry.tag) })),
 	);
 
-	await checkForeignTriggerConflicts(runner, migrations);
-
-	const result = await applyMigrations(runner, migrations, ctx.config.migrationsTable);
-	for (const warning of result.warnings) ctx.log(`  ! ${warning}`);
+	// `checkForeignTriggerConflicts` now runs inside `applyMigrations` itself,
+	// and warnings are logged as `applyMigration` produces them (not only after
+	// every migration has resolved) so a split is visible even if a later
+	// migration in the same run fails before `applyMigrations` returns.
+	const result = await applyMigrations(
+		runner,
+		migrations,
+		ctx.config.migrationsTable,
+		(warning) => ctx.log(`  ! ${warning}`),
+	);
 	for (const tag of result.applied) ctx.log(`Applied ${tag}.`);
 	return [...result.applied];
 }
