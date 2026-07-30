@@ -8,7 +8,7 @@
  * each — so the interface stays this small on purpose.
  */
 import type { IntrospectionInput, MasterRow } from './introspect.js';
-import type { ForeignKeyRow, IndexListRow, TableInfoRow } from './introspect.js';
+import type { ForeignKeyRow, IndexInfoRow, IndexListRow, TableInfoRow } from './introspect.js';
 import { isAppendOnlyTrigger, isInternalTable, snapshotFromIntrospection } from './introspect.js';
 import type { Snapshot } from './snapshot.js';
 import {
@@ -146,7 +146,17 @@ export async function introspect(runner: SqlRunner, foreignTriggers?: Record<str
 		for (const index of indexes) indexInfo[index.name] = [];
 		await Promise.all(indexes.map((index) =>
 			gate.run(async () => {
-				indexInfo[index.name] = await runner.all(`pragma index_info("${index.name.replaceAll('"', '""')}")`);
+				// `index_xinfo`, not `index_info`: the latter reports a DESC- or
+				// COLLATE-qualified column exactly like an ordinary one, so the
+				// modifier had nowhere to come from. `index_xinfo` additionally
+				// appends the rowid tail SQLite adds to a non-unique index for
+				// uniqueness — those rows carry `key: 0` and are not indexed
+				// columns, so they are filtered out here rather than leaking into
+				// the snapshot as extra members.
+				const xinfo = await runner.all<IndexInfoRow>(
+					`pragma index_xinfo("${index.name.replaceAll('"', '""')}")`,
+				);
+				indexInfo[index.name] = xinfo.filter((row) => row.key === 1);
 			})));
 	}));
 

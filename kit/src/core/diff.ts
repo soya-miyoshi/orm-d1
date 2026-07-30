@@ -690,6 +690,17 @@ const canonicalIndex = (index: IndexSnapshot): string =>
 		index.columns.map(normalizeIndexColumn).map((c) => [
 			c.isExpression ? canonicalizeExpression(c.expression) : c.expression,
 			c.isExpression,
+			// A pre-upgrade snapshot has no `desc`/`collate` at all — normalised
+			// here to the same "no modifier" value a freshly-introspected
+			// unqualified column gets, or the two would diff as different when
+			// they describe the identical index.
+			c.desc ?? false,
+			// D1 preserves a `COLLATE`'s original case verbatim in the DDL text,
+			// so `collate NoCase` (from a live DB) and `NOCASE` (from the schema
+			// side, via `.collate()`) name the same collation but compare
+			// unequal unless folded to a common case first — same for the
+			// `binary` guard, which D1 also preserves lowercase.
+			c.collate && c.collate.toLowerCase() !== 'binary' ? c.collate.toLowerCase() : undefined,
 		]),
 		index.isUnique,
 		(index.where ?? '').replaceAll(/\s+/g, ' ').trim(),

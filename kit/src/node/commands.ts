@@ -386,6 +386,19 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 					imports.add('sql');
 					return `sql.raw(${JSON.stringify(c.expression)})`;
 				}
+				// Drizzle's `IndexColumn` in this version is `SQLiteColumn | SQL` —
+				// there is no `.desc()`/`.collate()` on the column builder to call
+				// here, so a DESC or COLLATE member is rendered the same way an
+				// expression member already is: a raw SQL fragment, which is a
+				// legal `IndexColumn` on its own terms, not a spelling Drizzle
+				// lacks.
+				if (c.desc || c.collate) {
+					imports.add('sql');
+					const quoted = `"${c.expression.replaceAll('"', '""')}"`;
+					const collate = c.collate ? ` collate ${c.collate}` : '';
+					const order = c.desc ? ' desc' : '';
+					return `sql.raw(${JSON.stringify(`${quoted}${collate}${order}`)})`;
+				}
 				return `t.${columnId(c.expression)}`;
 			}).join(', ');
 			const where = index.where ? `.where(sql.raw(${JSON.stringify(index.where)}))` : '';

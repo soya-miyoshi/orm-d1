@@ -371,7 +371,11 @@ const adoptReverse = (config: RelationsConfig, relation: Relation, where: string
 		? { source: reverse.through.target, target: reverse.through.source }
 		: undefined;
 	relation.throughTable = reverse.throughTable;
-	relation.isReversed = true;
+	// A `where` stated on this side names this side's own target columns, not
+	// the source it's being reversed onto, so it is not treated as "reversed"
+	// for the purposes of where-compilation (drizzle-orm/relations.js:60).
+	const thatWhere = relation.where;
+	relation.isReversed = !thatWhere;
 	// A `where` stated on this side wins; otherwise the other side's applies.
 	relation.where = relation.where ?? reverse.where;
 };

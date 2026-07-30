@@ -48,6 +48,16 @@ export interface IndexInfoRow {
 	readonly seqno: number;
 	readonly cid: number;
 	readonly name: string | null;
+	/**
+	 * `index_xinfo`'s extra columns, absent from `index_info`: whether this
+	 * member sorts descending (0/1), and its collation. `index_xinfo` also
+	 * appends the rowid tail SQLite adds to make a non-unique index's rows
+	 * unique — those carry `key: 0` and must be filtered out by the caller
+	 * before this array is built, or they show up as phantom index members.
+	 */
+	readonly desc?: number;
+	readonly coll?: string;
+	readonly key?: number;
 }
 
 export interface ForeignKeyRow {
@@ -227,6 +237,40 @@ const parseIndexColumns = (sql: string | null): string[] | undefined => {
 };
 
 /**
+ * `index_xinfo`'s `coll` reports the *column's* declared collation — inherited
+ * from the `CREATE TABLE` — not the index member's own, so a plain `create
+ * index … ("name")` on a `COLLATE NOCASE` column reports `coll: 'NOCASE'`
+ * even though the index text states no collation at all. Trusting it here
+ * would make the recreated index (whose member also has no explicit
+ * `COLLATE`, and so also inherits the column's) look different from the
+ * introspected one forever — a diff that can never converge.
+ *
+ * So `collate` is read the same way an expression member's text is: from the
+ * index's own `CREATE INDEX` text in `sqlite_master.sql`, one member at a
+ * time via {@link parseIndexColumns}, and only recorded when that member's
+ * own text explicitly carries a `COLLATE` clause.
+ */
+const parseIndexCollations = (sql: string | null): (string | undefined)[] | undefined => {
+	const members = parseIndexColumns(sql);
+	if (!members) return undefined;
+	const collateRe = /\bcollate\s+("(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|'(?:[^']|'')+'|\w+)/i;
+	const unquote = (token: string): string => {
+		if (
+			(token.startsWith('"') && token.endsWith('"')) || (token.startsWith('\'') && token.endsWith('\''))
+		) {
+			return token.slice(1, -1).replaceAll(token[0]! + token[0]!, token[0]!);
+		}
+		if (token.startsWith('`') && token.endsWith('`')) return token.slice(1, -1).replaceAll('``', '`');
+		if (token.startsWith('[') && token.endsWith(']')) return token.slice(1, -1);
+		return token;
+	};
+	return members.map((member) => {
+		const match = collateRe.exec(member);
+		return match ? unquote(match[1]!) : undefined;
+	});
+};
+
+/**
  * The `STRICT` / `WITHOUT ROWID` suffix, which no pragma reports.
  *
  * They are table options rather than constraints, so they appear *after* the
@@ -334,11 +378,20 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			const rawColumns = sortedMembers.some((m) => m.name === null)
 				? parseIndexColumns(indexSql.get(index.name) ?? null)
 				: undefined;
-			const memberColumns: { expression: string; isExpression: boolean }[] = sortedMembers
-				.map((m, i) => m.name !== null
-					? { expression: m.name, isExpression: false }
-					: { expression: rawColumns?.[i] ?? '', isExpression: true })
-				.filter((c) => c.expression !== '');
+			// `desc` from `index_xinfo` is per-member and reliable; `coll` is not
+			// (see {@link parseIndexCollations}), so collation is read from the
+			// index's own DDL text instead, one member at a time.
+			const collations = parseIndexCollations(indexSql.get(index.name) ?? null);
+			const memberColumns: { expression: string; isExpression: boolean; desc?: boolean; collate?: string }[] =
+				sortedMembers
+					.map((m, i) => ({
+						...(m.name !== null
+							? { expression: m.name, isExpression: false }
+							: { expression: rawColumns?.[i] ?? '', isExpression: true }),
+						...(m.desc === 1 ? { desc: true } : {}),
+						...(collations?.[i] ? { collate: collations[i] } : {}),
+					}))
+					.filter((c) => c.expression !== '');
 
 			if (index.origin === 'pk') continue;
 			if (index.origin === 'u') {

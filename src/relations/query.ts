@@ -473,8 +473,14 @@ export class RelationalQueryBuilder {
 		 * `where` declared on the relation itself, which narrows the target rows
 		 * every time it is traversed. Compiled here rather than in `#run` because
 		 * this is the only level that has the `Relation` in hand.
+		 *
+		 * Not for a reversed relation, though: there, the `where` was declared on
+		 * the opposite side and names columns of the *source* table — this
+		 * level, the parent — not the target. There is no correlated scope here
+		 * to compile it into (unlike `joined.ts`), so it is handled separately,
+		 * below, against the parent rows themselves.
 		 */
-		const declared = relation.where
+		const declared = relation.where && !relation.isReversed
 			? compileFilter(relation.where, targetConfig.table, targetColumns, targetConfig.relations, this.schema)
 			: undefined;
 
@@ -517,6 +523,29 @@ export class RelationalQueryBuilder {
 		if (keys.length === 0) {
 			for (const row of rows) row[name] = isMany ? [] : null;
 			return;
+		}
+
+		/**
+		 * A relation's own `where`, when the relation is reversed (adopted from
+		 * the opposite side via `adoptReverse` — see `src/relations/define.ts`),
+		 * names columns of the *source* table: this level, the parent, not the
+		 * target. `joined.ts` has a correlated subquery to put that predicate
+		 * inside of, evaluated per parent row. The split plan has no such scope:
+		 * parents are already fetched into plain rows by the time this runs, and
+		 * the only query it can group by is "does *any* row with this join key
+		 * satisfy the predicate" — which, whenever the source column isn't
+		 * unique, leaks a passing parent's status onto every other parent that
+		 * happens to share its key. There is no fix here that stays within the
+		 * split plan's shape, so this refuses instead of silently computing
+		 * wrong rows for the shape it can't handle.
+		 */
+		if (relation.isReversed && relation.where) {
+			throw new Error(
+				`Relation "${name}" on "${this.config.name}" is reversed and carries its own "where", which the `
+					+ '"split" relational strategy cannot evaluate correctly (it can only test whether *some* row '
+					+ 'sharing a parent\'s join key matches, not each parent\'s own row). Use `relationalStrategy: '
+					+ "'joined'` for this query.",
+			);
 		}
 
 		const matcherFor = (subset: readonly unknown[][]): Condition | undefined =>
