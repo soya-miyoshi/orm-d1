@@ -8,7 +8,8 @@ Baseline at sweep start: **green, 565 passed / 4 skipped**.
 After the feature iteration (`15f24ef`): **green, 594 passed / 4 skipped**.
 After the efficiency + bugs iteration (`516dbd5`): **green, 616 passed / 4 skipped**.
 After the security iteration (`60ff73f`): **green, 644 passed / 4 skipped**.
-After the iteration-4 feature pass (`91de9e1`): **green, 659 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
+After the iteration-4 feature pass (`91de9e1`): **green, 659 passed / 4 skipped**.
+After the iteration-5 efficiency + bugs pass (`efe70a4`): **green, 677 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
 
 ## Rotation
 
@@ -16,8 +17,12 @@ One lens per iteration, rotating `feature` → `efficiency + bugs` → `security
 Advanced in every terminal case, including blocked and nothing-found, so a lens that keeps
 failing cannot starve the other two.
 
-- Next lens: **efficiency + bugs**
-- Last ran: feature — 2026-07-30, merged `91de9e1` **over an unresolved round-2 rejection**.
+- Next lens: **security**
+- Last ran: efficiency + bugs — 2026-07-30, merged `efe70a4` **over an unresolved round-2
+  rejection** — the fifth in a row. Two clean closes (`[F-062]`, `[F-063]`), two partial
+  (`[F-060]`, `[F-061]`). Open from it: `[F-068]` (a regression vs `main` — an expression
+  index with a modifier can never converge), `[F-069]`, `[F-070]`, `[F-071]`, `[F-072]`.
+- Ran before that: feature — 2026-07-30, merged `91de9e1` **over an unresolved round-2 rejection**.
   Three `COMPAT-DEFECT`s closed (`$onUpdate` in upserts, nullable-group collapsing, Drizzle's
   exact `snake_case`). Open from it: `[F-055]` (a regression — a `CompileError` that fires on
   queries which used to work, at the default budget), `[F-056]`, `[F-057]`, `[F-058]`, `[F-059]`.
@@ -543,7 +548,7 @@ compiled and ran fine now throws `CompileError`. Fix it first.
 
 ## Findings — efficiency + bugs lens (iteration 5)
 
-### [F-060] A relation's inherited `where` is applied to the wrong table — status: todo — severity: **high** — area: relations
+### [F-060] A relation's inherited `where` is applied to the wrong table — status: done (`efe70a4`, joined + filter DSL correct; split now refuses — see `[F-070]`, `[F-071]`) — severity: **high** — area: relations
 - **Where**: `src/relations/define.ts:374` sets `relation.isReversed = true` and `:376` inherits the opposite side's `where`, but **nothing in `src/` ever reads `isReversed`**. Three sites compile that predicate against the relation's *target* when it belongs to its *source*: `src/relations/query.ts:477`, `src/relations/filter.ts:345`, `src/relations/joined.ts:215`.
 - **Drizzle picks the table explicitly** (`drizzle-orm/relations.js:683`, `:690`): `relationsFilterToSQL(relation.isReversed ? sourceTable : targetTable, relation.where)`.
 - **Failure scenario**: the `where`-on-one-side, `many`-picks-it-up spelling that `adoptReverse` exists to serve — `posts.author = r.one.users({ from, to, where: { active: true } })` with `users.posts = r.many.posts()` adopting `from`/`to` *and* `where*`. Both `users` and `posts` have an `active` column. With user 1 active (posts 10 active, 11 archived) and user 2 inactive (post 12 active), `findMany({ with: { posts: true } })` gives Drizzle `[{id:1,posts:[10,11]},{id:2,posts:[]}]` and d1zzle `[{id:1,posts:[10]},{id:2,posts:[12]}]` — **wrong in both directions**: post 11 dropped from a user that should have it, post 12 returned for a user that should have none. Silent, because `split` and `joined` agree with each other, which is the only cross-check the suite has.
@@ -551,7 +556,7 @@ compiled and ran fine now throws `CompileError`. Fix it first.
 - **Fix**: thread `isReversed` through. In `filter.ts:345` it is local — `compileRelationFilter` already holds the outer `table` and `sourceColumns`, so compile against those when reversed; the predicate stays inside the `exists (…)` body where the outer row is in scope. In `joined.ts:215`, compile against the *parent* level's aliased table and push into `predicates`, still inside the correlated subquery, exactly as Drizzle does. In `query.ts:477` the split plan has no correlated scope, so the reversed predicate must be evaluated against the parent rows in `#fetchChild`: a parent that fails it is excluded from `byKey` and gets `[]`/`null` — the same observable answer.
 - **Prove it**: no existing test can — every `where`-carrying relation in `test/workers/relations.test.ts:1322` and `:826` states `from`/`to` explicitly, so `isReversed` is always `false` there. Add the schema above with the three-way assertion the file's header prescribes (split, joined, filter path), plus a case where the target lacks the column asserting it does not throw.
 
-### [F-061] `DESC` and `COLLATE` index members are invisible to introspection, and a rebuild drops them — status: todo — severity: **high** — area: kit/introspect
+### [F-061] `DESC` and `COLLATE` index members are invisible to introspection, and a rebuild drops them — status: done (`efe70a4`, **columns only** — expression members regressed, see `[F-068]`, `[F-069]`) — severity: **high** — area: kit/introspect
 - **Where**: `kit/src/core/introspect.ts:334` falls back to parsing the raw `CREATE INDEX` only when a member's `name` is `null`. `pragma index_info` reports a `DESC` or `COLLATE`-qualified member as an ordinary named column, so the modifier never reaches the snapshot. Verified on D1: `index_info` gives `{"name":"created_at"}` where `index_xinfo` gives `{"name":"created_at","desc":1,"coll":"BINARY","key":1}`; only `cid:-2` (a true expression) triggers the fallback.
 - **Failure scenario A — a unique constraint is downgraded by a routine rebuild**: live `create unique index "acct_email_ci" on "acct" ("email" collate nocase)` introspects as `columns: [{ expression: 'email', isExpression: false }]`. Any later unrelated change forcing a rebuild re-emits `create unique index "acct_email_ci" on "acct" ("email")`. The duplicate `alice@x.com` now inserts and the table holds two rows. Nothing errors, nothing warns, `diff.errors` is empty. **This is the `.unique()`-on-64-tables failure mode the project exists to prevent, one level down.**
 - **Failure scenario B — permanent false drift on a schema that is in sync**: `index('evt_created_desc').on(sql\`${t.createdAt} desc\`)` is legal in the Drizzle subset. `canonicalIndex` compares `[['"created_at"desc', true]]` against `[['created_at', false]]`, so `check` exits 1 forever, `verify` reports a mismatch, and `push` drops and rebuilds the index on every run.
@@ -560,14 +565,14 @@ compiled and ran fine now throws `CompileError`. Fix it first.
 - **Fix**: read `pragma index_xinfo` instead of `pragma index_info` at `kit/src/core/apply.ts:149` — available on D1, carries `desc` and `coll` (filter out the `key: 0` rowid tail rows). Add `desc?: boolean` and `collate?: string` to `IndexColumnSnapshot` (`kit/src/core/snapshot.ts:61`), emit in `createIndexFromSnapshot` (`:340`) and `renderSchemaModule` (`commands.ts:384`), include in `canonicalIndex` (`kit/src/core/diff.ts:688`). Keep the `parseIndexColumns` fallback for `cid === -2`. For the column-level family, which has no snapshot representation at all, `recreateTable` should refuse the way it already refuses for foreign triggers.
 - **Prove it**: `kit/test/workers/roundtrip.test.ts` — add a `DESC` index and a `COLLATE NOCASE` unique index to the `flags` fixture, assert an empty diff. `kit/test/workers/migrate.test.ts` — the scenario-A sequence, asserting the duplicate insert still rejects after a rebuild.
 
-### [F-062] `--remote=true` silently runs against the local database — status: todo — severity: med — area: kit/cli
+### [F-062] `--remote=true` silently runs against the local database — status: **done** (`efe70a4`, confirmed closed by round-2 review) — severity: med — area: kit/cli
 - **Where**: `kit/src/cli.ts:75` assigns any `--flag=value` as a *string*; `:136` tests `flags['remote'] === true` strictly, so an `=`-spelled boolean is neither honoured nor rejected and falls through to the `--local` default at `kit/src/node/commands.ts:66`.
 - **Failure scenario**: `d1zzle-migrate migrate --remote=true` in CI. `parseArgs` gives `{ remote: 'true' }`, `asTargetFlags` gives `{ local: false, remote: false, acceptDataLoss: false }`, `resolveRunner` falls to `localRunner`. Every pending migration is applied to `.wrangler/state`, it prints `Applied 0007_…` and exits 0. Production is untouched and nothing says so. `push --remote=true --accept-data-loss` is the same shape with a destructive payload. (`--remote true` behaves identically — the space form consumes `true` as the flag's value.)
 - **Contrast**: a previous lens blessed `--accept-data-loss=true` as failing closed, which is true. The same rule applied to `--remote` fails *sideways*, onto a different database — which `resolveRunner`'s own comment calls out as "how the wrong one gets hit".
 - **Fix**: in `parseArgs`, coerce a recognised boolean spelling — when `inline` is `'true'`/`'false'`, `set(name, inline === 'true')`. Or, narrower and stricter, have `asTargetFlags` throw when any of those three flags is a string rather than silently reading it as absent.
 - **Prove it**: `kit/test/unit/cli.test.ts:133` — `expect(asTargetFlags(parseArgs(['migrate','--remote=true']).flags)).toMatchObject({ remote: true })`.
 
-### [F-063] `d1zzle-migrate --help` fails with "No d1zzle config found" — status: todo — severity: low — area: kit/cli
+### [F-063] `d1zzle-migrate --help` fails with "No d1zzle config found" — status: **done** (`efe70a4`, confirmed closed by round-2 review) — severity: low — area: kit/cli
 - **Where**: `kit/src/cli.ts:53` takes `argv[0]` as the command unconditionally, so `--help` becomes the command string; the guard at `:146` only matches the literal command `help` or a `--help` flag *after* a command.
 - **Failure scenario**: `npx d1zzle-migrate --help` in a project that has not written `d1zzle.config.ts` yet — the exact moment someone reaches for help — reaches `loadConfig` at `:152` and exits 1 with `No d1zzle config found`. With a config present it exits 1 with `Unknown command "--help"`. `-h` behaves the same. `generate --help` does work.
 - **Fix**: at `:146`, also match when `command` starts with `-`.
@@ -584,6 +589,54 @@ compiled and ran fine now throws `CompileError`. Fix it first.
 
 ### [F-067] A Drizzle fragment inside DDL ignores `bareColumns` — status: todo — severity: med — area: sql — OFF-LENS from efficiency + bugs
 - **Where**: `src/sql/drizzle-sql.ts:109` honours `ctx.paramToken` but not `ctx.bareColumns`, so `check('c', drizzleSql\`${col} > 0\`)` renders `"t"."col" > 0` inside a `CHECK`, which SQLite rejects. Concrete and in-lens; recorded rather than batched only to keep this iteration's batch small.
+
+## Unresolved objections merged anyway (`efe70a4`)
+
+Fifth consecutive round-2 rejection merged under the sweep's own rule (gate green,
+677 passed / 4 skipped). Revert as one unit with `git revert -m 1 efe70a4`.
+
+**Read `[F-068]` and `[F-069]` before anything else in this file.** `[F-068]` is a
+regression against `main` that re-opens the project's own reason to exist — a diff that
+stays green while describing an index it can never converge on — and `[F-069]` can emit
+unparseable DDL and interpolate an unescaped collation name.
+
+### [F-068] An expression index member carrying `DESC` or `COLLATE` now drifts forever — status: todo — severity: **high** — area: kit/introspect — REGRESSION vs `main`
+- **Where**: `kit/src/core/introspect.ts:385-394`
+- **Defect**: `sortedMembers.map(...)` attaches `desc`/`collate` to **every** member, including expression members (`cid: -2`) whose `expression` text — recovered by `parseIndexColumns` — *already contains* the suffix. The schema side (`decorateIndexColumn`, which only matches a bare quoted identifier) attaches neither, so the two sides can never agree.
+- **Failure scenario**: `index('t_a_idx').on(sql\`lower("a") desc\`)` against live `create index t_a_idx on t (lower("a") desc)`. `main` records `{"expression":"lower(\"a\") desc","isExpression":true}` and diffs `[]` — converged. HEAD records the same plus `"desc":true` and diffs `drop index` + `create index`, and **never converges**: applying the statements and re-diffing gives a byte-identical round 1. `check` exits 1 forever on an in-sync database, `verify` reports a permanent mismatch, `push` recreates the index every run, `generate` emits a fresh no-op migration every run. Same for `sql\`substr("a", 1, 3) collate nocase\``.
+- **Worse**: `createIndexFromSnapshot` (`kit/src/core/snapshot.ts:385`, exported from `kit/src/core/index.ts`) then renders the modifier twice — `create index "t_a_idx" on "t" (lower("a") desc desc)` → `D1_ERROR: near "desc": syntax error`. The CLI dodges it today because every `diffSnapshots` call site passes a *schema* snapshot as `after`, but the function is public API.
+- **Why no test caught it**: every added `roundtrip.test.ts` case (`sql\`"weight" desc\``, `sql\`"name" collate NOCASE\``) is a bare quoted identifier. No test in the diff puts a modifier on an expression member.
+- **Fix**: skip `desc`/`collate` decoration when `isExpression` — the expression text already carries them.
+
+### [F-069] `parseIndexCollations` scans raw member text, not `blankLiterals(...)` — status: todo — severity: **high** — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:253-271`
+- **Defect**: `parseIndexColumns` slices its members from the **original** `sql` deliberately, so string literals survive; `collateRe.exec(member)` then runs over that unblanked text. This is the exact hazard its sibling was fixed for one iteration ago.
+- **Failure scenario**: `create index t_a_idx on t (replace("a", ' collate frobnicate ', ''))` snapshots as `{"collate":"frobnicate"}` and renders `… replace("a", ' collate frobnicate ', '') collate frobnicate` → `D1_ERROR: no such collation sequence: frobnicate`. The same root cause reaches quoted identifiers: a column named `my collate col` yields `{"collate":"col"}`, and `createIndexFromSnapshot` interpolates the collation name **raw** (`\` collate ${c.collate}\``, `snapshot.ts:390`) — the one place in that function that is neither quoted nor escaped.
+- **Fix**: fixing `[F-068]` (skip modifiers when `isExpression`) closes the literal case; the identifier case needs the scan to run over `blankLiterals`.
+- **Confirmed clean by the reviewer**: a partial index whose `where` mentions `collate` is excluded correctly, `COLLATE  NoCase` with doubled whitespace and mixed case parses and folds, and a column named `collate_key` does not match.
+
+### [F-070] The split-path refusal names a remedy that provably does not work — status: todo — severity: **high** — area: relations
+- **Where**: `src/relations/query.ts:542-549`
+- **Defect**: `#useJoined` (`query.ts:267`) requires `supportsJoined`, which returns `false` for a `through` relation, a payload with a `blob` column, a payload over 63 keys, and a placeholder nested `limit`/`offset` — and falls back to the split plan. For those shapes `relationalStrategy: 'joined'` *is* the split plan, so the split plan throws telling the user to set `relationalStrategy: 'joined'`. **There is no configuration under which those queries run**; Drizzle answers them (it has only the lateral plan).
+- **Proved against real D1**, same message from both strategies: a reversed many-to-many (`through`), and a reversed one-to-many whose child payload has a `blob()` column.
+- **Contradicts two stated invariants the diff did not update**: `README.md:441` ("Both return identical results … a performance switch and nothing else") and `src/relations/joined.ts:85-88`, which explicitly falls *back* to split for placeholder limits so that "`relationalStrategy` … must not change which queries are legal".
+- **Secondary**: the message is unactionable even when joined would work — it does not say which side declared the `where`, or that moving it to the other side is the fix.
+- **The comment at `query.ts:538` is wrong**: "there is no fix here that stays within the split plan's shape". The reviewer points out the parent query at `#run` (`query.ts:430-448`) is issued by this same object and could project the compiled predicate as an extra boolean column per child relation — an exact per-parent answer with zero extra round trips and no key list at all. That is the fix to write.
+
+### [F-071] The split-path refusal is data-dependent — passes in dev, throws in production — status: todo — severity: med — area: relations
+- **Where**: `src/relations/query.ts:523-549`
+- **Defect**: the throw sits *after* the `keys.length === 0` early return (line 523), and `#fetchChild` is not called at all when `rows.length === 0` (line 451). Verified: the same schema and query throws with data present and returns `[]` cleanly after `delete from users`. A refusal meant as a hard gate should fire when the relation is resolved, not when a row happens to exist.
+
+### [F-072] The batch's bundle cost was reported against the previous commit, not `main` — status: todo — severity: low — area: efficiency
+- Measured against `main`: `src/core.ts` 41,352 → 41,352 (0); `src/index.ts` 60,457 → 60,911 (**+454**); `src/relations/index.ts` 27,271 → 27,721 (**+450**). Most of the +454 is the 330-character throw message from `[F-070]` shipped to every cold isolate — a string that exists to say something that is not true for the shapes in `[F-070]`.
+
+### Confirmed correct by the round-2 reviewer
+- **`isReversed` now matches Drizzle's `relation.isReversed = !where`** in all four combinations, checked by running d1zzle's and `drizzle-orm`'s `defineRelations` side by side: own-where → `false`, inherited → `true`, both → `false` with own where winning, neither → `true`. Rows match Drizzle exactly through `sqlite-proxy` for the reversed inherited `where` under `joined`, for the non-reversed relation under both plans, and for the filter DSL. The non-reversed path is unchanged by construction — all three new branches are gated on `relation.isReversed`.
+- **`[F-061]`'s core case works**: a `collate nocase` unique index survives a table rebuild and still rejects `'A@B.C'` after `'a@b.c'` — the test enforces the constraint rather than comparing DDL. A `collate nocase` *column* with an unqualified index gives an empty diff across three rounds; an index that states `collate NOCASE` round-trips; mixed and expression-adjacent members map to the right member.
+- **Case folding works**: `collate NoCase` (live) vs `collate NOCASE` (schema) fold equal; a pre-change snapshot upgrades in exactly one rebuild and then converges; `pull` → re-snapshot → `generate` is stable.
+- **`[F-062]`/`[F-063]` fully closed**: `--help`/`-h`/`help`/`generate --help` → 0; `--nope`/`-x`/`--config=foo.ts`/`--remote migrate` → 1; `--remote=true`/`--remote true`/`--accept-data-loss=true` coerce to real booleans; `--remote=yes` throws `--remote expects true or false`; `pull --force` and `--force=true` pass the overwrite gate; `--name true`/`--name=true` stay the string `'true'`.
+- **The unchunked key list is gone** and the diff introduces no new key list of any kind.
+- **The two changed test expectations are legitimate**: neither existed on `main` — both were introduced by this branch's own first commit. No coverage that existed on `main` was lost.
 
 ## Audit areas
 
