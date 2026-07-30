@@ -570,9 +570,26 @@ const dependenciesOf = (t: TableSnapshot | undefined): string[] => [
  * with its own spacing, so a byte comparison reports drift on an index that
  * has not changed. Same rule `canonicalTable` applies to check constraints.
  */
+/**
+ * Whitespace-normalise an expression for comparison, without touching
+ * whitespace inside a string literal (`'a b'` and `'a  b'` are different
+ * strings). Collapsing runs to a single space, the way `where` below does,
+ * is not enough on its own — `lower( "a" )` (hand-written) and `lower("a")`
+ * (schema-generated) already have no *runs* of whitespace to collapse, only
+ * single spaces touching the parens, which SQL treats as insignificant
+ * everywhere outside a literal. So every non-literal space is dropped
+ * entirely, and only literal segments (recovered the same way
+ * `blankLiterals` finds them, but kept instead of blanked) survive verbatim.
+ */
+const canonicalizeExpression = (text: string): string =>
+	text.replaceAll(/'(?:[^']|'')*'|\s+/g, (match) => (match[0] === "'" ? match : ''));
+
 const canonicalIndex = (index: IndexSnapshot): string =>
 	JSON.stringify([
-		index.columns.map(normalizeIndexColumn).map((c) => [c.expression, c.isExpression]),
+		index.columns.map(normalizeIndexColumn).map((c) => [
+			c.isExpression ? canonicalizeExpression(c.expression) : c.expression,
+			c.isExpression,
+		]),
 		index.isUnique,
 		(index.where ?? '').replaceAll(/\s+/g, ' ').trim(),
 	]);

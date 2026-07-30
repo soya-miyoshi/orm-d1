@@ -168,6 +168,19 @@ describe('primaryKey()’s HasDefault is gated like Drizzle’s', () => {
 		id: integer('id').primaryKey(),
 	});
 
+	// `SQLiteTimestampBuilder` and `SQLiteBooleanBuilder` both extend
+	// `SQLiteBaseIntegerBuilder` (`sqlite-core/columns/integer.d.ts`), so they
+	// inherit `primaryKeyHasDefault` too — an `integer(..., { mode: 'timestamp' |
+	// 'boolean' })` primary key is still SQLite's rowid alias underneath and is
+	// just as optional on insert as a plain integer one.
+	const withTimestampPk = sqliteTable('with_timestamp_pk', {
+		id: integer('id', { mode: 'timestamp' }).primaryKey(),
+	});
+
+	const withBooleanPk = sqliteTable('with_boolean_pk', {
+		id: integer('id', { mode: 'boolean' }).primaryKey(),
+	});
+
 	it('requires the id on insert for a non-integer primary key', () => {
 		type Insert = InferInsert<typeof withCustomPk>;
 		expectTypeOf<Insert['id']>().toEqualTypeOf<string>();
@@ -176,5 +189,15 @@ describe('primaryKey()’s HasDefault is gated like Drizzle’s', () => {
 	it('leaves the id optional on insert for an integer primary key', () => {
 		type Insert = InferInsert<typeof withIntegerPk>;
 		expectTypeOf<Insert['id']>().toEqualTypeOf<number | undefined>();
+	});
+
+	it('leaves the id optional on insert for a timestamp-mode integer primary key', () => {
+		type Insert = InferInsert<typeof withTimestampPk>;
+		expectTypeOf<Insert['id']>().toEqualTypeOf<Date | undefined>();
+	});
+
+	it('leaves the id optional on insert for a boolean-mode integer primary key', () => {
+		type Insert = InferInsert<typeof withBooleanPk>;
+		expectTypeOf<Insert['id']>().toEqualTypeOf<boolean | undefined>();
 	});
 });

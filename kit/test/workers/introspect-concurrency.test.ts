@@ -68,7 +68,12 @@ describe('introspect concurrency', () => {
 		// table-level pragmas, then that table's index_info pragmas) is the
 		// most this should ever need, plus the one `sqlite_master` read.
 		expect(sequentialCalls).toBeLessThan(TABLE_COUNT + 2);
-		// And the concurrency actually reached is more than "one at a time".
+		// And the concurrency actually reached is more than "one at a time"...
 		expect(peak).toBeGreaterThan(1);
+		// ...but never exceeds the shared cap `introspect()` enforces, even
+		// though this schema's 8 tables x 3 table-level pragmas comfortably
+		// exceed it — the whole point of the gate is that a large schema on
+		// `--remote` never bursts past a bounded number of simultaneous calls.
+		expect(peak).toBeLessThanOrEqual(12);
 	});
 });

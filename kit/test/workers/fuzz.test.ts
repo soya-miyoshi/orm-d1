@@ -177,15 +177,33 @@ const randomSnapshot = (next: () => number, tableCount: number): Snapshot => {
  */
 const comparable = (snapshot: Snapshot) =>
 	Object.fromEntries(
-		Object.entries(snapshot.tables).map(([name, t]) => [name, {
-			...canonicalTable(t),
-			indexes: Object.fromEntries(
-				Object.entries(t.indexes).map(([i, index]) => [
-					i,
-					{ columns: index.columns.map(normalizeIndexColumn), isUnique: index.isUnique },
-				]),
-			),
-		}]),
+		Object.entries(snapshot.tables).map(([name, t]) => {
+			const canonical = canonicalTable(t);
+			return [name, {
+				...canonical,
+				// `declaredType` is deliberately not part of the affinity-based
+				// equality `canonicalTable` documents (see `ColumnSnapshot.declaredType`
+				// in snapshot.ts) — it exists only so `columnDifference` can
+				// special-case a pre-`declaredType` snapshot, and only for DDL
+				// emission. `snapshotFromIntrospection` now stamps it with the raw
+				// spelling `table_xinfo` reports (e.g. `"INTEGER"`), which a
+				// hand-built `randomSnapshot` fixture — not run through DDL
+				// generation — never carries, so comparing it directly here would
+				// assert something the diff engine itself does not.
+				columns: Object.fromEntries(
+					Object.entries(canonical.columns).map(([columnName, column]) => {
+						const { declaredType: _declaredType, ...rest } = column;
+						return [columnName, rest];
+					}),
+				),
+				indexes: Object.fromEntries(
+					Object.entries(t.indexes).map(([i, index]) => [
+						i,
+						{ columns: index.columns.map(normalizeIndexColumn), isUnique: index.isUnique },
+					]),
+				),
+			}];
+		}),
 	);
 
 const dropEverything = async (): Promise<void> => {

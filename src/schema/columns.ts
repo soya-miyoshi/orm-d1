@@ -339,7 +339,7 @@ export class ColumnBuilder<M extends ColumnMeta = ColumnMeta> {
 	// spelling — this only narrows the *type*.
 	primaryKey(
 		options?: { autoIncrement?: boolean },
-	): ColumnBuilder<M & { notNull: true } & (M['columnType'] extends 'SQLiteInteger' ? { hasDefault: true } : unknown)> {
+	): ColumnBuilder<M & { notNull: true } & (M['columnType'] extends 'SQLiteInteger' | 'SQLiteTimestamp' | 'SQLiteBoolean' ? { hasDefault: true } : unknown)> {
 		return this.with({
 			primaryKey: true,
 			notNull: true,

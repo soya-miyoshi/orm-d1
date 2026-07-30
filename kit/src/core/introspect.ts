@@ -188,34 +188,41 @@ const parseIndexWhere = (sql: string | null): string | undefined => {
  */
 const parseIndexColumns = (sql: string | null): string[] | undefined => {
 	if (!sql) return undefined;
-	const openAfterOn = /\bon\s+(?:"(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|\w+)\s*\(/i.exec(sql);
+	// Scan `blankLiterals(sql)`, not `sql` itself — an expression member such as
+	// `replace("name", '(', '')` or `"name" || ','` has a paren or comma inside
+	// a string literal, which would otherwise desynchronise the depth counter
+	// or split a member in half. Only the *offsets* come from the blanked
+	// text; the actual slices are taken from the original `sql` so the
+	// literal's real contents survive. Same technique as `parseChecks`.
+	const scan = blankLiterals(sql);
+	const openAfterOn = /\bon\s+(?:"(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|\w+)\s*\(/i.exec(scan);
 	if (!openAfterOn) return undefined;
 	const start = openAfterOn.index + openAfterOn[0].length;
 
 	let depth = 1;
 	let i = start;
-	while (i < sql.length && depth > 0) {
-		if (sql[i] === '(') depth++;
-		else if (sql[i] === ')') depth--;
+	while (i < scan.length && depth > 0) {
+		if (scan[i] === '(') depth++;
+		else if (scan[i] === ')') depth--;
 		i++;
 	}
 	if (depth > 0) return undefined;
-	const body = sql.slice(start, i - 1);
+	const bodyEnd = i - 1;
 
 	const members: string[] = [];
-	let member = '';
+	let memberStart = start;
 	let nesting = 0;
-	for (const ch of body) {
+	for (let j = start; j < bodyEnd; j++) {
+		const ch = scan[j];
 		if (ch === '(') nesting++;
 		else if (ch === ')') nesting--;
 		if (ch === ',' && nesting === 0) {
-			members.push(member.trim());
-			member = '';
-		} else {
-			member += ch;
+			members.push(sql.slice(memberStart, j).trim());
+			memberStart = j + 1;
 		}
 	}
-	if (member.trim().length > 0) members.push(member.trim());
+	const last = sql.slice(memberStart, bodyEnd).trim();
+	if (last.length > 0) members.push(last);
 	return members;
 };
 
@@ -364,6 +371,17 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			columns[column.name] = {
 				name: column.name,
 				type: column.type.toLowerCase(),
+				// The raw spelling `sqlite_master`/`table_xinfo` reports, verbatim —
+				// the same slot a schema-side `customType` fills with its exact
+				// `dataType(config)` string. Setting it here (rather than leaving it
+				// `undefined`) turns off `typeMatchesAcrossUpgrade`'s legacy-affinity
+				// hatch for every live-vs-schema and live-vs-live comparison: both
+				// sides now carry a `declaredType`, so `columnDifference` compares
+				// `typeAffinity` of the real spellings on both sides instead of
+				// reinterpreting one side under the old substring rule. The hatch
+				// only still fires for a *stored* snapshot written before this field
+				// existed, which genuinely has no `declaredType` on disk.
+				declaredType: column.type,
 				primaryKey: single,
 				notNull: column.notnull === 1 || single,
 				autoincrement: single && hasAutoincrement(createSql, column.name),

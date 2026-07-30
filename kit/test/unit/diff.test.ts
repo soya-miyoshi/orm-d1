@@ -72,6 +72,38 @@ describe('diffing snapshots', () => {
 		expect(createIndex).not.toContain('("lower(""email"")")');
 	});
 
+	it('does not report drift for an expression index whose whitespace differs from the schema', () => {
+		// `canonicalIndex` already normalises `where`'s whitespace because
+		// SQLite hands a partial index's predicate back with its own spacing.
+		// An expression *member* goes through `sqlite_master`'s verbatim
+		// `CREATE INDEX` text the same way, so a hand-written
+		// `lower( "a" )` in the database against `lower("a")` in the schema
+		// must compare equal too, not report a permanent drop/create.
+		const t = sqliteTable('spaced', {
+			id: integer('id').primaryKey(),
+			a: text('a').notNull(),
+		}, (c) => [index('spaced_lower_a_idx').on(sql`lower(${c.a})`)]);
+		const schemaSide = snapshotOf(t);
+		const liveSide: Snapshot = {
+			...schemaSide,
+			origin: 'introspection',
+			tables: {
+				spaced: {
+					...schemaSide.tables['spaced']!,
+					indexes: {
+						...schemaSide.tables['spaced']!.indexes,
+						spaced_lower_a_idx: {
+							...schemaSide.tables['spaced']!.indexes['spaced_lower_a_idx']!,
+							columns: [{ expression: 'lower( "a" )', isExpression: true }],
+						},
+					},
+				},
+			},
+		};
+
+		expect(diffSnapshots(liveSide, schemaSide).statements).toEqual([]);
+	});
+
 	it('reads an old-shape index snapshot (plain string columns) without reporting drift', () => {
 		// Before `IndexColumnSnapshot`, `columns` was `readonly string[]`.
 		// A snapshot on disk from before this change still has that shape, and
@@ -310,6 +342,38 @@ describe('diffing snapshots', () => {
 		};
 
 		expect(diffSnapshots(legacy, fresh).statements).toEqual([]);
+	});
+
+	it('reports real drift between a live TEXT column and a schema customType declaring int', () => {
+		// The legacy hatch above only exists to keep a *pre-declaredType*
+		// snapshot from looking like drift against itself. Since
+		// `snapshotFromIntrospection` now stamps `declaredType` with the raw
+		// spelling `table_xinfo` reports (see `kit/src/core/introspect.ts`), a
+		// live snapshot always carries one — so a column that is genuinely
+		// TEXT in the database, compared against a schema that declares it
+		// `customType(() => 'int')`, must still be reported as a type change
+		// rather than silently swallowed by the legacy substring rule.
+		const schemaSide = snapshotOf(sqliteTable('drift', {
+			id: text('id').primaryKey(),
+			amount: customType<string>({ dataType: () => 'int' })('amount'),
+		}));
+		const liveSide: Snapshot = {
+			...schemaSide,
+			origin: 'introspection',
+			tables: {
+				drift: {
+					...schemaSide.tables['drift']!,
+					columns: {
+						...schemaSide.tables['drift']!.columns,
+						amount: { ...schemaSide.tables['drift']!.columns['amount']!, type: 'text', declaredType: 'text' },
+					},
+				},
+			},
+		};
+
+		const { statements } = diffSnapshots(liveSide, schemaSide);
+		expect(statements.length).toBeGreaterThan(0);
+		expect(statements.some((s) => s.reason?.includes('changes type'))).toBe(true);
 	});
 
 	it('still reports a genuine type change between two declaredType-carrying snapshots', () => {

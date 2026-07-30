@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createSchema } from '../../src/ddl.js';
+import { setDev } from '../../src/dev.js';
 import { blob, CompileError, drizzle, eq, integer, primaryKey, ph, sql, sqliteTable, text } from '../../src/index.js';
 import { defineRelations } from '../../src/relations/index.js';
 import * as schema from '../schema.js';
@@ -637,18 +638,27 @@ describe('composite-key relations', () => {
 			onQuery: (event) => paramCounts.push(event.params?.length ?? 0),
 		});
 
-		const rows = await withCounter.query.regions.findMany({
-			columns: { country: true, zone: true },
-			with: {
-				sites: {
-					columns: { id: true },
-					// A bound value inside the callback form: one extra param per child
-					// statement that `reserved` must account for.
-					orderBy: (t, { sql }) => sql`${t.id} + ${0}`,
+		// `QueryEvent.params` is only populated in dev mode (`src/runtime/result.ts`);
+		// without this, every recorded count is 0 and the assertions below measure
+		// nothing. The workers project runs with dev off by default.
+		setDev(true);
+		let rows;
+		try {
+			rows = await withCounter.query.regions.findMany({
+				columns: { country: true, zone: true },
+				with: {
+					sites: {
+						columns: { id: true },
+						// A bound value inside the callback form: one extra param per child
+						// statement that `reserved` must account for.
+						orderBy: (t, { sql }) => sql`${t.id} + ${0}`,
+					},
 				},
-			},
-			orderBy: { zone: 'asc' },
-		});
+				orderBy: { zone: 'asc' },
+			});
+		} finally {
+			setDev(false);
+		}
 
 		expect(rows).toHaveLength(PARENTS_50);
 		expect(rows.every((r) => r.sites.length === 1)).toBe(true);

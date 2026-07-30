@@ -102,6 +102,55 @@ describe('schema ↔ introspection round trip', () => {
 });
 
 /**
+ * `parseIndexColumns` recovers an expression index member's text from
+ * `sqlite_master`'s verbatim `CREATE INDEX` SQL, because `pragma index_info`
+ * reports an expression member as `{ cid: -2, name: null }` with no text at
+ * all. Unlike `parseChecks` in the same file, it used to scan the raw SQL
+ * directly for paren-matching and comma-splitting, so a string literal inside
+ * the expression that itself contained a `(` or a `,` desynchronised the
+ * parser — losing the expression, or truncating it — and reported permanent
+ * drift on an index that never changed.
+ */
+describe('expression indexes whose text contains a paren or comma inside a string literal', () => {
+	const literalParen = sqliteTable('literal_paren', {
+		id: integer('id').primaryKey(),
+		name: text('name').notNull(),
+	}, (t) => [index('literal_paren_idx').on(sql`replace(${t.name}, '(', '')`)]);
+
+	const literalComma = sqliteTable('literal_comma', {
+		id: integer('id').primaryKey(),
+		name: text('name').notNull(),
+	}, (t) => [index('literal_comma_idx').on(sql`${t.name} || ','`)]);
+
+	beforeEach(async () => {
+		const existing = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'table' and name not like 'sqlite_%' "
+				+ "and name not like '\\_cf\\_%' escape '\\'",
+		);
+		for (const table of existing) await DB.prepare(`drop table if exists "${table.name}"`).run();
+		for (const statement of createSchema([literalParen, literalComma])) await DB.prepare(statement).run();
+	});
+
+	it('recovers an expression containing a paren inside a string literal', async () => {
+		const live = await introspect(runner);
+		const expected = snapshotFromSchema([literalParen, literalComma]);
+
+		const columns = live.tables['literal_paren']!.indexes['literal_paren_idx']!.columns;
+		expect(columns).toEqual([{ expression: `replace("name", '(', '')`, isExpression: true }]);
+		expect(diffSnapshots(live, expected).statements).toEqual([]);
+	});
+
+	it('recovers an expression containing a comma inside a string literal', async () => {
+		const live = await introspect(runner);
+		const expected = snapshotFromSchema([literalParen, literalComma]);
+
+		const columns = live.tables['literal_comma']!.indexes['literal_comma_idx']!.columns;
+		expect(columns).toEqual([{ expression: `"name" || ','`, isExpression: true }]);
+		expect(diffSnapshots(live, expected).statements).toEqual([]);
+	});
+});
+
+/**
  * The same property, for the three things a schema module cannot say.
  *
  * `STRICT`, `WITHOUT ROWID` and the append-only trigger live in a sidecar

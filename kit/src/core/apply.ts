@@ -23,6 +23,49 @@ export interface SqlRunner {
 /** D1 caps a batch; beyond it atomicity is lost and the caller must be told. */
 export const MAX_STATEMENTS_PER_BATCH = 100;
 
+/**
+ * On `--remote`, every `all()` is a real HTTP call to `api.cloudflare.com`.
+ * `Promise.all` over every table (and then every index) fires them all at
+ * once — hundreds of simultaneous requests on a large schema, well past what
+ * a single-origin HTTP client keeps open, and a single 429 from Cloudflare
+ * aborts the whole `introspect()` since the remote runner does not retry.
+ * The local Miniflare path and the workerd D1 binding used in tests have no
+ * such limit, so this only bites `--remote`, but the cap applies everywhere
+ * for one code path. Kept inline (not a dependency): `kit/src/core/` stays
+ * Node-free and filesystem-free.
+ */
+const MAX_CONCURRENT_INTROSPECT_CALLS = 12;
+
+/**
+ * A global gate on how many `fn` calls run at once, independent of how they
+ * are dispatched (a flat map, or — as here — a per-table map that itself
+ * dispatches a per-index map). Without a single shared gate, nesting two
+ * pools with the same per-pool limit multiplies rather than bounds: 12
+ * concurrent tables each opening 12 concurrent index calls is 144 in flight,
+ * not 12. `run` queues the call instead of starting it once `limit` are
+ * already in flight, and releases its slot to the next queued call when it
+ * settles (success or failure).
+ */
+class ConcurrencyGate {
+	private inFlight = 0;
+	private readonly queue: (() => void)[] = [];
+
+	constructor(private readonly limit: number) {}
+
+	async run<R>(fn: () => Promise<R>): Promise<R> {
+		if (this.inFlight >= this.limit) {
+			await new Promise<void>((resolve) => this.queue.push(resolve));
+		}
+		this.inFlight++;
+		try {
+			return await fn();
+		} finally {
+			this.inFlight--;
+			this.queue.shift()?.();
+		}
+	}
+}
+
 export interface ApplyResult {
 	readonly applied: readonly string[];
 	/** Set when a migration had to be split, which loses atomicity across it. */
@@ -58,24 +101,31 @@ export async function introspect(runner: SqlRunner): Promise<Snapshot> {
 		indexList[row.name] = [];
 	}
 
+	const gate = new ConcurrencyGate(MAX_CONCURRENT_INTROSPECT_CALLS);
+
+	// Dispatching all tables' async work up front costs nothing by itself —
+	// only the `gate.run` calls below actually start a pragma query, so this
+	// `Promise.all` is what makes the *iteration* concurrent while the shared
+	// gate is what bounds how many real network calls are in flight at once.
 	await Promise.all(tableRows.map(async (row) => {
 		const quoted = `"${row.name.replaceAll('"', '""')}"`;
 
 		// `table_xinfo`, not `table_info`: the latter omits generated columns
 		// completely, so a schema with one drifted against itself forever.
 		const [xinfo, fks, indexes] = await Promise.all([
-			runner.all<TableInfoRow>(`pragma table_xinfo(${quoted})`),
-			runner.all<ForeignKeyRow>(`pragma foreign_key_list(${quoted})`),
-			runner.all<IndexListRow>(`pragma index_list(${quoted})`),
+			gate.run(() => runner.all<TableInfoRow>(`pragma table_xinfo(${quoted})`)),
+			gate.run(() => runner.all<ForeignKeyRow>(`pragma foreign_key_list(${quoted})`)),
+			gate.run(() => runner.all<IndexListRow>(`pragma index_list(${quoted})`)),
 		]);
 		tableInfo[row.name] = xinfo;
 		foreignKeys[row.name] = fks;
 		indexList[row.name] = indexes as never;
 
 		for (const index of indexes) indexInfo[index.name] = [];
-		await Promise.all(indexes.map(async (index) => {
-			indexInfo[index.name] = await runner.all(`pragma index_info("${index.name.replaceAll('"', '""')}")`);
-		}));
+		await Promise.all(indexes.map((index) =>
+			gate.run(async () => {
+				indexInfo[index.name] = await runner.all(`pragma index_info("${index.name.replaceAll('"', '""')}")`);
+			})));
 	}));
 
 	return snapshotFromIntrospection({ master, tableInfo, indexList, indexInfo, foreignKeys });
