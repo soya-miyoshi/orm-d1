@@ -7,6 +7,7 @@ Gate: `npm run check` (typecheck → build → test → typecheck:kit → build:
 Baseline at sweep start: **green, 565 passed / 4 skipped**.
 After the feature iteration (`15f24ef`): **green, 594 passed / 4 skipped**.
 After the efficiency + bugs iteration (`516dbd5`): **green, 616 passed / 4 skipped**.
+After the security iteration (`60ff73f`): **green, 644 passed / 4 skipped**.
 
 ## Rotation
 
@@ -14,8 +15,13 @@ One lens per iteration, rotating `feature` → `efficiency + bugs` → `security
 Advanced in every terminal case, including blocked and nothing-found, so a lens that keeps
 failing cannot starve the other two.
 
-- Next lens: **security**
-- Last ran: efficiency + bugs — 2026-07-30, merged `516dbd5` **over an unresolved round-2
+- Next lens: **feature**
+- Last ran: security — 2026-07-30, merged `60ff73f` **over an unresolved round-2 rejection**.
+  Four findings; the round-2 reviewer confirmed the `pull` RCE (`[F-035]`) and the
+  append-only gate (`[F-036]`) genuinely closed and rejected on six further points.
+  `[F-043]` and `[F-044]` are misleading tests now on `main` and should be fixed before the
+  defects they claim to cover. Also open: `[F-041]`, `[F-042]`, `[F-045]`, `[F-046]`, `[F-047]`.
+- Ran before that: efficiency + bugs — 2026-07-30, merged `516dbd5` **over an unresolved round-2
   rejection**. Eight findings in the batch; the round-2 reviewer verified seven closed and
   rejected on the eighth. `[F-029]` is a regression against `main` and is the highest-value
   open item in this file. Also open from this iteration: `[F-030]`, `[F-031]`, `[F-032]`.
@@ -270,7 +276,7 @@ columns). They stay `todo` and the next efficiency + bugs iteration owns them.
 - **Fix**: two dependent waves instead of `3T + I` serial trips — `Promise.all` over tables, and inside each table `Promise.all` over `[table_xinfo, foreign_key_list, index_list]` then `Promise.all` over that table's `index_info` calls. `SqlRunner.all` is already `async`; `localRunner` is synchronous underneath so `Promise.all` costs it nothing, and the workerd test runner is concurrency-safe. Nothing in `core/` changes shape, so the Node-free constraint holds.
 - **Prove it**: a `kit/test/workers` case wrapping `SqlRunner.all` in a counter that also records concurrency depth — assert the number of *sequential waves* is O(1) rather than O(tables). Today the harness records 16 strictly serial calls for 3 tables.
 
-### [F-027] `pull` emits introspected text straight into template literals — status: todo — severity: low — area: kit/node — lens: security (OFF-LENS from efficiency + bugs)
+### [F-027] `pull` emits introspected text straight into template literals — status: done (`60ff73f`, superseded by `[F-035]`) — severity: low — area: kit/node — lens: security (OFF-LENS from efficiency + bugs)
 - **Where**: `kit/src/node/commands.ts:335,339,391`
 - **Defect**: `.default(sql\`${column.default}\`)`, `check('${c.name}', sql\`${c.value}\`)` and `sqliteTable('${table.name}'` interpolate live database text into generated source. A backtick or `${` in a check expression, a default, or a table name produces a schema module that does not parse. Contrived to hit, but `uniqueIdentifier` right below it exists precisely because "files that do not compile, from a command whose whole job is to write one" is treated as a bug class here.
 
@@ -325,7 +331,7 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 
 ## Findings — security lens (iteration 3)
 
-### [F-033] A migration split across batches cuts through a table rebuild — `drop table` commits without its `rename` — status: todo — severity: high — area: kit/apply
+### [F-033] A migration split across batches cuts through a table rebuild — `drop table` commits without its `rename` — status: done (`60ff73f`, **partial** — see `[F-041]`, `[F-043]`, `[F-044]`) — severity: high — area: kit/apply
 - **Where**: `kit/src/core/apply.ts:189-192`, and the identical loop in `kit/src/node/commands.ts:232-234` for `push`
 - **Defect**: the split is a blind fixed stride over a flat statement list, so it can fall *inside* the five-statement rebuild group `recreateTable` emits (`kit/src/core/diff.ts:263-284`) — between `drop table "X"` and `alter table "__new_X" rename to "X"`. The first batch commits.
 - **Failure scenario** (reproduced): a migration creating 96 tables then rebuilding `orders` compiles to 102 statements; statement 100 is `drop table "orders"` and 101 is the rename. With the second batch failing (a D1 500, a 429, a dropped connection on `--remote`, or CI being killed), `orders` is gone and the rows survive only in `__new_orders`.
@@ -334,7 +340,7 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 - **Fix**: make the rebuild an indivisible unit the packer can see — give `Statement` a `group` id (or return `readonly Statement[][]` from `diffSnapshots`) and have both `applyMigration` and `push` pack whole groups into batches, never splitting one; refuse outright if a single group exceeds `MAX_STATEMENTS_PER_BATCH`. Append `record` to the last batch rather than issuing it alone. Log the split warning before the first `runner.batch`.
 - **Prove it**: a fake `SqlRunner` recording each batch, asserting no batch contains `drop table "X"` unless the same batch contains its rename, and that the final batch carries the `d1_migrations` insert; plus the >100-statement migration above in `kit/test/workers/migrate.test.ts` with a runner that throws on batch 2, asserting `orders` still exists with its rows.
 
-### [F-034] The 12-step rebuild destroys every trigger except the append-only guard, and nothing can detect the loss — status: todo — severity: high — area: kit/diff
+### [F-034] The 12-step rebuild destroys every trigger except the append-only guard, and nothing can detect the loss — status: done (`60ff73f`, conservative refusal — bypasses remain, see `[F-042]`, `[F-045]`) — severity: high — area: kit/diff
 - **Where**: `kit/src/core/diff.ts:286-296` (rebuild re-creates `after.indexes` and, if set, `appendOnlyTrigger`, nothing else); `kit/src/core/introspect.ts:288-293` (`snapshotFromIntrospection` reads triggers only through `isAppendOnlyTrigger`)
 - **Defect**: `docs/09-d1zzle-migrate.md:127` specifies the recipe as "recreate indexes, triggers, and views that referenced the table". Triggers are not recreated, are not in `TableSnapshot`, and are not compared by `canonicalTable` — so `check`, `verify` and the next `push` all report the table as matching.
 - **Failure scenario** (reproduced): a live `BEFORE INSERT` trigger raising `ABORT` unless `email = lower(email)`. Change `age` from `text` to `integer` and `push` emits the five rebuild statements with no `create trigger` anywhere. The guard is gone, mixed-case emails insert cleanly, and introspecting the result diffs `statements: [], errors: []` — `check` prints "Up to date, no drift." Exactly the `docs/09` failure mode the project exists to prevent, one object over from `unique()`.
@@ -342,7 +348,7 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 - **Two fixes the reviewer offered**: (a) carry triggers in the snapshot — `introspect()` already selects `type = 'trigger'` (`apply.ts:79-81`) so the SQL text is in hand; add `triggers` to `TableSnapshot`, re-emit after the rename, include in `canonicalTable`. (b) Minimum viable: refuse the rebuild when the live table carries a trigger the kit did not author, the same way `recreateTable` already refuses on dependents (`diff.ts:220-233`).
 - **This iteration implements (b)**, deliberately. (a) changes `TableSnapshot`'s shape, and the two previous iterations both drew their unresolved rejections from snapshot-shape changes — `[F-029]` is still open from exactly that class. (b) converts silent invariant loss into a loud refusal with no format change. **`[F-040]` carries (a) as the real fix for a human to schedule.**
 
-### [F-035] `pull` reaches arbitrary code execution in the CLI's own Node process — status: todo — severity: **high** — area: kit/node
+### [F-035] `pull` reaches arbitrary code execution in the CLI's own Node process — status: **done** (`60ff73f`, confirmed closed by round-2 review) — severity: **high** — area: kit/node
 - **Where**: `kit/src/node/commands.ts:298` (table name), `:335` (generated expression), `:339` (default), `:363` (expression index member), `:367` (partial-index `where`), `:369`, `:379` (index / unique names), `:397` (check name and body)
 - **Defect**: this is the escalation of the previously-known "produces a module that does not parse" (`[F-027]`). Everything introspected is dropped into `` sql`…` ``, so a `${` in the source text becomes a **JavaScript expression evaluated at module load**.
 - **Failure scenario (a)** — no quote balancing needed. A plain SQLite `DEFAULT` text literal: `create table "notes" ("id" integer primary key, "body" text default '${globalThis.__PWNED__ = 1}')`. `renderSchemaModule` emits `` body: text('body').default(sql`'${globalThis.__PWNED__ = 1}'`) ``. The module parses, and the interpolation runs the moment it is imported. The check-constraint path is identical via a comment inside a `CHECK` body.
@@ -351,7 +357,7 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 - **Fix**: stop building the module by interpolation. Emit every string literal with `JSON.stringify(value)`, and every SQL fragment as `sql.raw(${JSON.stringify(text)})` instead of `` sql`${text}` `` — `Raw` has `toQuery`, so `ColumnBuilder.default` still classifies it as `kind: 'sql'` and `renderInline` reproduces the same DDL.
 - **Prove it**: `kit/test/unit/cli.test.ts` — `renderSchemaModule` over a snapshot whose table name, index name, check name, check body, default and partial-index `where` each contain `` ` ``, `${`, `'` and `\`; feed the output through `esbuild.transform({ loader: 'ts' })` and assert it parses, that the emitted code contains no `${` beyond the ones the renderer itself wrote, and that re-parsing reproduces the input snapshot.
 
-### [F-036] Dropping the append-only guard escapes `--accept-data-loss` when the table is renamed in the same migration — status: todo — severity: med — area: kit/diff
+### [F-036] Dropping the append-only guard escapes `--accept-data-loss` when the table is renamed in the same migration — status: **done** (`60ff73f`, confirmed closed by round-2 review) — severity: med — area: kit/diff
 - **Where**: `kit/src/core/diff.ts:334`
 - **Defect**: `if (t.appendOnly) statements.push({ sql: dropAppendOnlyTrigger(name), destructive: false })`. The in-place transition at `diff.ts:509-513` marks the identical statement `destructive: true` with the reason `"X" is no longer append-only, so UPDATE is permitted again` — the code explicitly argues that removing this protection is "worth saying out loud rather than doing quietly". The rename path does it quietly, and because line 335 sets `appendOnly: false` on the carried-forward table, the destructive branch at 505 never fires afterwards.
 - **Failure scenario** (reproduced): with `tableOptions([[auditLog, { appendOnly: true }]])`, renaming `audit_log` → `audit_events` and dropping it from `tableOptions` gives `generate --rename-table audit_log=audit_events` success with no flag — the audit table becomes rewritable. The identical change without the rename is refused with "This migration would lose data … Re-run with `--accept-data-loss`".
@@ -383,6 +389,67 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 - **Published tarball and git history are clean**: `npm pack --dry-run` gives 162 files — `dist` + 11 `docs/*.md` + README + LICENSE. No credentials, no `.env`, no `.tsbuildinfo`; the `.js.map` files carry no `sourcesContent`. `wrangler.jsonc` has `"database_id": "local"`. No high-entropy token, account id or database id anywhere in `git rev-list --all`, and no private schema module was ever committed.
 - **`check` is genuinely read-only** (`commands.ts:538` passes `create = false`; `introspect` issues only reads).
 - **`--accept-data-loss` parsing fails closed**: `--accept-data-loss=true` yields the string `'true'`, which `asTargetFlags` (`cli.ts:137`) rejects. `--local`/`--remote` default to local.
+
+## Unresolved objections merged anyway (`60ff73f`)
+
+The round-2 reviewer of `sweep/security-20260730-191312` confirmed the `pull` RCE fix and the
+append-only rename gate genuinely closed, and rejected the batch on six further points. Two
+review rounds is the cap, the gate was green (644 passed / 4 skipped), so it merged under the
+sweep's own rule. Revert as one unit with `git revert -m 1 60ff73f`.
+
+**`[F-043]` and `[F-044]` are two misleading tests now on `main`** — one asserts the opposite
+of what its own title claims, the other passes against untouched state. A test that pins the
+bug under a name claiming the fix is worse than no test, and it is the same
+"both artifacts agree so CI stays green" shape `docs/09` describes. Fix those two first,
+before the defects they were supposed to cover.
+
+### [F-041] The rebuild group stops at the rename, so a `UNIQUE` index can still be split off and silently lost — status: todo — severity: **high** — area: kit/apply
+- **Where**: `kit/src/core/sql.ts:161-203` (`statementGroups`), against `kit/src/core/diff.ts:311-321`
+- **Defect**: `statementGroups` closes the group at `alter table "__new_X" rename to "X"`, but `recreateTable` emits the table's indexes and its append-only trigger *after* that rename — that is where the rebuild restores its constraints. Those become singleton groups, so `packIntoBatches` will put the boundary immediately after the rename.
+- **Failure scenario** (95 filler creates + a rebuild of a table carrying `uniqueIndex('orders_code')`, batch 2 failing on a D1 500 / 429 / dropped `--remote` connection): batches are `[100, 2]` with batch 2 = `create unique index "orders_code" …` + the `d1_migrations` insert. On real D1: `indexes on orders after the failed migration: []`, two rows now share `code='A'` — the UNIQUE constraint is gone — the migration is unrecorded, and the retry dies on `table "f0" already exists`. `push` self-heals on re-run; `migrate` does not.
+- **Why it matters more than it looks**: this is `docs/09`'s reason-for-existence failure — a `unique()` constraint gone with nothing reporting it — reproduced *through the code path this batch rewrote*. It is not a new hole (fixed-stride slicing could cut here too), but the fix redefines "what must stay in one batch" and leaves the constraint-restoring tail of the rebuild outside that definition.
+- **Fix**: extend the group through the index and trigger statements `recreateTable` emits after the rename, so the whole rebuild — including constraint restoration — is indivisible.
+
+### [F-042] A rename in an *earlier pending migration* still bypasses the trigger guard — status: todo — severity: high — area: kit/apply
+- **Where**: `kit/src/core/apply.ts:284-304`
+- **Defect**: `parsed` computes `renames` per migration and the lookup is `migration.renames[table] ?? table`, so only a rename inside the *same file* is resolved. Renames from earlier pending migrations in the same `migrate` run are not accumulated, while the live `foreignTriggers` map is keyed by the pre-run `tbl_name`.
+- **Failure scenario** (proven on real D1): `0001_rename` = `alter table "orders" rename to "sales"`, `0002_retype` = a type change forcing a rebuild of `sales`, with trigger `orders_audit` live on `orders`. `applyMigrations(runner, [m1, m2])` issues no refusal; triggers after migrate: `[]`. Generating a rename migration, then a schema change, then deploying and running `migrate` once is the ordinary workflow. The same hole swallows the error message's own recommended remedy: a `create trigger` hand-added to migration N and a rebuild in migration N+1, both pending, applies with no refusal.
+- **Fix**: fold each migration's renames into a running name→live map *before* checking that migration's rebuilt tables, instead of resetting per file.
+- **Secondary**: the scanner only recognises the kit's own double-quoted spelling — a hand-written `alter table orders rename to sales;` is not seen.
+
+### [F-043] The gap-2 fix is a no-op, and its test asserts the opposite of its own title — status: todo — severity: **high** — area: kit/apply + test-integrity
+- **Where**: `kit/src/core/apply.ts:215`; test at `kit/test/unit/apply.test.ts:122-133`
+- **Defect**: replacing the explicit "append record to last batch if room" with `packIntoBatches([...statements, record], MAX)` is byte-for-byte identical in every case. Measured side by side: 99 → `[100]`, 100 → `[100, 1]`, 101 → `[100, 2]`, 200 → `[100, 100, 1]` — identical for both implementations. At any exact fill the record is still alone in its own trailing batch.
+- **Failure scenario**: a 100-statement migration commits batch 1, batch 2 (the record alone) fails, the schema change is applied but unrecorded, and the next `migrate` dies on `table … already exists` — permanently stuck.
+- **The test integrity problem**: `kit/test/unit/apply.test.ts:122-133` is titled `does not push the record into its own trailing batch when the real statements fill the last batch exactly (gap 2)` and **asserts** `expect(batches[1]).toEqual([insert into "d1_migrations" …])` — i.e. it pins the behaviour its own name says is fixed.
+- **Fix**: either do the real work (shift the last singleton run into the trailing batch with the record, or reserve a slot) or withdraw the claim and rename the test to describe what it actually pins. It cannot stay as it is.
+
+### [F-044] The flagship regression test for the batch-split finding exercises nothing — status: todo — severity: **high** — area: test-integrity
+- **Where**: `kit/test/workers/migrate.test.ts:238-247`
+- **Defect**: `applyMigrations` issues `ensureMigrationsTable` as its own `batch()` first, so `calls === 2` is the *first real batch*, not the second. The migration applies zero statements, and the assertions (`rebuilt` present, one row, `Number(age) === 30`) pass against the untouched pre-migration state — `age` is still the text `'30'`. The split-across-batches failure the test is named for is never reached.
+- **Fix**: correct the off-by-one to `calls === 3`. The reviewer notes that doing so is exactly what exposed `[F-041]`, so expect this test to go red until `[F-041]` is fixed too.
+
+### [F-045] `from.startsWith('__new_')` excludes real renames, giving a third guard bypass — status: todo — severity: med — area: kit/apply
+- **Where**: `kit/src/core/apply.ts:253`
+- **Defect**: the exclusion rule cannot distinguish a rebuild's closing rename from a genuine `--rename-table` whose *source* table is named `__new_*` — a table the codebase itself acknowledges exists (`diff.ts:412`, "a real table someone genuinely named `__new_orders`").
+- **Failure scenario** (verified): for live table `__new_orders` with trigger `nn_audit`, `generate --rename-table __new_orders=orders_v2` plus a type change produces a migration where `checkForeignTriggerConflicts` does not throw, and `drop table "orders_v2"` takes the trigger. Narrow precondition, same silent-loss outcome. The non-renamed rebuild of a `__new_*` table is handled correctly — the temp name becomes `__new___new_stuff` and the guard fires.
+
+### [F-046] A *refused* rebuild now emits a statement — status: todo — severity: low — area: kit/diff
+- **Where**: `kit/src/core/diff.ts:553-559`
+- **Defect**: `recreateTable`'s contract is "no statements alongside the refusal" (`diff.ts:237-240`), but the new append-only block runs after the `recreateTable` call regardless of whether it refused, so both refusal paths emit a lone destructive `drop trigger if exists …`. Also reproduces for the pre-existing dependents refusal.
+- **Not reachable as a bad outcome** — `generate` and `push` throw on `errors` before reading `statements` — but `check` now prints a `Drift:` line for a table it simultaneously reports as blocked.
+
+### [F-047] `applyMigrations` gained an optional `onWarning` parameter and can now throw where it previously applied — status: needs-human — severity: med — area: api
+- **Where**: `kit/src/core/apply.ts:339-372`; exported from `kit/src/core/index.ts:8`
+- The parameter itself is additive, optional, and cannot break a consumer in either assignment direction. **The undisclosed change is behavioural**: `applyMigrations` now issues an extra `sqlite_master` read and can **throw** (the foreign-trigger refusal) where it previously applied. If the standing rule is "no changes to published functions", that behavioural change is covered by it, and it is the part a human should sign off on — not the parameter.
+- **Related**: `applyMigration` (singular) is also public and does **not** call the guard, so the protection is inconsistent across the two published entry points. `checkForeignTriggerConflicts` is correctly not exported.
+
+### Confirmed closed by the round-2 reviewer
+- **`[F-035]` the `pull` RCE**: no `` sql`${…}` `` or `'${…}'` interpolation of introspected text survives in `renderSchemaModule`; identifiers go through `toIdentifier`, which strips to `[A-Za-z0-9_]`. Inert against U+2028, U+2029, lone surrogates, `\\`, `\n`, `\r`, backtick, `*/`, `'))//` and `</script>`. `sql.raw('(unixepoch())')` snapshots identically to `` sql`(unixepoch())` `` — zero migration churn.
+- **`[F-036]` the append-only gate**: destructive with a reason in both the renamed and in-place transitions.
+- **`[F-034]`'s refusal is not too eager**: verified on real D1 that an append-only table still rebuilds through `migrate` with its guard re-created, and that the refusal fires on neither the kit's own guard nor a table with no triggers. Wired into `push`, `check`, `verify` and `migrate`.
+- **The gap-4 introspection saving is correct and cheap**: 0 queries when nothing rebuilds, 1 `sqlite_master` read otherwise, and that row set is everything the guard reads.
+- **The `[F-033]` leftover-`__new_X` warning** fires with both names, never emits the drop, does not fire for a `__new_*` table present in the schema, and reaches the operator on `push`, `check` and `generate`.
 
 ## Audit areas
 
