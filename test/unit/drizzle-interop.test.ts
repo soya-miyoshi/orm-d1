@@ -103,6 +103,18 @@ describe('the column surface adapters read', () => {
 			d1: sqliteTable('a', { c: text({ enum: ['x', 'y'] }) }).c,
 			dz: dz.sqliteTable('a', { c: dz.text({ enum: ['x', 'y'] }) }).c,
 		})],
+		['text()', () => ({
+			d1: sqliteTable('a', { c: text() }).c,
+			dz: dz.sqliteTable('a', { c: dz.text() }).c,
+		})],
+		["text('c')", () => ({
+			d1: sqliteTable('a', { c: text('c') }).c,
+			dz: dz.sqliteTable('a', { c: dz.text('c') }).c,
+		})],
+		["text('c', { length: 5 })", () => ({
+			d1: sqliteTable('a', { c: text('c', { length: 5 }) }).c,
+			dz: dz.sqliteTable('a', { c: dz.text('c', { length: 5 }) }).c,
+		})],
 		['text({ mode: "json" })', () => ({
 			d1: sqliteTable('a', { c: text({ mode: 'json' }) }).c,
 			dz: dz.sqliteTable('a', { c: dz.text({ mode: 'json' }) }).c,
@@ -155,6 +167,28 @@ describe('the column surface adapters read', () => {
 
 		// And the runtime value agrees, as it always did.
 		expect(roleColumn.dataType).toBe('string enum');
+
+		// `._['data']` narrows to the enum union, not the widened `string`.
+		type RoleData = (typeof roleColumn)['_']['data'];
+		const dataAssertion: AssertEqual<RoleData, 'admin' | 'member'> = true;
+		void dataAssertion;
+	});
+
+	it('infers a plain text() column as `string`, not an enum', () => {
+		// Regression: `DataTypeOf` used to compare `TEnum` (instantiated with
+		// `Writable<T>`, which strips `readonly`) against the *readonly* enum
+		// tuple, so the `Equal` check never matched and every plain `text()`
+		// column was misreported as an enum. Fixed by comparing against the
+		// mutable `[string, ...string[]]`, matching drizzle-orm's own
+		// `text.d.ts`.
+		type AssertEqual<A, B> = (<T>() => T extends A ? 1 : 0) extends (<T>() => T extends B ? 1 : 0) ? true : false;
+
+		const plainColumn = sqliteTable('plain_text', { c: text('c') }).c;
+		type PlainDataType = (typeof plainColumn)['_']['dataType'];
+		const assertion: AssertEqual<PlainDataType, 'string'> = true;
+		void assertion;
+
+		expect(plainColumn.dataType).toBe('string');
 	});
 
 	it('exposes dataType, columnType and the SQL type', () => {

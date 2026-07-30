@@ -20,7 +20,7 @@ import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots } from '../../src/core/diff.js';
 import { snapshotFromSchema } from '../../src/core/snapshot.js';
 import { allTables } from '../../../test/schema.js';
-import { check, integer, primaryKey, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
+import { check, index, integer, primaryKey, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
 
 /**
  * Declared here rather than in the shared fixture, which misses this by one
@@ -42,6 +42,10 @@ const flags = sqliteTable('flags', {
 }, (t) => [
 	uniqueIndex('flags_active_idx').on(t.name).where(sql`${t.active} = ${1}`),
 	check('flags_weight_check', sql`${t.weight} >= ${0}`),
+	// An expression index: `pragma index_info` reports this member as
+	// `{ cid: -2, name: null }`, and the `CREATE INDEX` text has to be parsed
+	// to recover `lower("name")` — see `parseIndexColumns`.
+	index('flags_lower_name_idx').on(sql`lower(${t.name})`),
 ]);
 
 const schemaTables = [...allTables, flags];
@@ -94,6 +98,55 @@ describe('schema ↔ introspection round trip', () => {
 		expect(expected.origin).toBe('schema');
 		expect(diffSnapshots(live, expected).warnings).toEqual([]);
 		expect(diffSnapshots(expected, live).warnings).toEqual([]);
+	});
+});
+
+/**
+ * `parseIndexColumns` recovers an expression index member's text from
+ * `sqlite_master`'s verbatim `CREATE INDEX` SQL, because `pragma index_info`
+ * reports an expression member as `{ cid: -2, name: null }` with no text at
+ * all. Unlike `parseChecks` in the same file, it used to scan the raw SQL
+ * directly for paren-matching and comma-splitting, so a string literal inside
+ * the expression that itself contained a `(` or a `,` desynchronised the
+ * parser — losing the expression, or truncating it — and reported permanent
+ * drift on an index that never changed.
+ */
+describe('expression indexes whose text contains a paren or comma inside a string literal', () => {
+	const literalParen = sqliteTable('literal_paren', {
+		id: integer('id').primaryKey(),
+		name: text('name').notNull(),
+	}, (t) => [index('literal_paren_idx').on(sql`replace(${t.name}, '(', '')`)]);
+
+	const literalComma = sqliteTable('literal_comma', {
+		id: integer('id').primaryKey(),
+		name: text('name').notNull(),
+	}, (t) => [index('literal_comma_idx').on(sql`${t.name} || ','`)]);
+
+	beforeEach(async () => {
+		const existing = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'table' and name not like 'sqlite_%' "
+				+ "and name not like '\\_cf\\_%' escape '\\'",
+		);
+		for (const table of existing) await DB.prepare(`drop table if exists "${table.name}"`).run();
+		for (const statement of createSchema([literalParen, literalComma])) await DB.prepare(statement).run();
+	});
+
+	it('recovers an expression containing a paren inside a string literal', async () => {
+		const live = await introspect(runner);
+		const expected = snapshotFromSchema([literalParen, literalComma]);
+
+		const columns = live.tables['literal_paren']!.indexes['literal_paren_idx']!.columns;
+		expect(columns).toEqual([{ expression: `replace("name", '(', '')`, isExpression: true }]);
+		expect(diffSnapshots(live, expected).statements).toEqual([]);
+	});
+
+	it('recovers an expression containing a comma inside a string literal', async () => {
+		const live = await introspect(runner);
+		const expected = snapshotFromSchema([literalParen, literalComma]);
+
+		const columns = live.tables['literal_comma']!.indexes['literal_comma_idx']!.columns;
+		expect(columns).toEqual([{ expression: `"name" || ','`, isExpression: true }]);
+		expect(diffSnapshots(live, expected).statements).toEqual([]);
 	});
 });
 
@@ -177,5 +230,41 @@ describe('table options against a real D1 database', () => {
 		const live = await introspect(runner);
 		expect(live.tables.ledger).toMatchObject({ strict: true, withoutRowid: false, appendOnly: true });
 		expect(live.tables.pairs).toMatchObject({ strict: true, withoutRowid: true, appendOnly: false });
+	});
+});
+
+describe('an expression unique index actually indexes the expression', () => {
+	beforeEach(async () => {
+		await DB.prepare('drop table if exists "expr_unique"').run();
+		for (
+			const statement of createSchema([
+				sqliteTable('expr_unique', {
+					id: integer('id').primaryKey(),
+					name: text('name').notNull(),
+				}, (t) => [uniqueIndex('expr_unique_lower_name_idx').on(sql`lower(${t.name})`)]),
+			])
+		) {
+			await DB.prepare(statement).run();
+		}
+	});
+
+	it('lets two rows with distinct expression values both insert', async () => {
+		// If `columns` were quoted unconditionally (the bug this guards
+		// against), the unique index would bind to the constant string
+		// `"lower(""name"")"` instead of the expression, so *every* row would
+		// collide on the same value and only one insert in the whole table
+		// would ever succeed.
+		await DB.prepare(`insert into "expr_unique" ("id", "name") values (1, 'Alice')`).run();
+		await DB.prepare(`insert into "expr_unique" ("id", "name") values (2, 'Bob')`).run();
+
+		const rows = await runner.all<{ n: number }>('select count(*) as n from "expr_unique"');
+		expect(rows[0]!.n).toBe(2);
+	});
+
+	it('still enforces uniqueness on the expression itself', async () => {
+		await DB.prepare(`insert into "expr_unique" ("id", "name") values (1, 'Alice')`).run();
+		await expect(
+			DB.prepare(`insert into "expr_unique" ("id", "name") values (2, 'ALICE')`).run(),
+		).rejects.toThrow();
 	});
 });

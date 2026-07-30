@@ -54,6 +54,85 @@ describe('diffing snapshots', () => {
 		expect(statements.every((s) => !s.destructive)).toBe(true);
 	});
 
+	it('renders an expression index member unquoted, not as a string literal', () => {
+		// Regression: every `columns` entry used to be wrapped in `quote()`
+		// unconditionally, so `index(...).on(sql\`lower(${t.email})\`)` rendered
+		// as `("lower(""email"")")` — an index on the constant string, not the
+		// expression. For a `uniqueIndex` that silently limited the table to one
+		// row.
+		const t = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [index('users_lower_email_idx').on(sql`lower(${c.email})`)]);
+
+		const { statements } = diffSnapshots(emptySnapshot(), snapshotOf(t));
+		const createIndex = statements.map((s) => s.sql).find((s) => s.includes('create index'));
+
+		expect(createIndex).toContain('(lower("email"))');
+		expect(createIndex).not.toContain('("lower(""email"")")');
+	});
+
+	it('does not report drift for an expression index whose whitespace differs from the schema', () => {
+		// `canonicalIndex` already normalises `where`'s whitespace because
+		// SQLite hands a partial index's predicate back with its own spacing.
+		// An expression *member* goes through `sqlite_master`'s verbatim
+		// `CREATE INDEX` text the same way, so a hand-written
+		// `lower( "a" )` in the database against `lower("a")` in the schema
+		// must compare equal too, not report a permanent drop/create.
+		const t = sqliteTable('spaced', {
+			id: integer('id').primaryKey(),
+			a: text('a').notNull(),
+		}, (c) => [index('spaced_lower_a_idx').on(sql`lower(${c.a})`)]);
+		const schemaSide = snapshotOf(t);
+		const liveSide: Snapshot = {
+			...schemaSide,
+			origin: 'introspection',
+			tables: {
+				spaced: {
+					...schemaSide.tables['spaced']!,
+					indexes: {
+						...schemaSide.tables['spaced']!.indexes,
+						spaced_lower_a_idx: {
+							...schemaSide.tables['spaced']!.indexes['spaced_lower_a_idx']!,
+							columns: [{ expression: 'lower( "a" )', isExpression: true }],
+						},
+					},
+				},
+			},
+		};
+
+		expect(diffSnapshots(liveSide, schemaSide).statements).toEqual([]);
+	});
+
+	it('reads an old-shape index snapshot (plain string columns) without reporting drift', () => {
+		// Before `IndexColumnSnapshot`, `columns` was `readonly string[]`.
+		// A snapshot on disk from before this change still has that shape, and
+		// reading it must not itself look like the index changed.
+		const t = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [uniqueIndex('users_email_idx').on(c.email)]);
+
+		const fresh = snapshotOf(t);
+		const oldShape: Snapshot = {
+			...fresh,
+			tables: {
+				users: {
+					...fresh.tables['users']!,
+					indexes: {
+						users_email_idx: {
+							...fresh.tables['users']!.indexes['users_email_idx']!,
+							columns: ['email'],
+						},
+					},
+				},
+			},
+		};
+
+		expect(diffSnapshots(oldShape, fresh).statements).toEqual([]);
+		expect(diffSnapshots(fresh, oldShape).statements).toEqual([]);
+	});
+
 	it('drops a removed table, and marks it destructive', () => {
 		const t = sqliteTable('gone', { id: integer('id').primaryKey() });
 		const { statements } = diffSnapshots(snapshotOf(t), emptySnapshot());
@@ -202,6 +281,13 @@ describe('diffing snapshots', () => {
 		const t = sqliteTable('ct2', {
 			id: text('id').primaryKey(),
 			amount: customType<string>({ dataType: () => 'varchar(10)' })('amount'),
+			// `'int'` is the case that actually distinguishes the old substring
+			// rule from `affinityOf`'s real rules: the old rule's `.find()` over
+			// `['integer', 'text', 'real', 'blob', 'numeric']` never matches
+			// `'int'` as a substring of any of those five (it's a substring of
+			// `'integer'`, not the other way around) and falls back to `'text'`,
+			// while `affinityOf('int')` correctly says `'integer'`.
+			flag: customType<string>({ dataType: () => 'int' })('flag'),
 		});
 		const fresh = snapshotOf(t);
 		const preExisting: Snapshot = {
@@ -220,6 +306,87 @@ describe('diffing snapshots', () => {
 		};
 
 		expect(diffSnapshots(preExisting, fresh).statements).toEqual([]);
+	});
+
+	it('does not rebuild a genuinely 0.1.3-shaped snapshot whose type disagrees only under the old substring rule', () => {
+		// Unlike the test above (which strips `declaredType` from a *freshly
+		// computed* snapshot, so `type` was already derived by the new rule),
+		// this hand-constructs what an actual pre-upgrade (0.1.3) snapshot
+		// looked like: `type` computed by the OLD substring rule
+		// (`.find()` over `['integer', 'text', 'real', 'blob', 'numeric']`,
+		// `'text'` fallback), no `declaredType` field at all. For
+		// `customType(() => 'int')`, the old rule recorded `'text'` (`'int'`
+		// matches none of the five candidates as a substring); the current
+		// schema's real affinity is `'integer'`. That disagreement must not be
+		// reported as a type change.
+		const t = sqliteTable('ct_legacy', {
+			id: text('id').primaryKey(),
+			amount: customType<string>({ dataType: () => 'int' })('amount'),
+		});
+		const fresh = snapshotOf(t);
+		const legacy: Snapshot = {
+			...fresh,
+			tables: {
+				ct_legacy: {
+					...fresh.tables['ct_legacy']!,
+					columns: {
+						...fresh.tables['ct_legacy']!.columns,
+						amount: {
+							...fresh.tables['ct_legacy']!.columns['amount']!,
+							type: 'text',
+							declaredType: undefined,
+						},
+					},
+				},
+			},
+		};
+
+		expect(diffSnapshots(legacy, fresh).statements).toEqual([]);
+	});
+
+	it('reports real drift between a live TEXT column and a schema customType declaring int', () => {
+		// The legacy hatch above only exists to keep a *pre-declaredType*
+		// snapshot from looking like drift against itself. Since
+		// `snapshotFromIntrospection` now stamps `declaredType` with the raw
+		// spelling `table_xinfo` reports (see `kit/src/core/introspect.ts`), a
+		// live snapshot always carries one — so a column that is genuinely
+		// TEXT in the database, compared against a schema that declares it
+		// `customType(() => 'int')`, must still be reported as a type change
+		// rather than silently swallowed by the legacy substring rule.
+		const schemaSide = snapshotOf(sqliteTable('drift', {
+			id: text('id').primaryKey(),
+			amount: customType<string>({ dataType: () => 'int' })('amount'),
+		}));
+		const liveSide: Snapshot = {
+			...schemaSide,
+			origin: 'introspection',
+			tables: {
+				drift: {
+					...schemaSide.tables['drift']!,
+					columns: {
+						...schemaSide.tables['drift']!.columns,
+						amount: { ...schemaSide.tables['drift']!.columns['amount']!, type: 'text', declaredType: 'text' },
+					},
+				},
+			},
+		};
+
+		const { statements } = diffSnapshots(liveSide, schemaSide);
+		expect(statements.length).toBeGreaterThan(0);
+		expect(statements.some((s) => s.reason?.includes('changes type'))).toBe(true);
+	});
+
+	it('still reports a genuine type change between two declaredType-carrying snapshots', () => {
+		const before = snapshotOf(sqliteTable('ct_changed', {
+			id: text('id').primaryKey(),
+			amount: customType<string>({ dataType: () => 'int' })('amount'),
+		}));
+		const after = snapshotOf(sqliteTable('ct_changed', {
+			id: text('id').primaryKey(),
+			amount: customType<string>({ dataType: () => 'text' })('amount'),
+		}));
+
+		expect(diffSnapshots(before, after).statements.length).toBeGreaterThan(0);
 	});
 
 	it('does not rebuild for a single-column table-level primary key', () => {

@@ -233,6 +233,53 @@ The whole batch is revertible as one unit: `git revert -m 1 15f24ef`.
 - `src/schema/columns.ts:48,233` — `isLengthExact` is declared and exposed but never assigned by any column factory, so it is permanently `undefined`. That happens to match Drizzle for SQLite (only `pg-core`/`cockroach-core` set it), so `[F-007]`'s new test passes for a reason unrelated to the getter; it is dead weight in the shipped bundle.
 - `test/unit/ddl.test.ts:141` — the pre-existing `expect(createTable(t)).toContain('"short" text')` now passes against `"short" text(10)`; the assertion survived a behaviour change without noticing it. A `toContain` where an equality belongs.
 
+## Findings — efficiency + bugs lens (iteration 2)
+
+**Batch composition, iteration 2.** The eight highest-severity implementable items went to
+the coder: `[F-017]`, `[F-018]`, `[F-019]`, `[F-020]`, `[F-021]` (carried from iteration 1's
+unresolved rejection) plus `[F-024]`, `[F-025]`, `[F-026]` (new). **Deferred from this
+iteration for batch size**, not because they were judged unimportant: `[F-022]`
+(case-sensitive rowid-alias test), `[F-023]` (three minor items), `[F-014]` (interop tests
+assert against constants), `[F-015]` (FK derived name), `[F-016]` (`through` holds raw
+columns). They stay `todo` and the next efficiency + bugs iteration owns them.
+
+### [F-024] Expression indexes are quoted as identifiers — the kit emits an index on a constant string — status: todo — severity: high — area: kit/diff
+- **Where**: `kit/src/core/snapshot.ts:312` (`createIndexFromSnapshot`), fed by `kit/src/core/snapshot.ts:189` and `kit/src/core/introspect.ts:282`
+- **Defect**: `IndexSnapshot.columns` is a flat `readonly string[]` that cannot say whether an entry is an identifier or an expression. `snapshotFromSchema` writes `renderInline(chunk)` into it for a non-column entry and `createIndexFromSnapshot` then wraps every entry in `quote()`.
+- **Failure scenario**: `index('users_lower_email_idx').on(sql\`lower(${t.email})\`)`. `src/ddl.ts:300` (the *other* emitter) gets it right; `d1zzle-migrate generate` emits `create index "users_lower_email_idx" on "users" ("lower(""email"")")`. SQLite's double-quoted-string-literal fallback makes that an index on the constant `'lower("email")'` — created, named, listed in `sqlite_master`, and never used (`SCAN t` vs `SEARCH t USING INDEX good (<expr>=?)`, verified on D1). The `uniqueIndex` variant is worse: every row hashes to the same constant, so the second insert gives `UNIQUE constraint failed` — a migration after which the table accepts exactly one row.
+- **Second half**: `pragma index_info` reports an expression member as `{seqno:0, cid:-2, name:null}` and `introspect.ts:282` filters `null` out, so an expression index introspects as `columns: []`. Against a correctly-built database `check` exits non-zero forever and `push` runs `drop index` + recreate-the-constant-one — and `drop index` is marked `destructive: false`, so `--accept-data-loss` is not required. `pull` then renders `index('…').on()` with no columns (`kit/src/node/commands.ts:360`), a schema module that cannot compile back to valid DDL.
+- **Fix**: `IndexSnapshot.columns` must carry the distinction — drizzle-kit's own snapshot stores `{ expression, isExpression }` per entry, and matching it keeps the import story. `createIndexFromSnapshot` quotes only when `!isExpression`; `snapshotFromSchema:189` sets `isExpression: !isColumn(c)`; `snapshotFromIntrospection` recovers the expression text from `sqlite_master.sql` (the column list between the `(` after `on "<table>"` and its matching paren — the same source `parseIndexWhere` already reads) instead of dropping `null` members.
+- **Prove it**: add `index('flags_lower_name_idx').on(sql\`lower(${t.name})\`)` to the `flags` fixture in `kit/test/workers/roundtrip.test.ts` — the existing `expect(diffSnapshots(live, expected).statements).toEqual([])` fails immediately. Plus a `kit/test/unit/diff.test.ts` assertion that the statement contains `(lower("email"))` and not `("lower(""email"")")`. The current fixtures and the `fuzz.test.ts` generator only ever produce column-list indexes, which is why this survived.
+
+### [F-025] The relational child chunker undercounts reserved parameters — `too many SQL variables` at the default budget — status: todo — severity: high — area: relations
+- **Where**: `src/relations/query.ts:596`
+- **Defect**: `reserved` counts the child's `where`, the relation's declared `where`, and the window bounds, then sizes each key chunk to `$maxParams - reserved`. The child's `orderBy` and `extras` bind into the *same* statement and are not counted, so the chunk it computes overflows the budget it was computed from. The comment directly above the calculation names exactly this hazard for `where` and the window bounds, then omits the two other places `#run` binds.
+- **Failure scenario**: default `maxParams: 100`, a composite two-column relation key, 50 parents, and a nested `orderBy` that interpolates one value gives `D1_ERROR: too many SQL variables` — 50 × 2 key params + 1 = 101, because `maxKeys` was 50 with `reserved` at 0. The whole `findMany` throws. Same for `extras` (`Object.assign(selection, resolveExtras(...))` at `query.ts:427`).
+- **Fix**: count them the same way `childFilter` is counted, in `#fetchChild` before `budget` — a `chunksOf` helper reducing `render(c, renderContextOf(this.db)).params.length` over `resolveOrderBy(entry.config.orderBy, targetColumns)` and `Object.values(resolveExtras(entry.config.extras, targetColumns))`. Both resolvers are module-scope in the same file and take exactly those arguments; double-invoking a callback is the cost the code already accepts for `compileFilter` ("Rendering the filters twice … is cheap next to the round trip it protects").
+- **Prove it**: `test/workers/relations.test.ts`, in the existing `composite-key relations` block — 50 parents, default `maxParams`, a nested `orderBy` callback interpolating one value; assert the query resolves and that no statement's parameter count exceeds `$maxParams`.
+
+### [F-026] `introspect()` issues `1 + 3T + I` sequential round trips — status: todo — severity: med — area: kit/efficiency
+- **Where**: `kit/src/core/apply.ts:44-58`
+- **Defect**: the per-table pragmas are `await`ed one at a time inside a `for` loop, and `pragma index_info` is `await`ed once per index inside that. Instrumented against the 3-table fixture: 16 queries for 3 tables and 6 indexes, confirming the formula.
+- **Failure scenario**: a 64-table schema with ~3 indexes per table (counting the `sqlite_autoindex_*` entries every `UNIQUE`/composite PK creates, which `index_list` returns and this loop dutifully probes) is `1 + 192 + 192 ≈ 385` sequential POSTs to the Cloudflare API — `remoteRunner.all` is one `fetch` per call (`kit/src/node/runners.ts:157`). At a ~120 ms round trip that is ~46 s of wall clock for a single `d1zzle-migrate check --remote`, per CI run, and again for `push --remote` and `pull --remote`. There is no dependency between tables, and none between the `index_info` calls within a table.
+- **Fix**: two dependent waves instead of `3T + I` serial trips — `Promise.all` over tables, and inside each table `Promise.all` over `[table_xinfo, foreign_key_list, index_list]` then `Promise.all` over that table's `index_info` calls. `SqlRunner.all` is already `async`; `localRunner` is synchronous underneath so `Promise.all` costs it nothing, and the workerd test runner is concurrency-safe. Nothing in `core/` changes shape, so the Node-free constraint holds.
+- **Prove it**: a `kit/test/workers` case wrapping `SqlRunner.all` in a counter that also records concurrency depth — assert the number of *sequential waves* is O(1) rather than O(tables). Today the harness records 16 strictly serial calls for 3 tables.
+
+### [F-027] `pull` emits introspected text straight into template literals — status: todo — severity: low — area: kit/node — lens: security (OFF-LENS from efficiency + bugs)
+- **Where**: `kit/src/node/commands.ts:335,339,391`
+- **Defect**: `.default(sql\`${column.default}\`)`, `check('${c.name}', sql\`${c.value}\`)` and `sqliteTable('${table.name}'` interpolate live database text into generated source. A backtick or `${` in a check expression, a default, or a table name produces a schema module that does not parse. Contrived to hit, but `uniqueIdentifier` right below it exists precisely because "files that do not compile, from a command whose whole job is to write one" is treated as a bug class here.
+
+### [F-028] Index name recovered by regexing the rendered `CREATE INDEX` — status: todo — severity: low — area: kit/diff
+- **Where**: `kit/src/core/snapshot.ts:184-186`
+- **Defect**: recovers an index's name by rendering the full statement (including `renderInline` of the partial-index predicate) and regexing the name back out, when `indexName(extra.meta, name)` is exported from `src/schema/constraints.ts` and already imported by its two siblings (`foreignKeyName`, `uniqueConstraintName`) in the same import statement. Not a live defect; a fragile derivation next to two direct ones.
+
+### Dropped by the reviewer after investigation (no failure scenario) — do not re-file
+- `lowerIn` in `src/better-auth.ts:169` builds an unbounded `in (…)` with no budget check, unlike `inArray` — unreachable, `mode: 'insensitive'` appears nowhere in `better-auth`'s shipped `dist`.
+- `compileInsert`'s per-row `Object.keys(columns).filter(...)` and `last.fields.join(...)` (`src/plan/compile.ts:446,456`) are hoistable, but a 500-row × 20-column insert compiles in 2.87 ms total, on a path that ends in a 100-statement `batch()`.
+- `readRow`'s per-row closure allocation on the nested mapper path (`src/plan/mapper.ts:151,163`) — real but sub-microsecond against the RPC.
+- `alter table … add column … references … default 'x'` is accepted by D1, so `isAddable` needs no extra guard.
+- A kitchen-sink round trip (composite FK with `on delete set null`/`on update cascade`, `customType` declared type, enum text, `numeric` default, `sql` default, a default containing a quote, partial index, unique index, table-level unique, check) drifts by **zero** statements. The diff engine is solid; expression indexes are the hole.
+
 ## Audit areas
 
 Unchecked areas, roughly in descending order of what a bug there would cost. One

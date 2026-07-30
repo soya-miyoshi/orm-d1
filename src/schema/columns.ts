@@ -331,7 +331,15 @@ export class ColumnBuilder<M extends ColumnMeta = ColumnMeta> {
 		return this.with({ notNull: true });
 	}
 
-	primaryKey(options?: { autoIncrement?: boolean }): ColumnBuilder<M & { notNull: true; hasDefault: true }> {
+	// Only integer builders are SQLite's rowid alias and thus defaultable —
+	// matches Drizzle's `ColumnBuilder.primaryKey()`, which gates `HasDefault`
+	// on `TExtraConfig['primaryKeyHasDefault']` (set only by its integer
+	// builder). The runtime `hasDefault` value below already accounts for
+	// customType columns whose declared type isn't the literal `integer`
+	// spelling — this only narrows the *type*.
+	primaryKey(
+		options?: { autoIncrement?: boolean },
+	): ColumnBuilder<M & { notNull: true } & (M['columnType'] extends 'SQLiteInteger' | 'SQLiteTimestamp' | 'SQLiteBoolean' ? { hasDefault: true } : unknown)> {
 		return this.with({
 			primaryKey: true,
 			notNull: true,
@@ -456,7 +464,7 @@ type DataTypeOf<CT extends DrizzleColumnType, TEnum extends readonly string[] | 
 	// check and misreport "no enum" as an enum. Exact equality against that
 	// specific fallback tuple is the only thing that tells the two apart,
 	// matching `drizzle-orm/sqlite-core`'s own `Equal<TEnum, [string, ...string[]]>`.
-	: CT extends 'SQLiteText' ? (Equal<TEnum, readonly [string, ...string[]]> extends true ? 'string' : 'string enum')
+	: CT extends 'SQLiteText' ? (Equal<TEnum, [string, ...string[]]> extends true ? 'string' : 'string enum')
 	: CT extends 'SQLiteTextJson' | 'SQLiteBlobJson' ? 'object json'
 	: CT extends 'SQLiteBlobBuffer' ? 'object buffer'
 	: CT extends 'SQLiteNumeric' ? 'string numeric'
