@@ -73,7 +73,34 @@ describe('insert compilation', () => {
 			.onConflictDoUpdate({ target: users.email, set: { name: 'x' }, where: eq(users.active, true) })
 			.compile();
 
-		expect(upsert.sql).toContain('on conflict ("email") do update set "name" = ? where "users"."active" = ?');
+		// `updatedAt` carries `$onUpdate`, so the update half of the upsert must
+		// fold it in exactly as `update().set()` does — otherwise the conflict
+		// path silently keeps a stale `updated_at` forever. This assertion used
+		// to stop at `"name" = ?`, which is the bug: it passed only because the
+		// $onUpdate column was never considered.
+		expect(upsert.sql).toContain(
+			'on conflict ("email") do update set "name" = ?, "updated_at" = ? where "users"."active" = ?',
+		);
+	});
+
+	it('folds $onUpdate columns into the do-update-set half of an upsert', () => {
+		const compiled = query.insert(users).values({ email: 'a@b.c' })
+			.onConflictDoUpdate({ target: users.email, set: { name: 'x' } })
+			.compile();
+
+		expect(compiled.sql).toContain('on conflict ("email") do update set "name" = ?, "updated_at" = ?');
+	});
+
+	it('does not fold $onUpdate columns into onConflictDoNothing or an empty conflict set', () => {
+		expect(
+			query.insert(users).values({ email: 'a@b.c' }).onConflictDoNothing().compile().sql,
+		).toContain('on conflict do nothing');
+
+		const empty = query.insert(users).values({ email: 'a@b.c' })
+			.onConflictDoUpdate({ target: users.email, set: {} })
+			.compile();
+		expect(empty.sql).toContain('on conflict ("email") do nothing');
+		expect(empty.sql).not.toContain('do update set');
 	});
 
 	it('falls back to do nothing when the conflict set has nothing to assign', () => {

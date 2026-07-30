@@ -122,11 +122,17 @@ export const resetCasing = (): void => {
 
 export const getCasing = (): 'preserve' | 'snake_case' => casingMode;
 
+/**
+ * Matches Drizzle's `toSnakeCase` (`drizzle-orm/casing.js`) exactly, rather
+ * than a from-scratch regex pair: this is the one place where "the same
+ * output as Drizzle" is the entire spec, since a schema ported from Drizzle
+ * with `casing: 'snake_case'` has to resolve to identical column names or
+ * every query against the existing database fails with "no such column".
+ */
 const toSnakeCase = (name: string): string =>
-	name
-		.replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-		.replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
-		.toLowerCase();
+	(name.replace(/['’]/g, '').match(/[\da-z]+|[A-Z]+(?![a-z])|[A-Z][\da-z]+/g) ?? [])
+		.map((w) => w.toLowerCase())
+		.join('_');
 
 export const applyCasing = (name: string): string => {
 	// Latched here rather than in `Column.name`, so every path that resolves a

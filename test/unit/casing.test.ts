@@ -6,7 +6,8 @@
  * throw at the point of the mistake.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { configureCasing, resetCasing } from '../../src/schema/columns.js';
+import { toSnakeCase as drizzleToSnakeCase } from 'drizzle-orm/casing';
+import { applyCasing, configureCasing, isColumn, resetCasing } from '../../src/schema/columns.js';
 import { integer, sqliteTable, text } from '../../src/index.js';
 
 afterEach(() => resetCasing());
@@ -42,5 +43,54 @@ describe('configureCasing', () => {
 		// Redundant, but not a mistake: the names it would produce are the ones
 		// already handed out.
 		expect(() => configureCasing('preserve')).not.toThrow();
+	});
+
+	// Asserted against `toSnakeCase` imported from the real `drizzle-orm`
+	// package rather than a literal: a previous finding ([F-014]) records that
+	// asserting against constants read off the implementation is what let two
+	// snake_case disagreements ship unnoticed. Verified this import resolves
+	// (drizzle-orm/casing, re-exported from the package root's dist layout).
+	it('matches drizzle-orm\'s toSnakeCase exactly, including the cases the old regex pair disagreed on', () => {
+		configureCasing('snake_case');
+		// `explicitName` (the `text('column_name')` form) bypasses casing
+		// entirely, so this exercises only the field-key path — the same path
+		// `applyCasing`/`toSnakeCase` cover for arbitrary strings below.
+		const t = sqliteTable('t', {
+			apiV2: text(),
+			formatV3: text(),
+			utf8MB4: text(),
+			_id: text(),
+			__typename: text(),
+			firstName: text(),
+			userID: text(),
+			HTTPServer: text(),
+			emailVerified: text(),
+			oauth2Token: text(),
+			myURLPath: text(),
+			ABCDef: text(),
+			iOS: text(),
+			fooBAR: text(),
+		});
+
+		for (const [key, column] of Object.entries(t)) {
+			if (!isColumn(column)) continue;
+			expect(column.name).toBe(drizzleToSnakeCase(key));
+		}
+
+		// The specific disagreements the fix closed, spelled out explicitly.
+		expect(t.apiV2.name).toBe('api_v_2');
+		expect(t.formatV3.name).toBe('format_v_3');
+		expect(t.utf8MB4.name).toBe('utf8_mb_4');
+		expect(t._id.name).toBe('id');
+		expect(t.__typename.name).toBe('typename');
+	});
+
+	it('matches drizzle-orm\'s toSnakeCase for strings not reachable as a JS identifier field key', () => {
+		configureCasing('snake_case');
+		for (const input of ['user’sName', '__typename', 'some name', "user's Name"]) {
+			expect(applyCasing(input)).toBe(drizzleToSnakeCase(input));
+		}
+		expect(applyCasing('user’sName')).toBe('users_name');
+		expect(applyCasing('some name')).toBe('some_name');
 	});
 });

@@ -359,6 +359,54 @@ describe('the surface a subquery exposes', () => {
 	});
 });
 
+describe('explicit selections over an outer join', () => {
+	const on = eq(posts.authorId, users.id);
+
+	it('collapses a nested group from the nullable side to null, not an object of nulls', () => {
+		const c = query.select({
+			u: { id: users.id, name: users.name },
+			p: { id: posts.id, title: posts.title },
+		}).from(users).leftJoin(posts, on).compile();
+
+		expect(c.map([[1, 'alice', null, null]])[0]!.p).toBeNull();
+		expect(c.map([[1, 'alice', null, null]])[0]!.u).not.toBeNull();
+	});
+
+	it('does not collapse a group over an innerJoin', () => {
+		const c = query.select({
+			u: { id: users.id, name: users.name },
+			p: { id: posts.id, title: posts.title },
+		}).from(users).innerJoin(posts, on).compile();
+
+		expect(c.map([[1, 'alice', null, null]])[0]!.p).toEqual({ id: null, title: null });
+	});
+
+	it('does not collapse a group mixing columns from two tables', () => {
+		const c = query.select({
+			mixed: { userId: users.id, postId: posts.id },
+		}).from(users).leftJoin(posts, on).compile();
+
+		expect(c.map([[1, null]])[0]!.mixed).toEqual({ userId: 1, postId: null });
+	});
+
+	it('does not collapse a group containing a sql expression', () => {
+		const c = query.select({
+			p: { id: posts.id, upper: sql<string>`upper(${posts.title})` },
+		}).from(users).leftJoin(posts, on).compile();
+
+		expect(c.map([[null, null]])[0]!.p).toEqual({ id: null, upper: null });
+	});
+
+	it('does not collapse a group from the non-nullable side of the join', () => {
+		const c = query.select({
+			u: { id: users.id, name: users.name },
+			p: { id: posts.id, title: posts.title },
+		}).from(users).leftJoin(posts, on).compile();
+
+		expect(c.map([[1, 'alice', null, null]])[0]!.u).toEqual({ id: 1, name: 'alice' });
+	});
+});
+
 describe('inArray strategy', () => {
 	it('binds blob values instead of routing them through json_each', () => {
 		// `JSON.stringify(new Uint8Array([1]))` is `{"0":1}`, which matches

@@ -137,6 +137,22 @@ const tableSelection = (t: Table): Selection => getTableColumns(t) as unknown as
 const inheritedNullable = (t: Table, prefix: string): string[] =>
 	[...getTableNullableGroups(t)].map((path) => (prefix ? `${prefix}.${path}` : path));
 
+/**
+ * The tables (keyed by their in-plan name — post-alias) whose columns an
+ * outer/full join can turn into a row of `null`s. Shared by the implicit
+ * per-table grouping below and by `explicitNullableGroups`, which needs the
+ * same set to decide whether a hand-written nested group can collapse.
+ */
+const nullableTables = (plan: SelectPlan): Set<string> => {
+	const tables = new Set<string>();
+	if (!plan.from) return tables;
+	for (const join of plan.joins) {
+		if (join.type === 'left' || join.type === 'full') tables.add(getTableName(join.table));
+		if (join.type === 'right' || join.type === 'full') tables.add(getTableName(plan.from));
+	}
+	return tables;
+};
+
 const implicitSelection = (plan: SelectPlan): { selection: Selection; nullable: Set<string> } => {
 	const nullable = new Set<string>();
 	if (!plan.from) return { selection: {}, nullable };
@@ -151,15 +167,51 @@ const implicitSelection = (plan: SelectPlan): { selection: Selection; nullable: 
 	const selection: Record<string, Selection> = {
 		[getTableName(plan.from)]: tableSelection(plan.from),
 	};
+	const nullableGroupNames = nullableTables(plan);
 	for (const path of inheritedNullable(plan.from, getTableName(plan.from))) nullable.add(path);
 	for (const join of plan.joins) {
 		const name = getTableName(join.table);
 		selection[name] = tableSelection(join.table);
 		for (const path of inheritedNullable(join.table, name)) nullable.add(path);
-		if (join.type === 'left' || join.type === 'full') nullable.add(name);
-		if (join.type === 'right' || join.type === 'full') nullable.add(getTableName(plan.from));
 	}
+	for (const name of nullableGroupNames) nullable.add(name);
 	return { selection, nullable };
+};
+
+/**
+ * The same collapsing `implicitSelection` derives for its per-table groups,
+ * computed instead for a hand-written nested projection: for each depth-1
+ * group whose leaves are all bare columns from exactly one table, and that
+ * table is on the nullable side of an outer/full join, the group's path
+ * collapses to `null` rather than materialising as an object of nulls.
+ *
+ * Deliberately conservative — a group mixing columns from two tables, one
+ * containing a `sql` expression, or over an `innerJoin`, is left alone and
+ * always returns an object.
+ */
+const explicitNullableGroups = (plan: SelectPlan): Set<string> => {
+	const groups = new Set<string>();
+	if (!plan.selection) return groups;
+	const nullable = nullableTables(plan);
+	if (nullable.size === 0) return groups;
+	for (const [key, entry] of Object.entries(plan.selection)) {
+		if (!isSelectionObject(entry)) continue;
+		const leaves = flattenSelection(entry, [key]);
+		if (leaves.length === 0) continue;
+		const tableNames = new Set<string>();
+		let allColumns = true;
+		for (const leaf of leaves) {
+			if (!leaf.column) {
+				allColumns = false;
+				break;
+			}
+			tableNames.add(leaf.column.tableName);
+		}
+		if (!allColumns || tableNames.size !== 1) continue;
+		const [tableName] = tableNames;
+		if (tableName && nullable.has(tableName)) groups.add(key);
+	}
+	return groups;
 };
 
 /**
@@ -198,12 +250,13 @@ export interface ProjectedColumn {
  * `projectedColumns` reports — what `.as()` has to carry so the property
  * survives being read back out of a subquery.
  *
- * An explicit selection has none: nothing today marks a hand-written projection
- * nullable, so a `db.select({ p: { … } })` over a left join is an object of
- * nulls both directly and through `.as()`. Consistent, and unchanged here.
+ * An explicit selection collapses too, via `explicitNullableGroups`: a
+ * depth-1 group whose leaves are all bare columns from one table on the
+ * nullable side of an outer/full join returns `null` rather than an object
+ * of nulls, same as the implicit per-table grouping.
  */
 export const projectedNullableGroups = (plan: SelectPlan): ReadonlySet<string> =>
-	plan.selection === undefined ? implicitSelection(plan).nullable : new Set<string>();
+	plan.selection === undefined ? implicitSelection(plan).nullable : explicitNullableGroups(plan);
 
 export const projectedColumns = (plan: SelectPlan): readonly ProjectedColumn[] => {
 	const selection = plan.selection ?? implicitSelection(plan).selection;
@@ -335,7 +388,7 @@ const sealed = <TRow>(query: CompiledQuery<TRow>, ctx: RenderContext): CompiledQ
 export function compileSelect<TRow>(plan: SelectPlan, ctx: RenderContext): CompiledQuery<TRow> {
 	const implicit = plan.selection === undefined ? implicitSelection(plan) : undefined;
 	const selection = plan.selection ?? implicit!.selection;
-	const nullableGroups = implicit?.nullable ?? new Set<string>();
+	const nullableGroups = implicit?.nullable ?? explicitNullableGroups(plan);
 	const leaves = flattenSelection(selection);
 	if (leaves.length === 0) throw new CompileError('A select must project at least one column.');
 
@@ -524,6 +577,26 @@ const definedValues = (
 	return Object.keys(out).length > 0 ? out : undefined;
 };
 
+/**
+ * Fold `$onUpdate` columns into a set of values, the same way both the update
+ * half of `update().set()` and the update half of an upsert need to: any
+ * column with `onUpdateFn` that the caller did not already set gets its
+ * generator chunk added. Drizzle routes both through the same `buildUpdateSet`
+ * (`drizzle-orm/sqlite-core/dialect.js`); this is the shared equivalent.
+ */
+const withOnUpdate = (
+	values: Record<string, unknown>,
+	columns: Record<string, Column<any>>,
+): Record<string, unknown> => {
+	const out: Record<string, unknown> = { ...values };
+	for (const [field, column] of Object.entries(columns)) {
+		if (column.config.onUpdateFn && out[field] === undefined) {
+			out[field] = { toQuery: () => ({ sql: '?', params: [{ k: 'fn', fn: column.config.onUpdateFn!, encode: column.config.encode }] }) } satisfies SQLChunk;
+		}
+	}
+	return out;
+};
+
 const writeOnConflict = (
 	writer: Writer,
 	conflict: NonNullable<InsertPlan['onConflict']>,
@@ -542,13 +615,16 @@ const writeOnConflict = (
 	// values are all undefined has nothing to assign and used to render the
 	// invalid `do update set `. There is a sensible answer here that there is
 	// not for `update()` — an upsert with nothing to update is `do nothing`.
+	// That decision is made on the user's own set alone — $onUpdate columns are
+	// folded in only after we already know we're emitting `do update set`, so an
+	// empty user set still yields `do nothing`.
 	const assignments = definedValues(conflict.set);
 	if (conflict.doNothing || !assignments) {
 		writer.text(' do nothing');
 		return;
 	}
 	writer.text(' do update set ');
-	writeAssignments(writer, assignments, columns);
+	writeAssignments(writer, withOnUpdate(assignments, columns), columns);
 	if (conflict.setWhere) writer.text(' where ').chunk(conflict.setWhere);
 	void ctx;
 };
@@ -575,13 +651,7 @@ export function compileUpdate<TRow>(plan: UpdatePlan, ctx: RenderContext): Compi
 	// is how conditional updates get written. Keeping the key produced a
 	// non-empty `set` object whose assignments all rendered to nothing, so the
 	// statement came out as the invalid `update "t" set `.
-	const values: Record<string, unknown> = { ...definedValues(plan.set) };
-
-	for (const [field, column] of Object.entries(columns)) {
-		if (column.config.onUpdateFn && values[field] === undefined) {
-			values[field] = { toQuery: () => ({ sql: '?', params: [{ k: 'fn', fn: column.config.onUpdateFn!, encode: column.config.encode }] }) } satisfies SQLChunk;
-		}
-	}
+	const values = withOnUpdate(definedValues(plan.set) ?? {}, columns);
 	if (Object.keys(values).length === 0) throw new CompileError('update().set({}) has nothing to set.');
 
 	writer.text(`update ${quoteIdentifier(getTableName(plan.table))} set `);
