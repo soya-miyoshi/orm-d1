@@ -196,7 +196,7 @@ are the reviewer's objections, recorded verbatim because they are now claims abo
 closed one hole and opened another — and are the highest-value work available to any lens.
 The whole batch is revertible as one unit: `git revert -m 1 15f24ef`.
 
-### [F-017] The `text()` enum fix inverts the mismatch it closed: every plain `text()` column now types as `'string enum'` — status: todo — severity: high — area: drizzle-compat — REGRESSION
+### [F-017] The `text()` enum fix inverts the mismatch it closed: every plain `text()` column now types as `'string enum'` — status: done (`516dbd5`) — severity: high — area: drizzle-compat — REGRESSION
 - **Where**: `src/schema/columns.ts:459`
 - **Defect**: `DataTypeOf` compares against the **readonly** tuple, but `Meta` is instantiated with `Writable<T>`, which strips `readonly`. Drizzle's own `text.d.ts:9` compares against the **mutable** `[string, ...string[]]`, matching the `SQLiteTextBuilder<Writable<T>>` it passes. For `text('c')` the uninferred `T` falls back to `Readonly<[U, ...U[]]>`, so `TEnum` = `[string, ...string[]]`, which is *not* `Equal` to the readonly target → `'string enum'`. The runtime correctly says `'string'`.
 - **Failure scenario**: through the reverse-alias path `docs/08` exists to protect — `createSelectSchema(aliased).shape.email` is `ZodEnum<{[x: string]: string}>` where Drizzle gives `ZodString` (`drizzle-orm/zod/column.types.d.ts:23` branches on `constraint extends 'enum'`). At runtime the adapter reads `'string'` and builds a `z.string()`, so `.shape.email.options` type-checks and is `undefined` at execution. The same wrong branch reaches Pothos and drizzle-graphql via `_['dataType']`. Confirmed for `text('c')`, `text('c', { length: 5 })` and `text()`.
