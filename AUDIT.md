@@ -8,6 +8,7 @@ Baseline at sweep start: **green, 565 passed / 4 skipped**.
 After the feature iteration (`15f24ef`): **green, 594 passed / 4 skipped**.
 After the efficiency + bugs iteration (`516dbd5`): **green, 616 passed / 4 skipped**.
 After the security iteration (`60ff73f`): **green, 644 passed / 4 skipped**.
+After the iteration-4 feature pass (`91de9e1`): **green, 659 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
 
 ## Rotation
 
@@ -15,8 +16,12 @@ One lens per iteration, rotating `feature` → `efficiency + bugs` → `security
 Advanced in every terminal case, including blocked and nothing-found, so a lens that keeps
 failing cannot starve the other two.
 
-- Next lens: **feature**
-- Last ran: security — 2026-07-30, merged `60ff73f` **over an unresolved round-2 rejection**.
+- Next lens: **efficiency + bugs**
+- Last ran: feature — 2026-07-30, merged `91de9e1` **over an unresolved round-2 rejection**.
+  Three `COMPAT-DEFECT`s closed (`$onUpdate` in upserts, nullable-group collapsing, Drizzle's
+  exact `snake_case`). Open from it: `[F-055]` (a regression — a `CompileError` that fires on
+  queries which used to work, at the default budget), `[F-056]`, `[F-057]`, `[F-058]`, `[F-059]`.
+- Ran before that: security — 2026-07-30, merged `60ff73f` **over an unresolved round-2 rejection**.
   Four findings; the round-2 reviewer confirmed the `pull` RCE (`[F-035]`) and the
   append-only gate (`[F-036]`) genuinely closed and rejected on six further points.
   `[F-043]` and `[F-044]` are misleading tests now on `main` and should be fixed before the
@@ -453,14 +458,14 @@ before the defects they were supposed to cover.
 
 ## Findings — feature lens (iteration 4)
 
-### [F-048] `onConflictDoUpdate()` silently drops `$onUpdate` columns from the `DO UPDATE SET` clause — status: todo — severity: high — area: sql/compile — COMPAT-DEFECT
+### [F-048] `onConflictDoUpdate()` silently drops `$onUpdate` columns from the `DO UPDATE SET` clause — status: **done** (`91de9e1`, confirmed byte-identical to Drizzle by round-2 review) — severity: high — area: sql/compile — COMPAT-DEFECT
 - **Where**: `src/plan/compile.ts:545` (`writeOnConflict` → `definedValues(conflict.set)` → `writeAssignments`)
 - **Defect**: `compileUpdate` folds every `$onUpdate` column into the assignment list (`src/plan/compile.ts:580-584`), but `writeOnConflict` does not — so the update half of an upsert writes only the keys the caller listed. Drizzle routes both through the same `buildUpdateSet`, which includes any column with `onUpdateFn` (`drizzle-orm/sqlite-core/dialect.js:55`).
 - **Failure scenario** (both verified): `db.insert(users).values({ id: 1, email: 'a@b.c' }).onConflictDoUpdate({ target: users.id, set: { email: 'x@y.z' } })` gives d1zzle `… on conflict ("id") do update set "email" = ?` where Drizzle gives `… do update set "email" = ?, "updated_at" = ?`. On the insert path `updated_at` *is* written; on the conflict path it is not. A session/token/counter table upserted on every request keeps its very first `updated_at` forever. `updatedAt` is the canonical `$onUpdate` column and "upsert a session row" is the canonical use of `onConflictDoUpdate`.
 - **Fix**: in `writeOnConflict`, after `definedValues(conflict.set)` decides the `do nothing` fallback — **keep that decision based on the user's set alone**; Drizzle throws `No values to set` there, so d1zzle's `do nothing` is a deliberate, better divergence and must not change — fold in `$onUpdate` columns before rendering, exactly as `compileUpdate` does. Extracting the six lines at `compile.ts:580-584` into a shared `withOnUpdate(values, columns)` avoids a third copy.
 - **Prove it**: `test/unit/compile-write.test.ts` — the fixture `users` already has `updatedAt.$onUpdate(...)`. The existing assertion at `compile-write.test.ts:76` will go red and must gain `, "updated_at" = ?`; that it passes today is the evidence the case was never considered.
 
-### [F-049] A nested *explicit* selection over an outer join materialises an object of nulls where Drizzle returns `null` — status: todo — severity: high — area: sql/compile — COMPAT-DEFECT
+### [F-049] A nested *explicit* selection over an outer join materialises an object of nulls where Drizzle returns `null` — status: done (`91de9e1`, depth-2 groups only — see `[F-056]`) — severity: high — area: sql/compile — COMPAT-DEFECT
 - **Where**: `src/plan/compile.ts:338` (`const nullableGroups = implicit?.nullable ?? new Set<string>()`) and `src/plan/compile.ts:206` (`projectedNullableGroups`)
 - **Defect**: nullable-group collapsing is derived only when `plan.selection === undefined`. A hand-written nested projection over a `leftJoin`/`rightJoin`/`fullJoin` therefore never collapses, and the missed side comes back as `{ id: null, title: null }`. Drizzle's `mapResultRow` nullifies any depth-2 group whose columns all come from a table the join map marks nullable.
 - **Failure scenario** (both implementations run on the same driver row `[1, 'alice', null, null]`): `db.select({ u: { id: users.id, name: users.name }, p: { id: posts.id, title: posts.title } }).from(users).leftJoin(posts, …)` gives Drizzle `{ u: {...}, p: null }` and d1zzle `{ u: {...}, p: { id: null, title: null } }`. A ported handler reading `row.p ? render(row.p) : renderEmpty()` takes the truthy branch for every author with no posts. The type is wrong too — `SelectionToRow` (`src/builders/select.ts:67`) never adds `| null` to a nested group, so TypeScript agrees with the wrong runtime.
@@ -468,7 +473,7 @@ before the defects they were supposed to cover.
 - **Fix**: hoist the table-nullability computation out of `implicitSelection` into `nullableTables(plan): Set<string>` (the loop at `compile.ts:159-160` is already exactly this), then for an explicit selection compute the group set from the leaves — for each depth-1 group, if every leaf is a `Column` and they all share one `column.tableName` that is in `nullableTables(plan)`, add the group's path. Use it at `compile.ts:338` and in `projectedNullableGroups` so `.as()` inherits it. The mapper needs no change: `readRow` (`src/plan/mapper.ts:122`) already collapses a `nullable` group whose indexes are all null. Widen `SelectionToRow`'s object branch to `… | null` for a group whose columns come from a nullable side.
 - **Prove it**: `test/unit/compile-select.test.ts`, beside the existing `.as()` test — `expect(c.map([[1, null, null]])[0]!.p).toBeNull()`.
 
-### [F-050] `casing: 'snake_case'` uses a different algorithm from Drizzle's, so some columns get a different database name — status: todo — severity: high — area: schema — COMPAT-DEFECT
+### [F-050] `casing: 'snake_case'` uses a different algorithm from Drizzle's, so some columns get a different database name — status: **done** (`91de9e1`, 17,593 adversarial inputs vs `drizzle-orm/casing`, 0 mismatches — but see `[F-059]`) — severity: high — area: schema — COMPAT-DEFECT
 - **Where**: `src/schema/columns.ts:125-136` (`toSnakeCase`/`applyCasing`), reached from `src/runtime/database.ts:29` and `kit/src/node/config.ts:44`
 - **Defect**: d1zzle uses two boundary-insertion regexes; Drizzle (`drizzle-orm/casing.js:3`) tokenises with `/[\da-z]+|[A-Z]+(?![a-z])|[A-Z][\da-z]+/g` after stripping apostrophes, then lowercases and joins. They disagree on any key with an uppercase run followed by a digit, and on any key with leading underscores or non-word characters: `apiV2` → Drizzle `api_v_2` vs d1zzle `api_v2`; `utf8MB4` → `utf8_mb_4` vs `utf8_mb4`; `_id` → `id` vs `_id`; `__typename` → `typename` vs `__typename`; `user’sName` → `users_name` vs `user’s_name`; `some name` → `some_name` vs `some name`. (`firstName`, `userID`, `HTTPServer`, `emailVerified`, `oauth2Token`, `myURLPath`, `ABCDef`, `iOS`, `fooBAR` all agree.)
 - **Failure scenario**: a Drizzle project with `casing: 'snake_case'` and a column `apiV2: integer()` has `api_v_2` in production. Porting to d1zzle emits `"api_v2" integer` (verified), so every query gives `D1_ERROR: no such column: api_v2` and `d1zzle-migrate generate` proposes `ADD COLUMN "api_v2"` plus a destructive drop of `api_v_2`. The leading-underscore case silently *renames* rather than errors during `push`.
@@ -498,6 +503,43 @@ Recorded, not built. Ranked as the reviewer ranked them:
 ### [F-054] `lowerIn` has no bound-parameter guard — status: todo — severity: low — area: better-auth — lens: efficiency + bugs (OFF-LENS from feature)
 - **Where**: `src/better-auth.ts:169`
 - **Defect**: the case-sensitive path goes through `inArray`, which collapses to `json_each` above the threshold and names the budget above `maxParams`; the `mode: 'insensitive'` path binds one parameter per value unconditionally, so an `in` of >100 values surfaces as a bare `too many SQL variables` from D1. Reachable only when a caller sets `mode: 'insensitive'` on an `in`, which the reviewer could not find better-auth doing on its own — latent rather than confirmed. (A previous lens dropped this for the same reason; it is recorded now because the *guard* asymmetry is concrete even if the caller is not.)
+
+## Unresolved objections merged anyway (`91de9e1`)
+
+The round-2 reviewer of `sweep/feature-20260730-205013` confirmed all three findings closed
+and rejected on three further points. Two review rounds is the cap, the gate was green
+(659 passed / 4 skipped), so it merged. Revert as one unit with `git revert -m 1 91de9e1`.
+
+**`[F-055]` is a regression against `main` reachable at the default budget** — a query that
+compiled and ran fine now throws `CompileError`. Fix it first.
+
+### [F-055] The new bound-parameter guard counts *columns*, not parameters, and rejects inserts that worked — status: todo — severity: **high** — area: sql/compile — REGRESSION
+- **Where**: `src/plan/compile.ts:539`
+- **Defect**: `cols.length + conflictParams > ctx.maxParams` treats every column in the row as one bound parameter, but a value supplied as a zero-parameter `sql` fragment occupies a column without binding anything. The `CompileError` therefore fires on queries whose emitted statement is nowhere near the budget — **at the default `maxParams: 100`**, not only under a lowered one.
+- **Failure scenario** (verified against both revisions, default budget): an 80-column table where 40 values are SQL literals binding nothing, upserted with `set: { c0: sql\`excluded."c0"\` }` (0 params) and `where: inArray(wide.c1, [25 ids])` (25 params). `main` compiles to **one statement with 65 bound parameters**, which D1 accepts. HEAD throws `CompileError: A row of 80 columns plus 25 bound parameter(s) from "on conflict" exceed the bound-parameter limit of 100; no chunking can satisfy it.` A realistic instance: a 98-column table (legal), three values written as `sql\`unixepoch()\``, an upsert binding 3 → `98 + 3 = 101` throws, while the real statement binds `95 + 3 = 98`.
+- **The pre-existing sibling check** (`cols.length > ctx.maxParams`, line 533) has the same flaw but is unreachable at the default budget — D1 caps a table at 100 columns (`src/limits.ts:46`). Adding `conflictParams` to it is what makes the flaw reachable.
+- **Second, narrower window**: `maxParams` is documented as a chunking *lever* (`docs/02-d1-platform.md:183`, `src/plan/compile.ts:378`), not only as D1's ceiling. A 10-column table with `maxParams: 10` and an upsert on a table carrying `$onUpdate` compiled to a valid 11-parameter statement on `main` and now throws.
+- **Fix**: count the row's actual bound parameters — render or count them the way `countOnConflictParams` already does for the conflict clause — rather than equating columns with parameters. The same conflation makes `rowsPerChunk` (line 546) inexact in both directions, but that part is pre-existing; only the *throw* is new.
+
+### [F-056] A group mixing a depth-2 leaf with a deeper leaf does not do what Drizzle does — status: todo — severity: med — area: sql/compile
+- **Where**: `src/plan/compile.ts:213` — `if (leaves.some((leaf) => leaf.path.length !== 2)) continue;`
+- **Defect**: this applies Drizzle's `path.length === 2` rule as a group-wide veto. Drizzle applies it *per leaf*: a deeper leaf is simply skipped (`drizzle-orm/utils.js:136`) and the group's own depth-2 Column leaves still decide. The comment above the line ("Only a group's *own* depth matters") describes Drizzle's rule; the code implements a stricter one.
+- **Failure scenario**, both implementations on driver row `[7, null, null]`: `select({ postId: posts.id, author: { id: users.id, contact: { email: users.email } } }).from(posts).leftJoin(users, …)` gives Drizzle `[{ postId: 7, author: null }]` and d1zzle `[{ postId: 7, author: { id: null, contact: { email: null } } }]`. This is the exact "null row materialized as an object of nulls" shape the batch exists to fix.
+- **Not a regression against `main`** (equally wrong there), but note that `fd11e75` happened to get this shape right and `4b70c35` traded it for the depth-3 fix.
+- **Fix**: skip deeper leaves rather than vetoing the group. **Matching Drizzle also requires `GroupSpec.columnIndexes` to hold only the group's *direct* depth-2 column leaves** — today `buildShape` pushes each column index into every ancestor (`src/plan/mapper.ts:99`), so a naive relaxation of line 213 would test the wrong indexes.
+
+### [F-057] `GroupSpec.indexes` is now write-only — dead allocations and 75 bundle bytes — status: todo — severity: low — area: efficiency
+- **Where**: `src/plan/mapper.ts:38`
+- **Defect**: `readRow` was the only reader and now reads `columnIndexes` (line 145). `indexes` is still declared, initialized in four places, pushed to once per (field × ancestor depth) in `buildShape` (line 98), and copied into every `GroupSpec` (line 120). Deleting it gives 41,223 bytes vs 41,298 — **75 of this batch's 1,083 bytes are dead weight** parsed on every cold isolate, plus one dead array allocation per group and one dead push per column per level on every compile.
+- **Careful**: `[F-056]`'s fix needs `columnIndexes` to change meaning, so do these two together.
+
+### [F-058] The same `too many SQL variables` remains reachable through `returning()` and multi-parameter `values()` — status: todo — severity: med — area: sql/compile
+- **Where**: `src/plan/compile.ts` (the `rowsPerChunk` computation)
+- **Defect**: the chunker still assumes exactly one bound parameter per column in `VALUES` and zero from `returning`. Both reproduced against real D1 in workerd: `db.insert(t).values(40 rows × 4 cols).returning({ id: t.id, tag: sql\`${'tag'}\` })` → parts `[101, 61]` → `D1_ERROR: too many SQL variables at offset 411`; and a `values()` entry written as `sql\`${'x'} || ${'y'}\`` (2 params in one column) → parts `[125, 75]` → same error.
+- **Pre-existing, not introduced by this batch** — but `countOnConflictParams` is the right shape for both, and a general "params outside/inside VALUES, rendered not guessed" reservation would close them together with `[F-055]`.
+
+### [F-059] The casing fix is a silent breaking change for existing d1zzle users on `snake_case` — status: needs-human — severity: med — area: release
+- `[F-050]` made `toSnakeCase` match Drizzle exactly, which is correct — but for a project already on d1zzle with `casing: 'snake_case'`, derived column names change: `apiV2` `api_v2` → `api_v_2`, `_id` `_id` → `id`. The kit surfaces it as a destructive diff rather than losing data quietly, so it is loud, but it needs a release note and possibly a major-version decision. Also note that `{ id, _id }` now both derive `id`; nothing detects the collision, though SQLite rejects the duplicate column loudly at apply time. That collision behaviour is Drizzle's exactly.
 
 ## Audit areas
 
