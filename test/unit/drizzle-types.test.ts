@@ -14,7 +14,7 @@ import {
 import { describe, expectTypeOf, it } from 'vitest';
 import { asDrizzleSchema, asDrizzleTable } from '../../src/drizzle.js';
 import type { InferInsert, InferSelect } from '../../src/index.js';
-import { integer, query, sql, sqliteTable, text } from '../../src/index.js';
+import { customType, integer, query, sql, sqliteTable, text } from '../../src/index.js';
 import * as schema from '../schema.js';
 import { posts, users } from '../schema.js';
 
@@ -150,5 +150,31 @@ describe("text({ mode: 'json' }) matches Drizzle", () => {
 		// union, or a plain column comes back as both branches at once.
 		expectTypeOf<InferSelect<typeof ours>['plain']>().toEqualTypeOf<string | null>();
 		expectTypeOf<InferSelectModel<typeof theirs>['plain']>().toEqualTypeOf<string | null>();
+	});
+});
+
+describe('primaryKey()’s HasDefault is gated like Drizzle’s', () => {
+	// Drizzle's `ColumnBuilder.primaryKey()` only adds `HasDefault` when
+	// `TExtraConfig['primaryKeyHasDefault']` extends `true` — set only by the
+	// integer builder (see `sqlite-core/columns/integer.d.ts`). A `customType`
+	// column has no such flag, so its primary key stays required on insert.
+	const uuid = customType<string>({ dataType: () => 'text' });
+
+	const withCustomPk = sqliteTable('with_custom_pk', {
+		id: uuid('id').primaryKey(),
+	});
+
+	const withIntegerPk = sqliteTable('with_integer_pk', {
+		id: integer('id').primaryKey(),
+	});
+
+	it('requires the id on insert for a non-integer primary key', () => {
+		type Insert = InferInsert<typeof withCustomPk>;
+		expectTypeOf<Insert['id']>().toEqualTypeOf<string>();
+	});
+
+	it('leaves the id optional on insert for an integer primary key', () => {
+		type Insert = InferInsert<typeof withIntegerPk>;
+		expectTypeOf<Insert['id']>().toEqualTypeOf<number | undefined>();
 	});
 });

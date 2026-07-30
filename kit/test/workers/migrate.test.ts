@@ -187,7 +187,7 @@ describe('introspection', () => {
 		});
 		expect(child.checkConstraints['child_score_check']!.value).toBe('"score" >= 0');
 		expect(child.indexes['child_score_idx']).toMatchObject({
-			columns: ['score'],
+			columns: [{ expression: 'score', isExpression: false }],
 			isUnique: false,
 			where: '"score" > 0',
 		});

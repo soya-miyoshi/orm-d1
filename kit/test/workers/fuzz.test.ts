@@ -15,7 +15,7 @@ import { describe, expect, it } from 'vitest';
 import { applyMigrations, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots, orderByDependency, renderMigration } from '../../src/core/diff.js';
-import { canonicalTable, createTableFromSnapshot, emptySnapshot } from '../../src/core/snapshot.js';
+import { canonicalTable, createTableFromSnapshot, emptySnapshot, normalizeIndexColumn } from '../../src/core/snapshot.js';
 import type { ColumnSnapshot, Snapshot, TableSnapshot } from '../../src/core/snapshot.js';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -180,7 +180,10 @@ const comparable = (snapshot: Snapshot) =>
 		Object.entries(snapshot.tables).map(([name, t]) => [name, {
 			...canonicalTable(t),
 			indexes: Object.fromEntries(
-				Object.entries(t.indexes).map(([i, index]) => [i, { columns: index.columns, isUnique: index.isUnique }]),
+				Object.entries(t.indexes).map(([i, index]) => [
+					i,
+					{ columns: index.columns.map(normalizeIndexColumn), isUnique: index.isUnique },
+				]),
 			),
 		}]),
 	);

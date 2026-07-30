@@ -8,6 +8,7 @@
  * each — so the interface stays this small on purpose.
  */
 import type { IntrospectionInput, MasterRow } from './introspect.js';
+import type { ForeignKeyRow, IndexListRow, TableInfoRow } from './introspect.js';
 import { isInternalTable, snapshotFromIntrospection } from './introspect.js';
 import type { Snapshot } from './snapshot.js';
 import { applicableStatements, createMigrationsTable, MIGRATIONS_TABLE, quoteIdentifier } from './sql.js';
@@ -41,21 +42,41 @@ export async function introspect(runner: SqlRunner): Promise<Snapshot> {
 	const indexInfo: IntrospectionInput['indexInfo'] = {};
 	const foreignKeys: IntrospectionInput['foreignKeys'] = {};
 
-	for (const row of master) {
-		if (row.type !== 'table' || isInternalTable(row.name)) continue;
+	// One pragma round trip per table (and, within a table, per index) used to
+	// be sequential — O(tables + indexes) awaits in a row, each one a network
+	// hop on remote D1. Every table's three pragmas run concurrently, and once
+	// a table's indexes are known, every one of *its* `index_info` pragmas
+	// runs concurrently too — two dependent waves total, not one per table.
+	// Assignment stays keyed by name, and tables are seeded into the result
+	// objects in `master`'s order below before any `await`, so the *iteration*
+	// order downstream code sees is what it always was, whichever pragma
+	// happens to resolve first.
+	const tableRows = master.filter((row) => row.type === 'table' && !isInternalTable(row.name));
+	for (const row of tableRows) {
+		tableInfo[row.name] = [];
+		foreignKeys[row.name] = [];
+		indexList[row.name] = [];
+	}
+
+	await Promise.all(tableRows.map(async (row) => {
 		const quoted = `"${row.name.replaceAll('"', '""')}"`;
 
 		// `table_xinfo`, not `table_info`: the latter omits generated columns
 		// completely, so a schema with one drifted against itself forever.
-		tableInfo[row.name] = await runner.all(`pragma table_xinfo(${quoted})`);
-		foreignKeys[row.name] = await runner.all(`pragma foreign_key_list(${quoted})`);
-		const indexes = await runner.all<{ name: string }>(`pragma index_list(${quoted})`);
+		const [xinfo, fks, indexes] = await Promise.all([
+			runner.all<TableInfoRow>(`pragma table_xinfo(${quoted})`),
+			runner.all<ForeignKeyRow>(`pragma foreign_key_list(${quoted})`),
+			runner.all<IndexListRow>(`pragma index_list(${quoted})`),
+		]);
+		tableInfo[row.name] = xinfo;
+		foreignKeys[row.name] = fks;
 		indexList[row.name] = indexes as never;
 
-		for (const index of indexes) {
+		for (const index of indexes) indexInfo[index.name] = [];
+		await Promise.all(indexes.map(async (index) => {
 			indexInfo[index.name] = await runner.all(`pragma index_info("${index.name.replaceAll('"', '""')}")`);
-		}
-	}
+		}));
+	}));
 
 	return snapshotFromIntrospection({ master, tableInfo, indexList, indexInfo, foreignKeys });
 }

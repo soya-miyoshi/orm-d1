@@ -121,6 +121,10 @@ const payloadIsExpressible = (config: FindConfig, tableConfig: TableRelationalCo
 	const keys = pickColumns(tableConfig.columns, config.columns).length
 		+ Object.keys(config.with ?? {}).length
 		+ Object.keys(config.extras ?? {}).length;
+	// `columns: {}` with no nested `with`/`extras` projects zero columns —
+	// `sql.join([], ', ')` would render `select  from …`, invalid SQL. Fall
+	// back to the split plan, which handles the empty payload correctly.
+	if (keys === 0) return false;
 	return keys <= MAX_JSON_OBJECT_KEYS;
 };
 
@@ -259,7 +263,12 @@ const renderInner = (
 	// object directly emits only its alias, which SQLite reads as a table of
 	// that name — so the inner query looked for a table called "d1zzle_j1".
 	const from = sql.raw(`${quote(getTableOriginalName(table))} as ${quote(getTableName(table))}`);
-	let out = sql`select ${projection} from ${from} where ${sql.join([...predicates], ' and ')}`;
+	// Each predicate is parenthesized before joining: `compileFilter` returns
+	// an unwrapped `RAW` fragment for a lone predicate (matching Drizzle's
+	// `and()` of one operand), and an unparenthesized `or` inside it would
+	// otherwise bind looser than intended once joined with the other
+	// predicates by a bare `and`.
+	let out = sql`select ${projection} from ${from} where ${sql.join(predicates.map((p) => sql`(${p})`), ' and ')}`;
 	if (orderBy.length > 0) out = sql`${out} order by ${sql.join([...orderBy], ', ')}`;
 
 	// A `one` relation takes at most one row whatever the data says, so the

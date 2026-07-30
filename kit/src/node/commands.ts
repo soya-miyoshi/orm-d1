@@ -10,7 +10,7 @@ import { applicableStatements, isPragma } from '../core/sql.js';
 import { diffSnapshots, renderMigration } from '../core/diff.js';
 import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
-import { snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
+import { normalizeIndexColumn, snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
 import type { Snapshot } from '../core/snapshot.js';
 import type { Config } from './config.js';
 import { localRunner, remoteRunner, scratchRunner } from './runners.js';
@@ -357,7 +357,13 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 		for (const index of Object.values(table.indexes)) {
 			const factory = index.isUnique ? 'uniqueIndex' : 'index';
 			imports.add(factory);
-			const columns = index.columns.map((c) => `t.${columnId(c)}`).join(', ');
+			const columns = index.columns.map(normalizeIndexColumn).map((c) => {
+				if (c.isExpression) {
+					imports.add('sql');
+					return `sql\`${c.expression}\``;
+				}
+				return `t.${columnId(c.expression)}`;
+			}).join(', ');
 			const where = index.where ? `.where(sql\`${index.where}\`)` : '';
 			if (index.where) imports.add('sql');
 			extras.push(`${factory}('${index.name}').on(${columns})${where}`);

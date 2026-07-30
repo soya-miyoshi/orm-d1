@@ -11,7 +11,7 @@
  */
 import { appendOnlyTrigger, dropAppendOnlyTrigger } from 'd1zzle/ddl';
 import type { ColumnSnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
-import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot } from './snapshot.js';
+import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
 
 export interface Statement {
 	readonly sql: string;
@@ -92,7 +92,9 @@ const survivingReferenceTo = (table: TableSnapshot, column: string): string | un
 		text !== undefined && new RegExp(`\\b${escapeRegExp(column)}\\b`).test(withoutLiterals(text));
 
 	for (const index of Object.values(table.indexes)) {
-		if (index.columns.includes(column)) return `index "${index.name}"`;
+		const columns = index.columns.map(normalizeIndexColumn);
+		if (columns.some((c) => !c.isExpression && c.expression === column)) return `index "${index.name}"`;
+		if (columns.some((c) => c.isExpression && mentions(c.expression))) return `index "${index.name}"`;
 		if (mentions(index.where)) return `the predicate of index "${index.name}"`;
 	}
 	for (const check of Object.values(table.checkConstraints)) {
@@ -569,7 +571,11 @@ const dependenciesOf = (t: TableSnapshot | undefined): string[] => [
  * has not changed. Same rule `canonicalTable` applies to check constraints.
  */
 const canonicalIndex = (index: IndexSnapshot): string =>
-	JSON.stringify([[...index.columns], index.isUnique, (index.where ?? '').replaceAll(/\s+/g, ' ').trim()]);
+	JSON.stringify([
+		index.columns.map(normalizeIndexColumn).map((c) => [c.expression, c.isExpression]),
+		index.isUnique,
+		(index.where ?? '').replaceAll(/\s+/g, ' ').trim(),
+	]);
 
 /** Returned split, because drops and creates bracket the column changes. */
 const diffIndexes = (

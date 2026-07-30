@@ -175,6 +175,51 @@ const parseIndexWhere = (sql: string | null): string | undefined => {
 };
 
 /**
+ * The raw column-list text of a `CREATE INDEX`, split into its members in
+ * declaration order.
+ *
+ * `pragma index_info` reports an expression member as `{ cid: -2, name: null
+ * }`, losing the expression entirely — there is no pragma that returns it.
+ * The only place it survives is `sqlite_master.sql`'s verbatim text, so it is
+ * recovered the same way `parseIndexWhere` recovers a partial index's
+ * predicate: find the parenthesised list right after `on "<table>"` and
+ * split it at its top-level commas (nested parens, e.g. `lower(...)`, do not
+ * count as separators).
+ */
+const parseIndexColumns = (sql: string | null): string[] | undefined => {
+	if (!sql) return undefined;
+	const openAfterOn = /\bon\s+(?:"(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|\w+)\s*\(/i.exec(sql);
+	if (!openAfterOn) return undefined;
+	const start = openAfterOn.index + openAfterOn[0].length;
+
+	let depth = 1;
+	let i = start;
+	while (i < sql.length && depth > 0) {
+		if (sql[i] === '(') depth++;
+		else if (sql[i] === ')') depth--;
+		i++;
+	}
+	if (depth > 0) return undefined;
+	const body = sql.slice(start, i - 1);
+
+	const members: string[] = [];
+	let member = '';
+	let nesting = 0;
+	for (const ch of body) {
+		if (ch === '(') nesting++;
+		else if (ch === ')') nesting--;
+		if (ch === ',' && nesting === 0) {
+			members.push(member.trim());
+			member = '';
+		} else {
+			member += ch;
+		}
+	}
+	if (member.trim().length > 0) members.push(member.trim());
+	return members;
+};
+
+/**
  * The `STRICT` / `WITHOUT ROWID` suffix, which no pragma reports.
  *
  * They are table options rather than constraints, so they appear *after* the
@@ -275,20 +320,27 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 		const uniqueConstraints: Record<string, { name: string; columns: readonly string[] }> = {};
 
 		for (const index of input.indexList[row.name] ?? []) {
-			const members = (input.indexInfo[index.name] ?? [])
-				.slice()
-				.sort((a, b) => a.seqno - b.seqno)
-				.map((m) => m.name)
-				.filter((n): n is string => n !== null);
+			const sortedMembers = (input.indexInfo[index.name] ?? []).slice().sort((a, b) => a.seqno - b.seqno);
+			// `cid === -2` is an expression member — `pragma index_info` has no
+			// text for it, so the raw `CREATE INDEX` column list is parsed and
+			// matched up by position (both are in declaration order).
+			const rawColumns = sortedMembers.some((m) => m.name === null)
+				? parseIndexColumns(indexSql.get(index.name) ?? null)
+				: undefined;
+			const memberColumns: { expression: string; isExpression: boolean }[] = sortedMembers
+				.map((m, i) => m.name !== null
+					? { expression: m.name, isExpression: false }
+					: { expression: rawColumns?.[i] ?? '', isExpression: true })
+				.filter((c) => c.expression !== '');
 
 			if (index.origin === 'pk') continue;
 			if (index.origin === 'u') {
-				uniqueConstraints[index.name] = { name: index.name, columns: members };
+				uniqueConstraints[index.name] = { name: index.name, columns: memberColumns.map((c) => c.expression) };
 				continue;
 			}
 			indexes[index.name] = {
 				name: index.name,
-				columns: members,
+				columns: memberColumns,
 				isUnique: index.unique === 1,
 				where: index.partial ? parseIndexWhere(indexSql.get(index.name) ?? null) : undefined,
 			};

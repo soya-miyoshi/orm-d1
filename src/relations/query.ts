@@ -593,8 +593,17 @@ export class RelationalQueryBuilder {
 		);
 		const paramsOf = (condition: Condition | undefined): number =>
 			condition ? render(condition, renderContextOf(this.db)).params.length : 0;
+		// `orderBy` and `extras` bind params into the same statement too — a
+		// nested `orderBy` callback that interpolates a bound value, or an
+		// `extras` expression that does, was missing from `reserved` entirely,
+		// so a chunk sized against the rest of the budget could still overflow
+		// `$maxParams` by however many those bound.
+		const chunksOf = (chunks: readonly SQLChunk[]): number =>
+			chunks.reduce((n, c) => n + render(c, renderContextOf(this.db)).params.length, 0);
 		const reserved = paramsOf(childFilter)
 			+ paramsOf(declared)
+			+ chunksOf(resolveOrderBy(entry.config.orderBy, targetColumns))
+			+ chunksOf(Object.values(resolveExtras(entry.config.extras, targetColumns)))
 			+ (window?.limit !== undefined ? 1 : 0)
 			+ (window?.offset ? 1 : 0);
 

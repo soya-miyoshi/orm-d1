@@ -9,7 +9,7 @@
 import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName } from 'd1zzle/ddl';
 import type { TableOptionsMap } from 'd1zzle/ddl';
 import type { Column, Table } from 'd1zzle';
-import { getTableColumns, getTableExtras, getTableName } from 'd1zzle';
+import { getTableColumns, getTableExtras, getTableName, isColumn } from 'd1zzle';
 
 /**
  * `2` added `strict`, `withoutRowid` and `appendOnly` to `TableSnapshot`.
@@ -45,9 +45,35 @@ export interface ColumnSnapshot {
 	readonly references?: ForeignKeySnapshot | undefined;
 }
 
+/**
+ * One member of an index's column list.
+ *
+ * `isExpression: true` means `expression` is a SQL fragment (e.g.
+ * `lower("email")` from `index(...).on(sql\`lower(${t.email})\`)`), not a bare
+ * identifier — `createIndexFromSnapshot` must not quote it as one, or the
+ * index binds to a constant string literal instead of the expression.
+ *
+ * A snapshot written before this shape existed has plain strings in
+ * `columns` instead of `IndexColumnSnapshot` objects; every reader normalises
+ * a bare string to `{ expression: <string>, isExpression: false }` — see
+ * `normalizeIndexColumn`.
+ */
+export interface IndexColumnSnapshot {
+	readonly expression: string;
+	readonly isExpression: boolean;
+}
+
+/**
+ * Reads either shape a `columns` entry can be on disk: the current
+ * `IndexColumnSnapshot`, or a bare string from a pre-upgrade snapshot (always
+ * an identifier, so `isExpression: false`).
+ */
+export const normalizeIndexColumn = (entry: string | IndexColumnSnapshot): IndexColumnSnapshot =>
+	typeof entry === 'string' ? { expression: entry, isExpression: false } : entry;
+
 export interface IndexSnapshot {
 	readonly name: string;
-	readonly columns: readonly string[];
+	readonly columns: readonly (string | IndexColumnSnapshot)[];
 	readonly isUnique: boolean;
 	readonly where?: string | undefined;
 }
@@ -186,7 +212,11 @@ export function snapshotFromSchema(
 						?.replaceAll('""', '"') ?? '';
 					indexes[indexName] = {
 						name: indexName,
-						columns: extra.meta.columns.map((c) => ('name' in (c as Column<any>) ? (c as Column<any>).name : renderInline(c as never))),
+						columns: extra.meta.columns.map((c) =>
+							isColumn(c)
+								? { expression: c.name, isExpression: false }
+								: { expression: renderInline(c as never), isExpression: true }
+						),
 						isUnique: extra.meta.unique,
 						where: extra.meta.where ? renderInline(extra.meta.where) : undefined,
 					};
@@ -310,7 +340,7 @@ const referenceClause = (fk: ForeignKeySnapshot, quote: (name: string) => string
 export function createIndexFromSnapshot(index: IndexSnapshot, tableName: string): string {
 	const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 	return `create ${index.isUnique ? 'unique ' : ''}index ${quote(index.name)} on ${quote(tableName)} (${
-		index.columns.map(quote).join(', ')
+		index.columns.map(normalizeIndexColumn).map((c) => (c.isExpression ? c.expression : quote(c.expression))).join(', ')
 	})${index.where ? ` where ${index.where}` : ''}`;
 }
 
@@ -333,11 +363,28 @@ export function createIndexFromSnapshot(index: IndexSnapshot, tableName: string)
  */
 export interface CanonicalColumn {
 	readonly type: string;
+	/**
+	 * The raw `declaredType` this column's `type` was derived from, when the
+	 * snapshot carried one. `undefined` means this is a pre-`declaredType`
+	 * snapshot (written before that field existed) — see `columnDifference`.
+	 */
+	readonly declaredType: string | undefined;
 	readonly notNull: boolean;
 	readonly default: string | null;
 	readonly autoincrement: boolean;
 	readonly generated: string | null;
 }
+
+/**
+ * The affinity rule `columnDifference` used before `declaredType` existed: a
+ * plain substring search over the five canonical spellings, defaulting to
+ * `'text'`. Kept only to reproduce what an old snapshot's `type` field means,
+ * so upgrading past `declaredType` does not itself look like a type change.
+ */
+const legacyAffinity = (declared: string): string => {
+	const lower = declared.toLowerCase();
+	return ['integer', 'text', 'real', 'blob', 'numeric'].find((candidate) => lower.includes(candidate)) ?? 'text';
+};
 
 export interface CanonicalTable {
 	readonly columns: Record<string, CanonicalColumn>;
@@ -358,12 +405,35 @@ export interface CanonicalTable {
  * stays as specific as it was before normalisation.
  */
 export const columnDifference = (a: CanonicalColumn, b: CanonicalColumn): string | undefined => {
-	if (a.type !== b.type) return 'changes type';
+	if (a.type !== b.type && !typeMatchesAcrossUpgrade(a, b) && !typeMatchesAcrossUpgrade(b, a)) return 'changes type';
 	if (a.notNull !== b.notNull) return 'changes nullability';
 	if (a.default !== b.default) return 'changes its default';
 	if (a.autoincrement !== b.autoincrement) return 'changes autoincrement';
 	if (a.generated !== b.generated) return 'changes its generated expression';
 	return undefined;
+};
+
+/**
+ * Whether `old` (no `declaredType`, i.e. a pre-upgrade snapshot) and `fresh`
+ * (carries a `declaredType`) actually describe the same type, once `old`'s
+ * value is reinterpreted under the rule that produced it.
+ *
+ * A pre-`declaredType` snapshot's `type` was computed with the old substring
+ * rule (`legacyAffinity`), not `affinityOf`'s real SQLite rules. Comparing the
+ * two rules' outputs directly disagrees for plenty of customTypes even though
+ * nothing about the schema changed — e.g. `customType(() => 'int')` was
+ * recorded as `'text'` under the old rule but is `'integer'` under the new
+ * one. So when one side has no `declaredType`, the two only really differ if
+ * applying the OLD rule to the NEW side's `declaredType` still disagrees with
+ * what the old snapshot recorded.
+ *
+ * Both sides carrying a `declaredType` skips this entirely — that comparison
+ * stays the plain `a.type !== b.type` check, so a genuine type change between
+ * two current-shaped snapshots is still caught.
+ */
+const typeMatchesAcrossUpgrade = (old: CanonicalColumn, fresh: CanonicalColumn): boolean => {
+	if (old.declaredType !== undefined || fresh.declaredType === undefined) return false;
+	return legacyAffinity(fresh.declaredType) === old.type;
 };
 
 /**
@@ -454,6 +524,7 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 		columns[name] = {
 			// Affinity, not the declared spelling — see `typeAffinity`.
 			type: typeAffinity(column.type),
+			declaredType: column.declaredType,
 			notNull: column.notNull || lonePrimaryKey.has(column.name),
 			default: canonicalDefault(column.default),
 			autoincrement: column.autoincrement,

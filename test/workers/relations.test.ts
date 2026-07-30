@@ -449,6 +449,37 @@ describe('the filter DSL', () => {
 		).toEqual([]);
 	});
 
+	it('parenthesises a nested RAW OR fragment the same way under both relational strategies', async () => {
+		// Same defect as the top-level case above, but in `joined.ts`'s
+		// `renderInner`: the correlation predicate, the caller's filter and the
+		// relation's declared `where` used to be joined with a bare `' and '`.
+		// `compileFilter` returns an unwrapped fragment for a lone predicate, so
+		// an unparenthesised `or` inside a nested RAW filter bound looser than
+		// intended once joined that way.
+		const joinedDb = drizzle({ client: DB, relations: schema.relations, relationalStrategy: 'joined' });
+
+		const query = {
+			columns: { id: true },
+			with: {
+				posts: {
+					columns: { id: true },
+					where: {
+						RAW: (table: unknown, { sql: rawSql }: { sql: typeof sql }) => {
+							const t = table as typeof schema.posts;
+							return rawSql`${t.title} like 'f%' or ${t.views} = 1`;
+						},
+					},
+				},
+			},
+			orderBy: { id: 'asc' },
+		} as const;
+
+		const splitRows = await db.query.users.findMany(query);
+		const joinedRows = await joinedDb.query.users.findMany(query);
+
+		expect(joinedRows).toEqual(splitRows);
+	});
+
 	it('threads a placeholder through to execution rather than binding it early', async () => {
 		// One query, re-executed with different values: the filter compiler has
 		// to leave the slot unencoded rather than baking a value into the SQL.
@@ -580,6 +611,52 @@ describe('composite-key relations', () => {
 		// One parent query, then several bounded child queries.
 		expect(queries.length).toBeGreaterThan(2);
 		expect(queries.slice(1).every((q) => q.includes('"country" = ?'))).toBe(true);
+	});
+
+	it('does not overrun $maxParams when a nested orderBy also binds a parameter', async () => {
+		// `reserved` used to count only `childFilter`, `declared` and the window
+		// bounds, not a nested `orderBy`'s own bound params, so a chunk sized
+		// against the rest of the default 100-param budget could still overflow
+		// it by however many the `orderBy` bound.
+		for (const name of ['sites', 'regions']) await DB.prepare(`drop table if exists "${name}"`).run();
+		for (const statement of createSchema([regions, sites])) await DB.prepare(statement).run();
+
+		const PARENTS_50 = 50;
+		const seed = drizzle({ client: DB, relations: compositeRelations });
+		await seed.insert(regions).values(
+			Array.from({ length: PARENTS_50 }, (_, i) => ({ country: `c${i}`, zone: i, label: `l${i}` })),
+		);
+		await seed.insert(sites).values(
+			Array.from({ length: PARENTS_50 }, (_, i) => ({ id: i + 1, country: `c${i}`, zone: i })),
+		);
+
+		const paramCounts: number[] = [];
+		const withCounter = drizzle({
+			client: DB,
+			relations: compositeRelations,
+			onQuery: (event) => paramCounts.push(event.params?.length ?? 0),
+		});
+
+		const rows = await withCounter.query.regions.findMany({
+			columns: { country: true, zone: true },
+			with: {
+				sites: {
+					columns: { id: true },
+					// A bound value inside the callback form: one extra param per child
+					// statement that `reserved` must account for.
+					orderBy: (t, { sql }) => sql`${t.id} + ${0}`,
+				},
+			},
+			orderBy: { zone: 'asc' },
+		});
+
+		expect(rows).toHaveLength(PARENTS_50);
+		expect(rows.every((r) => r.sites.length === 1)).toBe(true);
+		expect(paramCounts.every((n) => n <= 100)).toBe(true);
+		// Confirms this exercise actually needed to chunk (50 parents times 2 key
+		// columns is 100, right at the boundary once the orderBy's own param is
+		// counted), not that the budget was simply never tight.
+		expect(paramCounts.length).toBeGreaterThan(2);
 	});
 
 	it('stays a single child query when the budget allows it', async () => {
@@ -916,6 +993,19 @@ describe('joined strategy', () => {
 		{
 			name: 'a plain one-to-many child table',
 			run: (d) => d.query.posts.findMany({ with: { tags: true }, orderBy: { id: 'asc' } }),
+		},
+		{
+			// `columns: {}` on a nested relation with no `with`/`extras` projects
+			// zero columns. Under `joined`, `pickColumns` returning `[]` used to
+			// reach `renderInner`'s `sql.join([], ', ')`, rendering the invalid
+			// `select  from …` — this must fall back to the split plan instead.
+			name: 'an empty column selection on a nested relation',
+			run: (d) =>
+				d.query.users.findMany({
+					columns: { id: true },
+					with: { posts: { columns: {} } },
+					orderBy: { id: 'asc' },
+				}),
 		},
 		{
 			name: 'findFirst',

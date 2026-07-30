@@ -20,7 +20,7 @@ import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots } from '../../src/core/diff.js';
 import { snapshotFromSchema } from '../../src/core/snapshot.js';
 import { allTables } from '../../../test/schema.js';
-import { check, integer, primaryKey, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
+import { check, index, integer, primaryKey, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
 
 /**
  * Declared here rather than in the shared fixture, which misses this by one
@@ -42,6 +42,10 @@ const flags = sqliteTable('flags', {
 }, (t) => [
 	uniqueIndex('flags_active_idx').on(t.name).where(sql`${t.active} = ${1}`),
 	check('flags_weight_check', sql`${t.weight} >= ${0}`),
+	// An expression index: `pragma index_info` reports this member as
+	// `{ cid: -2, name: null }`, and the `CREATE INDEX` text has to be parsed
+	// to recover `lower("name")` — see `parseIndexColumns`.
+	index('flags_lower_name_idx').on(sql`lower(${t.name})`),
 ]);
 
 const schemaTables = [...allTables, flags];
@@ -177,5 +181,41 @@ describe('table options against a real D1 database', () => {
 		const live = await introspect(runner);
 		expect(live.tables.ledger).toMatchObject({ strict: true, withoutRowid: false, appendOnly: true });
 		expect(live.tables.pairs).toMatchObject({ strict: true, withoutRowid: true, appendOnly: false });
+	});
+});
+
+describe('an expression unique index actually indexes the expression', () => {
+	beforeEach(async () => {
+		await DB.prepare('drop table if exists "expr_unique"').run();
+		for (
+			const statement of createSchema([
+				sqliteTable('expr_unique', {
+					id: integer('id').primaryKey(),
+					name: text('name').notNull(),
+				}, (t) => [uniqueIndex('expr_unique_lower_name_idx').on(sql`lower(${t.name})`)]),
+			])
+		) {
+			await DB.prepare(statement).run();
+		}
+	});
+
+	it('lets two rows with distinct expression values both insert', async () => {
+		// If `columns` were quoted unconditionally (the bug this guards
+		// against), the unique index would bind to the constant string
+		// `"lower(""name"")"` instead of the expression, so *every* row would
+		// collide on the same value and only one insert in the whole table
+		// would ever succeed.
+		await DB.prepare(`insert into "expr_unique" ("id", "name") values (1, 'Alice')`).run();
+		await DB.prepare(`insert into "expr_unique" ("id", "name") values (2, 'Bob')`).run();
+
+		const rows = await runner.all<{ n: number }>('select count(*) as n from "expr_unique"');
+		expect(rows[0]!.n).toBe(2);
+	});
+
+	it('still enforces uniqueness on the expression itself', async () => {
+		await DB.prepare(`insert into "expr_unique" ("id", "name") values (1, 'Alice')`).run();
+		await expect(
+			DB.prepare(`insert into "expr_unique" ("id", "name") values (2, 'ALICE')`).run(),
+		).rejects.toThrow();
 	});
 });
