@@ -1125,6 +1125,79 @@ describe('snapshot and DDL agree, table for table', () => {
 
 		expect(() => snapshotFromSchema([users])).toThrow(/derive the name "users_collide_expr_unique"/);
 	});
+
+	it('names both colliding declarations in the message, not just the shared name', () => {
+		const users = sqliteTable('users', {
+			id: text('id').primaryKey(),
+			email: text('email').notNull(),
+			username: text('username').notNull(),
+		}, (t) => [
+			uniqueIndex().on(sql`lower(${t.email})`),
+			uniqueIndex().on(sql`lower(${t.username})`),
+		]);
+
+		expect(() => snapshotFromSchema([users])).toThrow(/lower\("username"\)/);
+	});
+
+	it('a check constraint collision tells the author to rename, not to add a name they already gave', () => {
+		const t = sqliteTable('checked', {
+			id: integer('id').primaryKey(),
+			n: integer('n'),
+		}, (t) => [
+			check('dupe', sql`${t.n} >= 0`),
+			check('dupe', sql`${t.n} <= 100`),
+		]);
+
+		expect(() => snapshotFromSchema([t])).toThrow(/Rename one/);
+		expect(() => snapshotFromSchema([t])).not.toThrow(/Give at least one an explicit name/);
+	});
+
+	// A constraint explicitly named `constructor`, `toString`, `valueOf`, etc.
+	// is a legal SQL identifier that `pull` on a foreign database can emit —
+	// and it collides with an *inherited* property of a plain object literal,
+	// not an own one. Testing with `in`/bracket access instead of
+	// `Object.hasOwn` reported every such name as colliding with itself.
+	for (const name of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf']) {
+		it(`an index named "${name}" snapshots as a single constraint, not a self-collision`, () => {
+			const t = sqliteTable('t1', { a: text('a') }, (x) => [index(name).on(x.a)]);
+			const snap = snapshotFromSchema([t]);
+			expect(Object.keys(snap.tables.t1!.indexes)).toEqual([name]);
+		});
+
+		it(`a check constraint named "${name}" snapshots as a single constraint, not a self-collision`, () => {
+			const t = sqliteTable('t2', { n: integer('n') }, (x) => [check(name, sql`${x.n} >= 0`)]);
+			const snap = snapshotFromSchema([t]);
+			expect(Object.keys(snap.tables.t2!.checkConstraints)).toEqual([name]);
+		});
+
+		it(`a unique constraint named "${name}" snapshots as a single constraint, not a self-collision`, () => {
+			const t = sqliteTable('t3', { a: text('a').notNull() }, (x) => [unique(name).on(x.a)]);
+			const snap = snapshotFromSchema([t]);
+			expect(Object.keys(snap.tables.t3!.uniqueConstraints)).toEqual([name]);
+		});
+	}
+
+	it('a genuine duplicate of a prototype-key name still throws', () => {
+		const t = sqliteTable('t4', { a: text('a'), b: text('b') }, (x) => [
+			index('constructor').on(x.a),
+			index('constructor').on(x.b),
+		]);
+		expect(() => snapshotFromSchema([t])).toThrow(/derive the name "constructor"/);
+	});
+
+	it('an index named "__proto__" lands as an own property instead of mutating the prototype', () => {
+		const t = sqliteTable('t5', { a: text('a') }, (x) => [index('__proto__').on(x.a)]);
+		const snap = snapshotFromSchema([t]);
+		expect(Object.hasOwn(snap.tables.t5!.indexes, '__proto__')).toBe(true);
+		expect(snap.tables.t5!.indexes.__proto__).toEqual(
+			expect.objectContaining({ name: '__proto__' }),
+		);
+		// The map itself must be unaffected by the assignment — this is what the
+		// bug broke: `indexes['__proto__'] = value` on a plain object literal
+		// repoints the object's prototype instead of adding an entry.
+		expect(Object.getPrototypeOf(snap.tables.t5!.indexes)).not.toBe(Object.prototype);
+		expect(snap.tables.t5!.indexes.constructor).toBeUndefined();
+	});
 });
 
 describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () => {
@@ -1364,6 +1437,37 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			expect(diff.errors).toHaveLength(1);
 			expect(diff.errors[0]).toMatch(/"people" has to be recreated/);
 			expect(diff.errors[0]).toMatch(/"users_audit"/);
+		});
+	});
+
+	// Gap 2 (regression review of finding 2): the anchoring means a hand-edited
+	// `<table>_no_update` is correctly no longer classified as the guard, so a
+	// live `appendOnly = false` -> schema `appendOnly = true` transition fires
+	// an in-place `create trigger` — but the name is already taken by that
+	// foreign trigger, so it cannot apply. Refuse instead of emitting SQL that
+	// fails with "trigger ... already exists".
+	describe('refusing an in-place append-only guard creation that collides with a foreign trigger', () => {
+		it('refuses when the live table already has a foreign trigger named "<table>_no_update"', () => {
+			const before = withOptions(events, {});
+			const after = withOptions(events, { appendOnly: true });
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { events: ['events_no_update'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"events_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
+		});
+
+		it('still creates the guard normally when no foreign trigger occupies the name', () => {
+			const before = withOptions(events, {});
+			const after = withOptions(events, { appendOnly: true });
+
+			const diff = diffSnapshots(before, after);
+
+			expect(diff.errors).toEqual([]);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(true);
 		});
 	});
 

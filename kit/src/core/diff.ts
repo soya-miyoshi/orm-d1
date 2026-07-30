@@ -9,7 +9,7 @@
  * from the intersection of old and new columns. `SELECT *` is the classic
  * corruption bug and never appears here.
  */
-import { appendOnlyTrigger, dropAppendOnlyTrigger } from 'd1zzle/ddl';
+import { appendOnlyTrigger, appendOnlyTriggerName, dropAppendOnlyTrigger } from 'd1zzle/ddl';
 import type { ColumnSnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
 
@@ -604,15 +604,35 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		// and dropping it is destructive only in the sense that it removes a
 		// protection, which is worth saying out loud rather than doing quietly.
 		if ((previous.appendOnly ?? false) !== (next.appendOnly ?? false)) {
-			statements.push(
-				next.appendOnly
-					? { sql: appendOnlyTrigger(name), destructive: false }
-					: {
-						sql: dropAppendOnlyTrigger(name),
-						destructive: true,
-						reason: `"${name}" is no longer append-only, so UPDATE is permitted again`,
-					},
-			);
+			if (next.appendOnly) {
+				// The trigger this would create is named `<table>_no_update`
+				// (`appendOnlyTrigger`). If that name is already taken by a trigger
+				// the live database has but d1zzle did not author — the anchoring
+				// above is exactly what makes that distinction reliable now — `create
+				// trigger` fails on apply with "already exists", and prepending
+				// `drop trigger if exists` would silently destroy whatever that
+				// foreign trigger does, which is the bug class this guard exists to
+				// prevent. Refuse instead, matching the rebuild-path foreign-trigger
+				// refusal above.
+				const foreignTriggersForTable = options.foreignTriggers?.[liveTableNames[name] ?? name] ?? [];
+				const guardName = appendOnlyTriggerName(name);
+				if (foreignTriggersForTable.includes(guardName)) {
+					errors.push(
+						`"${name}" is becoming append-only, but a trigger named "${guardName}" already exists and `
+							+ 'd1zzle did not create it. Creating the guard would fail on apply because the name is '
+							+ 'taken. Drop or rename that trigger, or bring it into the schema so d1zzle can carry it '
+							+ 'across rebuilds.',
+					);
+				} else {
+					statements.push({ sql: appendOnlyTrigger(name), destructive: false });
+				}
+			} else {
+				statements.push({
+					sql: dropAppendOnlyTrigger(name),
+					destructive: true,
+					reason: `"${name}" is no longer append-only, so UPDATE is permitted again`,
+				});
+			}
 		}
 	}
 
