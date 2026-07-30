@@ -255,6 +255,13 @@ export function snapshotFromSchema(
 					const statement = createIndex(extra.meta, name);
 					const indexName = statement.match(/index (?:if not exists )?"((?:[^"]|"")+)"/)?.[1]
 						?.replaceAll('""', '"') ?? '';
+					if (indexes[indexName]) {
+						throw new Error(
+							`"${name}" declares two indexes that both derive the name "${indexName}". `
+								+ 'Give at least one an explicit name — an unnamed expression index is named "expr" '
+								+ 'whatever the expression is, so the second would silently replace the first.',
+						);
+					}
 					indexes[indexName] = {
 						name: indexName,
 						columns: extra.meta.columns.map((c) =>
@@ -269,6 +276,12 @@ export function snapshotFromSchema(
 				}
 				case 'primaryKey': {
 					const pkName = extra.meta.name ?? `${name}_pk`;
+					if (compositePrimaryKeys[pkName]) {
+						throw new Error(
+							`"${name}" declares two primary keys that both derive the name "${pkName}". `
+								+ 'Give at least one an explicit name.',
+						);
+					}
 					compositePrimaryKeys[pkName] = {
 						name: pkName,
 						columns: extra.meta.columns.map((c) => c.name),
@@ -277,6 +290,12 @@ export function snapshotFromSchema(
 				}
 				case 'unique': {
 					const uqName = uniqueConstraintName(extra.meta, name);
+					if (uniqueConstraints[uqName]) {
+						throw new Error(
+							`"${name}" declares two unique constraints that both derive the name "${uqName}". `
+								+ 'Give at least one an explicit name.',
+						);
+					}
 					uniqueConstraints[uqName] = { name: uqName, columns: extra.meta.columns.map((c) => c.name) };
 					break;
 				}
@@ -286,6 +305,12 @@ export function snapshotFromSchema(
 					// DDL's — or that omits the columns, as this one did — loses a
 					// constraint to a collision between two unnamed keys.
 					const fkName = foreignKeyName(extra.meta, name);
+					if (foreignKeys[fkName]) {
+						throw new Error(
+							`"${name}" declares two foreign keys that both derive the name "${fkName}". `
+								+ 'Give at least one an explicit name.',
+						);
+					}
 					foreignKeys[fkName] = {
 						name: fkName,
 						columns: extra.meta.columns.map((c) => c.name),
@@ -297,6 +322,12 @@ export function snapshotFromSchema(
 					break;
 				}
 				case 'check': {
+					if (checkConstraints[extra.meta.name]) {
+						throw new Error(
+							`"${name}" declares two check constraints that both derive the name "${extra.meta.name}". `
+								+ 'Give at least one an explicit name.',
+						);
+					}
 					checkConstraints[extra.meta.name] = {
 						name: extra.meta.name,
 						value: renderInline(extra.meta.value),

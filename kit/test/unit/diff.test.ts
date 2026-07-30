@@ -1,5 +1,5 @@
 import { blob, check, customType, foreignKey, index, integer, numeric, primaryKey, real, sql, sqliteTable, text, unique, uniqueIndex } from 'd1zzle';
-import { tableOptions, validateTableOptions } from 'd1zzle/ddl';
+import { appendOnlyTrigger, tableOptions, validateTableOptions } from 'd1zzle/ddl';
 import type { Column } from 'd1zzle';
 import { describe, expect, it } from 'vitest';
 import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
@@ -1112,6 +1112,19 @@ describe('snapshot and DDL agree, table for table', () => {
 			expect(() => assertRoundTrip(table)).not.toThrow();
 		});
 	}
+
+	it('refuses two indexes whose derived names collide, rather than dropping one', () => {
+		const users = sqliteTable('users_collide', {
+			id: text('id').primaryKey(),
+			email: text('email').notNull(),
+			username: text('username').notNull(),
+		}, (t) => [
+			uniqueIndex().on(sql`lower(${t.email})`),
+			uniqueIndex().on(sql`lower(${t.username})`),
+		]);
+
+		expect(() => snapshotFromSchema([users])).toThrow(/derive the name "users_collide_expr_unique"/);
+	});
 });
 
 describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () => {
@@ -1426,6 +1439,16 @@ describe('reading table options back out of a CREATE TABLE', () => {
 		const extra = 'CREATE TRIGGER g BEFORE UPDATE ON "events" BEGIN '
 			+ "INSERT INTO audit VALUES (1); SELECT RAISE(ABORT, 'no'); END";
 		expect(isAppendOnlyTrigger(extra, 'events')).toBe(false);
+
+		// The standard conditional-constraint idiom: a bare `SELECT RAISE(ABORT, …)
+		// WHERE <cond>` is a prefix match for the guard but is not unconditional.
+		const filtered = 'CREATE TRIGGER guard BEFORE UPDATE ON "events" BEGIN '
+			+ "SELECT RAISE(ABORT, 'kind is immutable') WHERE new.kind <> old.kind; END";
+		expect(isAppendOnlyTrigger(filtered, 'events')).toBe(false);
+	});
+
+	it('still recognises d1zzle\'s own generated guard after the anchor tightening', () => {
+		expect(isAppendOnlyTrigger(appendOnlyTrigger('events'), 'events')).toBe(true);
 	});
 });
 

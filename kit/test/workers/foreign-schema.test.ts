@@ -16,7 +16,7 @@
  */
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { introspect } from '../../src/core/apply.js';
+import { checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots } from '../../src/core/diff.js';
 import { typeAffinity } from '../../src/core/snapshot.js';
@@ -124,5 +124,33 @@ describe('introspecting a database d1zzle did not write', () => {
 		const { statements } = diffSnapshots(live, changed);
 		expect(statements.length).toBeGreaterThan(0);
 		expect(statements.some((s) => s.sql.includes('__new_accounts'))).toBe(true);
+	});
+
+	it('does not mistake a hand-written conditional guard for the append-only trigger', async () => {
+		// The standard conditional-constraint idiom: a bare `SELECT RAISE(ABORT,
+		// …) WHERE <cond>` — not d1zzle's unconditional guard.
+		await DB.prepare(
+			`create trigger "accounts_balance_immutable" before update on "accounts" begin `
+				+ `select raise(abort, 'balance is immutable') where new."balance" <> old."balance"; end`,
+		).run();
+
+		const foreignTriggers: Record<string, string[]> = {};
+		const live = await introspect(runner, foreignTriggers);
+		expect(foreignTriggers['accounts']).toEqual(['accounts_balance_immutable']);
+
+		// Force a rebuild of "accounts" via a genuine affinity change, same as
+		// the test above.
+		const changed = structuredClone(live) as typeof live;
+		(changed.tables['accounts']!.columns as Record<string, { type: string }>)['email']!.type = 'integer';
+
+		const { errors } = diffSnapshots(live, changed, { foreignTriggers });
+		expect(errors.length).toBeGreaterThan(0);
+		expect(errors.some((e) => e.includes('accounts_balance_immutable'))).toBe(true);
+
+		await expect(checkForeignTriggerConflicts(runner, [{
+			tag: '0001_change',
+			sql: `create table "__new_accounts" ("id" integer primary key); `
+				+ `drop table "accounts"; alter table "__new_accounts" rename to "accounts"`,
+		}])).rejects.toThrow(/accounts_balance_immutable/);
 	});
 });

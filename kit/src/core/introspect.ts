@@ -322,7 +322,8 @@ export const isAppendOnlyTrigger = (sql: string, tableName: string): boolean => 
 
 	const body = text.slice(begin + ' begin '.length, end);
 	const parts = body.split(';').map((s) => s.trim()).filter(Boolean);
-	return parts.length > 0 && parts.every((s) => /^select\s+raise\s*\(\s*abort\b/.test(s));
+	return parts.length > 0
+		&& parts.every((s) => /^select\s+raise\s*\(\s*abort\s*(?:,[^()]*)?\)$/.test(s));
 };
 
 export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): Snapshot {
