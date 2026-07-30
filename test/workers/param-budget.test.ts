@@ -8,7 +8,7 @@
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createSchema } from '../../src/ddl.js';
-import { blob, drizzle, inArray, integer, sqliteTable, text } from '../../src/index.js';
+import { blob, drizzle, inArray, integer, sql, sqliteTable, text } from '../../src/index.js';
 import { defineRelations } from '../../src/relations/index.js';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -100,6 +100,41 @@ describe('relational loads over more parents than the parameter budget', () => {
 
 		expect(rows).toHaveLength(N);
 		expect(rows.filter((r) => r.items.length === 1)).toHaveLength(N);
+	});
+});
+
+describe('onConflictDoUpdate against the budget, against real D1', () => {
+	// 4 columns, one carrying `$onUpdate` — the exact shape that pushed a
+	// chunk that landed exactly on the budget from `VALUES` alone (100 = 25
+	// rows × 4 cols) one over, into D1's real "too many SQL variables".
+	const sync = sqliteTable('pb_sync', {
+		id: integer('id').primaryKey(),
+		email: text('email').notNull(),
+		note: text('note').notNull(),
+		updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).$onUpdate(() => new Date(0)),
+	});
+
+	beforeEach(async () => {
+		await DB.prepare('drop table if exists "pb_sync"').run();
+		for (const statement of createSchema([sync])) await DB.prepare(statement).run();
+	});
+
+	it('does not overflow D1 on a bulk upsert whose chunk lands exactly on the budget', async () => {
+		const rows = Array.from({ length: 40 }, (_, i) => ({ id: i, email: `e${i}`, note: 'n' }));
+
+		// `set: { email: sql\`excluded."email"\` }` is the canonical bulk-upsert
+		// spelling and binds zero of its own parameters — any overflow here is
+		// entirely the fold of `updatedAt`'s `$onUpdate` into the conflict
+		// clause, not anything the caller wrote.
+		await expect(
+			db.insert(sync).values(rows).onConflictDoUpdate({
+				target: sync.id,
+				set: { email: sql`excluded."email"` },
+			}),
+		).resolves.not.toThrow();
+
+		const rowCount = await DB.prepare('select count(*) as n from "pb_sync"').first<{ n: number }>();
+		expect(rowCount!.n).toBe(40);
 	});
 });
 

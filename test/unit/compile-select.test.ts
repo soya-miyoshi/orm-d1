@@ -372,6 +372,22 @@ describe('explicit selections over an outer join', () => {
 		expect(c.map([[1, 'alice', null, null]])[0]!.u).not.toBeNull();
 	});
 
+	it('does not collapse a depth-3 group — only a group at its own depth-1 is eligible', () => {
+		// Drizzle gates its nullify map on `path.length === 2` (drizzle-orm's
+		// `mapResultRow`/`processNullifyMap` in utils.js), so a leaf sitting two
+		// levels below the top of the selection never nullifies its
+		// grandparent group.
+		const c = query.select({
+			uid: users.id,
+			p: { inner: { id: posts.id, title: posts.title } },
+		}).from(users).leftJoin(posts, on).compile();
+
+		expect(c.map([[1, null, null]])[0]).toEqual({
+			uid: 1,
+			p: { inner: { id: null, title: null } },
+		});
+	});
+
 	it('does not collapse a group over an innerJoin', () => {
 		const c = query.select({
 			u: { id: users.id, name: users.name },
@@ -389,12 +405,33 @@ describe('explicit selections over an outer join', () => {
 		expect(c.map([[1, null]])[0]!.mixed).toEqual({ userId: 1, postId: null });
 	});
 
-	it('does not collapse a group containing a sql expression', () => {
+	// Matches Drizzle: `is(field, Column)` (drizzle-orm/utils.js) never installs
+	// a nullify entry for a non-Column field, so a `sql` leaf riding along in
+	// the group neither disqualifies the collapse nor survives it — the group
+	// still collapses to `null` when its Column leaves are all null, and the
+	// sql leaf's value is discarded along with the rest.
+	it('collapses a group containing a sql expression when its columns are all null', () => {
 		const c = query.select({
 			p: { id: posts.id, upper: sql<string>`upper(${posts.title})` },
 		}).from(users).leftJoin(posts, on).compile();
 
-		expect(c.map([[null, null]])[0]!.p).toEqual({ id: null, upper: null });
+		expect(c.map([[null, null]])[0]!.p).toBeNull();
+	});
+
+	it('collapses a group containing a sql expression even when the sql leaf is non-null', () => {
+		const c = query.select({
+			p: { id: posts.id, one: sql<number>`1` },
+		}).from(users).leftJoin(posts, on).compile();
+
+		expect(c.map([[null, 1]])[0]!.p).toBeNull();
+	});
+
+	it('does not collapse a group with no Column leaves at all', () => {
+		const c = query.select({
+			p: { one: sql<number>`1` },
+		}).from(users).leftJoin(posts, on).compile();
+
+		expect(c.map([[7]])[0]!.p).toEqual({ one: 7 });
 	});
 
 	it('does not collapse a group from the non-nullable side of the join', () => {

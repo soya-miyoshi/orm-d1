@@ -180,14 +180,24 @@ const implicitSelection = (plan: SelectPlan): { selection: Selection; nullable: 
 
 /**
  * The same collapsing `implicitSelection` derives for its per-table groups,
- * computed instead for a hand-written nested projection: for each depth-1
- * group whose leaves are all bare columns from exactly one table, and that
- * table is on the nullable side of an outer/full join, the group's path
- * collapses to `null` rather than materialising as an object of nulls.
+ * computed instead for a hand-written nested projection: for a depth-1 group
+ * whose Column leaves are all from exactly one table on the nullable side of
+ * an outer/full join, the group's path collapses to `null` rather than
+ * materialising as an object of nulls.
  *
- * Deliberately conservative — a group mixing columns from two tables, one
- * containing a `sql` expression, or over an `innerJoin`, is left alone and
- * always returns an object.
+ * Matches Drizzle's `mapResultRow`/`processNullifyMap` (`drizzle-orm/utils.js`)
+ * on two points that are easy to get wrong:
+ *
+ *  - Only a group's *own* depth matters (`path.length === 2`, i.e. `[key,
+ *    leafName]`). A leaf nested two levels down (`{ p: { inner: { id } } }`)
+ *    does not make `p` collapse — only `p.inner` could, were it examined on
+ *    its own. Recursing into deeper leaves here would nullify an ancestor
+ *    group Drizzle leaves as a live (if all-null) object.
+ *  - A non-Column leaf (`sql`, an expression) does not disqualify the group;
+ *    Drizzle simply never installs a nullify entry for it (`is(field,
+ *    Column)`) and lets it ride along. Only the Column leaves decide whether
+ *    the group is single-table and nullable. A group with no Column leaves
+ *    at all never collapses — there is nothing to key off of.
  */
 const explicitNullableGroups = (plan: SelectPlan): Set<string> => {
 	const groups = new Set<string>();
@@ -198,16 +208,15 @@ const explicitNullableGroups = (plan: SelectPlan): Set<string> => {
 		if (!isSelectionObject(entry)) continue;
 		const leaves = flattenSelection(entry, [key]);
 		if (leaves.length === 0) continue;
+		// Only this group's own depth is eligible — a leaf that sits deeper
+		// belongs to a nested group of its own, not to this one.
+		if (leaves.some((leaf) => leaf.path.length !== 2)) continue;
 		const tableNames = new Set<string>();
-		let allColumns = true;
 		for (const leaf of leaves) {
-			if (!leaf.column) {
-				allColumns = false;
-				break;
-			}
+			if (!leaf.column) continue;
 			tableNames.add(leaf.column.tableName);
 		}
-		if (!allColumns || tableNames.size !== 1) continue;
+		if (tableNames.size !== 1) continue;
 		const [tableName] = tableNames;
 		if (tableName && nullable.has(tableName)) groups.add(key);
 	}
@@ -296,6 +305,7 @@ const buildMappers = <TRow>(
 		index,
 		key: keys[index]!,
 		decode: leaf.decode,
+		isColumn: leaf.column !== undefined,
 	}));
 	const shape = buildShape(fields, nullableGroups);
 	return {
@@ -516,6 +526,8 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 		hasRows: false,
 	};
 
+	const conflictParams = plan.onConflict ? countOnConflictParams(plan.onConflict, columns, ctx) : 0;
+
 	for (const group of groups) {
 		const cols = group.fields.map((field) => columns[field]!);
 		if (cols.length > ctx.maxParams) {
@@ -524,7 +536,14 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 					+ 'no chunking can satisfy it. Insert fewer columns per statement.',
 			);
 		}
-		const rowsPerChunk = Math.max(1, Math.floor(ctx.maxParams / cols.length));
+		if (cols.length + conflictParams > ctx.maxParams) {
+			throw new CompileError(
+				`A row of ${cols.length} columns plus ${conflictParams} bound parameter(s) from `
+					+ `"on conflict" exceed the bound-parameter limit of ${ctx.maxParams}; no chunking can `
+					+ 'satisfy it. Insert fewer columns, or bind fewer parameters in the conflict clause.',
+			);
+		}
+		const rowsPerChunk = Math.max(1, Math.floor((ctx.maxParams - conflictParams) / cols.length));
 
 		for (let start = 0; start < group.rows.length; start += rowsPerChunk) {
 			const chunkRows = group.rows.slice(start, start + rowsPerChunk);
@@ -595,6 +614,29 @@ const withOnUpdate = (
 		}
 	}
 	return out;
+};
+
+/**
+ * How many bound parameters `writeOnConflict` will add to *every* statement
+ * in the insert, outside the `VALUES` list: the folded `$onUpdate` columns,
+ * the user's own `set`, and `targetWhere`/`where`. The row chunker must
+ * reserve this many slots out of `maxParams` before dividing the remainder
+ * among `VALUES` rows, or a chunk that lands exactly on the budget from
+ * `VALUES` alone overflows once this clause is appended.
+ *
+ * Rendered once against a scratch writer rather than estimated, because the
+ * user's own `set`/`where` can themselves be `sql` fragments that bind zero,
+ * one, or many parameters — counting must match what `writeOnConflict` will
+ * actually emit, not guess "one param per assignment".
+ */
+const countOnConflictParams = (
+	conflict: NonNullable<InsertPlan['onConflict']>,
+	columns: Record<string, Column<any>>,
+	ctx: RenderContext,
+): number => {
+	const scratch = new Writer(ctx);
+	writeOnConflict(scratch, conflict, columns, ctx);
+	return scratch.toQuery().params.length;
 };
 
 const writeOnConflict = (
