@@ -45,7 +45,16 @@ export interface ColumnConfig {
 	unique: boolean;
 	uniqueName?: string | undefined;
 	length?: number | undefined;
+	isLengthExact?: boolean | undefined;
 	enumValues?: readonly string[] | undefined;
+	/**
+	 * The exact string a `customType`'s `dataType(config)` returned, preserved
+	 * verbatim. `config.type` only ever holds one of the five SQLite storage
+	 * classes — `getSQLType()`/`typeName()` fall back to that for every other
+	 * column, but a custom column must emit what its author declared
+	 * (`'varchar(10)'`, `'int'`, …), not a guess reduced from it.
+	 */
+	declaredType?: string | undefined;
 	references?: ColumnReference | undefined;
 	generated?: { readonly as: SQLChunk | string; readonly mode: 'stored' | 'virtual' } | undefined;
 	/** Encoder used when binding this column's values. */
@@ -168,7 +177,7 @@ export class Column<M extends ColumnMeta = ColumnMeta> extends SQLiteColumnEntit
 	// ---- the surface Drizzle adapters read -------------------------------
 
 	get dataType(): DrizzleDataType {
-		return dataTypeOf(this.config.columnType);
+		return dataTypeOf(this.config);
 	}
 
 	get columnType(): DrizzleColumnType {
@@ -212,7 +221,17 @@ export class Column<M extends ColumnMeta = ColumnMeta> extends SQLiteColumnEntit
 	}
 
 	getSQLType(): string {
-		return this.config.type;
+		return this.config.declaredType ?? this.config.type;
+	}
+
+	/** Drizzle's `Column['length']` — set for `text(name, { length })`. */
+	get length(): number | undefined {
+		return this.config.length;
+	}
+
+	/** Drizzle's `Column['isLengthExact']`. */
+	get isLengthExact(): boolean | undefined {
+		return this.config.isLengthExact;
 	}
 
 	mapFromDriverValue(value: unknown): unknown {
@@ -403,13 +422,27 @@ const base = (
 	...patch,
 });
 
-/** Drizzle's `dataType`, derived from its column class name. */
-type DataTypeOf<CT extends DrizzleColumnType> = CT extends 'SQLiteInteger' | 'SQLiteReal' ? 'number'
+/**
+ * Drizzle's `dataType`, derived from its column class name — the v1
+ * `"<type> <constraint>"` pair spelling, matching `dataTypeOf` at runtime
+ * exactly (see `drizzle-entity.ts`). `TEnum` distinguishes `SQLiteText`'s two
+ * shapes: `columnType` alone can't tell plain text from an enum.
+ */
+type DataTypeOf<CT extends DrizzleColumnType, TEnum extends readonly string[] | undefined = undefined> = CT extends
+	'SQLiteInteger' ? 'number int53'
+	: CT extends 'SQLiteReal' ? 'number double'
 	: CT extends 'SQLiteBoolean' ? 'boolean'
-	: CT extends 'SQLiteTimestamp' ? 'date'
-	: CT extends 'SQLiteTextJson' | 'SQLiteBlobJson' ? 'json'
-	: CT extends 'SQLiteBlobBuffer' ? 'buffer'
-	: CT extends 'SQLiteBigInt' ? 'bigint'
+	: CT extends 'SQLiteTimestamp' ? 'object date'
+	// `TEnum`'s default is the *unbounded* `readonly string[]` (see `text()`
+	// below), which — being a supertype, not a tuple — does not extend the
+	// nonempty-tuple pattern below. An explicit `enum: [...] as const` infers a
+	// literal tuple, which does. That's what tells "no enum given" apart from
+	// "enum given" at the type level, since both share the same type parameter.
+	: CT extends 'SQLiteText' ? (TEnum extends readonly [string, ...string[]] ? 'string enum' : 'string')
+	: CT extends 'SQLiteTextJson' | 'SQLiteBlobJson' ? 'object json'
+	: CT extends 'SQLiteBlobBuffer' ? 'object buffer'
+	: CT extends 'SQLiteNumeric' ? 'string numeric'
+	: CT extends 'SQLiteBigInt' ? 'bigint int64'
 	: CT extends 'SQLiteCustomColumn' ? 'custom'
 	: 'string';
 
@@ -424,7 +457,7 @@ type Meta<T, CT extends DrizzleColumnType, TDriver = unknown, TEnum extends read
 	data: T;
 	notNull: boolean;
 	hasDefault: boolean;
-	dataType: DataTypeOf<CT>;
+	dataType: DataTypeOf<CT, TEnum>;
 	columnType: CT;
 	driverParam: TDriver;
 	enumValues: TEnum;
@@ -582,12 +615,12 @@ type BlobColumnType<TMode> = TMode extends 'json' ? 'SQLiteBlobJson'
 	: TMode extends 'bigint' ? 'SQLiteBigInt'
 	: 'SQLiteBlobBuffer';
 
-export function blob<TMode extends 'buffer' | 'json' | 'bigint' = 'buffer'>(
+export function blob<TMode extends 'buffer' | 'json' | 'bigint' = 'json'>(
 	name?: string | BlobConfig<TMode>,
 	config?: BlobConfig<TMode>,
 ): ColumnBuilder<Meta<BlobData<TMode>, BlobColumnType<TMode>, Uint8Array>> {
 	const [columnName, options] = splitArgs(name, config);
-	const mode = options?.mode ?? 'buffer';
+	const mode = options?.mode ?? 'json';
 
 	let patch: Partial<ColumnConfig>;
 	switch (mode) {
@@ -658,15 +691,31 @@ export interface CustomTypeParams<TData, TDriver, TConfig = unknown> {
  * declared. Calling it eagerly with no argument meant a `dataType` that read
  * `config.length` threw at module scope, on import, before any query existed.
  */
+/**
+ * SQLite's REAL affinity rules, applied to a *declared* type string to get one
+ * of the five storage classes/affinities the runtime actually needs to bind
+ * or decode a value by. Order matters — `INT` is checked before `CHAR`, so
+ * `POINT` is `integer` — and is duplicated verbatim from
+ * `kit/src/core/snapshot.ts`'s `typeAffinity()` rather than shared: `src/`
+ * cannot import from `kit/`.
+ */
+const affinityOf = (declared: string): SQLiteType => {
+	const type = declared.toUpperCase();
+	if (type.includes('INT')) return 'integer';
+	if (type.includes('CHAR') || type.includes('CLOB') || type.includes('TEXT')) return 'text';
+	if (type.includes('BLOB') || type.trim() === '') return 'blob';
+	if (type.includes('REAL') || type.includes('FLOA') || type.includes('DOUB')) return 'real';
+	return 'numeric';
+};
+
 export function customType<TData, TDriver = unknown, TConfig = unknown>(
 	params: CustomTypeParams<TData, TDriver, TConfig>,
 ): (name?: string, config?: TConfig) => ColumnBuilder<Meta<TData, 'SQLiteCustomColumn', TDriver>> {
 	return (name?: string, config?: TConfig) => {
 		const declared = String(params.dataType(config));
-		const type = (['integer', 'text', 'real', 'blob', 'numeric'] as const)
-			.find((t) => declared.toLowerCase().includes(t)) ?? 'text';
 
-		return new ColumnBuilder(base(type, 'SQLiteCustomColumn', name, {
+		return new ColumnBuilder(base(affinityOf(declared), 'SQLiteCustomColumn', name, {
+			declaredType: declared,
 			encode: params.toDriver ? (v) => params.toDriver!(v as TData) as D1Param : (v) => v as D1Param,
 			decode: params.fromDriver ? (v) => params.fromDriver!(v as TDriver) : undefined,
 		}));

@@ -73,37 +73,63 @@ export type DrizzleColumnType =
 	| 'SQLiteBigInt'
 	| 'SQLiteCustomColumn';
 
-/** Drizzle's `dataType`, which adapters map onto their own type systems. */
-export type DrizzleDataType = 'number' | 'string' | 'boolean' | 'date' | 'json' | 'buffer' | 'bigint' | 'custom';
+/**
+ * Drizzle's `dataType`, which adapters map onto their own type systems.
+ *
+ * Drizzle v1 spells this as a `"<type> <constraint>"` pair string rather than
+ * a flat name — `'object date'`, `'string enum'`, `'number int53'` — so a v1
+ * adapter (its Zod integration, in particular) can dispatch on the pair
+ * without re-deriving it from `columnType`. These are the exact strings
+ * `drizzle-orm/sqlite-core`'s column builders pass to `super()`.
+ */
+export type DrizzleDataType =
+	| 'number int53'
+	| 'number double'
+	| 'number'
+	| 'string'
+	| 'string enum'
+	| 'string numeric'
+	| 'boolean'
+	| 'object date'
+	| 'object json'
+	| 'object buffer'
+	| 'bigint int64'
+	| 'custom';
 
 /**
- * Drizzle v1 replaced the flat `dataType` with a `type constraint` pair spelled
- * as one string — `'object date'`, `'object json'`. The three values that moved
- * are remapped here so a v1 adapter reading `column._.dataType` off one of our
- * columns sees a value its own `ColumnType` union admits.
+ * No longer a remapping step — `DataTypeOf<CT>` (columns.ts) already computes
+ * the v1 pair spelling at the type level, so this is just an identity guard.
+ * Kept because `src/drizzle.ts` still names it.
  */
-export type ToDrizzleDataType<T> = T extends 'date' ? 'object date'
-	: T extends 'json' ? 'object json'
-	: T extends 'buffer' ? 'object buffer'
-	: T extends DrizzleDataType ? T
-	: 'string';
+export type ToDrizzleDataType<T> = T extends DrizzleDataType ? T : 'string';
 
-export const dataTypeOf = (columnType: DrizzleColumnType): DrizzleDataType => {
-	switch (columnType) {
+/** The subset of `ColumnConfig` `dataTypeOf` needs to disambiguate a pair string. */
+export interface DataTypeInput {
+	columnType: DrizzleColumnType;
+	enumValues?: readonly string[] | undefined;
+}
+
+export const dataTypeOf = (config: DataTypeInput): DrizzleDataType => {
+	switch (config.columnType) {
 		case 'SQLiteInteger':
+			return 'number int53';
 		case 'SQLiteReal':
-			return 'number';
+			return 'number double';
 		case 'SQLiteBoolean':
 			return 'boolean';
 		case 'SQLiteTimestamp':
-			return 'date';
+			return 'object date';
+		case 'SQLiteText':
+			return config.enumValues?.length ? 'string enum' : 'string';
 		case 'SQLiteTextJson':
 		case 'SQLiteBlobJson':
-			return 'json';
+			return 'object json';
 		case 'SQLiteBlobBuffer':
-			return 'buffer';
+			return 'object buffer';
+		case 'SQLiteNumeric':
+			return 'string numeric';
 		case 'SQLiteBigInt':
-			return 'bigint';
+			return 'bigint int64';
 		case 'SQLiteCustomColumn':
 			return 'custom';
 		default:

@@ -198,7 +198,7 @@ export const literal = (value: unknown): string => {
 	return `'${String(value).replaceAll("'", "''")}'`;
 };
 
-const typeName = (column: Column<any>): string => column.config.type;
+const typeName = (column: Column<any>): string => column.config.declaredType ?? column.config.type;
 
 const referenceClause = (column: Column<any>): string => {
 	const reference = column.config.references;

@@ -83,7 +83,11 @@ describe('reads and writes', () => {
 			settings: null,
 			score: 9.5,
 			createdAt: new Date(1000),
-			updatedAt: null,
+			// `updatedAt` carries `$onUpdate` and no `default`, so an insert that
+			// does not specify it now populates it too (F-005) — matching
+			// drizzle-orm's `buildInsertQuery`, rather than leaving it null until
+			// the first update.
+			updatedAt: new Date(0),
 		});
 	});
 
@@ -102,6 +106,17 @@ describe('reads and writes', () => {
 		const db = d1zzle(DB);
 		await db.update(users).set({ name: 'Ada L.' }).where(eq(users.id, 1)).run();
 		const row = await db.select({ updatedAt: users.updatedAt }).from(users).where(eq(users.id, 1)).get();
+		expect(row?.updatedAt).toEqual(new Date(0));
+	});
+
+	it('populates a plain $onUpdate column on insert too, not just on update', async () => {
+		// F-005: a column with `$onUpdate` and no `default` is populated at
+		// insert time as well, matching drizzle-orm's `buildInsertQuery` — it
+		// used to stay null until the first `update()` touched the row.
+		const db = d1zzle(DB);
+		await db.insert(users).values({ id: 3, email: 'c@b.c' }).run();
+		const row = await db.select({ updatedAt: users.updatedAt }).from(users).where(eq(users.id, 3)).get();
+		expect(row?.updatedAt).not.toBeNull();
 		expect(row?.updatedAt).toEqual(new Date(0));
 	});
 

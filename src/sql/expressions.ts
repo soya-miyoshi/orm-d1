@@ -95,7 +95,7 @@ const combine = (keyword: string) =>
 	const present = conditions.filter((c): c is Condition => c !== undefined);
 	if (present.length === 0) return undefined;
 	if (present.length === 1) return present[0]!;
-	return sql<boolean>`(${sql.join(present, ` ${keyword} `)})`;
+	return sql<boolean>`(${sql.join(present.map((c) => sql`(${c})`), ` ${keyword} `)})`;
 };
 
 export const and = combine('and');
