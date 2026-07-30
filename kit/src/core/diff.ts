@@ -695,7 +695,12 @@ const canonicalIndex = (index: IndexSnapshot): string =>
 			// unqualified column gets, or the two would diff as different when
 			// they describe the identical index.
 			c.desc ?? false,
-			c.collate && c.collate !== 'BINARY' ? c.collate : undefined,
+			// D1 preserves a `COLLATE`'s original case verbatim in the DDL text,
+			// so `collate NoCase` (from a live DB) and `NOCASE` (from the schema
+			// side, via `.collate()`) name the same collation but compare
+			// unequal unless folded to a common case first — same for the
+			// `binary` guard, which D1 also preserves lowercase.
+			c.collate && c.collate.toLowerCase() !== 'binary' ? c.collate.toLowerCase() : undefined,
 		]),
 		index.isUnique,
 		(index.where ?? '').replaceAll(/\s+/g, ' ').trim(),

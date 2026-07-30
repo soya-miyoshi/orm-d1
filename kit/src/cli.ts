@@ -54,7 +54,7 @@ interface Args {
  * because a flag's shape is fixed by the command it belongs to, not by
  * whatever a caller happens to pass on the command line.
  */
-const BOOLEAN_FLAGS = new Set(['local', 'remote', 'accept-data-loss']);
+const BOOLEAN_FLAGS = new Set(['local', 'remote', 'accept-data-loss', 'force', 'help']);
 
 export function parseArgs(argv: readonly string[]): Args {
 	const [command = 'help', ...rest] = argv;
@@ -177,7 +177,13 @@ export async function run(argv: readonly string[]): Promise<number> {
 	// is no command yet for it to be a flag of. Left unmatched, it fell
 	// through to the config-loading path below and failed with "No d1zzle
 	// config found" before the usage text ever printed.
-	if (command === 'help' || command.startsWith('-') || flags['help'] === true) {
+	//
+	// Matched by exact spelling, not `command.startsWith('-')`: that shape
+	// also caught every *other* flag-looking first token — `--nope`,
+	// `--remote` (flags-before-command) — and silently printed usage and
+	// exited 0 for them instead of failing. Those fall through to the
+	// `default:` case below like any other unrecognised command.
+	if (command === 'help' || command === '-h' || command === '--help' || flags['help'] === true) {
 		console.log(USAGE);
 		return 0;
 	}

@@ -188,6 +188,32 @@ describe('--help in the command position', () => {
 	it('prints usage instead of looking for a config', async () => {
 		await expect(run(['--help'])).resolves.toBe(0);
 	});
+
+	it('does not treat every other flag-shaped first token as --help', async () => {
+		// `command.startsWith('-')` used to match ANY leading-dash first token,
+		// so `--nope`, `-x`, and flags-before-command invocations like
+		// `d1zzle-migrate --remote migrate` all silently printed usage and
+		// exited 0 instead of failing. None of those are `-h`/`--help`/`help`,
+		// so they must fall through to the normal (non-zero) unrecognised-input
+		// path instead of resolving to 0.
+		// Past the help check, both fall through to the normal command path,
+		// which (with no d1zzle config in this test's cwd) rejects rather than
+		// resolving — the point is only that neither resolves to 0.
+		await expect(run(['--nope'])).rejects.toThrow();
+		await expect(run(['--remote', 'migrate'])).rejects.toThrow();
+	});
+});
+
+describe('BOOLEAN_FLAGS coercion', () => {
+	it('parses --force and --force=true as real booleans, not strings', () => {
+		expect(parseArgs(['pull', '--force']).flags['force']).toBe(true);
+		expect(parseArgs(['pull', '--force=true']).flags['force']).toBe(true);
+		expect(parseArgs(['pull', '--force=false']).flags['force']).toBe(false);
+	});
+
+	it('parses --help=true as a real boolean', () => {
+		expect(parseArgs(['generate', '--help=true']).flags['help']).toBe(true);
+	});
 });
 
 describe('rename flags', () => {

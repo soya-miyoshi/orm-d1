@@ -1471,19 +1471,20 @@ describe('a reversed relation inherits the where onto the source, not the target
 		await db.update(schema.users).set({ active: false }).where(eq(schema.users.id, 2)).run();
 	});
 
-	it('narrows children by the source row, in the split plan', async () => {
-		// User 1 is active and owns posts 10 and 11 — both come back. User 2 is
-		// inactive, so it gets none, even though post 12 is genuinely theirs.
-		const rows = await split.query.users.findMany({
+	it('refuses to compute this in the split plan, rather than risk leaking status across a non-unique key', async () => {
+		// The split plan has no correlated scope for a `where` compiled against
+		// the parent (the source, here): the only query it can group by is
+		// "does *any* row sharing this join key match", which would leak a
+		// passing user's status onto every other user sharing the key whenever
+		// the source column is not unique. Rather than silently compute that
+		// wrong answer, it refuses — naming the relation and pointing at the
+		// `joined` strategy, which evaluates this correctly per parent row (see
+		// the next test).
+		await expect(split.query.users.findMany({
 			columns: { id: true },
 			with: { posts: { columns: { id: true } } },
 			orderBy: { id: 'asc' },
-		});
-
-		expect(rows).toEqual([
-			{ id: 1, posts: [{ id: 10 }, { id: 11 }] },
-			{ id: 2, posts: [] },
-		]);
+		})).rejects.toThrow(/"posts".*"users".*reversed.*where.*relationalStrategy.*'joined'/s);
 	});
 
 	it('narrows children by the source row, in the joined plan too', async () => {
@@ -1515,6 +1516,12 @@ describe('a reversed relation inherits the where onto the source, not the target
 	it('still throws when a genuinely reversed where names a field absent from the correct table', async () => {
 		// The correct table for this `where` is `users`, the source — not
 		// `posts`. A field that exists on neither must still fail loudly.
+		//
+		// Run against `joined` — the strategy this shape actually works with.
+		// The `split` plan refuses any reversed relation carrying its own
+		// `where` outright (see the earlier test in this suite), regardless of
+		// whether the `where` itself is valid, so it would not reach this
+		// field-name check at all.
 		const bogus = defineRelations({ users: schema.users, posts: schema.posts }, (r) => ({
 			posts: {
 				author: r.one.users({ from: r.posts.authorId, to: r.users.id, where: { nope: true } as never }),
@@ -1523,10 +1530,68 @@ describe('a reversed relation inherits the where onto the source, not the target
 				posts: r.many.posts(),
 			},
 		}));
-		const d = drizzle({ client: DB, relations: bogus });
+		const d = drizzle({ client: DB, relations: bogus, relationalStrategy: 'joined' });
 
 		await expect(d.query.users.findMany({ with: { posts: true } })).rejects.toThrow(
 			/Unknown filter field "nope"/,
 		);
+	});
+});
+
+describe('a many() relation with its own where, reversed onto it from nothing, still applies own where', () => {
+	/**
+	 * `users.posts` states its own `where` here (unlike the suite above, where
+	 * it inherited one from `posts.author`) — so per Gap 1, `isReversed` must
+	 * come out `false`: the `where` names `posts`' own columns (`views`), the
+	 * *target* of this relation, not `users`, the source it was reversed onto
+	 * for its join columns alone. Compiling it as if reversed would try to
+	 * find a `views` column on `users` and throw "Unknown filter field".
+	 */
+	const rel = defineRelations({ users: schema.users, posts: schema.posts }, (r) => ({
+		posts: {
+			author: r.one.users({ from: r.posts.authorId, to: r.users.id }),
+		},
+		users: {
+			// No from/to: adopts the join from `posts.author`. Its own `where`
+			// is declared here, though, so it must NOT come out isReversed.
+			posts: r.many.posts({ where: { views: { gt: 10 } } }),
+		},
+	}));
+
+	const split = drizzle({ client: DB, relations: rel });
+	const joined = drizzle({ client: DB, relations: rel, relationalStrategy: 'joined' });
+
+	const expected = [
+		{ id: 1, posts: [{ id: 11 }] },
+		{ id: 2, posts: [] },
+	];
+
+	it('applies it against posts, its own table, in the split plan', async () => {
+		const rows = await split.query.users.findMany({
+			columns: { id: true },
+			with: { posts: { columns: { id: true } } },
+			orderBy: { id: 'asc' },
+		});
+		expect(rows).toEqual(expected);
+	});
+
+	it('applies it against posts, its own table, in the joined plan', async () => {
+		const rows = await joined.query.users.findMany({
+			columns: { id: true },
+			with: { posts: { columns: { id: true } } },
+			orderBy: { id: 'asc' },
+		});
+		expect(rows).toEqual(expected);
+	});
+
+	it('applies it against posts, its own table, through the relational filter DSL', async () => {
+		// `posts: true` embeds the declared `where` inside the correlated
+		// `exists`; only user 1 has a post with more than 10 views.
+		const rows = await split.query.users.findMany({
+			columns: { id: true },
+			where: { posts: true },
+			orderBy: { id: 'asc' },
+		});
+		expect(rows).toEqual([{ id: 1 }]);
 	});
 });

@@ -530,37 +530,22 @@ export class RelationalQueryBuilder {
 		 * the opposite side via `adoptReverse` — see `src/relations/define.ts`),
 		 * names columns of the *source* table: this level, the parent, not the
 		 * target. `joined.ts` has a correlated subquery to put that predicate
-		 * inside of; the split plan does not — parents are already fetched into
-		 * plain rows by the time this runs. So the predicate is evaluated here,
-		 * against the parent table directly, and a parent that fails it is
-		 * treated exactly like one with no matching children: `[]` for `many`,
-		 * `null` for `one`.
+		 * inside of, evaluated per parent row. The split plan has no such scope:
+		 * parents are already fetched into plain rows by the time this runs, and
+		 * the only query it can group by is "does *any* row with this join key
+		 * satisfy the predicate" — which, whenever the source column isn't
+		 * unique, leaks a passing parent's status onto every other parent that
+		 * happens to share its key. There is no fix here that stays within the
+		 * split plan's shape, so this refuses instead of silently computing
+		 * wrong rows for the shape it can't handle.
 		 */
-		let reversedFailedParents: Set<string> | undefined;
 		if (relation.isReversed && relation.where) {
-			const reversedWhere = compileFilter(
-				relation.where,
-				this.config.table,
-				this.config.columns,
-				this.config.relations,
-				this.schema,
+			throw new Error(
+				`Relation "${name}" on "${this.config.name}" is reversed and carries its own "where", which the `
+					+ '"split" relational strategy cannot evaluate correctly (it can only test whether *some* row '
+					+ 'sharing a parent\'s join key matches, not each parent\'s own row). Use `relationalStrategy: '
+					+ "'joined'` for this query.",
 			);
-			if (reversedWhere) {
-				const sourceSelection: Record<string, SQLChunk> = {};
-				for (const [i, column] of relation.sourceColumns!.entries()) {
-					sourceSelection[parentFieldNames[i]!] = column;
-				}
-				const sourceMatcher = parentFieldNames.length === 1
-					? inArray(relation.sourceColumns![0]!, keys.map((k) => k[0]))
-					: or(...keys.map((key) => and(...relation.sourceColumns!.map((c, i) => eq(c, key[i])))));
-				const passingRows = await this.db
-					.select(sourceSelection)
-					.from(this.config.table as never)
-					.where(and(sourceMatcher, reversedWhere))
-					.all(input) as Record<string, unknown>[];
-				const passing = new Set(passingRows.map((r) => keyOf(r, parentFieldNames)));
-				reversedFailedParents = new Set([...byKey.keys()].filter((key) => !passing.has(key)));
-			}
 		}
 
 		const matcherFor = (subset: readonly unknown[][]): Condition | undefined =>
@@ -680,10 +665,6 @@ export class RelationalQueryBuilder {
 
 		for (const row of rows) {
 			const parentKey = keyOf(row, parentFieldNames);
-			if (reversedFailedParents?.has(parentKey)) {
-				row[name] = isMany ? [] : null;
-				continue;
-			}
 			const bucket = grouped.get(parentKey) ?? [];
 			if (isMany) {
 				// Same rule as `one` below, one container up. Two parents share a

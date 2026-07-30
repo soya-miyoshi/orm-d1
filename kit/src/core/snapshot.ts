@@ -108,7 +108,11 @@ const decorateIndexColumn = (raw: string): IndexColumnSnapshot => {
 		expression: (name ?? '').replaceAll('""', '"'),
 		isExpression: false,
 		...(order?.toLowerCase() === 'desc' ? { desc: true } : {}),
-		...(collate && collate.toUpperCase() !== 'BINARY' ? { collate: collate.toUpperCase() } : {}),
+		// Folded the same way `canonicalIndex` (diff.ts) folds the
+		// introspected side, so `collate NOCASE` here and `collate NoCase`
+		// read back from a live DB's DDL compare equal instead of spuriously
+		// diffing on case alone.
+		...(collate && collate.toLowerCase() !== 'binary' ? { collate: collate.toLowerCase() } : {}),
 	};
 };
 

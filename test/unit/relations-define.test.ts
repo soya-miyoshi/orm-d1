@@ -108,6 +108,22 @@ describe('a relation with no from/to adopts the one pointing back', () => {
 		expect(names(config['users']!.relations['edited']!.targetColumns)).toEqual(['editor_id']);
 	});
 
+	it('is not marked reversed when this side declares its own where', () => {
+		// Drizzle (relations.js:60): `isReversed = !where`. A `where` stated on
+		// this side names *this* side's own target columns, not the source
+		// being reversed onto — so it must be compiled the ordinary way
+		// (against the target), not treated as needing the reversed,
+		// against-the-parent handling `isReversed` triggers elsewhere.
+		const config = defineRelations({ users, articles }, (r) => ({
+			users: { articles: r.many.articles({ where: { authorId: { isNotNull: true } } }) },
+			articles: { author: r.one.users({ from: r.articles.authorId, to: r.users.id }) },
+		}));
+
+		const many = config['users']!.relations['articles']!;
+		expect(many.isReversed).toBe(false);
+		expect(many.where).toEqual({ authorId: { isNotNull: true } });
+	});
+
 	it('says so when there is no relation pointing back', () => {
 		expect(() =>
 			defineRelations({ users, articles }, (r) => ({
