@@ -1,7 +1,6 @@
 ---
 name: audit-sweep
 description: Run one iteration of the d1zzle sweep — one of three rotating review lenses (feature, efficiency+bugs, security) over the whole codebase, a coder batch committed to its own branch, up to two review rounds, then a merge to main. State and the rotation pointer live in AUDIT.md. Intended to be driven on an interval by /loop.
-disable-model-invocation: true
 ---
 
 # One sweep iteration
