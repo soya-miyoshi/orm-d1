@@ -8,3 +8,9 @@ notes/
 
 # Local scratch copy of Drizzle, if present. Never vendored, never a dependency.
 drizzle-orm/
+
+# Per-machine Claude state. The agents and the skill in .claude/ are shared and
+# committed; these two are not — one holds local MCP toggles, the other is a
+# runtime lock.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

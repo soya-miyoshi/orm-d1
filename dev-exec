@@ -1,0 +1,35 @@
+#!/bin/bash
+# Exec into the d1zzle devcontainer.
+#
+#   ./dev-exec                  interactive zsh
+#   ./dev-exec npm run check    run one command and exit
+#
+# (The sibling product repo calls its copy dev-exec.sh; same script, different
+# container name.)
+
+set -uo pipefail
+
+CONTAINER_NAME="d1zzle-devcontainer"
+
+if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    echo "Error: Container '${CONTAINER_NAME}' is not running."
+    echo ""
+    echo "Start it with:"
+    echo "  docker compose up -d"
+    exit 1
+fi
+
+# node_modules is a container-owned volume, so a fresh container starts empty.
+# Say so once, here, instead of letting it surface as a confusing module error.
+if ! docker exec "${CONTAINER_NAME}" test -d /workspace/node_modules/vitest 2>/dev/null; then
+    echo "note: /workspace/node_modules looks empty (it is a container volume, not the host's)."
+    echo "      run:  ./dev-exec npm install"
+    echo ""
+fi
+
+if [ $# -eq 0 ]; then
+    echo "Opening interactive shell in ${CONTAINER_NAME}..."
+    exec docker exec -it "${CONTAINER_NAME}" /bin/zsh
+else
+    exec docker exec -it "${CONTAINER_NAME}" "$@"
+fi

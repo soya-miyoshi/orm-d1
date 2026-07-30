@@ -1,0 +1,84 @@
+# d1zzle devcontainer.
+#
+#   docker compose up -d      # build + start
+#   ./dev-exec                # interactive shell
+#   ./dev-exec npm run check  # one-off command
+#
+# One service, no databases: D1 here is miniflare's own storage inside workerd,
+# started by vitest (`@cloudflare/vitest-pool-workers`) per run. There is nothing
+# to depend on and nothing to keep warm.
+
+services:
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TZ: Asia/Tokyo
+        GIT_DELTA_VERSION: 0.18.2
+        ZSH_IN_DOCKER_VERSION: 1.2.0
+
+    container_name: d1zzle-devcontainer
+
+    user: node
+    init: true
+
+    volumes:
+      # The repo
+      - .:/workspace:cached
+
+      # node_modules is a container-owned volume, NOT the host's.
+      #
+      # This is load-bearing. npm installs platform-specific binaries — esbuild's
+      # executable, `@typescript/native-preview-<platform>` for tsgo, workerd —
+      # and a single node_modules can only ever hold one platform's set. Sharing
+      # the host's (macOS/arm64) with this container (linux) makes `npm run check`
+      # die with "Exec format error" and "Unable to resolve
+      # @typescript/native-preview-linux-x64", which look like code failures and
+      # are not. Keeping them separate means each side installs its own.
+      #
+      # Cost: one `npm install` inside the container the first time, and again
+      # after dependency changes. `./dev-exec npm install` does it.
+      - d1zzle-node-modules:/workspace/node_modules
+
+      # A real-world schema to exercise the kit against, read-only so nothing
+      # here can write to the product repo. `..` is the parent checkout; point
+      # FIXTURE_REPO somewhere else, or drop this mount, if that is not where
+      # yours lives.
+      - ${FIXTURE_REPO:-..}:/fixture:ro
+
+      # Persist shell history across rebuilds
+      - bashhistory:/commandhistory
+
+      # Claude credentials + onboarding state, shared with every other project
+      - ${HOME}/.claude-docker/.credentials.json:/home/node/.claude/.credentials.json
+      - ${HOME}/.claude-docker/.claude.json:/home/node/.claude/.claude.json
+
+      # npm cache
+      - npm-cache:/home/node/.npm
+
+      # Shell dotfiles (kp, kw, aliases) — auto-sourced by ~/.bashrc and ~/.zshrc
+      - ./dotfiles:/home/node/dotfiles:ro
+
+    # No ports. This is a library: vitest starts workerd in-process, nothing
+    # listens, and wrangler.jsonc exists only to give the test pool a D1
+    # binding. Add a mapping here if you ever want to attach a host debugger
+    # (`- "9229:9229"`) or hand-test a scratch Worker.
+
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=4096
+      - PATH=/usr/local/share/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/node/.local/bin
+      # Consumed by the big-schema regression harness (see AUDIT.md F-001).
+      # Unset it and that harness skips instead of failing.
+      - D1ZZLE_FIXTURE_SCHEMA=/fixture/apps/api/src/db/schema/index.ts
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-}
+
+    # Keep it alive; the work happens over `docker exec`.
+    command: sleep infinity
+
+volumes:
+  d1zzle-node-modules:
+  bashhistory:
+  npm-cache:
