@@ -137,6 +137,22 @@ const tableSelection = (t: Table): Selection => getTableColumns(t) as unknown as
 const inheritedNullable = (t: Table, prefix: string): string[] =>
 	[...getTableNullableGroups(t)].map((path) => (prefix ? `${prefix}.${path}` : path));
 
+/**
+ * The tables (keyed by their in-plan name — post-alias) whose columns an
+ * outer/full join can turn into a row of `null`s. Shared by the implicit
+ * per-table grouping below and by `explicitNullableGroups`, which needs the
+ * same set to decide whether a hand-written nested group can collapse.
+ */
+const nullableTables = (plan: SelectPlan): Set<string> => {
+	const tables = new Set<string>();
+	if (!plan.from) return tables;
+	for (const join of plan.joins) {
+		if (join.type === 'left' || join.type === 'full') tables.add(getTableName(join.table));
+		if (join.type === 'right' || join.type === 'full') tables.add(getTableName(plan.from));
+	}
+	return tables;
+};
+
 const implicitSelection = (plan: SelectPlan): { selection: Selection; nullable: Set<string> } => {
 	const nullable = new Set<string>();
 	if (!plan.from) return { selection: {}, nullable };
@@ -151,15 +167,60 @@ const implicitSelection = (plan: SelectPlan): { selection: Selection; nullable: 
 	const selection: Record<string, Selection> = {
 		[getTableName(plan.from)]: tableSelection(plan.from),
 	};
+	const nullableGroupNames = nullableTables(plan);
 	for (const path of inheritedNullable(plan.from, getTableName(plan.from))) nullable.add(path);
 	for (const join of plan.joins) {
 		const name = getTableName(join.table);
 		selection[name] = tableSelection(join.table);
 		for (const path of inheritedNullable(join.table, name)) nullable.add(path);
-		if (join.type === 'left' || join.type === 'full') nullable.add(name);
-		if (join.type === 'right' || join.type === 'full') nullable.add(getTableName(plan.from));
 	}
+	for (const name of nullableGroupNames) nullable.add(name);
 	return { selection, nullable };
+};
+
+/**
+ * The same collapsing `implicitSelection` derives for its per-table groups,
+ * computed instead for a hand-written nested projection: for a depth-1 group
+ * whose Column leaves are all from exactly one table on the nullable side of
+ * an outer/full join, the group's path collapses to `null` rather than
+ * materialising as an object of nulls.
+ *
+ * Matches Drizzle's `mapResultRow`/`processNullifyMap` (`drizzle-orm/utils.js`)
+ * on two points that are easy to get wrong:
+ *
+ *  - Only a group's *own* depth matters (`path.length === 2`, i.e. `[key,
+ *    leafName]`). A leaf nested two levels down (`{ p: { inner: { id } } }`)
+ *    does not make `p` collapse — only `p.inner` could, were it examined on
+ *    its own. Recursing into deeper leaves here would nullify an ancestor
+ *    group Drizzle leaves as a live (if all-null) object.
+ *  - A non-Column leaf (`sql`, an expression) does not disqualify the group;
+ *    Drizzle simply never installs a nullify entry for it (`is(field,
+ *    Column)`) and lets it ride along. Only the Column leaves decide whether
+ *    the group is single-table and nullable. A group with no Column leaves
+ *    at all never collapses — there is nothing to key off of.
+ */
+const explicitNullableGroups = (plan: SelectPlan): Set<string> => {
+	const groups = new Set<string>();
+	if (!plan.selection) return groups;
+	const nullable = nullableTables(plan);
+	if (nullable.size === 0) return groups;
+	for (const [key, entry] of Object.entries(plan.selection)) {
+		if (!isSelectionObject(entry)) continue;
+		const leaves = flattenSelection(entry, [key]);
+		if (leaves.length === 0) continue;
+		// Only this group's own depth is eligible — a leaf that sits deeper
+		// belongs to a nested group of its own, not to this one.
+		if (leaves.some((leaf) => leaf.path.length !== 2)) continue;
+		const tableNames = new Set<string>();
+		for (const leaf of leaves) {
+			if (!leaf.column) continue;
+			tableNames.add(leaf.column.tableName);
+		}
+		if (tableNames.size !== 1) continue;
+		const [tableName] = tableNames;
+		if (tableName && nullable.has(tableName)) groups.add(key);
+	}
+	return groups;
 };
 
 /**
@@ -198,12 +259,13 @@ export interface ProjectedColumn {
  * `projectedColumns` reports — what `.as()` has to carry so the property
  * survives being read back out of a subquery.
  *
- * An explicit selection has none: nothing today marks a hand-written projection
- * nullable, so a `db.select({ p: { … } })` over a left join is an object of
- * nulls both directly and through `.as()`. Consistent, and unchanged here.
+ * An explicit selection collapses too, via `explicitNullableGroups`: a
+ * depth-1 group whose leaves are all bare columns from one table on the
+ * nullable side of an outer/full join returns `null` rather than an object
+ * of nulls, same as the implicit per-table grouping.
  */
 export const projectedNullableGroups = (plan: SelectPlan): ReadonlySet<string> =>
-	plan.selection === undefined ? implicitSelection(plan).nullable : new Set<string>();
+	plan.selection === undefined ? implicitSelection(plan).nullable : explicitNullableGroups(plan);
 
 export const projectedColumns = (plan: SelectPlan): readonly ProjectedColumn[] => {
 	const selection = plan.selection ?? implicitSelection(plan).selection;
@@ -243,6 +305,7 @@ const buildMappers = <TRow>(
 		index,
 		key: keys[index]!,
 		decode: leaf.decode,
+		isColumn: leaf.column !== undefined,
 	}));
 	const shape = buildShape(fields, nullableGroups);
 	return {
@@ -335,7 +398,7 @@ const sealed = <TRow>(query: CompiledQuery<TRow>, ctx: RenderContext): CompiledQ
 export function compileSelect<TRow>(plan: SelectPlan, ctx: RenderContext): CompiledQuery<TRow> {
 	const implicit = plan.selection === undefined ? implicitSelection(plan) : undefined;
 	const selection = plan.selection ?? implicit!.selection;
-	const nullableGroups = implicit?.nullable ?? new Set<string>();
+	const nullableGroups = implicit?.nullable ?? explicitNullableGroups(plan);
 	const leaves = flattenSelection(selection);
 	if (leaves.length === 0) throw new CompileError('A select must project at least one column.');
 
@@ -463,6 +526,8 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 		hasRows: false,
 	};
 
+	const conflictParams = plan.onConflict ? countOnConflictParams(plan.onConflict, columns, ctx) : 0;
+
 	for (const group of groups) {
 		const cols = group.fields.map((field) => columns[field]!);
 		if (cols.length > ctx.maxParams) {
@@ -471,7 +536,14 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 					+ 'no chunking can satisfy it. Insert fewer columns per statement.',
 			);
 		}
-		const rowsPerChunk = Math.max(1, Math.floor(ctx.maxParams / cols.length));
+		if (cols.length + conflictParams > ctx.maxParams) {
+			throw new CompileError(
+				`A row of ${cols.length} columns plus ${conflictParams} bound parameter(s) from `
+					+ `"on conflict" exceed the bound-parameter limit of ${ctx.maxParams}; no chunking can `
+					+ 'satisfy it. Insert fewer columns, or bind fewer parameters in the conflict clause.',
+			);
+		}
+		const rowsPerChunk = Math.max(1, Math.floor((ctx.maxParams - conflictParams) / cols.length));
 
 		for (let start = 0; start < group.rows.length; start += rowsPerChunk) {
 			const chunkRows = group.rows.slice(start, start + rowsPerChunk);
@@ -524,6 +596,49 @@ const definedValues = (
 	return Object.keys(out).length > 0 ? out : undefined;
 };
 
+/**
+ * Fold `$onUpdate` columns into a set of values, the same way both the update
+ * half of `update().set()` and the update half of an upsert need to: any
+ * column with `onUpdateFn` that the caller did not already set gets its
+ * generator chunk added. Drizzle routes both through the same `buildUpdateSet`
+ * (`drizzle-orm/sqlite-core/dialect.js`); this is the shared equivalent.
+ */
+const withOnUpdate = (
+	values: Record<string, unknown>,
+	columns: Record<string, Column<any>>,
+): Record<string, unknown> => {
+	const out: Record<string, unknown> = { ...values };
+	for (const [field, column] of Object.entries(columns)) {
+		if (column.config.onUpdateFn && out[field] === undefined) {
+			out[field] = { toQuery: () => ({ sql: '?', params: [{ k: 'fn', fn: column.config.onUpdateFn!, encode: column.config.encode }] }) } satisfies SQLChunk;
+		}
+	}
+	return out;
+};
+
+/**
+ * How many bound parameters `writeOnConflict` will add to *every* statement
+ * in the insert, outside the `VALUES` list: the folded `$onUpdate` columns,
+ * the user's own `set`, and `targetWhere`/`where`. The row chunker must
+ * reserve this many slots out of `maxParams` before dividing the remainder
+ * among `VALUES` rows, or a chunk that lands exactly on the budget from
+ * `VALUES` alone overflows once this clause is appended.
+ *
+ * Rendered once against a scratch writer rather than estimated, because the
+ * user's own `set`/`where` can themselves be `sql` fragments that bind zero,
+ * one, or many parameters — counting must match what `writeOnConflict` will
+ * actually emit, not guess "one param per assignment".
+ */
+const countOnConflictParams = (
+	conflict: NonNullable<InsertPlan['onConflict']>,
+	columns: Record<string, Column<any>>,
+	ctx: RenderContext,
+): number => {
+	const scratch = new Writer(ctx);
+	writeOnConflict(scratch, conflict, columns, ctx);
+	return scratch.toQuery().params.length;
+};
+
 const writeOnConflict = (
 	writer: Writer,
 	conflict: NonNullable<InsertPlan['onConflict']>,
@@ -542,13 +657,16 @@ const writeOnConflict = (
 	// values are all undefined has nothing to assign and used to render the
 	// invalid `do update set `. There is a sensible answer here that there is
 	// not for `update()` — an upsert with nothing to update is `do nothing`.
+	// That decision is made on the user's own set alone — $onUpdate columns are
+	// folded in only after we already know we're emitting `do update set`, so an
+	// empty user set still yields `do nothing`.
 	const assignments = definedValues(conflict.set);
 	if (conflict.doNothing || !assignments) {
 		writer.text(' do nothing');
 		return;
 	}
 	writer.text(' do update set ');
-	writeAssignments(writer, assignments, columns);
+	writeAssignments(writer, withOnUpdate(assignments, columns), columns);
 	if (conflict.setWhere) writer.text(' where ').chunk(conflict.setWhere);
 	void ctx;
 };
@@ -575,13 +693,7 @@ export function compileUpdate<TRow>(plan: UpdatePlan, ctx: RenderContext): Compi
 	// is how conditional updates get written. Keeping the key produced a
 	// non-empty `set` object whose assignments all rendered to nothing, so the
 	// statement came out as the invalid `update "t" set `.
-	const values: Record<string, unknown> = { ...definedValues(plan.set) };
-
-	for (const [field, column] of Object.entries(columns)) {
-		if (column.config.onUpdateFn && values[field] === undefined) {
-			values[field] = { toQuery: () => ({ sql: '?', params: [{ k: 'fn', fn: column.config.onUpdateFn!, encode: column.config.encode }] }) } satisfies SQLChunk;
-		}
-	}
+	const values = withOnUpdate(definedValues(plan.set) ?? {}, columns);
 	if (Object.keys(values).length === 0) throw new CompileError('update().set({}) has nothing to set.');
 
 	writer.text(`update ${quoteIdentifier(getTableName(plan.table))} set `);

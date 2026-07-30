@@ -73,7 +73,34 @@ describe('insert compilation', () => {
 			.onConflictDoUpdate({ target: users.email, set: { name: 'x' }, where: eq(users.active, true) })
 			.compile();
 
-		expect(upsert.sql).toContain('on conflict ("email") do update set "name" = ? where "users"."active" = ?');
+		// `updatedAt` carries `$onUpdate`, so the update half of the upsert must
+		// fold it in exactly as `update().set()` does — otherwise the conflict
+		// path silently keeps a stale `updated_at` forever. This assertion used
+		// to stop at `"name" = ?`, which is the bug: it passed only because the
+		// $onUpdate column was never considered.
+		expect(upsert.sql).toContain(
+			'on conflict ("email") do update set "name" = ?, "updated_at" = ? where "users"."active" = ?',
+		);
+	});
+
+	it('folds $onUpdate columns into the do-update-set half of an upsert', () => {
+		const compiled = query.insert(users).values({ email: 'a@b.c' })
+			.onConflictDoUpdate({ target: users.email, set: { name: 'x' } })
+			.compile();
+
+		expect(compiled.sql).toContain('on conflict ("email") do update set "name" = ?, "updated_at" = ?');
+	});
+
+	it('does not fold $onUpdate columns into onConflictDoNothing or an empty conflict set', () => {
+		expect(
+			query.insert(users).values({ email: 'a@b.c' }).onConflictDoNothing().compile().sql,
+		).toContain('on conflict do nothing');
+
+		const empty = query.insert(users).values({ email: 'a@b.c' })
+			.onConflictDoUpdate({ target: users.email, set: {} })
+			.compile();
+		expect(empty.sql).toContain('on conflict ("email") do nothing');
+		expect(empty.sql).not.toContain('do update set');
 	});
 
 	it('falls back to do nothing when the conflict set has nothing to assign', () => {
@@ -111,6 +138,55 @@ describe('insert compilation', () => {
 
 	it('rejects an empty values list', () => {
 		expect(() => query.insert(posts).values([]).compile()).toThrow(CompileError);
+	});
+
+	describe('onConflict against the bound-parameter budget', () => {
+		// 4 columns, one (`updatedAt`) with `$onUpdate` and no `default` — so it
+		// is always in the insert's column list, and its fold into the
+		// conflict's `do update set` adds one bound parameter per statement.
+		const sync = sqliteTable('sync', {
+			id: integer('id').primaryKey(),
+			a: text('a').notNull(),
+			b: text('b').notNull(),
+			updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).$onUpdate(() => new Date(0)),
+		});
+
+		it('reserves the folded $onUpdate param before chunking VALUES rows', () => {
+			// 4 columns × 100 params lands exactly on the budget with nothing left
+			// over for the conflict clause — the case the bug shipped on.
+			const rows = Array.from({ length: 40 }, (_, i) => ({ id: i, a: 'x', b: 'y' }));
+			const compiled = query.insert(sync).values(rows)
+				// A canonical bulk-upsert `set`: `sql\`excluded."a"\`` binds zero of
+				// its own parameters, so any overflow here is the fold's doing.
+				.onConflictDoUpdate({ target: sync.id, set: { a: sql`excluded."a"` } })
+				.compile();
+
+			expect(compiled.parts.length).toBeGreaterThan(1);
+			for (const part of compiled.parts) {
+				expect(part.params.length).toBeLessThanOrEqual(100);
+			}
+		});
+
+		it('reserves both the folded $onUpdate param and the user\'s own set param', () => {
+			const cols: Record<string, ReturnType<typeof integer>> = { id: integer('id').primaryKey() };
+			for (let i = 0; i < 96; i++) cols[`c${i}`] = integer(`c${i}`);
+			cols.updatedAt = integer('updated_at', { mode: 'timestamp_ms' }).$onUpdate(() => new Date(0));
+			const wide = sqliteTable('wide', cols);
+
+			const row: Record<string, unknown> = { id: 1 };
+			for (let i = 0; i < 96; i++) row[`c${i}`] = i;
+			// 98 columns in VALUES (id + 96 c's + updatedAt) + the folded
+			// $onUpdate param + the user's own bound `set` param = 100 — the
+			// budget, not 101. A single row cannot be chunked further, so if the
+			// reservation ever pushes this over budget the honest answer is a
+			// clear compile-time error, not a statement D1 rejects at runtime.
+			const compiled = query.insert(wide).values(row as never)
+				.onConflictDoUpdate({ target: wide.id as never, set: { c0: 5 } as never })
+				.compile();
+
+			expect(compiled.parts).toHaveLength(1);
+			expect(compiled.parts[0]!.params.length).toBeLessThanOrEqual(100);
+		});
 	});
 });
 
