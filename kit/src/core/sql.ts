@@ -139,6 +139,128 @@ export const isPragma = (statement: string): boolean =>
 
 export const applicableStatements = (sql: string): string[] => splitStatements(sql).filter((s) => !isPragma(s));
 
+const escapeRegExpChars = (value: string): string => value.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Which statements must land in the same `batch()` or not run at all.
+ *
+ * By the time a migration is applied, it has already been flattened to plain
+ * SQL text (`applicableStatements` on a saved file, or `diff.statements` for
+ * `push`) — the `Statement[]` structure `recreateTable` built is gone. So the
+ * one rebuild group that cannot be split (`create table "__new_X"` … `alter
+ * table "__new_X" rename to "X"`, see `recreateTable` in `diff.ts`) has to be
+ * re-recognised from the statement text itself, by the `__new_` marker that
+ * survives into the rendered SQL. A directly preceding
+ * `PRAGMA defer_foreign_keys` — emitted only to make this specific rebuild
+ * safe — is folded into the same group.
+ *
+ * Returns one group id per statement; equal ids must stay in one batch.
+ * Everything outside a recognised rebuild is its own singleton group, so it
+ * is always safe to split between any two of them.
+ */
+export function statementGroups(statements: readonly string[]): number[] {
+	const groups: number[] = new Array(statements.length);
+	let nextGroup = 0;
+	let i = 0;
+
+	while (i < statements.length) {
+		// Looked ahead, not behind: a preceding PRAGMA would otherwise already
+		// have been consumed into its own singleton group by the time this loop
+		// reaches the `create table "__new_X"` that follows it.
+		const isPragmaLead = /^\s*pragma\s+defer_foreign_keys\b/i.test(statements[i]!);
+		const createIndex = isPragmaLead ? i + 1 : i;
+		const createMatch = createIndex < statements.length
+			? /^\s*create\s+table\s+"(__new_(?:[^"]|"")+)"/i.exec(statements[createIndex]!)
+			: null;
+
+		if (!createMatch) {
+			groups[i] = nextGroup++;
+			i++;
+			continue;
+		}
+
+		const tempName = createMatch[1]!;
+		const renamePattern = new RegExp(
+			`^\\s*alter\\s+table\\s+"${escapeRegExpChars(tempName)}"\\s+rename\\s+to\\s+"`,
+			'i',
+		);
+
+		let end = createIndex;
+		for (let j = createIndex + 1; j < statements.length; j++) {
+			if (renamePattern.test(statements[j]!)) {
+				end = j;
+				break;
+			}
+		}
+
+		const start = i;
+		const group = nextGroup++;
+		for (let k = start; k <= end; k++) groups[k] = group;
+		i = end + 1;
+	}
+
+	return groups;
+}
+
+/**
+ * Which live table(s) a flattened statement sequence rebuilds, named by the
+ * same `__new_<table>` marker `statementGroups` recognises. `migrate` applies
+ * pre-generated SQL text with no `Statement[]`/diff structure to consult, so
+ * this is how it can still ask "does this migration rebuild a table that
+ * carries a foreign trigger?" before running anything.
+ */
+export function tablesRebuiltIn(statements: readonly string[]): string[] {
+	const names: string[] = [];
+	for (const statement of statements) {
+		const match = /^\s*create\s+table\s+"(__new_(?:[^"]|"")+)"/i.exec(statement);
+		if (match) names.push(match[1]!.slice('__new_'.length).replaceAll('""', '"'));
+	}
+	return names;
+}
+
+/**
+ * Split `statements` into batches of at most `maxPerBatch`, without ever
+ * splitting a group `statementGroups` says must stay together — a group
+ * larger than the limit cannot be packed safely at all, so it is refused
+ * outright rather than split.
+ */
+export function packIntoBatches(statements: readonly string[], maxPerBatch: number): string[][] {
+	const groupIds = statementGroups(statements);
+
+	const runs: string[][] = [];
+	let i = 0;
+	while (i < statements.length) {
+		const id = groupIds[i];
+		let j = i + 1;
+		while (j < statements.length && groupIds[j] === id) j++;
+		runs.push(statements.slice(i, j));
+		i = j;
+	}
+
+	for (const run of runs) {
+		if (run.length > maxPerBatch) {
+			throw new Error(
+				`A group of ${run.length} statements that must be applied together (a table rebuild) exceeds the `
+					+ `per-batch limit of ${maxPerBatch}. Splitting it across batches risks leaving the database `
+					+ 'mid-rebuild — the old table dropped and the new one never renamed into place — if a later '
+					+ 'batch fails. Refusing rather than emitting that migration.',
+			);
+		}
+	}
+
+	const batches: string[][] = [];
+	let current: string[] = [];
+	for (const run of runs) {
+		if (current.length > 0 && current.length + run.length > maxPerBatch) {
+			batches.push(current);
+			current = [];
+		}
+		current.push(...run);
+	}
+	if (current.length > 0) batches.push(current);
+	return batches;
+}
+
 /** Wrangler's own migration bookkeeping table, reused so both appliers agree. */
 export const MIGRATIONS_TABLE = 'd1_migrations';
 

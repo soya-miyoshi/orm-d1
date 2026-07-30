@@ -4,9 +4,15 @@
  */
 import { configureCasing, getTableName, isTable } from 'd1zzle';
 import { validateTableOptions } from 'd1zzle/ddl';
-import { appliedMigrations, applyMigrations, introspect, MAX_STATEMENTS_PER_BATCH } from '../core/apply.js';
+import {
+	appliedMigrations,
+	applyMigrations,
+	checkForeignTriggerConflicts,
+	introspect,
+	MAX_STATEMENTS_PER_BATCH,
+} from '../core/apply.js';
 import type { SqlRunner } from '../core/apply.js';
-import { applicableStatements, isPragma } from '../core/sql.js';
+import { applicableStatements, isPragma, packIntoBatches } from '../core/sql.js';
 import { diffSnapshots, renderMigration } from '../core/diff.js';
 import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
@@ -185,6 +191,8 @@ export async function migrate(ctx: CommandContext, flags: TargetFlags = {}): Pro
 		pending.map(async (entry) => ({ tag: entry.tag, sql: await readMigration(ctx.config.out, entry.tag) })),
 	);
 
+	await checkForeignTriggerConflicts(runner, migrations);
+
 	const result = await applyMigrations(runner, migrations, ctx.config.migrationsTable);
 	for (const warning of result.warnings) ctx.log(`  ! ${warning}`);
 	for (const tag of result.applied) ctx.log(`Applied ${tag}.`);
@@ -195,9 +203,10 @@ export async function migrate(ctx: CommandContext, flags: TargetFlags = {}): Pro
 
 export async function push(ctx: CommandContext, flags: TargetFlags = {}): Promise<string[]> {
 	const runner = await resolveRunner(ctx, flags);
-	const live = await introspect(runner);
+	const foreignTriggers: Record<string, string[]> = {};
+	const live = await introspect(runner, foreignTriggers);
 	const next = await snapshotOfSchema(ctx);
-	const diff = diffSnapshots(live, next, flags.renames ?? {});
+	const diff = diffSnapshots(live, next, { ...(flags.renames ?? {}), foreignTriggers });
 
 	if (diff.errors.length > 0) {
 		throw new Error(`Cannot push safely:\n  - ${diff.errors.join('\n  - ')}`);
@@ -220,19 +229,22 @@ export async function push(ctx: CommandContext, flags: TargetFlags = {}): Promis
 
 	// Same pragma rule and same batch cap as `applyMigration` — a push that
 	// exceeded D1's per-batch limit used to be sent as one oversized batch.
+	// Packed by whole rebuild groups, never mid-group — see `packIntoBatches`.
 	const statements = diff.statements.map((s) => s.sql).filter((s) => !isPragma(s));
+	const batches = packIntoBatches(statements, MAX_STATEMENTS_PER_BATCH);
 
-	if (statements.length <= MAX_STATEMENTS_PER_BATCH) {
-		await runner.batch(statements);
-	} else {
+	// Logged before the first `batch()` call, not after: once a batch has run
+	// there is no undoing it, so the "this will be split, and atomicity is
+	// lost if it fails partway" warning is only useful said in advance.
+	if (batches.length > 1) {
 		ctx.log(
-			`  ! ${statements.length} statements must be split into batches of ${MAX_STATEMENTS_PER_BATCH}. `
-				+ 'Atomicity is lost at each split; if it fails part-way, the database is left between states.',
+			`  ! ${statements.length} statements must be split into ${batches.length} batches of up to `
+				+ `${MAX_STATEMENTS_PER_BATCH}. Atomicity is lost at each split; if it fails part-way, the `
+				+ 'database is left between states.',
 		);
-		for (let i = 0; i < statements.length; i += MAX_STATEMENTS_PER_BATCH) {
-			await runner.batch(statements.slice(i, i + MAX_STATEMENTS_PER_BATCH));
-		}
 	}
+
+	for (const batch of batches) await runner.batch(batch);
 
 	ctx.log(`Pushed ${statements.length} statements.`);
 	return statements;
@@ -295,7 +307,7 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 		}
 		const columnId = (columnName: string): string => columnIds.get(columnName) ?? toIdentifier(columnName);
 
-		lines.push(`export const ${identifier} = sqliteTable('${table.name}', {`);
+		lines.push(`export const ${identifier} = sqliteTable(${JSON.stringify(table.name)}, {`);
 
 		for (const column of Object.values(table.columns)) {
 			// By affinity, so a live column declared `VARCHAR(255)`, `BOOLEAN` or
@@ -321,8 +333,8 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 			// actually holds, so 'buffer' — a plain Uint8Array round-trip — is the
 			// only safe default.
 			let chain = factory === 'blob'
-				? `${factory}('${column.name}', { mode: 'buffer' })`
-				: `${factory}('${column.name}')`;
+				? `${factory}(${JSON.stringify(column.name)}, { mode: 'buffer' })`
+				: `${factory}(${JSON.stringify(column.name)})`;
 			if (column.primaryKey) chain += column.autoincrement ? '.primaryKey({ autoIncrement: true })' : '.primaryKey()';
 			else if (column.notNull) chain += '.notNull()';
 			// Everything below used to be dropped on the floor. The pulled
@@ -332,11 +344,18 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 			if (column.unique) chain += '.unique()';
 			if (column.generated) {
 				imports.add('sql');
-				chain += `.generatedAlwaysAs(sql\`${column.generated.as}\`, { mode: '${column.generated.mode}' })`;
+				// `sql.raw(…)` around a `JSON.stringify`-escaped string, not
+				// `` sql`${text}` ``: the expression is introspected text — it can
+				// contain anything, including a close-backtick or `${` — and
+				// interpolating it straight into the template literal this
+				// function writes would let it break out of the string and
+				// execute as code the moment the generated module is loaded.
+				chain += `.generatedAlwaysAs(sql.raw(${JSON.stringify(column.generated.as)}), `
+					+ `{ mode: ${JSON.stringify(column.generated.mode)} })`;
 			}
 			if (column.default !== undefined) {
 				imports.add('sql');
-				chain += `.default(sql\`${column.default}\`)`;
+				chain += `.default(sql.raw(${JSON.stringify(column.default)}))`;
 			}
 			if (column.references) {
 				const target = column.references;
@@ -344,8 +363,8 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 					columnIdIn(snapshot, target.tableTo, target.columnsTo[0] ?? '')
 				}`;
 				const actions = [
-					...(target.onDelete ? [`onDelete: '${target.onDelete}'`] : []),
-					...(target.onUpdate ? [`onUpdate: '${target.onUpdate}'`] : []),
+					...(target.onDelete ? [`onDelete: ${JSON.stringify(target.onDelete)}`] : []),
+					...(target.onUpdate ? [`onUpdate: ${JSON.stringify(target.onUpdate)}`] : []),
 				];
 				chain += actions.length > 0 ? `, { ${actions.join(', ')} })` : ')';
 			}
@@ -360,13 +379,13 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 			const columns = index.columns.map(normalizeIndexColumn).map((c) => {
 				if (c.isExpression) {
 					imports.add('sql');
-					return `sql\`${c.expression}\``;
+					return `sql.raw(${JSON.stringify(c.expression)})`;
 				}
 				return `t.${columnId(c.expression)}`;
 			}).join(', ');
-			const where = index.where ? `.where(sql\`${index.where}\`)` : '';
+			const where = index.where ? `.where(sql.raw(${JSON.stringify(index.where)}))` : '';
 			if (index.where) imports.add('sql');
-			extras.push(`${factory}('${index.name}').on(${columns})${where}`);
+			extras.push(`${factory}(${JSON.stringify(index.name)}).on(${columns})${where}`);
 		}
 
 		for (const pk of Object.values(table.compositePrimaryKeys)) {
@@ -376,7 +395,7 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 
 		for (const u of Object.values(table.uniqueConstraints)) {
 			imports.add('unique');
-			extras.push(`unique('${u.name}').on(${u.columns.map((c) => `t.${columnId(c)}`).join(', ')})`);
+			extras.push(`unique(${JSON.stringify(u.name)}).on(${u.columns.map((c) => `t.${columnId(c)}`).join(', ')})`);
 		}
 
 		for (const fk of Object.values(table.foreignKeys)) {
@@ -386,15 +405,15 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 				.map((c) => `${idOf(fk.tableTo)}.${columnIdIn(snapshot, fk.tableTo, c)}`)
 				.join(', ');
 			let chain = `foreignKey({ columns: [${columns}], foreignColumns: [${target}] })`;
-			if (fk.onDelete) chain += `.onDelete('${fk.onDelete}')`;
-			if (fk.onUpdate) chain += `.onUpdate('${fk.onUpdate}')`;
+			if (fk.onDelete) chain += `.onDelete(${JSON.stringify(fk.onDelete)})`;
+			if (fk.onUpdate) chain += `.onUpdate(${JSON.stringify(fk.onUpdate)})`;
 			extras.push(chain);
 		}
 
 		for (const c of Object.values(table.checkConstraints)) {
 			imports.add('check');
 			imports.add('sql');
-			extras.push(`check('${c.name}', sql\`${c.value}\`)`);
+			extras.push(`check(${JSON.stringify(c.name)}, sql.raw(${JSON.stringify(c.value)}))`);
 		}
 
 		if (extras.length === 0) {
@@ -521,8 +540,9 @@ export interface CheckResult {
 export const driftBetween = (
 	live: Snapshot,
 	expected: Snapshot,
+	foreignTriggers?: Record<string, readonly string[]>,
 ): { drift: string[]; blocked: string[]; warnings: string[] } => {
-	const comparison = diffSnapshots(live, expected);
+	const comparison = diffSnapshots(live, expected, foreignTriggers ? { foreignTriggers } : {});
 	return {
 		drift: comparison.statements.map((s) => s.sql),
 		blocked: [...comparison.errors],
@@ -538,9 +558,10 @@ export async function check(ctx: CommandContext, flags: TargetFlags = {}): Promi
 	const applied = await appliedMigrations(runner, ctx.config.migrationsTable, false);
 	const pending = pendingMigrations(journal, applied).map((entry) => entry.tag);
 
-	const live = await introspect(runner);
+	const foreignTriggers: Record<string, string[]> = {};
+	const live = await introspect(runner, foreignTriggers);
 	const expected = await readLatestSnapshot(ctx.config.out);
-	const { drift, blocked, warnings } = driftBetween(live, expected);
+	const { drift, blocked, warnings } = driftBetween(live, expected, foreignTriggers);
 
 	for (const tag of pending) ctx.log(`Unapplied migration: ${tag}`);
 	for (const warning of warnings) ctx.log(`  ! ${warning}`);
@@ -622,9 +643,10 @@ export async function verify(ctx: CommandContext): Promise<VerifyResult> {
 		corruption.push(`integrity_check: ${integrity.map((r) => r.integrity_check).join(', ')}`);
 	}
 
-	const replayed = await introspect(runner);
+	const foreignTriggers: Record<string, string[]> = {};
+	const replayed = await introspect(runner, foreignTriggers);
 	const expected = await snapshotOfSchema(ctx);
-	const diff = diffSnapshots(replayed, expected);
+	const diff = diffSnapshots(replayed, expected, { foreignTriggers });
 
 	// Both halves count: a statement means the replay is missing something the
 	// schema has, and a refusal means the differ could not even express the gap.

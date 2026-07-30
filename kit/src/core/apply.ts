@@ -9,9 +9,16 @@
  */
 import type { IntrospectionInput, MasterRow } from './introspect.js';
 import type { ForeignKeyRow, IndexListRow, TableInfoRow } from './introspect.js';
-import { isInternalTable, snapshotFromIntrospection } from './introspect.js';
+import { isAppendOnlyTrigger, isInternalTable, snapshotFromIntrospection } from './introspect.js';
 import type { Snapshot } from './snapshot.js';
-import { applicableStatements, createMigrationsTable, MIGRATIONS_TABLE, quoteIdentifier } from './sql.js';
+import {
+	applicableStatements,
+	createMigrationsTable,
+	MIGRATIONS_TABLE,
+	packIntoBatches,
+	quoteIdentifier,
+	tablesRebuiltIn,
+} from './sql.js';
 
 export interface SqlRunner {
 	/** Run a read query and return its rows. */
@@ -72,13 +79,28 @@ export interface ApplyResult {
 	readonly warnings: readonly string[];
 }
 
-export async function introspect(runner: SqlRunner): Promise<Snapshot> {
+/**
+ * @param foreignTriggers Out-param, populated (keyed by `tbl_name`) with the
+ * name of every trigger found that is not the append-only guard — kept
+ * separate from `Snapshot`/`TableSnapshot` rather than added as a field,
+ * since those shapes are exported and schema-facing. `recreateTable` refuses
+ * a rebuild that would silently drop one of these; see `diff.ts`.
+ */
+export async function introspect(runner: SqlRunner, foreignTriggers?: Record<string, string[]>): Promise<Snapshot> {
 	// Triggers are read too: the append-only guard is a trigger, and leaving it
 	// out of `master` made every guarded table look unguarded, so `check`
 	// reported drift and `push` re-emitted the trigger on every run.
 	const master = await runner.all<MasterRow>(
 		"select type, name, tbl_name, sql from sqlite_master where type in ('table', 'index', 'trigger')",
 	);
+
+	if (foreignTriggers) {
+		for (const row of master) {
+			if (row.type !== 'trigger' || !row.sql) continue;
+			if (isAppendOnlyTrigger(row.sql, row.tbl_name)) continue;
+			(foreignTriggers[row.tbl_name] ??= []).push(row.name);
+		}
+	}
 
 	const tableInfo: IntrospectionInput['tableInfo'] = {};
 	const indexList: IntrospectionInput['indexList'] = {};
@@ -175,22 +197,75 @@ export async function applyMigration(
 	const statements = applicableStatements(sql);
 	const record = `insert into ${quoteIdentifier(table)} (name) values ('${tag.replaceAll("'", "''")}')`;
 
-	if (statements.length + 1 <= MAX_STATEMENTS_PER_BATCH) {
-		await runner.batch([...statements, record]);
-		return warnings;
+	// Batched by whole rebuild groups, never mid-group — a `create table
+	// "__new_X"` … `alter table "__new_X" rename to "X"` split across two
+	// batches used to be able to commit the drop of "X" in one batch and then
+	// fail the rename in the next, leaving the table gone. `packIntoBatches`
+	// throws outright if a single group cannot fit in one batch, rather than
+	// splitting it.
+	const batches = packIntoBatches(statements, MAX_STATEMENTS_PER_BATCH);
+
+	// The migrations-table insert is never its own trailing batch — it rides
+	// along with the last batch of real statements so a split migration still
+	// records itself in the same atomic unit as its final effect, wherever
+	// that unit's boundary falls.
+	if (batches.length === 0) {
+		batches.push([record]);
+	} else {
+		const last = batches[batches.length - 1]!;
+		if (last.length < MAX_STATEMENTS_PER_BATCH) {
+			batches[batches.length - 1] = [...last, record];
+		} else {
+			batches.push([record]);
+		}
 	}
 
-	warnings.push(
-		`Migration "${tag}" has ${statements.length} statements and must be split into batches of `
-			+ `${MAX_STATEMENTS_PER_BATCH}. Atomicity is lost at each split; if it fails part-way, the `
-			+ 'database is left between states.',
-	);
-
-	for (let i = 0; i < statements.length; i += MAX_STATEMENTS_PER_BATCH) {
-		await runner.batch(statements.slice(i, i + MAX_STATEMENTS_PER_BATCH));
+	if (batches.length > 1) {
+		warnings.push(
+			`Migration "${tag}" has ${statements.length} statements and must be split into ${batches.length} `
+				+ `batches of up to ${MAX_STATEMENTS_PER_BATCH}. Atomicity is lost at each split; if it fails `
+				+ 'part-way, the database is left between states.',
+		);
 	}
-	await runner.batch([record]);
+
+	for (const batch of batches) await runner.batch(batch);
 	return warnings;
+}
+
+/**
+ * Refuse to apply any pending migration that would rebuild a table carrying
+ * a foreign (non-kit-authored) trigger — the same refusal `recreateTable`
+ * (`diff.ts`) applies to `push`/`check`/`verify`, but those all diff a live
+ * introspection against the schema, where `generate`'s output never does:
+ * a migration file is generated offline, with no DB connection, so it
+ * cannot know at generation time whether the table it will later rebuild has
+ * since grown a foreign trigger. `migrate` is the only place this can be
+ * caught — against a live introspection, right before applying, using the
+ * same `__new_<table>` marker `packIntoBatches` already recognises to name
+ * which table a flattened statement sequence rebuilds.
+ */
+export async function checkForeignTriggerConflicts(
+	runner: SqlRunner,
+	migrations: readonly { tag: string; sql: string }[],
+): Promise<void> {
+	const foreignTriggers: Record<string, string[]> = {};
+	await introspect(runner, foreignTriggers);
+	if (Object.keys(foreignTriggers).length === 0) return;
+
+	for (const migration of migrations) {
+		const statements = applicableStatements(migration.sql);
+		for (const table of tablesRebuiltIn(statements)) {
+			const triggers = foreignTriggers[table];
+			if (!triggers || triggers.length === 0) continue;
+			throw new Error(
+				`Migration "${migration.tag}" would rebuild "${table}", but it carries trigger(s) `
+					+ `${triggers.map((t) => `"${t}"`).join(', ')} that d1zzle did not create. Rebuilding drops `
+					+ 'the table, which drops those triggers with it, and there is no way to reproduce a trigger '
+					+ 'd1zzle does not know the definition of. Drop the trigger, recreate it by hand after this '
+					+ 'migration runs, or bring it into the schema so d1zzle can carry it across rebuilds.',
+			);
+		}
+	}
 }
 
 /** Apply a whole set of pending migrations, in order. */

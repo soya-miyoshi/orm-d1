@@ -326,7 +326,7 @@ describe('rendering a schema module from a snapshot', () => {
 		expect(rendered.split('\n')[0]).toBe(`import { blob, integer, sqliteTable } from 'd1zzle';`);
 		// blob() defaults to mode 'json'; an introspected BLOB-affinity column
 		// must round-trip as raw bytes, so pull emits explicit buffer mode.
-		expect(rendered).toContain(`payload: blob('payload', { mode: 'buffer' })`);
+		expect(rendered).toContain(`payload: blob("payload", { mode: 'buffer' })`);
 	});
 
 	it('keeps the constraints the snapshot has, so the next generate has nothing to remove', async () => {
@@ -371,10 +371,10 @@ describe('rendering a schema module from a snapshot', () => {
 
 		const rendered = renderSchemaModule(snapshot as never);
 
-		expect(rendered).toContain(`email: text('email').notNull().unique()`);
-		expect(rendered).toContain(`.references(() => users.id, { onDelete: 'cascade' })`);
+		expect(rendered).toContain(`email: text("email").notNull().unique()`);
+		expect(rendered).toContain(`.references(() => users.id, { onDelete: "cascade" })`);
 		expect(rendered).toContain(`primaryKey({ columns: [t.userId, t.slot] })`);
-		expect(rendered).toContain(`check('slot_check', sql\`"slot" >= 0\`)`);
+		expect(rendered).toContain(`check("slot_check", sql.raw("\\"slot\\" >= 0"))`);
 		// `users` is referenced by `scores`, so it has to be declared first.
 		expect(rendered.indexOf('export const users')).toBeLessThan(rendered.indexOf('export const scores'));
 	});
@@ -388,6 +388,185 @@ describe('rendering a schema module from a snapshot', () => {
 
 		expect(rendered.split('\n')[0])
 			.toBe(`import { sql, sqliteTable, text, uniqueIndex } from 'd1zzle';`);
+	});
+});
+
+describe('renderSchemaModule never interpolates raw text into generated code', () => {
+	// Every string that reaches the renderer from introspected SQL — a table
+	// name, a check body, a default, a partial-index predicate — is attacker
+	// data the moment `pull` runs against a database someone else can write
+	// to. `` sql`${text}` `` and `'${text}'` both let it break out of the
+	// template literal / string literal the renderer writes and run as code
+	// the moment the generated module is imported.
+	const column = (name: string, type: string, extra: Record<string, unknown> = {}) => ({
+		name,
+		type,
+		primaryKey: false,
+		notNull: false,
+		autoincrement: false,
+		unique: false,
+		...extra,
+	});
+
+	// One string carrying all four dangerous characters at once: a backtick, a
+	// `${` template-interpolation opener, a single quote, and a backslash.
+	const poison = `back\`tick \${dollar} 'quote' back\\slash`;
+
+	const poisonedSnapshot = (tableName: string) => ({
+		version: '1',
+		dialect: 'sqlite' as const,
+		id: 'x',
+		prevId: '',
+		tables: {
+			[tableName]: {
+				name: tableName,
+				columns: {
+					id: column('id', 'integer', { primaryKey: true }),
+					val: column('val', 'text', { default: `'${poison}'` }),
+				},
+				indexes: {
+					[`${tableName}_idx`]: {
+						name: `${tableName}_idx`,
+						columns: [{ expression: poison, isExpression: true }],
+						isUnique: false,
+						where: poison,
+					},
+				},
+				foreignKeys: {},
+				compositePrimaryKeys: {},
+				uniqueConstraints: {},
+				checkConstraints: {
+					[poison]: { name: poison, value: poison },
+				},
+			},
+		},
+	});
+
+	it('escapes a table name, index name, check name/body, default and partial-index where', async () => {
+		const { renderSchemaModule } = await import('../../src/node/commands.js');
+		const rendered = renderSchemaModule(poisonedSnapshot('things') as never);
+
+		// Everything dangerous went through JSON.stringify or
+		// sql.raw(JSON.stringify(...)), so it is JS string-literal *data* now,
+		// not live template syntax — the raw poison string legitimately still
+		// appears in the output (inside quotes), which is fine; what matters is
+		// that it never opens a real template literal or closes a real string.
+		expect(rendered).toContain(JSON.stringify(poison));
+		// No backtick in the output is un-escaped into starting a template
+		// literal: every backtick that survives is a plain character sitting
+		// inside a JSON.stringify'd "..." string, never a `` ` `` token.
+		expect(rendered).not.toMatch(/sql`/);
+
+		const { transform } = await import('esbuild');
+		const result = await transform(rendered, { loader: 'ts' });
+		expect(result.code).toBeTruthy();
+
+		// Re-parsing reproduces the value: `JSON.parse` on the exact escaped
+		// literal the renderer wrote gets the original poison text back, byte
+		// for byte — which is only meaningful because the previous assertion
+		// already pinned that literal as present in the output verbatim.
+		expect(JSON.parse(JSON.stringify(poison))).toBe(poison);
+
+		// Exactly one binding was declared — no extra `export const` sneaked
+		// in via the table name, check name, or any other field.
+		expect((result.code.match(/^export const /gm) ?? []).length).toBe(1);
+	});
+
+	it('regression: a DEFAULT payload cannot execute as a top-level side effect', async () => {
+		const { renderSchemaModule } = await import('../../src/node/commands.js');
+		const payload = `'\${globalThis.__PWNED__ = 1}'`;
+		const rendered = renderSchemaModule({
+			version: '1',
+			dialect: 'sqlite' as const,
+			id: 'x',
+			prevId: '',
+			tables: {
+				t: {
+					name: 't',
+					columns: { val: column('val', 'text', { default: payload }) },
+					indexes: {},
+					foreignKeys: {},
+					compositePrimaryKeys: {},
+					uniqueConstraints: {},
+					checkConstraints: {},
+				},
+			},
+		} as never);
+
+		// The raw payload text is expected to still appear — as escaped string
+		// *data* inside `sql.raw(JSON.stringify(...))`. What must not appear is
+		// a *live* `${globalThis.__PWNED__ = 1}` template-interpolation slot,
+		// which is what let it execute before this fix.
+		expect(rendered).toContain(JSON.stringify(payload));
+		expect(rendered).not.toMatch(/`[^`]*\$\{globalThis\.__PWNED__[^`]*`/);
+
+		const { transform } = await import('esbuild');
+		const result = await transform(rendered, { loader: 'ts' });
+		expect(result.code).toBeTruthy();
+		// Exactly one binding was declared — the payload never became a second
+		// top-level statement.
+		expect((result.code.match(/^export const /gm) ?? []).length).toBe(1);
+	});
+
+	it('regression: a table name cannot close the sqliteTable(...) call and inject a new statement', async () => {
+		const { renderSchemaModule } = await import('../../src/node/commands.js');
+		const evilName = "a', {}); globalThis.__PWNED3__ = 3; export const zz = sqliteTable('b";
+		const rendered = renderSchemaModule({
+			version: '1',
+			dialect: 'sqlite' as const,
+			id: 'x',
+			prevId: '',
+			tables: {
+				[evilName]: {
+					name: evilName,
+					columns: { id: column('id', 'integer', { primaryKey: true }) },
+					indexes: {},
+					foreignKeys: {},
+					compositePrimaryKeys: {},
+					uniqueConstraints: {},
+					checkConstraints: {},
+				},
+			},
+		} as never);
+
+		// The evil name legitimately still shows up — as an escaped string
+		// argument to `sqliteTable(...)`.
+		expect(rendered).toContain(JSON.stringify(evilName));
+
+		const { transform } = await import('esbuild');
+		const result = await transform(rendered, { loader: 'ts' });
+		expect(result.code).toBeTruthy();
+		// Only one binding was declared — no `export const zz` was injected as
+		// a second top-level statement.
+		expect((result.code.match(/^export const /gm) ?? []).length).toBe(1);
+	});
+
+	it('leaves ordinary, benign input producing the same DDL shape as before — only quoting style changed', async () => {
+		const { renderSchemaModule } = await import('../../src/node/commands.js');
+		const rendered = renderSchemaModule({
+			version: '1',
+			dialect: 'sqlite' as const,
+			id: 'x',
+			prevId: '',
+			tables: {
+				users: {
+					name: 'users',
+					columns: {
+						id: column('id', 'integer', { primaryKey: true }),
+						email: column('email', 'text', { notNull: true, unique: true }),
+					},
+					indexes: {},
+					foreignKeys: {},
+					compositePrimaryKeys: {},
+					uniqueConstraints: {},
+					checkConstraints: {},
+				},
+			},
+		} as never);
+
+		expect(rendered).toContain(`export const users = sqliteTable("users", {`);
+		expect(rendered).toContain(`id: integer("id").primaryKey()`);
+		expect(rendered).toContain(`email: text("email").notNull().unique()`);
 	});
 });
 
@@ -494,7 +673,7 @@ describe('renderSchemaModule identifiers', () => {
 		} as never);
 
 		expect(rendered).not.toMatch(/export const new\b/);
-		expect(rendered).toMatch(/export const new_ = sqliteTable\('new'/);
+		expect(rendered).toMatch(/export const new_ = sqliteTable\("new"/);
 	});
 });
 

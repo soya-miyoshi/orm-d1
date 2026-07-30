@@ -10,7 +10,7 @@ import { env } from 'cloudflare:test';
 import { createSchema } from 'd1zzle/ddl';
 import { integer, real, sqliteTable, text, uniqueIndex } from 'd1zzle';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { applyMigrations, appliedMigrations, introspect } from '../../src/core/apply.js';
+import { applyMigrations, appliedMigrations, checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
@@ -210,6 +210,132 @@ describe('introspection', () => {
 			expect(Object.keys(introspected.tables[name]!.columns))
 				.toEqual(Object.keys(declared.tables[name]!.columns));
 		}
+	});
+});
+
+describe('batching a large migration cannot cut a table rebuild in half (finding 1)', () => {
+	it('keeps the rebuilt table intact, with its rows, when a later batch fails', async () => {
+		// 96 plain table creates, plus a rebuild of one more table — 5 more
+		// statements — for 101 total: one over `MAX_STATEMENTS_PER_BATCH`
+		// (100), forcing a split. Under the old fixed-stride slicing, the
+		// rebuild's `drop table "rebuilt"` and its `alter table "__new_rebuilt"
+		// rename to "rebuilt"` would land in different batches.
+		const before = sqliteTable('rebuilt', { id: integer('id').primaryKey(), age: text('age') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+		await DB.prepare(`insert into rebuilt (id, age) values (1, '30')`).run();
+
+		const filler = Array.from({ length: 96 }, (_, i) => sqliteTable(`filler_${i}`, { id: integer('id').primaryKey() }));
+		// A type change on "age" forces `recreateTable`'s rebuild path.
+		const after = sqliteTable('rebuilt', { id: integer('id').primaryKey(), age: integer('age') });
+
+		const diff = diffSnapshots(snapshotFromSchema([before]), snapshotFromSchema([...filler, after]));
+		expect(diff.errors).toEqual([]);
+		const sql = renderMigration(diff);
+		// Confirms the fixture actually exercises the >100-statement split this
+		// test is about, rather than accidentally fitting in one batch.
+		expect(sql.split(';').filter((s) => s.trim()).length).toBeGreaterThan(100);
+
+		let calls = 0;
+		const throwingRunner: SqlRunner = {
+			...runner,
+			batch: async (statements) => {
+				calls++;
+				if (calls === 2) throw new Error('simulated failure on the second batch');
+				await runner.batch(statements);
+			},
+		};
+
+		await expect(
+			applyMigrations(throwingRunner, [{ tag: 'm_rebuild_split', sql }]),
+		).rejects.toThrow(/simulated failure/);
+
+		// The rebuild group is 5 statements — far short of the 100-statement
+		// cap — so with correct grouping it always lands whole in one batch,
+		// and that batch either fully ran (before the injected failure) or
+		// never started at all (if the failure landed on an earlier batch).
+		// Either way "rebuilt" is never left mid-rebuild — dropped with no
+		// "__new_rebuilt" ever renamed into its place — and its row survives
+		// either in the old (text) or new (integer) shape, never lost.
+		const tables = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'table' and name in ('rebuilt', '__new_rebuilt')",
+		);
+		expect(tables.map((t) => t.name)).toEqual(['rebuilt']);
+		const rows = await runner.all<{ id: number; age: unknown }>('select id, age from rebuilt');
+		expect(rows).toHaveLength(1);
+		expect(rows[0]!.id).toBe(1);
+		expect(Number(rows[0]!.age)).toBe(30);
+	});
+});
+
+describe('a rebuild refuses to silently drop a foreign trigger (finding 2)', () => {
+	it('refuses a rebuild-forcing push when the live table carries a trigger d1zzle did not author, naming it', async () => {
+		const before = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: integer('balance') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+
+		// A hand-written guard: balances may only increase.
+		await DB.prepare(
+			'create trigger "accounts_no_decrease" before update on "accounts" '
+				+ 'when new.balance < old.balance '
+				+ "begin select raise(abort, 'balance may not decrease'); end",
+		).run();
+
+		await DB.prepare(`insert into accounts (id, balance) values (1, 10)`).run();
+		await expect(DB.prepare(`update accounts set balance = 5 where id = 1`).run())
+			.rejects.toThrow(/balance may not decrease/);
+
+		// A type change forces the rebuild path.
+		const after = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: text('balance') });
+
+		const foreignTriggers: Record<string, string[]> = {};
+		const live = await introspect(runner, foreignTriggers);
+		const diff = diffSnapshots(live, snapshotFromSchema([after]), { foreignTriggers });
+
+		expect(diff.statements).toEqual([]);
+		expect(diff.errors).toHaveLength(1);
+		expect(diff.errors[0]).toMatch(/"accounts" has to be recreated/);
+		expect(diff.errors[0]).toMatch(/"accounts_no_decrease"/);
+
+		// And the trigger — and the guard it provides — are still there,
+		// exactly because nothing was applied.
+		await expect(DB.prepare(`update accounts set balance = '5' where id = 1`).run())
+			.rejects.toThrow(/balance may not decrease/);
+	});
+});
+
+describe('migrate refuses to silently drop a foreign trigger (finding 2, bug A)', () => {
+	// Unlike `push`/`check`/`verify`, `migrate` applies a migration file that
+	// `generate` already wrote offline, with no DB connection and thus no way
+	// to have known about a foreign trigger at generation time. The refusal
+	// has to happen here, against the live database, right before applying.
+	it('refuses to apply a rebuild migration that would drop a foreign trigger the migration file could not have known about', async () => {
+		const before = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: integer('balance') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+
+		// A hand-written guard: balances may only increase.
+		await DB.prepare(
+			'create trigger "accounts_no_decrease" before update on "accounts" '
+				+ 'when new.balance < old.balance '
+				+ "begin select raise(abort, 'balance may not decrease'); end",
+		).run();
+
+		await DB.prepare(`insert into accounts (id, balance) values (1, 10)`).run();
+
+		// Simulate what `generate` would have written offline: a diff against
+		// the schema-only snapshot, with no `foreignTriggers` (it has no DB
+		// connection at generation time and so cannot know the trigger exists).
+		const after = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: text('balance') });
+		const offlineDiff = diffSnapshots(snapshotFromSchema([before]), snapshotFromSchema([after]));
+		expect(offlineDiff.errors).toEqual([]);
+		expect(offlineDiff.statements.some((s) => s.sql.includes('__new_accounts'))).toBe(true);
+
+		const migrations = [{ tag: 'm_rebuild', sql: renderMigration(offlineDiff) }];
+
+		await expect(checkForeignTriggerConflicts(runner, migrations)).rejects.toThrow(/"accounts_no_decrease"/);
+
+		// And, since the check runs before `migrate` ever applies anything, the
+		// trigger — and the guard it provides — is still there.
+		await expect(DB.prepare(`update accounts set balance = '5' where id = 1`).run())
+			.rejects.toThrow(/balance may not decrease/);
 	});
 });
 
