@@ -130,6 +130,33 @@ describe('the column surface adapters read', () => {
 		expect(d1.dataType).toBe(dzCol.dataType);
 	});
 
+	it('infers `text(name, { enum: [...] })` as an enum at the type level without `as const`', () => {
+		// Runtime already gets this right (see the table above); this is the
+		// type-level half of the same guarantee. `drizzle-orm/sqlite-core`'s
+		// `text()` constrains its `enum` option with a tuple generic
+		// (`T extends Readonly<[U, ...U[]]>`), which is what lets a plain array
+		// literal infer as a tuple with no `as const` — a looser
+		// `TEnum extends readonly string[]` widens the literal to `string[]`
+		// and silently falls back to the "no enum" branch at compile time even
+		// though the value is a real enum at runtime.
+		type AssertEqual<A, B> = (<T>() => T extends A ? 1 : 0) extends (<T>() => T extends B ? 1 : 0) ? true : false;
+
+		const roleColumn = sqliteTable('role_no_as_const', {
+			role: text('role', { enum: ['admin', 'member'] }),
+		}).role;
+
+		// `.dataType` itself is typed as the widened `DrizzleDataType` union
+		// (it has to be — adapters read it off `Column<M>` generically); the
+		// phantom, still-narrow type lives on `._`, Drizzle's own inference
+		// surface (`DrizzleColumnShape`, mirrored in src/schema/columns.ts).
+		type RoleDataType = (typeof roleColumn)['_']['dataType'];
+		const assertion: AssertEqual<RoleDataType, 'string enum'> = true;
+		void assertion;
+
+		// And the runtime value agrees, as it always did.
+		expect(roleColumn.dataType).toBe('string enum');
+	});
+
 	it('exposes dataType, columnType and the SQL type', () => {
 		expect(users.id).toMatchObject({ dataType: 'number int53', columnType: 'SQLiteInteger', primary: true });
 		expect(users.email).toMatchObject({ dataType: 'string', columnType: 'SQLiteText', notNull: true });

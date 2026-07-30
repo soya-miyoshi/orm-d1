@@ -7,8 +7,12 @@ const binding = { prepare: () => {} } as unknown as D1Database;
 
 const keys = sqliteTable('keys', {
 	id: integer('id').primaryKey(),
-	// The shape with no faithful JSON spelling — UUID-as-bytes.
-	uuid: blob('uuid').notNull(),
+	// The shape with no faithful JSON spelling — UUID-as-bytes. Explicit
+	// buffer mode: what's under test here is `isBinary(rawValue)` in
+	// `collapsesToJsonEach` (src/sql/expressions.ts), which checks the raw
+	// values passed to `inArray()`, not the column's encoder — but buffer
+	// mode is still the honest column for a key that is actually bytes.
+	uuid: blob('uuid', { mode: 'buffer' }).notNull(),
 });
 
 const planOf = (where?: SelectPlan['where']): SelectPlan => ({

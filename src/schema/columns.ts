@@ -337,7 +337,13 @@ export class ColumnBuilder<M extends ColumnMeta = ColumnMeta> {
 			notNull: true,
 			autoIncrement: options?.autoIncrement ?? false,
 			// An INTEGER PRIMARY KEY is SQLite's rowid alias: always defaultable.
-			hasDefault: this.config.type === 'integer',
+			// Checked against the type that will actually be *emitted* — a
+			// `customType` column's `declaredType` (`'int'`, `'bigint'`, …) — not
+			// `config.type`, which is only a reduced affinity. `config.type` is
+			// `'integer'` for those too, but the DDL says `int` or `bigint`, not
+			// the literal `INTEGER PRIMARY KEY` spelling SQLite requires for the
+			// rowid alias, so they are not actually optional on insert.
+			hasDefault: (this.config.declaredType ?? this.config.type) === 'integer',
 		});
 	}
 
@@ -422,6 +428,15 @@ const base = (
 	...patch,
 });
 
+/** Strips `readonly` off every property — Drizzle's own `Writable<T>`. */
+type Writable<T> = { -readonly [K in keyof T]: T[K] };
+
+/**
+ * Exact type equality, not mutual assignability — needed because `X extends Y`
+ * is true for supertypes too. Copied from `drizzle-orm`'s internal `Equal`.
+ */
+type Equal<X, Y> = (<T>() => T extends X ? 1 : 0) extends (<T>() => T extends Y ? 1 : 0) ? true : false;
+
 /**
  * Drizzle's `dataType`, derived from its column class name — the v1
  * `"<type> <constraint>"` pair spelling, matching `dataTypeOf` at runtime
@@ -433,12 +448,15 @@ type DataTypeOf<CT extends DrizzleColumnType, TEnum extends readonly string[] | 
 	: CT extends 'SQLiteReal' ? 'number double'
 	: CT extends 'SQLiteBoolean' ? 'boolean'
 	: CT extends 'SQLiteTimestamp' ? 'object date'
-	// `TEnum`'s default is the *unbounded* `readonly string[]` (see `text()`
-	// below), which — being a supertype, not a tuple — does not extend the
-	// nonempty-tuple pattern below. An explicit `enum: [...] as const` infers a
-	// literal tuple, which does. That's what tells "no enum given" apart from
-	// "enum given" at the type level, since both share the same type parameter.
-	: CT extends 'SQLiteText' ? (TEnum extends readonly [string, ...string[]] ? 'string enum' : 'string')
+	// `Equal`, not `extends`: `text()` below constrains its enum generic to a
+	// tuple (`Readonly<[U, ...U[]]>`), so when no `enum` option is given at all
+	// the parameter is left uninferred and TypeScript falls back to that
+	// constraint itself — i.e. `TEnum` is *already* the tuple
+	// `readonly [string, ...string[]]`, which would satisfy a plain `extends`
+	// check and misreport "no enum" as an enum. Exact equality against that
+	// specific fallback tuple is the only thing that tells the two apart,
+	// matching `drizzle-orm/sqlite-core`'s own `Equal<TEnum, [string, ...string[]]>`.
+	: CT extends 'SQLiteText' ? (Equal<TEnum, readonly [string, ...string[]]> extends true ? 'string' : 'string enum')
 	: CT extends 'SQLiteTextJson' | 'SQLiteBlobJson' ? 'object json'
 	: CT extends 'SQLiteBlobBuffer' ? 'object buffer'
 	: CT extends 'SQLiteNumeric' ? 'string numeric'
@@ -521,7 +539,7 @@ export function integer<TMode extends 'number' | 'boolean' | 'timestamp' | 'time
 
 export interface TextConfig<TEnum extends readonly string[], TMode extends 'text' | 'json' = 'text' | 'json'> {
 	length?: number;
-	enum?: TEnum;
+	enum?: TEnum | Writable<TEnum>;
 	mode?: TMode;
 }
 
@@ -540,15 +558,27 @@ export interface TextConfig<TEnum extends readonly string[], TMode extends 'text
  * naked type parameter distributes over unions, and the default is the union
  * `'text' | 'json'`, so the bare form returned *both* branches for a column
  * declared with no mode at all.
+ *
+ * `<U extends string, T extends Readonly<[U, ...U[]]>>` — a tuple-constrained
+ * generic on `enum`, not a plain `TEnum extends readonly string[]` — is
+ * `drizzle-orm/sqlite-core`'s exact signature, copied verbatim. The point of
+ * the tuple constraint is contextual typing: because the *declared* type of
+ * `enum` is a tuple pattern, `enum: ['admin', 'member']` infers as the tuple
+ * `['admin', 'member']` on its own, without needing `as const`. A looser
+ * `TEnum extends readonly string[]` widens the same literal to `string[]`
+ * and loses the enum at the type level (though not at runtime), which is
+ * what made `text('role', { enum: [...] })` need `as const` to type-check as
+ * an enum while already behaving like one when read back.
  */
 export function text<
-	TEnum extends readonly string[] = readonly string[],
+	U extends string,
+	T extends Readonly<[U, ...U[]]>,
 	TMode extends 'text' | 'json' = 'text' | 'json',
 >(
-	name?: string | TextConfig<TEnum, TMode>,
-	config?: TextConfig<TEnum, TMode>,
+	name?: string | TextConfig<T, TMode>,
+	config?: TextConfig<T, TMode>,
 ): [TMode] extends ['json'] ? ColumnBuilder<Meta<unknown, 'SQLiteTextJson', string>>
-	: ColumnBuilder<Meta<TEnum[number], 'SQLiteText', string, TEnum>>
+	: ColumnBuilder<Meta<Writable<T>[number], 'SQLiteText', string, Writable<T>>>
 {
 	const [columnName, options] = splitArgs(name, config);
 	const json = options?.mode === 'json';

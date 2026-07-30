@@ -157,10 +157,15 @@ export function validateTableOptions(t: Table, options: TableOptions): string | 
 	}
 
 	if (options.strict) {
-		const bad = columns.filter((c) => !STRICT_TYPES.has(c.config.type.toLowerCase()));
+		// Checked against the string that will actually be emitted — `typeName()`,
+		// which for a `customType` column is its `declaredType`, not the reduced
+		// affinity in `config.type`. A `customType(() => 'varchar(10)')` has
+		// affinity `text`, which passes the affinity check, but the DDL says
+		// `varchar(10)` and D1 rejects that under STRICT with `unknown datatype`.
+		const bad = columns.filter((c) => !STRICT_TYPES.has(typeName(c).toLowerCase()));
 		if (bad.length > 0) {
 			return `"${name}" is declared STRICT but ${
-				bad.map((c) => `"${c.name}" is ${c.config.type.toUpperCase()}`).join(', ')
+				bad.map((c) => `"${c.name}" is ${typeName(c).toUpperCase()}`).join(', ')
 			}; a STRICT table allows only INT, INTEGER, REAL, TEXT, BLOB and ANY.`;
 		}
 	}

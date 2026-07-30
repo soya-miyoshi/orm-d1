@@ -38,7 +38,7 @@ export interface DiffOptions {
 const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
 const columnDefinition = (column: ColumnSnapshot): string => {
-	let ddl = `${quote(column.name)} ${column.type}`;
+	let ddl = `${quote(column.name)} ${column.declaredType ?? column.type}`;
 	if (column.notNull) ddl += ' not null';
 	if (column.unique) ddl += ' unique';
 	if (column.generated) ddl += ` generated always as (${column.generated.as}) ${column.generated.mode}`;
