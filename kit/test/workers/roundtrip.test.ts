@@ -46,6 +46,14 @@ const flags = sqliteTable('flags', {
 	// `{ cid: -2, name: null }`, and the `CREATE INDEX` text has to be parsed
 	// to recover `lower("name")` — see `parseIndexColumns`.
 	index('flags_lower_name_idx').on(sql`lower(${t.name})`),
+	// DESC and COLLATE index members: `pragma index_info` cannot tell one
+	// from an ordinary named column, only `index_xinfo` can. Drizzle's
+	// `IndexColumn` has no `.desc()`/`.collate()` to spell these with, so —
+	// like `flags_lower_name_idx` above — they go through the raw-SQL escape
+	// hatch, and `snapshotFromSchema` decomposes the decorated identifier
+	// back into a structured member (see `decorateIndexColumn`).
+	index('flags_weight_desc_idx').on(sql`"weight" desc`),
+	uniqueIndex('flags_name_nocase_idx').on(sql`"name" collate NOCASE`),
 ]);
 
 const schemaTables = [...allTables, flags];

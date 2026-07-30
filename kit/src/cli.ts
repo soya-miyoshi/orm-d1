@@ -49,6 +49,13 @@ interface Args {
 	flags: Record<string, FlagValue>;
 }
 
+/**
+ * Flags meant to carry a boolean value. Spelled out rather than inferred,
+ * because a flag's shape is fixed by the command it belongs to, not by
+ * whatever a caller happens to pass on the command line.
+ */
+const BOOLEAN_FLAGS = new Set(['local', 'remote', 'accept-data-loss']);
+
 export function parseArgs(argv: readonly string[]): Args {
 	const [command = 'help', ...rest] = argv;
 	const flags: Record<string, FlagValue> = {};
@@ -62,6 +69,14 @@ export function parseArgs(argv: readonly string[]): Args {
 		else flags[name] = value;
 	};
 
+	// `--remote=true` and `--remote true` name a boolean flag but hand it a
+	// *string* — `'true'`/`'false'` unless coerced here. Left as a string, it
+	// compares unequal to the literal `true` every reader tests against
+	// (`asTargetFlags`), so it silently fell through to that flag's default
+	// instead of being honoured — or rejected.
+	const coerce = (name: string, value: string): string | boolean =>
+		BOOLEAN_FLAGS.has(name) && (value === 'true' || value === 'false') ? value === 'true' : value;
+
 	for (let i = 0; i < rest.length; i++) {
 		const token = rest[i]!;
 		if (!token.startsWith('--')) continue;
@@ -72,9 +87,9 @@ export function parseArgs(argv: readonly string[]): Args {
 		const name = equals === -1 ? body : body.slice(0, equals);
 		const inline = equals === -1 ? undefined : body.slice(equals + 1);
 		const next = rest[i + 1];
-		if (inline !== undefined) set(name, inline);
+		if (inline !== undefined) set(name, coerce(name, inline));
 		else if (next && !next.startsWith('--')) {
-			set(name, next);
+			set(name, coerce(name, next));
 			i++;
 		} else set(name, true);
 	}
@@ -129,12 +144,26 @@ const splitPair = (entry: string, flag: string, shape: string): [string, string]
 	return [from, to];
 };
 
+/**
+ * Reads a flag `parseArgs` was supposed to have already coerced to a boolean.
+ * A string surviving to here means it was spelled in a way `coerce` does not
+ * recognise (e.g. `--remote=yes`) — failing loudly beats silently treating it
+ * as absent and running against the wrong database or skipping the
+ * data-loss check it looks like it passed.
+ */
+const asBooleanFlag = (flags: Record<string, FlagValue>, name: string): boolean => {
+	const value = flags[name];
+	if (value === undefined) return false;
+	if (typeof value === 'boolean') return value;
+	throw new Error(`--${name} expects true or false; received "${String(value)}".`);
+};
+
 export const asTargetFlags = (flags: Record<string, FlagValue>): TargetFlags => {
 	const renames = asRenames(flags);
 	return {
-		local: flags['local'] === true,
-		remote: flags['remote'] === true,
-		acceptDataLoss: flags['accept-data-loss'] === true,
+		local: asBooleanFlag(flags, 'local'),
+		remote: asBooleanFlag(flags, 'remote'),
+		acceptDataLoss: asBooleanFlag(flags, 'accept-data-loss'),
 		...(typeof flags['name'] === 'string' ? { name: flags['name'] } : {}),
 		...(renames ? { renames } : {}),
 	};
@@ -143,7 +172,12 @@ export const asTargetFlags = (flags: Record<string, FlagValue>): TargetFlags => 
 export async function run(argv: readonly string[]): Promise<number> {
 	const { command, flags } = parseArgs(argv);
 
-	if (command === 'help' || flags['help'] === true) {
+	// `--help`/`-h` in the *command* position (`d1zzle-migrate --help`) parses
+	// as `command === '--help'`, not as a flag on some other command — there
+	// is no command yet for it to be a flag of. Left unmatched, it fell
+	// through to the config-loading path below and failed with "No d1zzle
+	// config found" before the usage text ever printed.
+	if (command === 'help' || command.startsWith('-') || flags['help'] === true) {
 		console.log(USAGE);
 		return 0;
 	}

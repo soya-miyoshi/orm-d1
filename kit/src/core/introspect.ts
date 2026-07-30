@@ -48,6 +48,16 @@ export interface IndexInfoRow {
 	readonly seqno: number;
 	readonly cid: number;
 	readonly name: string | null;
+	/**
+	 * `index_xinfo`'s extra columns, absent from `index_info`: whether this
+	 * member sorts descending (0/1), and its collation. `index_xinfo` also
+	 * appends the rowid tail SQLite adds to make a non-unique index's rows
+	 * unique — those carry `key: 0` and must be filtered out by the caller
+	 * before this array is built, or they show up as phantom index members.
+	 */
+	readonly desc?: number;
+	readonly coll?: string;
+	readonly key?: number;
 }
 
 export interface ForeignKeyRow {
@@ -334,11 +344,20 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			const rawColumns = sortedMembers.some((m) => m.name === null)
 				? parseIndexColumns(indexSql.get(index.name) ?? null)
 				: undefined;
-			const memberColumns: { expression: string; isExpression: boolean }[] = sortedMembers
-				.map((m, i) => m.name !== null
-					? { expression: m.name, isExpression: false }
-					: { expression: rawColumns?.[i] ?? '', isExpression: true })
-				.filter((c) => c.expression !== '');
+			const memberColumns: { expression: string; isExpression: boolean; desc?: boolean; collate?: string }[] =
+				sortedMembers
+					.map((m, i) => ({
+						...(m.name !== null
+							? { expression: m.name, isExpression: false }
+							: { expression: rawColumns?.[i] ?? '', isExpression: true }),
+						...(m.desc === 1 ? { desc: true } : {}),
+						// `coll` is reported for every member, including an
+						// unqualified column's implicit default — only surface it
+						// when it actually differs, or every ordinary index grows a
+						// spurious `collate: 'BINARY'`.
+						...(m.coll && m.coll !== 'BINARY' ? { collate: m.coll } : {}),
+					}))
+					.filter((c) => c.expression !== '');
 
 			if (index.origin === 'pk') continue;
 			if (index.origin === 'u') {

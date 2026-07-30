@@ -1444,3 +1444,89 @@ describe('a relation with its own where', () => {
 		expect(sqls[0]).toMatch(/json_group_array/);
 	});
 });
+
+describe('a reversed relation inherits the where onto the source, not the target', () => {
+	/**
+	 * `posts.author` states `where` explicitly, on the `one` side. `users.posts`
+	 * states no `from`/`to` at all, so it adopts both from the reverse — and,
+	 * per Drizzle (`drizzle-orm/relations.js` ~683/~690), the inherited `where`
+	 * is compiled against `users`, the *source* of the now-reversed relation,
+	 * not `posts`, its target. `posts` has no `active` column at all, so
+	 * compiling the predicate against the wrong table wouldn't just disagree —
+	 * it would throw "Unknown filter field".
+	 */
+	const rel = defineRelations({ users: schema.users, posts: schema.posts }, (r) => ({
+		posts: {
+			author: r.one.users({ from: r.posts.authorId, to: r.users.id, where: { active: true } }),
+		},
+		users: {
+			posts: r.many.posts(), // adopts from/to *and* where from `posts.author`
+		},
+	}));
+
+	const split = drizzle({ client: DB, relations: rel });
+	const joined = drizzle({ client: DB, relations: rel, relationalStrategy: 'joined' });
+
+	beforeEach(async () => {
+		await db.update(schema.users).set({ active: false }).where(eq(schema.users.id, 2)).run();
+	});
+
+	it('narrows children by the source row, in the split plan', async () => {
+		// User 1 is active and owns posts 10 and 11 — both come back. User 2 is
+		// inactive, so it gets none, even though post 12 is genuinely theirs.
+		const rows = await split.query.users.findMany({
+			columns: { id: true },
+			with: { posts: { columns: { id: true } } },
+			orderBy: { id: 'asc' },
+		});
+
+		expect(rows).toEqual([
+			{ id: 1, posts: [{ id: 10 }, { id: 11 }] },
+			{ id: 2, posts: [] },
+		]);
+	});
+
+	it('narrows children by the source row, in the joined plan too', async () => {
+		const rows = await joined.query.users.findMany({
+			columns: { id: true },
+			with: { posts: { columns: { id: true } } },
+			orderBy: { id: 'asc' },
+		});
+
+		expect(rows).toEqual([
+			{ id: 1, posts: [{ id: 10 }, { id: 11 }] },
+			{ id: 2, posts: [] },
+		]);
+	});
+
+	it('narrows the same way through the relational filter DSL', async () => {
+		// `posts: true` embeds the relation's declared `where` inside the
+		// correlated `exists`, unconditionally — so it excludes user 2 even
+		// though the filter itself only asks "has any posts".
+		const rows = await split.query.users.findMany({
+			columns: { id: true },
+			where: { posts: true },
+			orderBy: { id: 'asc' },
+		});
+
+		expect(rows).toEqual([{ id: 1 }]);
+	});
+
+	it('still throws when a genuinely reversed where names a field absent from the correct table', async () => {
+		// The correct table for this `where` is `users`, the source — not
+		// `posts`. A field that exists on neither must still fail loudly.
+		const bogus = defineRelations({ users: schema.users, posts: schema.posts }, (r) => ({
+			posts: {
+				author: r.one.users({ from: r.posts.authorId, to: r.users.id, where: { nope: true } as never }),
+			},
+			users: {
+				posts: r.many.posts(),
+			},
+		}));
+		const d = drizzle({ client: DB, relations: bogus });
+
+		await expect(d.query.users.findMany({ with: { posts: true } })).rejects.toThrow(
+			/Unknown filter field "nope"/,
+		);
+	});
+});

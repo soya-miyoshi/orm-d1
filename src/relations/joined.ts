@@ -210,9 +210,15 @@ export function buildLevel(
 		// The relation's own `where` narrows the target rows every time it is
 		// traversed, so it belongs inside the correlated subquery alongside the
 		// caller's filter. Compiled through the same hook, which is what keeps
-		// the two plans emitting the same predicate for the same declaration.
+		// the two plans emitting the same predicate for the same declaration —
+		// except when the relation is reversed (`adoptReverse`): the `where` was
+		// declared on the opposite side and names columns of what is, from
+		// here, the *parent* level, not the child. It still belongs inside this
+		// correlated subquery, just compiled against the outer table/alias.
 		if (relation.where) {
-			const declared = compileWhere({ where: relation.where }, targetConfig, childTable);
+			const declared = relation.isReversed
+				? compileWhere({ where: relation.where }, tableConfig, table)
+				: compileWhere({ where: relation.where }, targetConfig, childTable);
 			if (declared) predicates.push(declared);
 		}
 

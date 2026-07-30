@@ -133,6 +133,38 @@ describe('diffing snapshots', () => {
 		expect(diffSnapshots(fresh, oldShape).statements).toEqual([]);
 	});
 
+	it('reads a pre-desc/collate index snapshot without reporting drift against an equivalent fresh one', () => {
+		// Before `desc`/`collate` existed on `IndexColumnSnapshot`, an
+		// unqualified index member had neither field at all — not `desc: false`
+		// or `collate: undefined`, just absent. A live database introspected
+		// after this change reports that same ordinary column exactly the same
+		// way (still no `desc`/`collate`, since neither applies to it), so the
+		// two must diff as identical.
+		const t = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [uniqueIndex('users_email_idx').on(c.email)]);
+
+		const fresh = snapshotOf(t);
+		const preDescCollate: Snapshot = {
+			...fresh,
+			tables: {
+				users: {
+					...fresh.tables['users']!,
+					indexes: {
+						users_email_idx: {
+							...fresh.tables['users']!.indexes['users_email_idx']!,
+							columns: [{ expression: 'email', isExpression: false }],
+						},
+					},
+				},
+			},
+		};
+
+		expect(diffSnapshots(preDescCollate, fresh).statements).toEqual([]);
+		expect(diffSnapshots(fresh, preDescCollate).statements).toEqual([]);
+	});
+
 	it('drops a removed table, and marks it destructive', () => {
 		const t = sqliteTable('gone', { id: integer('id').primaryKey() });
 		const { statements } = diffSnapshots(snapshotOf(t), emptySnapshot());

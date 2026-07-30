@@ -8,7 +8,7 @@
  */
 import { env } from 'cloudflare:test';
 import { createSchema } from 'd1zzle/ddl';
-import { integer, real, sqliteTable, text, uniqueIndex } from 'd1zzle';
+import { integer, real, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { applyMigrations, appliedMigrations, checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
@@ -130,6 +130,33 @@ describe('applying generated migrations', () => {
 			"select name from sqlite_master where type = 'index' and tbl_name = 'users' and sql is not null",
 		);
 		expect(indexes.map((i) => i.name)).toEqual(['users_email_idx']);
+	});
+
+	it('keeps a COLLATE NOCASE unique index enforcing case-insensitive uniqueness through a table rebuild', async () => {
+		// `pragma index_info` cannot see the COLLATE at all, only
+		// `index_xinfo` can — so before that fix, a rebuild-forcing diff would
+		// recreate this index without it, and the second insert below would
+		// stop being rejected.
+		const before = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email'),
+			age: text('age'),
+		}, (t) => [uniqueIndex('users_email_nocase_idx').on(sql`"email" collate NOCASE`)]);
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+		await DB.prepare(`insert into users (id, email, age) values (1, 'a@b.c', '30')`).run();
+		await expect(DB.prepare(`insert into users (id, email, age) values (2, 'A@B.C', '31')`).run())
+			.rejects.toThrow();
+
+		// A type change forces the rebuild.
+		const after = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email'),
+			age: integer('age'),
+		}, (t) => [uniqueIndex('users_email_nocase_idx').on(sql`"email" collate NOCASE`)]);
+		await migrateTo(snapshotFromSchema([before]), snapshotFromSchema([after]));
+
+		await expect(DB.prepare(`insert into users (id, email, age) values (3, 'A@B.C', 32)`).run())
+			.rejects.toThrow();
 	});
 
 	it('rolls a failed migration back completely, because a migration is one batch', async () => {

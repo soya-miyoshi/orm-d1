@@ -2,7 +2,7 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { asTargetFlags, parseArgs } from '../../src/cli.js';
+import { asTargetFlags, parseArgs, run } from '../../src/cli.js';
 import { appendEntry, emptyJournal, migrationName, migrationTag, nextIndex, pendingMigrations } from '../../src/core/journal.js';
 import { applicableStatements, isPragma, splitStatements } from '../../src/core/sql.js';
 import { loadConfig, parseJsonc, readWranglerConfig } from '../../src/node/config.js';
@@ -148,9 +148,45 @@ describe('argument parsing', () => {
 		expect(parseArgs(['generate', '--name=a=b']).flags).toEqual({ name: 'a=b' });
 	});
 
+	it('coerces an =-spelled boolean flag to an actual boolean', () => {
+		// `--remote=true` used to be stored as the *string* `'true'`, which
+		// `asTargetFlags`'s `=== true` check silently treated as absent — the
+		// command ran against the local database while looking like it had
+		// asked for remote.
+		expect(asTargetFlags(parseArgs(['migrate', '--remote=true']).flags)).toMatchObject({ remote: true });
+		expect(asTargetFlags(parseArgs(['migrate', '--remote=false']).flags)).toMatchObject({ remote: false });
+	});
+
+	it('coerces the space-separated boolean form too', () => {
+		expect(asTargetFlags(parseArgs(['migrate', '--remote', 'true']).flags)).toMatchObject({ remote: true });
+	});
+
+	it('honours a genuinely coerced --accept-data-loss=true', () => {
+		// The coercion that fixes `--remote=true` must not turn
+		// `--accept-data-loss=true` into something less than a real `true` —
+		// the whole point of `=true` failing closed *before* this fix was that
+		// a string can never accidentally grant it.
+		expect(asTargetFlags(parseArgs(['push', '--accept-data-loss=true']).flags))
+			.toMatchObject({ acceptDataLoss: true });
+	});
+
+	it('rejects a boolean flag spelled in a way parseArgs does not coerce', () => {
+		// Anything parseArgs did not turn into an actual boolean must fail
+		// loudly in asTargetFlags rather than silently default to false —
+		// failing closed beats quietly running against the wrong database.
+		expect(() => asTargetFlags({ remote: 'yes' })).toThrow(/--remote expects true or false/);
+		expect(() => asTargetFlags({ 'accept-data-loss': 'yes' })).toThrow(/--accept-data-loss expects true or false/);
+	});
+
 	it('accumulates a repeated flag', () => {
 		expect(parseArgs(['generate', '--rename-column', 'users.a=b', '--rename-column', 'posts.c=d']).flags)
 			.toEqual({ 'rename-column': ['users.a=b', 'posts.c=d'] });
+	});
+});
+
+describe('--help in the command position', () => {
+	it('prints usage instead of looking for a config', async () => {
+		await expect(run(['--help'])).resolves.toBe(0);
 	});
 });
 

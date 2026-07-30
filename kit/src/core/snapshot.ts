@@ -61,6 +61,16 @@ export interface ColumnSnapshot {
 export interface IndexColumnSnapshot {
 	readonly expression: string;
 	readonly isExpression: boolean;
+	/** `DESC` in the index's column list. Absent/`false` means ascending, SQLite's default. */
+	readonly desc?: boolean;
+	/**
+	 * An explicit `COLLATE <name>` on this index member. Absent means the
+	 * column's own declared collation (or `BINARY`) applies — SQLite reports
+	 * every member's collation, including the implicit default, so this is
+	 * only set when it differs from `BINARY`, the default for an unqualified
+	 * column, to keep an ordinary index from growing a spurious `collate`.
+	 */
+	readonly collate?: string;
 }
 
 /**
@@ -70,6 +80,37 @@ export interface IndexColumnSnapshot {
  */
 export const normalizeIndexColumn = (entry: string | IndexColumnSnapshot): IndexColumnSnapshot =>
 	typeof entry === 'string' ? { expression: entry, isExpression: false } : entry;
+
+/**
+ * Drizzle's `IndexColumn` (`SQLiteColumn | SQL`, `drizzle-orm/sqlite-core`)
+ * has no `.desc()`/`.collate()` on the column builder — there is no
+ * first-class spelling for a DESC or COLLATE index member, only the raw-SQL
+ * escape hatch already used for an expression index. A schema author states
+ * one as `sql\`"col" collate NOCASE desc\``, which arrives here as an opaque
+ * expression string identical in shape to `sql\`lower("col")\`` — but it
+ * isn't one: it is a plain column, decorated, and `pragma index_xinfo`
+ * reports it as exactly that (`cid` pointing at the real column, `desc`/`coll`
+ * set), not as an expression member (`cid: -2`). Left undecomposed, a
+ * schema-declared DESC/COLLATE index would permanently diff against the
+ * database it exactly describes. So a raw-SQL member that is nothing but a
+ * quoted identifier plus an optional `collate <name>` and/or `desc`/`asc` is
+ * parsed back into the same structured shape introspection produces —
+ * mirroring `parseIndexColumns`, which does the same job in the other
+ * direction for expression members.
+ */
+const decorateIndexColumn = (raw: string): IndexColumnSnapshot => {
+	const match = raw.trim().match(
+		/^"((?:[^"]|"")+)"(?:\s+collate\s+(\w+))?(?:\s+(asc|desc))?$/i,
+	);
+	if (!match) return { expression: raw, isExpression: true };
+	const [, name, collate, order] = match;
+	return {
+		expression: (name ?? '').replaceAll('""', '"'),
+		isExpression: false,
+		...(order?.toLowerCase() === 'desc' ? { desc: true } : {}),
+		...(collate && collate.toUpperCase() !== 'BINARY' ? { collate: collate.toUpperCase() } : {}),
+	};
+};
 
 export interface IndexSnapshot {
 	readonly name: string;
@@ -215,7 +256,7 @@ export function snapshotFromSchema(
 						columns: extra.meta.columns.map((c) =>
 							isColumn(c)
 								? { expression: c.name, isExpression: false }
-								: { expression: renderInline(c as never), isExpression: true }
+								: decorateIndexColumn(renderInline(c as never))
 						),
 						isUnique: extra.meta.unique,
 						where: extra.meta.where ? renderInline(extra.meta.where) : undefined,
@@ -339,8 +380,14 @@ const referenceClause = (fk: ForeignKeySnapshot, quote: (name: string) => string
 
 export function createIndexFromSnapshot(index: IndexSnapshot, tableName: string): string {
 	const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
+	const renderColumn = (c: IndexColumnSnapshot): string => {
+		const base = c.isExpression ? c.expression : quote(c.expression);
+		const collate = c.collate ? ` collate ${c.collate}` : '';
+		const order = c.desc ? ' desc' : '';
+		return `${base}${collate}${order}`;
+	};
 	return `create ${index.isUnique ? 'unique ' : ''}index ${quote(index.name)} on ${quote(tableName)} (${
-		index.columns.map(normalizeIndexColumn).map((c) => (c.isExpression ? c.expression : quote(c.expression))).join(', ')
+		index.columns.map(normalizeIndexColumn).map(renderColumn).join(', ')
 	})${index.where ? ` where ${index.where}` : ''}`;
 }
 

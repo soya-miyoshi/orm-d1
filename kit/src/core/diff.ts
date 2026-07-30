@@ -690,6 +690,12 @@ const canonicalIndex = (index: IndexSnapshot): string =>
 		index.columns.map(normalizeIndexColumn).map((c) => [
 			c.isExpression ? canonicalizeExpression(c.expression) : c.expression,
 			c.isExpression,
+			// A pre-upgrade snapshot has no `desc`/`collate` at all — normalised
+			// here to the same "no modifier" value a freshly-introspected
+			// unqualified column gets, or the two would diff as different when
+			// they describe the identical index.
+			c.desc ?? false,
+			c.collate && c.collate !== 'BINARY' ? c.collate : undefined,
 		]),
 		index.isUnique,
 		(index.where ?? '').replaceAll(/\s+/g, ' ').trim(),

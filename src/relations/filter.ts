@@ -295,7 +295,9 @@ const resolveRaw = (raw: RawFilter, table: Table): SQLChunk | undefined => {
 const compileRelationFilter = (
 	relation: Relation,
 	value: unknown,
+	table: Table,
 	sourceColumns: Record<string, Column<any>>,
+	sourceRelations: Record<string, Relation>,
 	config: RelationsConfig,
 	depth: number,
 ): Condition | undefined => {
@@ -341,9 +343,17 @@ const compileRelationFilter = (
 		? undefined
 		: compileFilter(value as RelationsFilter, target, targetColumns, targetConfig?.relations ?? {}, config, depth + 1);
 
-	// The relation's own `where`, if it has one, applies wherever it is used.
+	// The relation's own `where`, if it has one, applies wherever it is used —
+	// against the *target* table normally, but against the *source* table when
+	// the relation was adopted via `adoptReverse` (`relation.isReversed`): the
+	// `where` was declared on the opposite side, where it names columns of what
+	// is, from here, the source. The outer table is already in scope as
+	// `sourceColumns`/`table` — no fresh alias is needed, it correlates through
+	// the same reference the join condition uses.
 	const declared = relation.where
-		? compileFilter(relation.where, target, targetColumns, targetConfig?.relations ?? {}, config, depth + 1)
+		? relation.isReversed
+			? compileFilter(relation.where, table, sourceColumns, sourceRelations, config, depth)
+			: compileFilter(relation.where, target, targetColumns, targetConfig?.relations ?? {}, config, depth + 1)
 		: undefined;
 
 	const predicate = and(joinCondition, declared, nested);
@@ -411,7 +421,7 @@ export function compileFilter(
 
 		const relation = relations[key];
 		if (relation) {
-			parts.push(compileRelationFilter(relation, value, columns, config, depth));
+			parts.push(compileRelationFilter(relation, value, table, columns, relations, config, depth));
 			continue;
 		}
 
