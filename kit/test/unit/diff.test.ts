@@ -175,6 +175,22 @@ describe('diffing snapshots', () => {
 		expect(errors[0]).toMatch(/"child" still references it/);
 	});
 
+	it('never drops a leftover "__new_X" from an interrupted rebuild, but warns about it by name (gap 3)', () => {
+		const orders = sqliteTable('orders', { id: integer('id').primaryKey() });
+		// Stands in for a live database left with both the original table and an
+		// uncommitted-rename leftover from a split rebuild that never made it
+		// past `alter table "__new_orders" rename to "orders"`.
+		const leftover = sqliteTable('__new_orders', { id: integer('id').primaryKey() });
+
+		const { statements, errors, warnings } = diffSnapshots(snapshotOf(orders, leftover), snapshotOf(orders));
+
+		expect(errors).toEqual([]);
+		expect(statements.map((s) => s.sql)).not.toContain('drop table "__new_orders"');
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toMatch(/"__new_orders"/);
+		expect(warnings[0]).toMatch(/"orders"/);
+	});
+
 	it('adds a nullable column in place', () => {
 		const before = sqliteTable('users', { id: integer('id').primaryKey() });
 		const after = sqliteTable('users', {
@@ -1180,6 +1196,152 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 	it('reports no drift when nothing about the options changed', () => {
 		const snapshot = withOptions(events, { strict: true, withoutRowid: false, appendOnly: true });
 		expect(diffSnapshots(snapshot, snapshot).statements).toEqual([]);
+	});
+
+	// Finding 4: renaming an append-only table used to clear `appendOnly` on
+	// the carried-forward table as a side effect of the rename, which made the
+	// in-place destructive check below never see the transition at all — the
+	// guard silently escaped `--accept-data-loss`.
+	describe('escaping --accept-data-loss by renaming an append-only table (finding 4)', () => {
+		const renamed = sqliteTable('audit', { id: text('id').primaryKey(), at: text('at').notNull() });
+		const opts = (table: any, appendOnly: boolean): Snapshot =>
+			snapshotFromSchema([table], '', tableOptions([[table, { appendOnly }]]));
+
+		it('marks the guard drop destructive when the renamed table does not stay append-only', () => {
+			const diff = diffSnapshots(opts(events, true), opts(renamed, false), {
+				renamedTables: { events: 'audit' },
+			});
+			expect(diff.statements.some((s) => s.destructive)).toBe(true);
+			const drop = diff.statements.find((s) => s.sql === 'drop trigger if exists "events_no_update"');
+			expect(drop?.destructive).toBe(true);
+			expect(drop?.reason).toMatch(/no longer append-only/);
+		});
+
+		it('still marks the in-place (non-renaming) transition destructive', () => {
+			const diff = diffSnapshots(withOptions(events, { appendOnly: true }), withOptions(events, {}));
+			const drop = diff.statements.find((s) => s.sql === 'drop trigger if exists "events_no_update"');
+			expect(drop?.destructive).toBe(true);
+			expect(drop?.reason).toMatch(/no longer append-only/);
+		});
+
+		it('does not mark the drop destructive when the renamed table stays append-only', () => {
+			const diff = diffSnapshots(opts(events, true), opts(renamed, true), {
+				renamedTables: { events: 'audit' },
+			});
+			const drop = diff.statements.find((s) => s.sql === 'drop trigger if exists "events_no_update"');
+			expect(drop).toBeDefined();
+			expect(drop?.destructive).toBe(false);
+			const create = diff.statements.find((s) => /create trigger "audit_no_update"/.test(s.sql));
+			expect(create).toBeDefined();
+			expect(create?.destructive).toBe(false);
+		});
+	});
+
+	// Finding 2: a rebuild only ever re-creates the append-only guard it
+	// authors itself; any other trigger on the live table is silently dropped
+	// with the table, with no error and no way to get it back.
+	describe('refusing a rebuild that would silently drop a foreign trigger (finding 2)', () => {
+		it('refuses when the live table carries a trigger d1zzle did not author', () => {
+			const before = withOptions(users, {});
+			const after = withOptions(
+				sqliteTable('users', { id: text('id').primaryKey(), email: text('email') }),
+				{},
+			);
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { users: ['users_audit'] },
+			});
+
+			expect(diff.statements).toEqual([]);
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"users" has to be recreated/);
+			expect(diff.errors[0]).toMatch(/"users_audit"/);
+		});
+
+		it('does not refuse when the only trigger present is the append-only guard itself', () => {
+			const before = withOptions(users, { appendOnly: true });
+			const after = withOptions(
+				sqliteTable('users', { id: text('id').primaryKey(), email: text('email') }),
+				{ appendOnly: true },
+			);
+
+			// The append-only guard is never passed as a `foreignTrigger` by a
+			// real caller (`introspect`'s out-param excludes it) — this proves
+			// the rebuild still succeeds when `foreignTriggers` is absent/empty.
+			const diff = diffSnapshots(before, after);
+			expect(diff.errors).toEqual([]);
+			expect(diff.statements.some((s) => /create table "__new_users"/.test(s.sql))).toBe(true);
+		});
+
+		it('still refuses for a table that also has dependents, naming the trigger not just the dependent', () => {
+			const parent = sqliteTable('parent', {
+				id: text('id').primaryKey(),
+				name: text('name'),
+			});
+			const child = sqliteTable('child', {
+				id: text('id').primaryKey(),
+				parentId: text('parent_id').references(() => parent.id),
+			});
+			const parentAfter = sqliteTable('parent', {
+				id: text('id').primaryKey(),
+				name: integer('name'),
+			});
+
+			const diff = diffSnapshots(
+				snapshotOf(parent, child),
+				snapshotOf(parentAfter, child),
+				{ foreignTriggers: { parent: ['parent_audit'] } },
+			);
+
+			// The dependents check runs first and refuses before the trigger
+			// check is ever reached — both are real reasons this rebuild cannot
+			// happen, and the first one found is reported.
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"child".*references it/);
+		});
+
+		it('still refuses when the trigger-carrying table is also renamed in the same migration', () => {
+			// `options.foreignTriggers` is keyed by the LIVE (pre-rename) name,
+			// the same way `introspect()` populates it — `users`, not `people`.
+			// A rebuild forced by the type change on `email` must still find it
+			// even though the diff also renames the table.
+			const before = withOptions(users, {});
+			const after = withOptions(
+				sqliteTable('people', { id: text('id').primaryKey(), email: integer('email') }),
+				{},
+			);
+
+			const diff = diffSnapshots(before, after, {
+				renamedTables: { users: 'people' },
+				foreignTriggers: { users: ['users_audit'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"people" has to be recreated/);
+			expect(diff.errors[0]).toMatch(/"users_audit"/);
+		});
+	});
+
+	// Finding 2 (smaller half): a rebuild triggered for some other reason
+	// (here, a type change) that also happens to turn off `appendOnly` used to
+	// `continue` past the in-place transition block entirely, losing the
+	// guard with no destructive `reason` naming it.
+	it('still emits the append-only-lost reason when a rebuild fires for another reason', () => {
+		const before = withOptions(events, { appendOnly: true });
+		const after = snapshotFromSchema(
+			[sqliteTable('events', { id: text('id').primaryKey(), at: text('at') })],
+			'',
+			tableOptions([[events, {}]]),
+		);
+
+		const diff = diffSnapshots(before, after);
+		expect(diff.statements.some((s) => /create table "__new_events"/.test(s.sql))).toBe(true);
+
+		const guardLoss = diff.statements.find((s) =>
+			s.sql === 'drop trigger if exists "events_no_update"' && s.destructive
+		);
+		expect(guardLoss).toBeDefined();
+		expect(guardLoss?.reason).toMatch(/no longer append-only/);
 	});
 });
 

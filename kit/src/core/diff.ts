@@ -33,6 +33,13 @@ export interface DiffOptions {
 	readonly renamedTables?: Record<string, string>;
 	/** `{ 'table.old_column': 'new_column' }`. */
 	readonly renamedColumns?: Record<string, string>;
+	/**
+	 * Triggers found on the *live* table (keyed by table name) that d1zzle did
+	 * not author — everything except the append-only guard. Not part of
+	 * `TableSnapshot`: that shape is schema-facing and exported, so this rides
+	 * alongside it instead. See `introspect`'s `foreignTriggers` out-param.
+	 */
+	readonly foreignTriggers?: Record<string, readonly string[]>;
 }
 
 const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
@@ -214,6 +221,7 @@ const recreateTable = (
 	columnRenames: Record<string, string>,
 	reason: string,
 	dependents: Record<string, TableSnapshot> = {},
+	foreignTriggers: readonly string[] = [],
 ): { statements: Statement[]; errors: string[] } => {
 	const errors: string[] = [];
 
@@ -229,6 +237,23 @@ const recreateTable = (
 		// No statements alongside the refusal: `generate` will not write them,
 		// and emitting SQL that cannot run next to an error saying so is worse
 		// than emitting nothing.
+		return { statements: [], errors };
+	}
+
+	// Same shape as the dependents refusal above: `DROP TABLE` takes every
+	// trigger on it with it, and the rebuild only knows how to re-create the
+	// one trigger it authors itself (the append-only guard, handled below).
+	// Any other trigger found on the live table would simply vanish — no
+	// error, no re-creation, just UPDATE (or whatever it guarded) quietly
+	// starting to behave differently the moment this migration runs.
+	if (foreignTriggers.length > 0) {
+		errors.push(
+			`"${before.name}" has to be recreated because ${reason}, but it carries trigger(s) `
+				+ `${foreignTriggers.map((t) => `"${t}"`).join(', ')} that d1zzle did not create. Rebuilding drops `
+				+ 'the table, which drops those triggers with it, and there is no way to reproduce a trigger '
+				+ 'd1zzle does not know the definition of. Drop the trigger, recreate it by hand after this '
+				+ 'migration runs, or bring it into the schema so d1zzle can carry it across rebuilds.',
+		);
 		return { statements: [], errors };
 	}
 	const temporary = `__new_${after.name}`;
@@ -313,6 +338,13 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 	const renamedTables = options.renamedTables ?? {};
 	const renamedColumns = options.renamedColumns ?? {};
 
+	// Reverse of `renamedTables`: post-rename name -> live (pre-rename) name.
+	// `options.foreignTriggers` is populated by `introspect()` keyed by the
+	// live `tbl_name`, before any rename in this diff is applied, so a lookup
+	// keyed by the post-rename identity misses it entirely.
+	const liveTableNames: Record<string, string> = {};
+	for (const [before, after] of Object.entries(renamedTables)) liveTableNames[after] = before;
+
 	const beforeNames = Object.keys(before.tables);
 	const afterNames = Object.keys(after.tables);
 
@@ -331,7 +363,23 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			// generated migration can ever clear. Drop it under the name it
 			// actually has, and let the guard be re-created below if it is still
 			// wanted (that is what clearing `appendOnly` here arranges).
-			if (t.appendOnly) statements.push({ sql: dropAppendOnlyTrigger(name), destructive: false });
+			if (t.appendOnly) {
+				// Carrying the guard across the rename is a separate, later step
+				// (re-creating it under the new name when `after` still wants it):
+				// this drop is unconditional. Whether it is *destructive* is not —
+				// dropping it here is safe exactly when it comes back under the new
+				// name in the same diff, which is the same test the in-place
+				// transition below uses (`next.appendOnly`), just against the
+				// renamed identity instead of the unchanged one.
+				const staysAppendOnly = after.tables[renamed]?.appendOnly === true;
+				statements.push({
+					sql: dropAppendOnlyTrigger(name),
+					destructive: !staysAppendOnly,
+					...(staysAppendOnly ? {} : {
+						reason: `"${renamed}" is no longer append-only, so UPDATE is permitted again`,
+					}),
+				});
+			}
 			effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: false };
 		} else {
 			effectiveBefore[name] = t;
@@ -353,10 +401,44 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 	// order. Dropping a parent first leaves the child's foreign key pointing at
 	// a table that no longer exists, which D1 enforces (it cannot be turned off
 	// inside a migration) and which fails the whole batch.
-	const dropped = Object.keys(effectiveBefore).filter((name) => !after.tables[name]);
+	// A `__new_<table>` leftover from a rebuild that failed to `batch()`
+	// atomically (a split migration hitting D1's cross-batch atomicity gap) is
+	// never auto-dropped here, even though it looks exactly like an ordinary
+	// removed table from this side of the diff. It is very likely the *only*
+	// surviving copy of the rebuilt data — the old table is already gone by
+	// the time this state is reached — so treating it as ordinary drift and
+	// emitting `drop table "__new_<table>"` would destroy the one thing left
+	// to recover from. `isInternalTable` is deliberately not widened to cover
+	// this: that would also hide a real table someone genuinely named
+	// `__new_orders` from `pull`, which is a different, much rarer table.
+	const dropped = Object.keys(effectiveBefore).filter((name) => !after.tables[name] && !name.startsWith('__new_'));
 	const survivors = Object.fromEntries(
 		Object.entries(effectiveBefore).filter(([name]) => !dropped.includes(name)),
 	);
+
+	// The `__new_` tables excluded from `dropped` above are silently left
+	// alone for the reason stated there — but silent is only safe for the
+	// destructive half (never drop the one surviving copy of the rebuilt
+	// rows). The leftover itself is a real defect: it does not show up as
+	// drift (this diff naturally has nothing to say about a table on the
+	// `before` side it is deliberately ignoring), so `check` reports clean
+	// with the orphan still sitting there, and the next rebuild of the table
+	// it belongs to fails on `create table "__new_<table>" already exists`
+	// with nothing in any command's output explaining why. Naming it here, as
+	// a warning rather than an error, keeps this diff's own statements
+	// unblocked (nothing about applying *this* diff is unsafe) while telling
+	// the operator what to do before the next rebuild finds it.
+	for (const name of Object.keys(effectiveBefore)) {
+		if (!name.startsWith('__new_') || after.tables[name]) continue;
+		const original = name.slice('__new_'.length);
+		warnings.push(
+			`"${name}" looks like a leftover table from an interrupted rebuild of "${original}" (a rebuild whose `
+				+ 'temporary copy was committed but never renamed into place). It is left alone because it may be '
+				+ `the only surviving copy of that table's rows. Drop it by hand once you've confirmed it isn't `
+				+ `needed, or bring it into the schema under its own name — otherwise the next migration that `
+				+ `rebuilds "${original}" will fail with \`table "${name}" already exists\`.`,
+		);
+	}
 
 	for (const name of orderByDependency({ ...before, tables: effectiveBefore }, dropped).reverse()) {
 		// Ordering only helps among the tables being dropped together. A table
@@ -453,9 +535,28 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			?? (unaddable && `column "${unaddable.columnName}" cannot be added in place: ${unaddable.blocker}`);
 
 		if (reason) {
-			const recreated = recreateTable(previous, next, columnRenames, reason, after.tables);
+			const foreignTriggersForTable = options.foreignTriggers?.[liveTableNames[name] ?? name] ?? [];
+			const recreated = recreateTable(previous, next, columnRenames, reason, after.tables, foreignTriggersForTable);
 			statements.push(...recreated.statements);
 			errors.push(...recreated.errors);
+
+			// The rebuild's own statements only ever *add back* the append-only
+			// guard (when `next.appendOnly`), because `recreateTable` has no
+			// other reason to touch it. A table that drops the guard as part of
+			// being rebuilt for some other reason therefore lost it silently —
+			// nothing failed, UPDATE just started working again — with no
+			// `reason` line naming that transition the way the in-place case
+			// below does. `dropAppendOnlyTrigger` is `drop trigger if exists`,
+			// so re-stating it here (the trigger is already gone with the old
+			// table by this point) is inert; it exists only to carry the
+			// destructive reason into `--accept-data-loss` prompts and logs.
+			if ((previous.appendOnly ?? false) && !(next.appendOnly ?? false)) {
+				statements.push({
+					sql: dropAppendOnlyTrigger(name),
+					destructive: true,
+					reason: `"${name}" is no longer append-only, so UPDATE is permitted again`,
+				});
+			}
 			continue;
 		}
 
