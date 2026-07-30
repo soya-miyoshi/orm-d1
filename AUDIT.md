@@ -6,6 +6,7 @@ delete, or re-rank anything here and the next iteration will follow it.
 Gate: `npm run check` (typecheck → build → test → typecheck:kit → build:kit).
 Baseline at sweep start: **green, 565 passed / 4 skipped**.
 After the feature iteration (`15f24ef`): **green, 594 passed / 4 skipped**.
+After the efficiency + bugs iteration (`516dbd5`): **green, 616 passed / 4 skipped**.
 
 ## Rotation
 
@@ -13,8 +14,12 @@ One lens per iteration, rotating `feature` → `efficiency + bugs` → `security
 Advanced in every terminal case, including blocked and nothing-found, so a lens that keeps
 failing cannot starve the other two.
 
-- Next lens: **efficiency + bugs**
-- Last ran: feature — 2026-07-30, merged `15f24ef` **over an unresolved round-2 rejection**.
+- Next lens: **security**
+- Last ran: efficiency + bugs — 2026-07-30, merged `516dbd5` **over an unresolved round-2
+  rejection**. Eight findings in the batch; the round-2 reviewer verified seven closed and
+  rejected on the eighth. `[F-029]` is a regression against `main` and is the highest-value
+  open item in this file. Also open from this iteration: `[F-030]`, `[F-031]`, `[F-032]`.
+- Ran before that: feature — 2026-07-30, merged `15f24ef` **over an unresolved round-2 rejection**.
   Seven `COMPAT-DEFECT` fixes landed; the round-2 reviewer's six open objections are
   recorded as `[F-017]`–`[F-022]` and are now claims about code on `main`. `[F-017]` and
   `[F-018]` are regressions this batch introduced and should be the next thing fixed,
@@ -198,25 +203,25 @@ The whole batch is revertible as one unit: `git revert -m 1 15f24ef`.
 - **Fix**: change line 459 to `Equal<TEnum, [string, ...string[]]>`. The reviewer copied `src/` to a scratch dir, applied exactly that, and all four assertions pass (`text('c')`, `text('c',{length})`, `text()` → `'string'`; `text('c',{enum:['x','y']})` → `'string enum'` with `data: 'x'|'y'`).
 - **Why nothing caught it**: the added type-level test in `test/unit/drizzle-interop.test.ts` only asserts the enum case, and the table-driven `dataTypeCases` has no plain `text()` row. Add one.
 
-### [F-018] `columns: {}` on a nested relation emits `select  from …` under `relationalStrategy: 'joined'` — status: todo — severity: high — area: relations — REGRESSION
+### [F-018] `columns: {}` on a nested relation emits `select  from …` under `relationalStrategy: 'joined'` — status: done (`516dbd5`) — severity: high — area: relations — REGRESSION
 - **Where**: `src/relations/projection.ts:22` + `src/relations/joined.ts:253-262`
 - **Defect**: new. Before `[F-008]`, `columns: {}` meant "all columns", so the joined builder always had a projection. Now `pickColumns` returns `[]`, `buildLevel` produces an empty `selection`, and `renderInner`'s `sql.join([], ', ')` yields nothing between `select` and `from`.
 - **Failure scenario**: `db.query.users.findMany({ columns: { id: true }, with: { posts: { columns: {} } } })`. Split strategy returns `[{id:1,posts:[{},{}]}, …]`; joined gives `D1_ERROR: near "from": syntax error at offset 79: SQLITE_ERROR` on `select json_group_array(json_object()) from (select  from "posts" …)`. This violates the invariant stated at `src/relations/joined.ts:85` — "`relationalStrategy` is a performance switch: it must not change which queries are legal" — which `supportsJoined` exists to uphold. Drizzle raises a clear `No fields selected for table "posts" ("posts")` (`sqlite-core/dialect.js:387`); d1zzle leaks a raw SQLite parse error.
 - **Fix**: either `payloadIsExpressible` returns `false` for an empty payload (falling back to split, as it already does for blob payloads), or `buildLevel` raises Drizzle's message. Top-level `columns: {}` with a `with` is fine; only nested levels with no columns, no nested `with` and no `extras` break.
 
-### [F-019] `[F-004]` is not closed on the joined path: predicates still concatenated with a bare `' and '` — status: todo — severity: high — area: relations — pre-existing
+### [F-019] `[F-004]` is not closed on the joined path: predicates still concatenated with a bare `' and '` — status: done (`516dbd5`) — severity: high — area: relations — pre-existing
 - **Where**: `src/relations/joined.ts:262`
 - **Defect**: `combine()` in `expressions.ts` is fixed, but `renderInner` joins the correlation predicate, the caller's filter and the relation's declared `where` by raw string. `compileFilter` returns a lone `RAW` fragment unwrapped (`and()` of one operand returns it bare, matching Drizzle), so the fragment's own `or` binds looser than the correlation `and` — the exact defect `[F-004]` describes, on the exact path it names (RAW filter, the Pothos path).
 - **Failure scenario**: `with: { posts: { where: { RAW: (t, { sql }) => sql\`${t.title} like 'f%' or ${t.views} = 1\` } } }` gives `("d0"."id" = "d1"."author_id" and title like 'f%') or views = 1`. Split returns `[{id:1,posts:[{id:10}]},{id:2,posts:[{id:12}]}]`; joined returns post 12 (author 2) materialised under user 1 as well.
 - **Fix**: wrap each predicate — `predicates.map(p => sql\`(${p})\`)`.
 - **Note**: pre-existing, but inside the blast radius of `[F-004]`; the new `relations.test.ts` RAW test only exercises the split path.
 
-### [F-020] `InferInsert` still makes a `customType(...).primaryKey()` optional — status: todo — severity: high — area: sql/compile
+### [F-020] `InferInsert` still makes a `customType(...).primaryKey()` optional — status: done (`516dbd5`) — severity: high — area: sql/compile
 - **Where**: `src/schema/columns.ts:334`
 - **Defect**: the runtime half of `[F-005]`'s sibling gap was fixed but `primaryKey()`'s **return type** unconditionally adds `hasDefault: true`, so the type half was never fixed. Drizzle gates it: `ColumnBuilder.primaryKey(): TExtraConfig['primaryKeyHasDefault'] extends true ? IsPrimaryKey<HasDefault<this>> : IsPrimaryKey<this>` (`column-builder.d.ts:217`), and only the integer builders set `primaryKeyHasDefault: true` (`sqlite-core/columns/integer.d.ts:17`).
 - **Failure scenario**: `const uuid = customType<string>({ dataType: () => 'text' }); db.insert(t).values({ name: 'x' })` type-checks with no cast, compiles to `insert into "t" ("name") values (?)` against `"id" text primary key not null`, and gives `NOT NULL constraint failed` at D1. The runtime `hasDefault` is now `false` (correct), so external adapters are fixed; d1zzle's own insert model is not.
 
-### [F-021] `affinityOf` moves `ColumnSnapshot.type` for most customTypes — one unannounced destructive rebuild on upgrade — status: todo — severity: high — area: kit/diff
+### [F-021] `affinityOf` moves `ColumnSnapshot.type` for most customTypes — one unannounced destructive rebuild on upgrade — status: **failed twice** — superseded by `[F-029]` — severity: high — area: kit/diff
 - **Where**: `kit/src/core/snapshot.ts:125` + `src/schema/columns.ts:732`
 - **Defect**: the backward-compat claim holds only for the fixture chosen. `columnDifference` (`snapshot.ts:361`) compares `typeAffinity(column.type)` and ignores `declaredType`, so the added `ct2` test proves only that the *new field* is invisible. But `config.type` itself changed: the old reduction was a substring `.find()` over `['integer','text','real','blob','numeric']` with a `'text'` fallback; `affinityOf` applies SQLite's real rules. They disagree for `int`, `bigint`, `double`, `float`, `decimal(…)`, `boolean`, `datetime`, `point`, `jsonb` — everything except the five canonical spellings and strings whose old fallback happened to be `text`. `varchar(10)`, the fixture chosen for both new tests, is one of the coincidences.
 - **Failure scenario**: reconstructing what 0.1.3 wrote (`type: 'text'`, no `declaredType`) for `customType(() => 'int')` produces `create table "__new_ct3" … reason: column "n" changes type` / `drop table "ct3"` with `destructive: true`. The migration is *right* — the live column really is `TEXT` and the schema means `int` — but every project with such a column gets an unannounced destructive-marked rebuild on the first `generate` after upgrading, which is the opposite of what `kit/test/unit/diff.test.ts`'s comment asserts.
@@ -243,7 +248,7 @@ iteration for batch size**, not because they were judged unimportant: `[F-022]`
 assert against constants), `[F-015]` (FK derived name), `[F-016]` (`through` holds raw
 columns). They stay `todo` and the next efficiency + bugs iteration owns them.
 
-### [F-024] Expression indexes are quoted as identifiers — the kit emits an index on a constant string — status: todo — severity: high — area: kit/diff
+### [F-024] Expression indexes are quoted as identifiers — the kit emits an index on a constant string — status: done (`516dbd5`) — severity: high — area: kit/diff
 - **Where**: `kit/src/core/snapshot.ts:312` (`createIndexFromSnapshot`), fed by `kit/src/core/snapshot.ts:189` and `kit/src/core/introspect.ts:282`
 - **Defect**: `IndexSnapshot.columns` is a flat `readonly string[]` that cannot say whether an entry is an identifier or an expression. `snapshotFromSchema` writes `renderInline(chunk)` into it for a non-column entry and `createIndexFromSnapshot` then wraps every entry in `quote()`.
 - **Failure scenario**: `index('users_lower_email_idx').on(sql\`lower(${t.email})\`)`. `src/ddl.ts:300` (the *other* emitter) gets it right; `d1zzle-migrate generate` emits `create index "users_lower_email_idx" on "users" ("lower(""email"")")`. SQLite's double-quoted-string-literal fallback makes that an index on the constant `'lower("email")'` — created, named, listed in `sqlite_master`, and never used (`SCAN t` vs `SEARCH t USING INDEX good (<expr>=?)`, verified on D1). The `uniqueIndex` variant is worse: every row hashes to the same constant, so the second insert gives `UNIQUE constraint failed` — a migration after which the table accepts exactly one row.
@@ -251,14 +256,14 @@ columns). They stay `todo` and the next efficiency + bugs iteration owns them.
 - **Fix**: `IndexSnapshot.columns` must carry the distinction — drizzle-kit's own snapshot stores `{ expression, isExpression }` per entry, and matching it keeps the import story. `createIndexFromSnapshot` quotes only when `!isExpression`; `snapshotFromSchema:189` sets `isExpression: !isColumn(c)`; `snapshotFromIntrospection` recovers the expression text from `sqlite_master.sql` (the column list between the `(` after `on "<table>"` and its matching paren — the same source `parseIndexWhere` already reads) instead of dropping `null` members.
 - **Prove it**: add `index('flags_lower_name_idx').on(sql\`lower(${t.name})\`)` to the `flags` fixture in `kit/test/workers/roundtrip.test.ts` — the existing `expect(diffSnapshots(live, expected).statements).toEqual([])` fails immediately. Plus a `kit/test/unit/diff.test.ts` assertion that the statement contains `(lower("email"))` and not `("lower(""email"")")`. The current fixtures and the `fuzz.test.ts` generator only ever produce column-list indexes, which is why this survived.
 
-### [F-025] The relational child chunker undercounts reserved parameters — `too many SQL variables` at the default budget — status: todo — severity: high — area: relations
+### [F-025] The relational child chunker undercounts reserved parameters — `too many SQL variables` at the default budget — status: done (`516dbd5`) — severity: high — area: relations
 - **Where**: `src/relations/query.ts:596`
 - **Defect**: `reserved` counts the child's `where`, the relation's declared `where`, and the window bounds, then sizes each key chunk to `$maxParams - reserved`. The child's `orderBy` and `extras` bind into the *same* statement and are not counted, so the chunk it computes overflows the budget it was computed from. The comment directly above the calculation names exactly this hazard for `where` and the window bounds, then omits the two other places `#run` binds.
 - **Failure scenario**: default `maxParams: 100`, a composite two-column relation key, 50 parents, and a nested `orderBy` that interpolates one value gives `D1_ERROR: too many SQL variables` — 50 × 2 key params + 1 = 101, because `maxKeys` was 50 with `reserved` at 0. The whole `findMany` throws. Same for `extras` (`Object.assign(selection, resolveExtras(...))` at `query.ts:427`).
 - **Fix**: count them the same way `childFilter` is counted, in `#fetchChild` before `budget` — a `chunksOf` helper reducing `render(c, renderContextOf(this.db)).params.length` over `resolveOrderBy(entry.config.orderBy, targetColumns)` and `Object.values(resolveExtras(entry.config.extras, targetColumns))`. Both resolvers are module-scope in the same file and take exactly those arguments; double-invoking a callback is the cost the code already accepts for `compileFilter` ("Rendering the filters twice … is cheap next to the round trip it protects").
 - **Prove it**: `test/workers/relations.test.ts`, in the existing `composite-key relations` block — 50 parents, default `maxParams`, a nested `orderBy` callback interpolating one value; assert the query resolves and that no statement's parameter count exceeds `$maxParams`.
 
-### [F-026] `introspect()` issues `1 + 3T + I` sequential round trips — status: todo — severity: med — area: kit/efficiency
+### [F-026] `introspect()` issues `1 + 3T + I` sequential round trips — status: done (`516dbd5`, bounded at 12 in flight — see `[F-031]`) — severity: med — area: kit/efficiency
 - **Where**: `kit/src/core/apply.ts:44-58`
 - **Defect**: the per-table pragmas are `await`ed one at a time inside a `for` loop, and `pragma index_info` is `await`ed once per index inside that. Instrumented against the 3-table fixture: 16 queries for 3 tables and 6 indexes, confirming the formula.
 - **Failure scenario**: a 64-table schema with ~3 indexes per table (counting the `sqlite_autoindex_*` entries every `UNIQUE`/composite PK creates, which `index_list` returns and this loop dutifully probes) is `1 + 192 + 192 ≈ 385` sequential POSTs to the Cloudflare API — `remoteRunner.all` is one `fetch` per call (`kit/src/node/runners.ts:157`). At a ~120 ms round trip that is ~46 s of wall clock for a single `d1zzle-migrate check --remote`, per CI run, and again for `push --remote` and `pull --remote`. There is no dependency between tables, and none between the `index_info` calls within a table.
@@ -279,6 +284,44 @@ columns). They stay `todo` and the next efficiency + bugs iteration owns them.
 - `readRow`'s per-row closure allocation on the nested mapper path (`src/plan/mapper.ts:151,163`) — real but sub-microsecond against the RPC.
 - `alter table … add column … references … default 'x'` is accepted by D1, so `isAddable` needs no extra guard.
 - A kitchen-sink round trip (composite FK with `on delete set null`/`on update cascade`, `customType` declared type, enum text, `numeric` default, `sql` default, a default containing a quote, partial index, unique index, table-level unique, check) drifts by **zero** statements. The diff engine is solid; expression indexes are the hole.
+
+## Unresolved objections merged anyway (`516dbd5`)
+
+The round-2 reviewer of `sweep/efficiency-bugs-20260730-174800` verified seven of the eight
+findings genuinely closed and rejected the batch on the eighth. Two review rounds is the
+cap, the gate was green (616 passed / 4 skipped), so it merged under the sweep's own rule.
+Revert the batch as one unit with `git revert -m 1 516dbd5`.
+
+**`[F-029]` is the most serious thing in this file.** It is a *regression against `main`* on
+this project's bug class #1 — a type change that silently disappears while CI stays green —
+and it was introduced by the attempt to fix `[F-021]`. Two iterations have now failed to
+land a correct fix for the `declaredType` comparison; the third attempt should probably
+start by reverting `[F-021]`'s suppression entirely and accepting the noisy-but-visible
+destructive rebuild instead, since a loud wrong answer beats a silent one here.
+
+### [F-029] The legacy `declaredType` hatch fires on every ordinary column, so genuine type changes produce no migration — status: todo — severity: **high** — area: kit/diff — REGRESSION vs `main`
+- **Where**: `kit/src/core/snapshot.ts:434` (`typeMatchesAcrossUpgrade`)
+- **Defect**: the hatch gates on `old.declaredType === undefined`, treating that as "this snapshot predates `declaredType`". It is not. `kit/src/core/snapshot.ts:152` writes `declaredType: column.config.declaredType`, and `config.declaredType` is set **only** by `customType` (`src/schema/columns.ts:756`) — so *every* `integer`/`text`/`real`/`blob`/`numeric` column in a current, freshly-generated snapshot has `declaredType: undefined`, while `kit/src/core/introspect.ts:384` now guarantees the other side always has one. The hatch is live on the ordinary path, not the legacy one. Compounding it, `legacyAffinity` reproduces 0.1.3's rule, but 0.1.3 applied that substring rule *only inside `customType`* (`git show v0.1.3:src/schema/columns.ts:666`) — it is being applied to pairs it never described.
+- **Failure scenario A — `generate`, no legacy snapshot involved, both sides current**: `customType(() => 'int')('amount')` → `text('amount')` gives `diffSnapshots(before, after).statements === []`. Same in reverse, and same for `text()` → `customType(() => 'double')`. The column changes from INTEGER (or REAL) affinity to TEXT and `generate` writes an empty migration. The branch's new test only covers `customType`-vs-`customType`, the one pair where both sides carry `declaredType`.
+- **Failure scenario B — `check`/`push`/`verify` against a real D1**, schema says `text('amount')`, live column declared as shown: `INT`, `BIGINT` (integer affinity) → **0 statements**; `DECIMAL(10,5)`, `BOOLEAN`, `DATETIME` (numeric) → **0**; `FLOAT`, `DOUBLE` (real) → **0**; no type at all (blob) → **0**. Controls `INTEGER`/`REAL`/`BLOB` correctly emit 5. On `main` before this branch all eleven reported the change. `INT` is the ordinary hand-written and drizzle-kit spelling, so this is the common case: a table whose `amount` is `INT` in the database and `text()` in the schema passes `check` silently, `push` emits nothing, and the ORM binds strings into an INTEGER-affinity column.
+- **`verify` is hit by the same hole** (`kit/src/node/commands.ts:596`) — and its own docstring says it exists precisely because "the renderer drops a constraint, both artifacts are self-consistent, and CI stays green". That is now true of column types.
+- **Fix**: the hatch needs a signal that actually means "written before `declaredType` existed" (`Snapshot.version`, or `origin` — neither of which `canonicalTable`/`columnDifference` currently sees), or it must be restricted to pairs where the side carrying `declaredType` is a `customType` column. Stamping `declaredType` on introspected snapshots (`introspect.ts:384`) is fine on its own — the reviewer confirmed byte-identical `pull` round trips and that everything else reading it only emits DDL from the *target* side — but it fixes only one of the two sides.
+
+### [F-030] `canonicalizeExpression` strips whitespace inside quoted identifiers, so two different columns compare equal — status: todo — severity: med — area: kit/diff
+- **Where**: `kit/src/core/diff.ts:584`
+- **Defect**: the regex `/'(?:[^']|'')*'|\s+/g` protects single-quoted literals but not quoted identifiers, and SQLite allows a space in a column name.
+- **Failure scenario**: with columns `"a b"` and `"ab"` both on the table, `index('t_idx').on(sql\`lower("a b")\`)` → `index('t_idx').on(sql\`lower("ab")\`)` gives `statements === []`. The control (`lower("x")` → `lower("y")`) correctly emits a drop and a create. The index keeps pointing at the wrong column forever, with no diff.
+- **Fix**: keep `"…"`, `` `…` `` and `[…]` segments verbatim, the same way the single-quoted-literal branch already does.
+
+### [F-031] `ConcurrencyGate` is not a correct semaphore — status: todo — severity: low (latent) — area: kit/core
+- **Where**: `kit/src/core/apply.ts:56`
+- **Defect**: `run` releases with `inFlight--` *before* `queue.shift()?.()`, and the woken waiter never re-checks `inFlight` after resuming. A caller arriving in the microtask window between the release and the waiter's resumption sees a free slot and takes it; the waiter then increments on top. With `limit = 1` the reviewer measured a peak of 2.
+- **Not live today**: across 64 tables × 3 indexes with microtask, macrotask, randomised and zero delay the peak was exactly 12 every time, because a table's `index_info` dispatch is always ordered after the woken waiter's resumption by `Promise.all`'s extra tick. It is a hazard for the next call site, not this one.
+- **Fix**: loop `while (this.inFlight >= this.limit) await …`, or increment the count in the releaser on behalf of the waiter.
+
+### [F-032] `IndexColumnSnapshot` / `normalizeIndexColumn` are unexported from the kit's public entry — status: needs-human — severity: low — area: api
+- **Where**: `kit/src/core/index.ts:27`
+- `IndexSnapshot.columns` is exported from `d1zzle-migrate/core`, but the new `IndexColumnSnapshot` member type and the `normalizeIndexColumn` helper are not, so an external consumer now reads a union whose object member is unnameable from the public entry. Construction still compiles; only reading is affected. Exporting them changes the published API surface, which the sweep may not do.
 
 ## Audit areas
 
