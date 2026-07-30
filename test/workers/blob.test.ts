@@ -14,7 +14,7 @@ const DB = (env as { DB: D1Database }).DB;
 
 const blobs = sqliteTable('blob_round_trip', {
 	id: integer('id').primaryKey(),
-	bytes: blob('bytes').notNull(),
+	bytes: blob('bytes', { mode: 'buffer' }).notNull(),
 	payload: blob('payload', { mode: 'json' }).$type<{ a: number }>(),
 	big: blob('big', { mode: 'bigint' }),
 });

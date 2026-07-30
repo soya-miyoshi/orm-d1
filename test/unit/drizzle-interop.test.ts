@@ -6,9 +6,11 @@
  */
 import { getTableColumns as drizzleGetTableColumns, getTableName as drizzleGetTableName, is } from 'drizzle-orm';
 import { Column as DrizzleColumn, Table as DrizzleTable } from 'drizzle-orm';
+import * as dz from 'drizzle-orm/sqlite-core';
 import { SQLiteColumn, SQLiteInteger, SQLiteTable, SQLiteText } from 'drizzle-orm/sqlite-core';
+import { createSelectSchema } from 'drizzle-orm/zod';
 import { describe, expect, it } from 'vitest';
-import { alias, blob, integer, query, sql, sqliteTable, text } from '../../src/index.js';
+import { alias, blob, integer, query, real, numeric, sql, sqliteTable, text } from '../../src/index.js';
 import { postTags, posts, users } from '../schema.js';
 
 describe('drizzle entity recognition', () => {
@@ -82,26 +84,129 @@ describe('drizzle entity recognition', () => {
 });
 
 describe('the column surface adapters read', () => {
+	/**
+	 * `dataType` must match Drizzle 1.0.0-rc.4's `"<type> <constraint>"` pair
+	 * spelling exactly — table-driven against the real `drizzle-orm/sqlite-core`
+	 * builders, so a version bump on either side shows up here rather than as a
+	 * silently wrong string a hand-written expectation would not catch.
+	 */
+	const dataTypeCases: [string, () => { d1: { dataType: string }; dz: { dataType: string } }][] = [
+		['integer()', () => ({
+			d1: sqliteTable('a', { c: integer() }).c,
+			dz: dz.sqliteTable('a', { c: dz.integer() }).c,
+		})],
+		['integer({ mode: "timestamp" })', () => ({
+			d1: sqliteTable('a', { c: integer({ mode: 'timestamp' }) }).c,
+			dz: dz.sqliteTable('a', { c: dz.integer({ mode: 'timestamp' }) }).c,
+		})],
+		['text({ enum: [...] })', () => ({
+			d1: sqliteTable('a', { c: text({ enum: ['x', 'y'] }) }).c,
+			dz: dz.sqliteTable('a', { c: dz.text({ enum: ['x', 'y'] }) }).c,
+		})],
+		['text({ mode: "json" })', () => ({
+			d1: sqliteTable('a', { c: text({ mode: 'json' }) }).c,
+			dz: dz.sqliteTable('a', { c: dz.text({ mode: 'json' }) }).c,
+		})],
+		['real()', () => ({
+			d1: sqliteTable('a', { c: real() }).c,
+			dz: dz.sqliteTable('a', { c: dz.real() }).c,
+		})],
+		['numeric()', () => ({
+			d1: sqliteTable('a', { c: numeric() }).c,
+			dz: dz.sqliteTable('a', { c: dz.numeric() }).c,
+		})],
+		['blob({ mode: "buffer" })', () => ({
+			d1: sqliteTable('a', { c: blob({ mode: 'buffer' }) }).c,
+			dz: dz.sqliteTable('a', { c: dz.blob({ mode: 'buffer' }) }).c,
+		})],
+		['blob({ mode: "bigint" })', () => ({
+			d1: sqliteTable('a', { c: blob({ mode: 'bigint' }) }).c,
+			dz: dz.sqliteTable('a', { c: dz.blob({ mode: 'bigint' }) }).c,
+		})],
+	];
+
+	it.each(dataTypeCases)('matches drizzle-orm\'s dataType for %s', (_label, build) => {
+		const { d1, dz: dzCol } = build();
+		expect(d1.dataType).toBe(dzCol.dataType);
+	});
+
+	it('infers `text(name, { enum: [...] })` as an enum at the type level without `as const`', () => {
+		// Runtime already gets this right (see the table above); this is the
+		// type-level half of the same guarantee. `drizzle-orm/sqlite-core`'s
+		// `text()` constrains its `enum` option with a tuple generic
+		// (`T extends Readonly<[U, ...U[]]>`), which is what lets a plain array
+		// literal infer as a tuple with no `as const` — a looser
+		// `TEnum extends readonly string[]` widens the literal to `string[]`
+		// and silently falls back to the "no enum" branch at compile time even
+		// though the value is a real enum at runtime.
+		type AssertEqual<A, B> = (<T>() => T extends A ? 1 : 0) extends (<T>() => T extends B ? 1 : 0) ? true : false;
+
+		const roleColumn = sqliteTable('role_no_as_const', {
+			role: text('role', { enum: ['admin', 'member'] }),
+		}).role;
+
+		// `.dataType` itself is typed as the widened `DrizzleDataType` union
+		// (it has to be — adapters read it off `Column<M>` generically); the
+		// phantom, still-narrow type lives on `._`, Drizzle's own inference
+		// surface (`DrizzleColumnShape`, mirrored in src/schema/columns.ts).
+		type RoleDataType = (typeof roleColumn)['_']['dataType'];
+		const assertion: AssertEqual<RoleDataType, 'string enum'> = true;
+		void assertion;
+
+		// And the runtime value agrees, as it always did.
+		expect(roleColumn.dataType).toBe('string enum');
+	});
+
 	it('exposes dataType, columnType and the SQL type', () => {
-		expect(users.id).toMatchObject({ dataType: 'number', columnType: 'SQLiteInteger', primary: true });
+		expect(users.id).toMatchObject({ dataType: 'number int53', columnType: 'SQLiteInteger', primary: true });
 		expect(users.email).toMatchObject({ dataType: 'string', columnType: 'SQLiteText', notNull: true });
 		expect(users.active).toMatchObject({ dataType: 'boolean', columnType: 'SQLiteBoolean' });
-		expect(users.createdAt).toMatchObject({ dataType: 'date', columnType: 'SQLiteTimestamp' });
-		expect(users.settings).toMatchObject({ dataType: 'json', columnType: 'SQLiteTextJson' });
+		expect(users.createdAt).toMatchObject({ dataType: 'object date', columnType: 'SQLiteTimestamp' });
+		expect(users.settings).toMatchObject({ dataType: 'object json', columnType: 'SQLiteTextJson' });
 		expect(users.id.getSQLType()).toBe('integer');
 		expect(users.active.getSQLType()).toBe('integer');
 	});
 
+	it('changes zod behaviour: a timestamp column now rejects a non-date value', () => {
+		// Before the fix, `createdAt.dataType` was the flat `'date'`, which the
+		// v1 zod adapter's `columnToSchema` does not recognise as its `"date"`
+		// branch — it fell through to a permissive default. The pair spelling
+		// `'object date'` is what makes the adapter emit `z.date()` and this
+		// actually reject something.
+		const schema = createSelectSchema(users as never);
+		const shape = (schema as unknown as { shape: Record<string, { safeParse: (v: unknown) => { success: boolean } }> })
+			.shape;
+		expect(shape.createdAt!.safeParse('not a date').success).toBe(false);
+	});
+
 	it('classifies every blob mode', () => {
 		const t = sqliteTable('t', {
-			bytes: blob('bytes'),
-			payload: blob('payload', { mode: 'json' }),
+			bytes: blob('bytes', { mode: 'buffer' }),
+			payload: blob('payload'),
 			big: blob('big', { mode: 'bigint' }),
 		});
 
-		expect(t.bytes).toMatchObject({ dataType: 'buffer', columnType: 'SQLiteBlobBuffer' });
-		expect(t.payload).toMatchObject({ dataType: 'json', columnType: 'SQLiteBlobJson' });
-		expect(t.big).toMatchObject({ dataType: 'bigint', columnType: 'SQLiteBigInt' });
+		expect(t.bytes).toMatchObject({ dataType: 'object buffer', columnType: 'SQLiteBlobBuffer' });
+		expect(t.payload).toMatchObject({ dataType: 'object json', columnType: 'SQLiteBlobJson' });
+		expect(t.big).toMatchObject({ dataType: 'bigint int64', columnType: 'SQLiteBigInt' });
+	});
+
+	it('defaults blob() to json mode, not buffer', () => {
+		expect(blob('x').build('x').columnType).toBe('SQLiteBlobJson');
+	});
+
+	it('round trips a json blob through encode/decode', () => {
+		const column = blob('x').build('x');
+		const bytes = column.mapToDriverValue({ a: 1 });
+		expect(column.mapFromDriverValue(bytes)).toEqual({ a: 1 });
+	});
+
+	it('exposes length and isLengthExact like drizzle-orm does', () => {
+		const d1 = sqliteTable('a', { short: text('short', { length: 5 }) }).short;
+		const dzCol = dz.sqliteTable('a', { short: dz.text('short', { length: 5 }) }).short;
+		expect(d1.length).toBe(5);
+		expect(d1.length).toBe(dzCol.length);
+		expect(d1.isLengthExact).toBe(dzCol.isLengthExact);
 	});
 
 	it('exposes enum values, defaults and uniqueness', () => {

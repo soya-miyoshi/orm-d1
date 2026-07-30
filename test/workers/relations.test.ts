@@ -54,7 +54,8 @@ describe('db.query', () => {
 				settings: null,
 				score: null,
 				createdAt: new Date(0),
-				updatedAt: null,
+				// See F-005: `$onUpdate` with no `default` now populates on insert.
+				updatedAt: new Date(0),
 			},
 		});
 	});
@@ -76,6 +77,24 @@ describe('db.query', () => {
 		await db.delete(schema.posts).where(eq(schema.posts.authorId, 2)).run();
 		const rows = await db.query.users.findMany({ columns: { id: true }, with: { posts: true } });
 		expect(rows[1]).toEqual({ id: 2, posts: [] });
+	});
+
+	it('selects zero own columns for `columns: {}`, keeping only the `with` keys', async () => {
+		// F-008: `columns: {}` used to fall through to "select every column";
+		// it must select none, while join keys the relation needs to stitch
+		// children back on are still fetched and dropped, same as any other
+		// projection.
+		const rows = await db.query.users.findMany({
+			columns: {},
+			with: { posts: { columns: { id: true } } },
+			orderBy: { id: 'asc' },
+		});
+
+		expect(rows).toEqual([
+			{ posts: [{ id: 10 }, { id: 11 }] },
+			{ posts: [{ id: 12 }] },
+		]);
+		expect(Object.keys(rows[0]!)).toEqual(['posts']);
 	});
 
 	it('nests relations to arbitrary depth', async () => {
@@ -406,6 +425,28 @@ describe('the filter DSL', () => {
 				where: { RAW: (table, { eq: equals }) => equals((table as typeof schema.posts).id, 11) },
 			}),
 		).toEqual([{ id: 11 }]);
+	});
+
+	it('parenthesises a RAW OR fragment against the column filter it is AND-ed with', async () => {
+		// Before the fix: `author_id = 2 and title like 'f%' or title like 'z%'`
+		// parses, by SQL's normal AND-over-OR precedence, as
+		// `(author_id = 2 and title like 'f%') or title like 'z%'` — so post 10
+		// ("first", authorId 1) would wrongly match through the trailing `or`
+		// even though `authorId: 2` should have excluded it. Correctly
+		// parenthesised, it is `author_id = 2 and (title like 'f%' or title like
+		// 'z%')`, and no post matches.
+		expect(
+			await db.query.posts.findMany({
+				columns: { id: true },
+				where: {
+					authorId: 2,
+					RAW: (table, { sql: rawSql }) => {
+						const t = table as typeof schema.posts;
+						return rawSql`${t.title} like 'f%' or ${t.title} like 'z%'`;
+					},
+				},
+			}),
+		).toEqual([]);
 	});
 
 	it('threads a placeholder through to execution rather than binding it early', async () => {
@@ -1025,7 +1066,7 @@ describe('joined strategy falls back rather than failing', () => {
 	const files = sqliteTable('joined_files', {
 		id: integer('id').primaryKey(),
 		ownerId: integer('owner_id').notNull(),
-		bytes: blob('bytes'),
+		bytes: blob('bytes', { mode: 'buffer' }),
 	});
 
 	/**

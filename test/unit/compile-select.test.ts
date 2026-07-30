@@ -60,10 +60,15 @@ describe('select compilation', () => {
 			.compile();
 
 		expect(compiled.sql).toBe(
-			'select "users"."id" from "users" where ("users"."id" = ? and ("users"."name" is null '
-				+ 'or not ("users"."email" like ?)))',
+			'select "users"."id" from "users" where (("users"."id" = ?) and ((("users"."name" is null) '
+				+ 'or (not ("users"."email" like ?)))))',
 		);
 		expect(compiled.params).toEqual([{ k: 'const', v: 1 }, { k: 'const', v: '%@b.c' }]);
+	});
+
+	it('parenthesises each operand of and()/or(), so a raw fragment with its own or/and cannot leak precedence', () => {
+		const combined = and(sql`a = 1 or b = 2`, eq(posts.views, 0))!;
+		expect(combined.toQuery().sql).toBe('((a = 1 or b = 2) and ("posts"."views" = ?))');
 	});
 
 	it('renders a short inArray as bound parameters', () => {

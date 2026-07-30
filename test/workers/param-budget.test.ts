@@ -16,12 +16,12 @@ const DB = (env as { DB: D1Database }).DB;
 // A blob primary key — UUID-as-bytes is a real pattern, and the one key shape
 // that cannot collapse to a single `json_each` parameter.
 const owners = sqliteTable('pb_owners', {
-	id: blob('id').primaryKey(),
+	id: blob('id', { mode: 'buffer' }).primaryKey(),
 	name: text('name'),
 });
 const items = sqliteTable('pb_items', {
 	id: integer('id').primaryKey(),
-	ownerId: blob('owner_id').notNull(),
+	ownerId: blob('owner_id', { mode: 'buffer' }).notNull(),
 });
 
 // The integer control, so a regression in chunking cannot be mistaken for a

@@ -15,9 +15,15 @@ export const pickColumns = (
 ): string[] => {
 	const keys = Object.keys(all);
 	if (!selection) return keys;
-	const included = keys.filter((key) => selection[key] === true);
+	// `columns: {}` (or an object whose values are all `undefined`) selects
+	// *zero* columns — Drizzle's `getSelectedTableColumns` semantics. Only a
+	// missing `columns` key at all (handled above) means "select everything".
+	const entries = Object.entries(selection).filter(([, v]) => v !== undefined);
+	if (entries.length === 0) return [];
+	const included = keys.filter((key) => entries.find(([k, v]) => k === key && v === true));
 	if (included.length > 0) return included;
-	return keys.filter((key) => selection[key] !== false);
+	const excluded = new Set(entries.filter(([, v]) => v === false).map(([k]) => k));
+	return keys.filter((key) => !excluded.has(key));
 };
 
 /**

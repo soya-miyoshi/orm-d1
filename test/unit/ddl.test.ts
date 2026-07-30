@@ -142,6 +142,38 @@ describe('customType', () => {
 		expect(createTable(t)).toContain('"short" text');
 	});
 
+	it('preserves the declared type verbatim, instead of guessing one of the five storage classes', () => {
+		// Old behaviour: only whichever of integer|text|real|blob|numeric the
+		// declared string happened to contain as a substring survived, so 'int'
+		// rendered as a bare 'text' guess-miss and 'varchar(10)' lost its length.
+		const intType = customType({ dataType: () => 'int' });
+		const t1 = sqliteTable('t', { n: intType('n') });
+		expect(createTable(t1)).toContain('"n" int');
+		expect(createTable(t1)).not.toContain('"n" text');
+		expect(t1.n.getSQLType()).toBe('int');
+
+		const varchar = customType<string, string, { length: number }>({
+			dataType: (config) => `varchar(${config!.length})`,
+		});
+		const t2 = sqliteTable('t', { name: varchar('name', { length: 10 }) });
+		expect(createTable(t2)).toContain('varchar(10)');
+	});
+
+	it('does not treat a customType declared "int" as the INTEGER PRIMARY KEY rowid alias', () => {
+		// `hasDefault` on `primaryKey()` means "optional on insert" — true for
+		// SQLite's actual `INTEGER PRIMARY KEY` rowid alias. A customType whose
+		// declared spelling is `int` has affinity `integer` (same as a plain
+		// `integer()` column) but the DDL emits the literal `int primary key`,
+		// not `integer primary key`, which SQLite does *not* treat as the rowid
+		// alias — so the column stays required on insert.
+		const intType = customType({ dataType: () => 'int' });
+		const t = sqliteTable('t', { id: intType('id').primaryKey() });
+		expect(t.id.hasDefault).toBe(false);
+
+		const plain = sqliteTable('t2', { id: integer('id').primaryKey() });
+		expect(plain.id.hasDefault).toBe(true);
+	});
+
 	it('applies toDriver and fromDriver as the column encoder and decoder', () => {
 		const upper = customType<string, string>({
 			dataType: () => 'text',

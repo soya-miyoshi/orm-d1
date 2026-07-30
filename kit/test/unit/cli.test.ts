@@ -324,7 +324,9 @@ describe('rendering a schema module from a snapshot', () => {
 		}) as never);
 
 		expect(rendered.split('\n')[0]).toBe(`import { blob, integer, sqliteTable } from 'd1zzle';`);
-		expect(rendered).toContain(`payload: blob('payload')`);
+		// blob() defaults to mode 'json'; an introspected BLOB-affinity column
+		// must round-trip as raw bytes, so pull emits explicit buffer mode.
+		expect(rendered).toContain(`payload: blob('payload', { mode: 'buffer' })`);
 	});
 
 	it('keeps the constraints the snapshot has, so the next generate has nothing to remove', async () => {

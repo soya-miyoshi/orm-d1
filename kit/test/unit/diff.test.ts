@@ -1,4 +1,4 @@
-import { blob, check, foreignKey, index, integer, numeric, primaryKey, real, sql, sqliteTable, text, unique, uniqueIndex } from 'd1zzle';
+import { blob, check, customType, foreignKey, index, integer, numeric, primaryKey, real, sql, sqliteTable, text, unique, uniqueIndex } from 'd1zzle';
 import { tableOptions, validateTableOptions } from 'd1zzle/ddl';
 import type { Column } from 'd1zzle';
 import { describe, expect, it } from 'vitest';
@@ -189,6 +189,37 @@ describe('diffing snapshots', () => {
 		};
 
 		expect(diffSnapshots(liveSide, schemaSide).statements).toEqual([]);
+	});
+
+	it('does not rebuild a customType column just because an old snapshot predates declaredType', () => {
+		// `declaredType` was added to `ColumnSnapshot` to keep migration
+		// generation and direct DDL generation from disagreeing on a
+		// `customType` column's spelling (see the round-trip fixture below). A
+		// snapshot written before the field existed simply lacks it — that has
+		// to compare equal to a freshly generated one, or every existing
+		// `customType` column in every project's snapshot history rebuilds the
+		// first time `generate` runs after upgrading.
+		const t = sqliteTable('ct2', {
+			id: text('id').primaryKey(),
+			amount: customType<string>({ dataType: () => 'varchar(10)' })('amount'),
+		});
+		const fresh = snapshotOf(t);
+		const preExisting: Snapshot = {
+			...fresh,
+			tables: {
+				ct2: {
+					...fresh.tables['ct2']!,
+					columns: Object.fromEntries(
+						Object.entries(fresh.tables['ct2']!.columns).map(([name, column]) => {
+							const { declaredType: _declaredType, ...rest } = column;
+							return [name, rest];
+						}),
+					),
+				},
+			},
+		};
+
+		expect(diffSnapshots(preExisting, fresh).statements).toEqual([]);
 	});
 
 	it('does not rebuild for a single-column table-level primary key', () => {
@@ -850,6 +881,15 @@ describe('snapshot and DDL agree, table for table', () => {
 			name: text('name').notNull(),
 			shout: text('shout').generatedAlwaysAs(sql`upper("name")`, { mode: 'stored' }),
 		}),
+		// `customType`'s `declaredType` — the literal string its `dataType()`
+		// returned — has to make it through the snapshot unchanged, or the DDL
+		// `createTableFromSnapshot` regenerates for `generate` disagrees with
+		// `createSchema`'s direct emission over the *reduced affinity* the
+		// snapshot used to store instead (kit/src/core/snapshot.ts).
+		'a customType column': sqliteTable('ct', {
+			id: integer('id').primaryKey(),
+			amount: customType<string>({ dataType: () => 'varchar(10)' })('amount').notNull(),
+		}),
 	};
 
 	for (const [description, table] of Object.entries(fixtures)) {
@@ -1058,6 +1098,34 @@ describe('table options that SQLite would reject', () => {
 		const t = sqliteTable('log', { id: integer('id').primaryKey({ autoIncrement: true }) });
 		expect(validateTableOptions(t, { withoutRowid: true })).toMatch(/AUTOINCREMENT/);
 		expect(validateTableOptions(t, { withoutRowid: false })).toBeUndefined();
+	});
+
+	it('refuses STRICT on a customType column whose declared spelling is not an allowed type', () => {
+		// `varchar(10)` and `bigint` both reduce to an allowed *affinity*
+		// (`text`, `integer`), which used to be what this check compared — but
+		// the DDL emits the literal declared string, and D1 rejects both of
+		// those spellings under STRICT with `unknown datatype`.
+		const varchar = sqliteTable('sv', {
+			id: text('id').primaryKey(),
+			amount: customType<string>({ dataType: () => 'varchar(10)' })('amount'),
+		});
+		expect(validateTableOptions(varchar, { strict: true })).toMatch(/VARCHAR\(10\)/);
+
+		const bigint = sqliteTable('sb', {
+			id: text('id').primaryKey(),
+			amount: customType<bigint>({ dataType: () => 'bigint' })('amount'),
+		});
+		expect(validateTableOptions(bigint, { strict: true })).toMatch(/BIGINT/);
+	});
+
+	it('accepts a customType column whose declared spelling is STRICT-legal', () => {
+		for (const declared of ['int', 'integer', 'real', 'text', 'blob', 'any']) {
+			const t = sqliteTable('sok', {
+				id: text('id').primaryKey(),
+				v: customType<string>({ dataType: () => declared })('v'),
+			});
+			expect(validateTableOptions(t, { strict: true })).toBeUndefined();
+		}
 	});
 
 	it('rejects a duplicate table in tableOptions rather than letting one win', () => {

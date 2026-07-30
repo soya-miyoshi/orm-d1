@@ -28,8 +28,14 @@ describe('insert compilation', () => {
 	it('evaluates $defaultFn per execution rather than at compile time', () => {
 		const compiled = query.insert(users).values({ email: 'a@b.c' }).compile();
 
-		expect(compiled.sql).toBe('insert into "users" ("email", "created_at") values (?, ?)');
+		// `updatedAt` carries only `$onUpdate`, no `default` — Drizzle's
+		// `buildInsertQuery` still populates it on insert in that case, so it
+		// belongs in the column list alongside `created_at`'s `$defaultFn`.
+		expect(compiled.sql).toBe(
+			'insert into "users" ("email", "created_at", "updated_at") values (?, ?, ?)',
+		);
 		expect(compiled.params[1]).toMatchObject({ k: 'fn' });
+		expect(compiled.params[2]).toMatchObject({ k: 'fn' });
 	});
 
 	it('chunks a large multi-row insert against the bound-parameter limit', () => {

@@ -23,6 +23,17 @@ export const SNAPSHOT_VERSION = '2';
 export interface ColumnSnapshot {
 	readonly name: string;
 	readonly type: string;
+	/**
+	 * The exact string a `customType`'s `dataType(config)` declared, when this
+	 * column has one — `d1zzle/ddl`'s `typeName()` emits this verbatim instead
+	 * of `type` (which is only ever a reduced SQLite storage-class affinity).
+	 * Absent on a snapshot written before this field existed, and absent for
+	 * every non-`customType` column; both read as "no declared type", i.e. fall
+	 * back to `type`. Comparison (`canonicalTable`) deliberately does not look
+	 * at this — it stays affinity-based so a live D1 column's spelling never
+	 * causes a spurious diff — only DDL *emission* needs the exact string.
+	 */
+	readonly declaredType?: string | undefined;
 	readonly primaryKey: boolean;
 	readonly notNull: boolean;
 	readonly autoincrement: boolean;
@@ -112,6 +123,7 @@ const defaultOf = (column: Column<any>): string | undefined => {
 const columnSnapshot = (column: Column<any>): ColumnSnapshot => ({
 	name: column.name,
 	type: column.config.type,
+	declaredType: column.config.declaredType,
 	primaryKey: column.config.primaryKey,
 	notNull: column.config.notNull,
 	autoincrement: column.config.autoIncrement,
@@ -248,7 +260,7 @@ export function createTableFromSnapshot(t: TableSnapshot): string {
 	const parts: string[] = [];
 
 	for (const column of Object.values(t.columns)) {
-		let ddl = `${quote(column.name)} ${column.type}`;
+		let ddl = `${quote(column.name)} ${column.declaredType ?? column.type}`;
 		if (!hasCompositePk && column.primaryKey) {
 			ddl += ' primary key';
 			if (column.autoincrement) ddl += ' autoincrement';

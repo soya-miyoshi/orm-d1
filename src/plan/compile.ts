@@ -411,7 +411,14 @@ const valueChunk = (column: Column<any>, value: unknown): SQLChunk => {
 const defaultChunk = (column: Column<any>): SQLChunk => ({
 	toQuery: (): Query => ({
 		sql: '?',
-		params: [{ k: 'fn', fn: column.config.defaultFn!, encode: column.config.encode }],
+		params: [{
+			k: 'fn',
+			// Matches drizzle-orm's sqlite-core `buildInsertQuery`: a plain
+			// `default` always wins; `onUpdateFn` only supplies the insert-time
+			// value when there is no `default` to fall back to instead.
+			fn: column.config.defaultFn ?? column.config.onUpdateFn!,
+			encode: column.config.encode,
+		}],
 	}),
 });
 
@@ -439,7 +446,9 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 		const fields = Object.keys(columns).filter(
 			(field) =>
 				!columns[field]!.config.generated
-				&& (row[field] !== undefined || columns[field]!.config.defaultFn !== undefined),
+				&& (row[field] !== undefined
+					|| columns[field]!.config.defaultFn !== undefined
+					|| (columns[field]!.config.onUpdateFn !== undefined && columns[field]!.config.default === undefined)),
 		);
 		if (fields.length === 0) throw new CompileError('An inserted row has no values and no defaults.');
 		const key = fields.join(FIELD_SEPARATOR);

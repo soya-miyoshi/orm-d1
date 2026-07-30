@@ -315,7 +315,14 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 				: 'text';
 			imports.add(factory);
 
-			let chain = `${factory}('${column.name}')`;
+			// blob() defaults to mode 'json' (see src/schema/columns.ts), which
+			// would decode/encode an introspected BLOB column as JSON and corrupt
+			// it. A live BLOB-affinity column has no way to say what encoding it
+			// actually holds, so 'buffer' — a plain Uint8Array round-trip — is the
+			// only safe default.
+			let chain = factory === 'blob'
+				? `${factory}('${column.name}', { mode: 'buffer' })`
+				: `${factory}('${column.name}')`;
 			if (column.primaryKey) chain += column.autoincrement ? '.primaryKey({ autoIncrement: true })' : '.primaryKey()';
 			else if (column.notNull) chain += '.notNull()';
 			// Everything below used to be dropped on the floor. The pulled
