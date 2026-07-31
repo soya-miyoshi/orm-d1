@@ -189,12 +189,8 @@ class SQL<T = unknown> implements SQLChunk<T> {
 		let text = '';
 		const params: ParamSlot[] = [];
 
-		for (let i = 0; i < this.strings.length; i++) {
-			text += this.strings[i]!;
-			if (i >= this.values.length) continue;
-
-			const value = this.values[i];
-			if (value === undefined) continue;
+		const emit = (value: unknown): void => {
+			if (value === undefined) return;
 			if (isSQLChunk(value)) {
 				const nested = render(value, ctx);
 				text += nested.sql;
@@ -203,20 +199,19 @@ class SQL<T = unknown> implements SQLChunk<T> {
 				text += '(';
 				for (const [j, item] of value.entries()) {
 					if (j > 0) text += ', ';
-					if (isSQLChunk(item)) {
-						const nested = render(item, ctx);
-						text += nested.sql;
-						params.push(...nested.params);
-					} else {
-						text += paramToken(ctx);
-						params.push({ k: 'const', v: item as D1Param });
-					}
+					emit(item);
 				}
 				text += ')';
 			} else {
 				text += paramToken(ctx);
 				params.push({ k: 'const', v: value as D1Param });
 			}
+		};
+
+		for (let i = 0; i < this.strings.length; i++) {
+			text += this.strings[i]!;
+			if (i >= this.values.length) continue;
+			emit(this.values[i]);
 		}
 
 		return { sql: text, params };

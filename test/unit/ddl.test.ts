@@ -85,6 +85,23 @@ describe('ddl generation', () => {
 		expect(createTable(t)).toContain('check ("role" in (\'admin\', \'member\'))');
 	});
 
+	it('elides an undefined element inside an interpolated array check instead of inlining null', () => {
+		// A missing constant must not silently produce `in (..., null, ...)` —
+		// `x in (..., null)` is NULL (neither true nor false) for any x not in the
+		// list, so the CHECK passes on exactly the rows it was meant to reject.
+		const ROLES = ['admin', undefined as unknown as string, 'member'];
+		const t = sqliteTable('t', {
+			role: text('role').notNull(),
+		}, (c) => [
+			check('t_role_check', sql`${c.role} in ${ROLES}`),
+		]);
+
+		const ddl = createTable(t);
+		expect(ddl).toContain('check ("role" in (\'admin\', , \'member\'))');
+		expect(ddl).not.toContain("'admin', null");
+		expect(ddl).not.toContain('null, ');
+	});
+
 	it('renders sql defaults inline and value defaults as literals', () => {
 		const t = sqliteTable('t', {
 			at: integer('at').notNull().default(sql`(unixepoch())`),
