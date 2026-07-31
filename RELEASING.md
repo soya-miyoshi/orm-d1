@@ -81,10 +81,37 @@ After this, every later release is automated and no token is involved.
 ## Cutting a release
 
 ```bash
+make release          # patch: 0.1.3 -> 0.1.4
+make release minor    # 0.1.3 -> 0.2.0
+make release major    # 0.1.3 -> 1.0.0
+make release-dry      # print what a release would do, change nothing
+```
+
+`make release` bumps both `package.json` files and the kit's peer range, commits, pushes,
+and creates the GitHub Release — which is what fires the publish.
+
+**It does not run the gate locally, on purpose.** `ci.yml` runs `npm run check` on every
+push to `main`, and `release.yml` runs it again immediately before publishing, so a third
+run on a laptop bought nothing but a hard dependency on a working local toolchain — and a
+weaker signal than either, since CI publishes from ubuntu with npm 11 while a laptop is
+whatever it is. What the target enforces instead is that **HEAD is a commit `ci.yml` has
+already passed**; it refuses to release otherwise. That also implies HEAD is pushed, since a
+run cannot exist for a commit GitHub has never seen.
+
+The one thing that reaches the registry unverified by `ci.yml` is the version-bump commit
+the target creates, which changes two version strings and nothing else. `release.yml`'s own
+gate is the backstop for it: if that fails, nothing is published, and the recovery is
+`gh release delete v0.2.0 --cleanup-tag` plus a revert.
+
+The target still refuses a dirty tree, a branch other than `main`, a missing or
+unauthenticated `gh`, and a version already on the registry.
+
+Doing it by hand is the same steps:
+
+```bash
 npm run version:set 0.2.0   # both package.json files + kit's peer range
-npm run check               # the same gate CI runs
 git commit -am "Release 0.2.0"
-git push
+git push                    # wait for ci.yml to go green
 ```
 
 Then draft a GitHub Release with the tag `v0.2.0` (note the `v`; the workflow strips it) and
