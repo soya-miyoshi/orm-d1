@@ -165,7 +165,7 @@ class InArray implements SQLChunk<boolean> {
 		}
 
 		const chunks = this.values.map((v) => bindValue(this.operand, v));
-		return sql<boolean>`${this.operand} ${sql.raw(keyword)} (${sql.join(chunks)})`.toQuery(ctx);
+		return sql<boolean>`${this.operand} ${sql.raw(keyword)} (${sql.join(chunks, ', ')})`.toQuery(ctx);
 	}
 }
 

@@ -712,6 +712,56 @@ introspected-vs-stored (plain-vs-plain), so no null-prototype object reaches a d
 - **Fix**: the complete data is already in `options.foreignTriggers` — flattening its values covers it. Note the check guards only the in-place transition: the created-table path (`diff.ts:397`) and the rebuild path (`diff.ts:320`) emit `appendOnlyTrigger()` with no check at all.
 - **Low severity**: the batch is atomic, so this is a loud rollback rather than data loss, and it is the same outcome as before the fix.
 
+## Findings — feature lens (iteration 7)
+
+### [F-080] `sql` binds an interpolated `undefined` instead of eliding it — status: todo — severity: **high** — area: sql — COMPAT-DEFECT
+- **Where**: `src/sql/sql.ts:201-204` (the `else` branch of `SQL.toQuery`)
+- **Defect**: Drizzle's `buildQueryFromSourceParams` has an explicit `if (chunk === undefined) return { sql: "", params: [] }` (`drizzle-orm/sql/sql.js:96`); d1zzle has no such branch, so an `undefined` hole becomes a bound parameter slot. Not an exotic input — it is the *designed* output of `and()`/`or()` over all-undefined operands and of Drizzle's `SQL.if()`, both of which exist to be interpolated conditionally.
+- **Failure scenario (query)**: `` sql`select 1 where ${and(maybeA, maybeB)}` `` with both filters absent gives Drizzle `{"sql":"select 1 where ","params":[]}` and d1zzle `{"sql":"select 1 where ?","params":[undefined]}`. The parameter reaches `D1PreparedStatement.bind(undefined)`.
+- **Failure scenario (DDL — this is bug class #1)**: `renderInline` (`src/ddl.ts:187`) replaces each parameter token with `literal(slot.v)`, and `literal(undefined)` is `'null'`. A schema with `check('score_ok', sql\`${c.score} >= ${MIN_SCORE}\`)` where `MIN_SCORE` is `undefined` generates `constraint "score_ok" check ("score" >= null)` — which SQLite accepts, and which then accepts `insert into scores values (1, -999)` (verified with `node:sqlite`). drizzle-kit's equivalent renders `"score" >= ` and the migration fails loudly. d1zzle emits a self-consistent migration whose CHECK is permanently inert, and `check` compares it equal to itself forever.
+- **Fix**: one line, before the `isSQLChunk` test — `if (value === undefined) continue;`.
+- **Prove it**: `render(sql\`select 1 where ${and(undefined, undefined)}\`)` → `{ sql: 'select 1 where ', params: [] }`; plus a `test/unit/ddl.test.ts` case asserting `check('c', sql\`${col} >= ${undefined}\`)` does **not** render `>= null`.
+
+### [F-081] `sql` does not expand an interpolated array into `(?, ?, ?)` — status: todo — severity: **high** — area: sql — COMPAT-DEFECT
+- **Where**: `src/sql/sql.ts:201-204` (same branch)
+- **Defect**: Drizzle's renderer has a dedicated array case (`drizzle-orm/sql/sql.js:100-108`) emitting `(`, the elements separated by `, `, `)`. It is the mechanism Drizzle's own `inArray`/`notInArray` are built on (`conditions.js:150`), and therefore how ported user code spells a literal list. d1zzle binds the whole array to one slot.
+- **Failure scenario**: `` db.select().from(users).where(sql`${users.id} in ${ids}`) `` with `ids = [1,2,3]` gives Drizzle `id in (?, ?, ?)` / `[1,2,3]` and d1zzle `id in ?` / `[[1,2,3]]` → `D1zzleQueryError: near "?": syntax error` (on D1, `D1_TYPE_ERROR: Type 'object' not supported` fires first). This also reaches the `orderBy`/`extras` callbacks in `db.query`, whose operator bag *is* the d1zzle `sql` tag (`src/relations/query.ts:63-75`) — the exact spelling Pothos' drizzle plugin documents.
+- **Fix**: ~5 lines in the same loop, mirroring Drizzle — open paren, iterate with `, ` separators recursing into `isSQLChunk` items, close paren, `continue`.
+- **Repairs the DDL path for free**: `check('c', sql\`${c.role} in ${['admin','member']}\`)` currently renders `check ("role" in 'admin,member')`, which SQLite rejects with `subqueries prohibited in CHECK constraints`; with the fix it renders `in ('admin', 'member')`.
+- **Prove it**: `render(sql\`id in ${[1,2,3]}\`)` → `{ sql: 'id in (?, ?, ?)' }` with 3 slots, plus the check-constraint case.
+
+### [F-082] `db.run` / `db.all` / `db.get` reject a `sql` fragment or a string — status: **needs-human** — severity: med — area: api — COMPAT-DEFECT
+- **Where**: `src/runtime/database.ts:131`, `:135`, `:139`
+- **Defect**: Drizzle's SQLite database exposes `run`/`all`/`get`/`values` taking `string | SQLWrapper` (`drizzle-orm/sqlite-core/async/db.js:320-346`). d1zzle keeps the three names but its contract is `(query: CompiledQuery, input?)`. A d1zzle fragment has no `parts`, so `Executor.executeRows`/`executeRun` dereference `query.parts.length` on `undefined`.
+- **Failure scenario**: `db.run(sql\`pragma foreign_keys = on\`)` — the canonical SQLite escape hatch — and `db.all(sql\`select 1 as n\`)`, `db.get(...)`, `db.run('select 1')` all give `TypeError: Cannot read properties of undefined (reading 'length')`. The message names neither the method nor the argument, and the working raw path (`db.execute(sqlString, params)`) is not pointed at.
+- **Why parked**: the fix widens three published method signatures to `CompiledQuery<TRow> | SQLChunk | string`, which is a change to the published API surface the sweep may not make. d1zzle's compiled-query contract for these names is documented at `docs/03-architecture.md:184`, so it is a widening rather than a redefinition — a `CompiledQuery` is distinguishable by `Array.isArray(q.parts)`.
+- **Question for the human**: widen the three signatures (matching Drizzle, and the reviewer sketched the guard), or keep the compiled-query-only contract and merely **throw with a message naming `db.execute()`** instead of letting a `TypeError` escape? The second is small and does not touch the signature.
+
+### [F-083] `sql.join`'s default separator is `', '`; Drizzle's is none — status: todo — severity: med — area: sql — COMPAT-DEFECT
+- **Where**: `src/sql/sql.ts:237`
+- **Defect**: Drizzle's `sql.join(chunks, separator)` inserts a separator only `if (i > 0 && separator !== void 0)` (`drizzle-orm/sql/sql.js:335-341`) — the no-argument form concatenates. d1zzle's inserts commas.
+- **Failure scenario (forward)**: the standard chunk-assembly idiom gives Drizzle `select * from "users" where "id" = 1` and d1zzle `select * from "users",  where "id" = 1`.
+- **Failure scenario (reverse-alias — `docs/08` makes this a standing constraint)**: a schema using `sql.join` inside a `check()` renders correctly under d1zzle and, once aliased back to `drizzle-orm/sqlite-core` for `studio`, renders `in ('admin''member')` — a single concatenated literal, so the CHECK admits values it was written to reject.
+- **Fix**: default to `undefined` and thread it through both branches, then pass `', '` explicitly at the three internal callers that relied on it — `src/sql/functions.ts:59` (`coalesce`), `src/sql/expressions.ts:168` (`InArray`), `src/better-auth.ts:172` (`lowerIn`). `relations/query.ts:334,335` and `relations/joined.ts:263,277,278` already pass separators explicitly.
+- **Prove it**: `render(sql.join([sql\`a\`, sql\`b\`]))` → `{ sql: 'ab' }` and with `', '` → `{ sql: 'a, b' }`; the existing `inArray`/`coalesce`/`lowerIn` assertions must stay green — they are what pins the three call-site edits.
+
+### [F-084] `NEW-SURFACE` from the iteration-7 feature lens — status: needs-human — severity: n/a — area: api
+Only items not already on the recorded list:
+1. **`db.values(query)`** — the fourth member of Drizzle's session API (`sqlite-core/async/db.js:341`), returning rows as positional arrays. The machinery exists: `CompiledQuery.map` already reads `D1PreparedStatement.raw()`.
+2. **`.execute(placeholderValues?)` on the four builders.** Every Drizzle builder inherits it from `QueryPromise`. d1zzle has it on `RelationalQuery` (`relations/query.ts:735`) but not on `SelectBuilder`/`InsertBuilder`/`UpdateBuilder`/`DeleteBuilder`, so the surface is inconsistent with itself as well as with Drizzle. A one-line alias for `all()`/`run()` on each.
+3. **`.prepare()`** returning a reusable statement, with `preparedStatement.execute(values)`. `compile()` + `bind()` + `all(input)` already covers the semantics under different names.
+4. **`db.batch([db.query.users.findMany()])`** — Drizzle's D1 driver accepts a relational query in a batch (`SQLiteAsyncRelationalQuery` implements `_prepare`); d1zzle throws `TypeError: item.compile is not a function`. Only expressible for queries that compile to one statement — the `joined` strategy, or any `find*` with no `with` — so a real design decision, not a small patch.
+5. **`sql.fromList`, `sql.param`, `sql.comment`, `SQL.prototype.append`** — on Drizzle's `sql` namespace, absent from `SQLTag` (`src/sql/sql.ts:212-219`).
+
+### [F-085] `alias(subquery, 'x')` silently produces wrong SQL — status: todo — severity: med — area: schema — OFF-LENS from feature
+- **Where**: `src/schema/table.ts:352`
+- **Defect**: `alias()` runs `buildTable(...)`, which does not copy the `TableSource` symbol, so the inner statement is lost. `query.select({id: a.id}).from(alias(sq,'x'))` compiles to `select "x"."id" from "sq" "x"` and fails at runtime with `no such table: sq`, instead of inlining `(select …) "x"`.
+- Off-lens because Drizzle's `alias()` is documented for tables and views, not subqueries — but it is wrong SQL produced silently at compile time.
+
+### [F-086] `logger` is accepted and ignored — status: todo — severity: low — area: runtime — OFF-LENS from feature
+- **Where**: `src/runtime/database.ts:59`
+- **Defect**: `logger: true` is the single most common Drizzle debugging switch; silently discarding it means a user who sets it concludes no queries are running. `docs/08`'s Tier 2 says such options should carry a `__DEV__` warning; this one does not.
+
 ## Audit areas
 
 Unchecked areas, roughly in descending order of what a bug there would cost. One

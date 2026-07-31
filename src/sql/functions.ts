@@ -56,7 +56,7 @@ export const coalesce = <T>(...operands: (Column<any> | SQLChunk<T> | T)[]): SQL
 				+ 'or reduce the list.',
 		);
 	}
-	return sql<T>`coalesce(${sql.join(operands as SQLChunk[])})`;
+	return sql<T>`coalesce(${sql.join(operands as SQLChunk[], ', ')})`;
 };
 
 export const lower = (operand: Column<any> | SQLChunk): SQLChunk<string> => sql<string>`lower(${operand})`;
