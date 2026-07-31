@@ -289,7 +289,7 @@ a package the application already depends on directly.
 | Drizzle `SQL` fragments over d1zzle columns (`eq`, `inArray`, `sql`) | **Verified by test** — rendered through the bridge in `sql/drizzle-sql.ts` | n/a |
 | Pothos `plugin-drizzle` | **Verified end to end** — `test/workers/pothos.test.ts` executes GraphQL against real D1 in workerd. Needs our `getTableConfig` and `asDrizzleRelations` | `DrizzleRelations: PothosRelations<typeof relations>`; see below |
 | Better Auth | **Verified end to end** — `test/workers/better-auth.test.ts` drives `d1zzle/better-auth` against real D1 in workerd. Not a bridge: a native `CustomAdapter`, no `drizzle-orm` involved | n/a — the adapter is typed against Better Auth, not Drizzle |
-| Validator adapters (Zod, Valibot, TypeBox) | Read columns only; expected to work | `asDrizzleSchema` |
+| Validator adapters (Zod, Valibot, TypeBox, ArkType) | Read columns only — **unverified**, no test imports them. See [P1](#p1--validator-adapters-test-only) | `asDrizzleSchema` |
 | Drizzle Studio (extension) | Works — it introspects the live database and never sees our objects at all | n/a |
 
 The honest gaps:
@@ -332,3 +332,155 @@ The honest gaps:
 - **drizzle-graphql** was removed from this repo's devDependencies. It had sat there with
   no test importing it, which is exactly the shape of an unverified claim, and it branches
   on `is(db, BaseSQLiteDatabase)` — the gap above. It is not claimed as supported.
+
+## The rest of the ecosystem
+
+Two adapters shipped. The question that follows is which of the others are worth building,
+and the answer is not proportional to how popular they are — it is set by **which of the
+four mechanisms above an adapter uses**, plus one filter specific to this project.
+
+### Mechanism decides cost
+
+| Mechanism | What it costs |
+| --- | --- |
+| **A. Schema readers** — `entityKind` walks, `Symbol.for('drizzle:*')`, column duck-typing | ~Zero code. `schema/drizzle-entity.ts` already answers. The cost is a *test*, plus `asDrizzleSchema()` at the type level. |
+| **B. Query-builder drivers** — call `db.insert().values()`, Drizzle's `eq`/`and`, Drizzle's session | The bridge is the wrong tool ([above](#better-auth--where-the-bridge-stops-being-the-answer)). Requires a native adapter written against the host framework's own seam. |
+| **C. Database-object checkers** — `is(db, BaseSQLiteDatabase)` | Out of scope, and measured: nothing worth having is behind it. |
+| **D. Never sees our objects** — introspects the live database, or lints source | Free. Documentation only. |
+
+### The filter: does it run in a Worker?
+
+d1zzle is Workers-only, so an adapter that can only run in a Node process is not a gap in
+our compatibility — it is a thing our users were never going to reach. Roughly half of what
+gets called "the Drizzle ecosystem" is admin panels and Postgres tooling in that category.
+Recording those as **declined** rather than **pending** is what keeps this document honest;
+a permanently deferred item and a decided one look identical from the outside, and only one
+of them is true.
+
+### Survey
+
+| Adapter | Mechanism | Runs in a Worker? | Status |
+| --- | --- | --- | --- |
+| `@pothos/plugin-drizzle` | A (+ one `instanceof`) | Yes | **Shipped**, verified end to end |
+| Better Auth | **B** | Yes | **Shipped** as a native `CustomAdapter` |
+| `drizzle-zod` / `-valibot` / `-typebox` / `-arktype` | A | Yes | **P1** — believed to work, not verified |
+| `@auth/drizzle-adapter` (Auth.js / NextAuth) | **B** | Yes | **P2** — the largest real gap |
+| `eslint-plugin-drizzle` | D | Yes | **P3** — probably free, undocumented |
+| `drizzle-seed` | A + B | Dev-time only | **P4** — belongs in `kit/`, if anywhere |
+| Drizzle Studio | D | Yes | Works; never sees our objects |
+| `drizzle-graphql` | C | — | **Declined**, with the measurement [above](#status-by-adapter) |
+| `adminjs-drizzle` | B | **No** — Node admin server | **Declined** |
+| Payload CMS | n/a — embeds Drizzle as its *own* engine rather than adapting a user schema | No | Not applicable |
+| ZenStack v3 | n/a — built on Kysely, not a Drizzle consumer | — | Not applicable |
+| tRPC, Hono, TanStack | n/a — no adapter; they consume inferred types | Yes | Already works |
+
+### P1 — Validator adapters, test-only
+
+The status table used to say "expected to work" for this row. That is the same shape of
+claim `drizzle-graphql` sat on for months, and the same shape the Pothos `instanceof` bug
+hid behind: a survey, not a test. These read the column surface and nothing else, so the
+work is almost certainly zero code and one file —
+`test/unit/drizzle-validators.test.ts`, importing the real `drizzle-zod`:
+
+- `createSelectSchema` / `createInsertSchema` / `createUpdateSchema` over
+  `asDrizzleSchema(schema)` from `test/schema.ts`, parsing one valid and one invalid value
+  per column.
+- Every `mode`: `integer({ mode: 'boolean' | 'timestamp' | 'timestamp_ms' })`,
+  `text({ mode: 'json' })`, `blob({ mode: 'buffer' | 'json' | 'bigint' })`, `customType`.
+- Negative controls: a `notNull` column must reject `null`; a narrowed
+  `text({ enum: [...] })` must reject an off-list string.
+
+Two places it can plausibly fail, and the test should aim at both deliberately:
+
+1. **`columnType` string equality.** `drizzle-zod`'s `isColumnType` matches literal internal
+   names — `'SQLiteBlobBuffer'`, `'SQLiteTimestamp'`, `'SQLiteCustomColumn'`. Drift in
+   `schema/columns.ts` does not throw; it falls through to a permissive default. The failure
+   mode is a **loosened validator**, which is worse than a crash because it looks like it
+   worked.
+2. **`generated`.** `schema/columns.ts` pins the *type* to `undefined` on purpose, so
+   `OptionalKeyOnly` does not drop the key, while the runtime getter returns the real
+   object. Type and runtime disagree by design. Whether that matters to a validator adapter
+   is exactly the kind of question only a runtime test answers.
+
+### P2 — Auth.js / NextAuth, a native adapter
+
+The largest genuine gap. Next-on-Cloudflare, SvelteKit and Nuxt all reach for `@auth/*`,
+and `@auth/drizzle-adapter` is mechanism B — it drives `db.select()` / `insert()` / `update()`
+through Drizzle's dialect, for exactly the reason [Better Auth does](#better-auth--where-the-bridge-stops-being-the-answer).
+`asDrizzleSchema()` cannot help.
+
+The shape is *easier* than Better Auth's, though: Auth.js's `Adapter` is a flat interface of
+about nineteen optional methods over four concrete models — `AdapterUser`, `AdapterAccount`,
+`AdapterSession`, `VerificationToken` — with no model mapping and no transform layer to
+satisfy. Sketch:
+
+```
+src/auth-js.ts              → a "./auth-js" export
+peerDependencies            → "@auth/core", optional, with an upper bound
+test/workers/auth-js.test.ts
+```
+
+Four design points, every one of them forced by D1 rather than by Auth.js:
+
+- **`useVerificationToken` is `consumeOne` again.** Magic links are single-use credentials,
+  so a read-then-delete loses the semantics under concurrency — the same argument made
+  [above](#two-methods-that-had-to-be-written-natively). Reuse the proven statement:
+
+  ```sql
+  delete from "verificationToken" where "rowid" in (
+    select "rowid" from "verificationToken"
+     where "identifier" = ? and "token" = ? limit 1
+  ) returning *
+  ```
+
+- **`getSessionAndUser` must be one join.** The method exists precisely to save a round
+  trip, and it runs on every authenticated request. Two awaits here spends the
+  [subrequest budget](./02-d1-platform.md) on every page view; that is a platform limit, not
+  a micro-optimisation.
+- **`deleteUser` has no transaction.** Auth.js expects the user, their sessions and their
+  accounts to go together. With no interactive transactions the choice is one
+  `db.batch([...])` of three deletes, or `on delete cascade` in the schema — which then
+  depends on D1's foreign-key enforcement state. Pick one and write down which; the failure
+  of leaving it implicit is orphaned sessions that still authenticate.
+- **No `createSchema`.** Same call as Better Auth, same reason: the schema file is what
+  `d1zzle-migrate` diffs against, so generating it inverts the source of truth. Ship the
+  four tables as copyable `d1zzle/sqlite-core` in the docs.
+
+**Verification, and a thing to check before writing any of it.** Auth.js publishes an
+adapter conformance suite that its first-party adapters run against. If it executes under
+`vitest-pool-workers` with a real D1 binding, the entire correctness argument comes for
+free and this table can claim conformance rather than "we wrote some tests" — a strictly
+stronger statement. If it turns out to be Node-bound, fall back to a hand-written suite
+shaped like `test/workers/better-auth.test.ts`, including the `Promise.all` race on
+`useVerificationToken`. **This has not been checked yet.** It is the first task of P2, not
+an assumption P2 rests on.
+
+### P3 — `eslint-plugin-drizzle`, verify then document
+
+`enforce-delete-with-where` and `enforce-update-with-where` catch an unqualified
+`db.delete(users)`. That rule is worth more here than it is in Drizzle, because an
+unqualified write on D1 is a full-table write billed by `rows_written`. The rules resolve
+their target either through the TypeScript checker or through a `drizzleObjectName: ['db']`
+option, and the second path is name-based, so it should point at a d1zzle `db` unchanged.
+That is a ten-minute experiment followed by a README section — and it stays out of the
+status table until someone runs it.
+
+### P4 — `drizzle-seed`, and why it is probably the wrong shape
+
+A hybrid: it reads schema internals (mechanism A, already satisfied) and then drives
+`db.insert()` (mechanism B, not). It is dev-time only, so a d1zzle equivalent would live in
+`kit/` at zero bundle cost, and it would need bound-parameter chunking — which
+`builders/insert.ts` already solves. Given that, a `d1zzle-migrate seed` reusing our own
+chunking is likely a better product than an adapter that reimplements it. Low urgency
+either way.
+
+### The recipe
+
+Every future adapter answers one question first: **does it read the schema, or does it drive
+the database?**
+
+Read-only means it already works, and the job is a test that proves it rather than a
+paragraph that asserts it. Driving the database means the bridge cannot help at any price,
+and the move is to find the host framework's own extension seam — `createAdapterFactory`,
+`Adapter`, a storage interface — and implement it natively. `src/better-auth.ts` is the
+worked example of the second case.
