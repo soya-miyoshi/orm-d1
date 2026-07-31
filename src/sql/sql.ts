@@ -189,19 +189,29 @@ class SQL<T = unknown> implements SQLChunk<T> {
 		let text = '';
 		const params: ParamSlot[] = [];
 
-		for (let i = 0; i < this.strings.length; i++) {
-			text += this.strings[i]!;
-			if (i >= this.values.length) continue;
-
-			const value = this.values[i];
+		const emit = (value: unknown): void => {
+			if (value === undefined) return;
 			if (isSQLChunk(value)) {
 				const nested = render(value, ctx);
 				text += nested.sql;
 				params.push(...nested.params);
+			} else if (Array.isArray(value)) {
+				text += '(';
+				for (const [j, item] of value.entries()) {
+					if (j > 0) text += ', ';
+					emit(item);
+				}
+				text += ')';
 			} else {
 				text += paramToken(ctx);
 				params.push({ k: 'const', v: value as D1Param });
 			}
+		};
+
+		for (let i = 0; i < this.strings.length; i++) {
+			text += this.strings[i]!;
+			if (i >= this.values.length) continue;
+			emit(this.values[i]);
 		}
 
 		return { sql: text, params };
@@ -234,7 +244,7 @@ export const sql: SQLTag = Object.assign(
 		placeholder: <T = unknown>(name: string): Placeholder<T> => new Placeholder<T>(name),
 		empty: (): SQLChunk => new Raw(''),
 		/** Join chunks with a separator. */
-		join: (chunks: readonly SQLChunk[], separator: string | SQLChunk = ', '): SQLChunk => {
+		join: (chunks: readonly SQLChunk[], separator?: string | SQLChunk): SQLChunk => {
 			const sep = typeof separator === 'string' ? separator : undefined;
 			if (sep !== undefined) {
 				const strings = ['', ...chunks.slice(1).map(() => sep), ''];

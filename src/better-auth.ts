@@ -169,7 +169,7 @@ const lowerLike = (column: Column<any>, pattern: string): Condition =>
 const lowerIn = (column: Column<any>, values: readonly unknown[], negated: boolean): Condition => {
 	// An empty set is a constant, and `in ()` is a syntax error.
 	if (values.length === 0) return sql<boolean>`${negated ? sql.raw('1 = 1') : sql.raw('1 = 0')}`;
-	const lowered = sql.join(values.map((v) => sql`lower(${v})`));
+	const lowered = sql.join(values.map((v) => sql`lower(${v})`), ', ');
 	return negated
 		? sql<boolean>`lower(${column}) not in (${lowered})`
 		: sql<boolean>`lower(${column}) in (${lowered})`;
