@@ -39,10 +39,10 @@ export const warn = (message: string): void => {
 export const assertHeader = (expected: readonly string[], actual: readonly string[]): void => {
 	if (expected.length !== actual.length || expected.some((name, i) => name !== actual[i])) {
 		warn(
-			// No "please report it": the project is unmaintained and nobody is
-			// reading reports (see CONTRIBUTING.md). Pointing at a channel that
-			// does not answer wastes the time of whoever hit this, so the message
-			// names the place to look in the fork they are running instead.
+			// No "please report it": the project is not open to contributions and
+			// a reply is not guaranteed (see CONTRIBUTING.md). Whoever hit this is
+			// most likely running a fork, so the message names the file to look in
+			// rather than a channel that may not answer in time to help them.
 			`Projection mismatch: compiled [${expected.join(', ')}] but D1 returned [${actual.join(', ')}]. `
 				+ 'This is a d1zzle bug — the projection is built in plan/compile.ts.',
 		);

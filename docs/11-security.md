@@ -148,11 +148,11 @@ credentials and writes to production databases.
 
 ## Reporting — welcome, but do not wait on it
 
-This project is not actively maintained. You are welcome to open an issue for a
-vulnerability, and for anything already public that is probably the right call — it warns
-other people running forks. But **there is no embargo process, no guaranteed response, no
-advisory, and no promise that a patched version ships.** See
-[CONTRIBUTING](../CONTRIBUTING.md).
+This project is not open to contributions and has no dedicated security process. You are
+welcome to open an issue for a vulnerability, and for anything already public that is
+probably the right call — it warns other people running forks. But **there is no embargo
+process, no guaranteed response, no advisory, and no promise that a patched version ships.**
+See [CONTRIBUTING](../CONTRIBUTING.md).
 
 That changes what this document is for. It is not a promise backed by a maintainer who will
 answer when the promise fails — it is a description of how the code behaves, written so

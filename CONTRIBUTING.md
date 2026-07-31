@@ -9,8 +9,9 @@ software, fork it.**
 GitHub shows this file when you start a pull request or open an issue, so it is worth being
 straight with you at the point where you would otherwise begin work.
 
-I (soya-miyoshi) do not have the capacity to maintain this project right now. That is a
-statement about my time, not about how welcome you are here.
+The project is maintained; it is not open to contributions. Those are different things, and
+what follows is about my capacity to review and own other people's changes, not about how
+welcome you are here.
 
 ### Pull requests
 
@@ -41,8 +42,8 @@ request I am able to act on.
 
 ## Security
 
-I **cannot guarantee the security of this software.** Nobody is monitoring for reports, so
-there is no embargo process, no advisory, and no promise that a fix ships.
+I **cannot guarantee the security of this software.** There is no embargo process, no
+advisory, and no promise that a fix ships on any particular timeline.
 
 You are welcome to open an issue for a vulnerability, and for anything already public that
 is probably the right call — it warns other people running forks. But please do not wait on

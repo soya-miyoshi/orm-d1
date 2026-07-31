@@ -9,21 +9,6 @@ inferred types — and drops everything that only exists to support other databa
 left is tuned for the one platform it targets: D1's positional read path, its
 bound-parameter limit, its Sessions API, and its billing counters.
 
-> ### ⚠️ Not actively maintained — fork it before you depend on it
->
-> I do not have the capacity to maintain this project at the moment. **Pull requests are
-> very unlikely to be merged**, and I cannot guarantee a response to issues or feature
-> requests — though issues are welcome, and useful to everyone running a fork even when I
-> cannot reply. I also **cannot guarantee the security of this software**.
->
-> **If you intend to depend on it, fork this repository and maintain your own copy.** You
-> are taking on the risk and the maintenance yourself. If enough funding or a volunteer
-> maintainer appears this could change, but that is not the situation today.
->
-> See [Support and maintenance](#support-and-maintenance) below,
-> [CONTRIBUTING](./CONTRIBUTING.md) before opening anything, and
-> [11-security](./docs/11-security.md) for what the library does and does not guarantee.
-
 ```bash
 npm install d1zzle
 npm install -D d1zzle-migrate
@@ -583,27 +568,29 @@ with trusted publishing (OIDC — no tokens) and provenance attestations. `npm r
 
 ## Support and maintenance
 
-**I (soya-miyoshi) do not have the capacity to maintain this project right now.** In
-practice that means:
+**This project is maintained, but it is not open to contributions.** Those are two
+different things, and the distinction is what matters if you are deciding whether to depend
+on it.
 
-- **Pull requests are very unlikely to be merged.** Please do not spend an evening on a
-  patch for this repository expecting it to land. You are welcome to open one, but treat it
-  as a public record for other people running forks rather than as something in a queue.
-- **Issues are welcome — I just cannot promise a reply.** A described bug or a reproduction
-  is worth having written down, and it helps the next person whether or not I answer. No
-  triage promise, no timeline; not a closed door either.
+- **Pull requests are very unlikely to be merged**, and feature requests are very unlikely
+  to be accepted. Reviewing a patch properly means owning it afterwards, and that is the
+  part I (soya-miyoshi) cannot take on at the moment — so please do not spend an evening on
+  a patch for this repository expecting it to land.
+- **Issues are welcome — I just cannot guarantee a reply.** A described bug or a
+  reproduction is worth having written down, and it helps everyone running a fork whether
+  or not I answer. No triage promise, no timeline; not a closed door either.
 - **I cannot guarantee the security of this software.** It is written carefully and tested
   against a real D1 binding, and [11-security](./docs/11-security.md) documents what the
-  compiler does and does not guarantee — but nobody is monitoring for reports, so no fix is
-  guaranteed to ship. Treat that as a standing condition of using it.
+  compiler does and does not guarantee — but nothing here is a substitute for reviewing the
+  copy you run, and no fix is guaranteed to ship on any timeline.
 
-**If you depend on this, fork it.** Own the copy you run, review it yourself, and patch it
-on your own schedule rather than waiting on an upstream that is not answering. The MIT
-license exists precisely so you can, and [CONTRIBUTING](./CONTRIBUTING.md) covers what a
-usable fork needs.
+**If you intend to depend on this, fork it and maintain your own copy.** You are taking on
+the risk and the maintenance yourself, deliberately, and the MIT license exists precisely
+so you can. [CONTRIBUTING](./CONTRIBUTING.md) covers what a usable fork needs — read it
+before opening anything.
 
-If enough funding or a volunteer maintainer appears, this can change — the project is
-otherwise in a state where it could be picked up.
+If enough funding or a volunteer maintainer appears, the contribution side of this can
+change. That is not the situation today.
 
 ## License
 
