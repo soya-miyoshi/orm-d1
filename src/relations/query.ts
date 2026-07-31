@@ -125,7 +125,14 @@ const resolveOrderBy = (orderBy: OrderByArg | undefined, columns: Record<string,
 	return Object.entries(orderBy)
 		.filter(([, direction]) => direction)
 		.map(([key, direction]) => {
-			const column = columns[key];
+			// `hasOwn`, not a bare index: the object form of `orderBy` is part of
+			// the same JSON-shaped config as `where` (see `docs/11`), and
+			// `columns['constructor']` resolves to `Object` — truthy — so the
+			// refusal below never ran. `asc(Object)` then compiled to `? asc` with
+			// a *function* in the parameter list, which `bind()` rejects at
+			// execution time: a clean 400 turned into an unhandled 500. Same trap
+			// as `relations/filter.ts`, which guards the sibling `where`.
+			const column = Object.hasOwn(columns, key) ? columns[key] : undefined;
 			if (!column) {
 				throw new Error(
 					`Cannot order by "${key}": it is not a column of this table. `
@@ -389,7 +396,12 @@ export class RelationalQueryBuilder {
 		const children = Object.entries(config.with ?? {})
 			.filter(([, value]) => value)
 			.map(([name, value]) => {
-				const relation = this.config.relations[name];
+				// `hasOwn`, as with `orderBy` and `where` above: a `with` key naming
+				// a prototype member resolved to a function, sailed past this
+				// refusal, and was caught two lines down by the "no resolved join
+				// columns" message — which names an internal invariant rather than
+				// the caller's mistake, and reads as a d1zzle bug report.
+				const relation = Object.hasOwn(this.config.relations, name) ? this.config.relations[name] : undefined;
 				if (!relation) {
 					throw new Error(
 						`"${this.config.name}" has no relation named "${name}". `

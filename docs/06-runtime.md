@@ -244,6 +244,12 @@ insert still names the SQL that failed rather than reporting `D1_ERROR` with no 
 Behind the `d1zzle/relations` entry point, and reachable from the root entry by passing
 `schema`, so users who never touch it never parse it.
 
+> The `FindConfig` this section describes — `where`, `orderBy`, `columns`, `with` — is
+> JSON-shaped on purpose, so it is what a client would send. Handing it one delegates
+> query construction to the caller: nothing is injected, and the data still leaves. See
+> [11-security](./11-security.md#the-filter-dsl-is-a-query-language) before passing a
+> request body to it.
+
 The design question is how to fetch a parent with its children. Two strategies:
 
 **JSON aggregation** (one round trip): `json_group_array(json_array(...))` in a correlated

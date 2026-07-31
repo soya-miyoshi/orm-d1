@@ -18,6 +18,7 @@ shares no code with it and does not depend on it.
 | [08-drizzle-compatibility.md](./08-drizzle-compatibility.md) | Accepting existing Drizzle schemas with a one-line import change |
 | [09-d1zzle-migrate.md](./09-d1zzle-migrate.md) | The migration CLI: commands, table recreation, drift detection |
 | [10-ecosystem-interop.md](./10-ecosystem-interop.md) | Being recognised by Drizzle's adapters: `entityKind`, symbols, the one gap that cannot be closed — and Better Auth, where being recognised is not enough and we ship a native adapter. Ends with a survey of the rest of the ecosystem and what each one would cost |
+| [11-security.md](./11-security.md) | What the compiler guarantees, the escape hatches that opt out of it, and why the filter DSL is a trust boundary rather than an input format |
 
 ## The short version
 

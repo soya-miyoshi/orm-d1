@@ -589,7 +589,14 @@ const definedValues = (
 	values: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined => {
 	if (!values) return undefined;
-	const out: Record<string, unknown> = {};
+	// Null-prototype, because `out['__proto__'] = v` on a plain object invokes
+	// the inherited setter and re-points the prototype instead of creating an
+	// own key. A `set()` parsed from JSON carries `__proto__` as an own key, so
+	// the assignment vanished here and the statement failed one step later with
+	// "nothing to set" — a refusal, but one that names the wrong problem and
+	// hides that the caller sent a field no column answers to. With no
+	// prototype the key survives to `writeAssignments`, which reports it.
+	const out: Record<string, unknown> = Object.create(null);
 	for (const [key, value] of Object.entries(values)) {
 		if (value !== undefined) out[key] = value;
 	}
@@ -679,7 +686,14 @@ const writeAssignments = (
 	const entries = Object.entries(values).filter(([, v]) => v !== undefined);
 	for (const [i, [field, value]] of entries.entries()) {
 		if (i > 0) writer.text(', ');
-		const column = columns[field];
+		// `hasOwn`, not a bare index: `set()` takes an object that routinely comes
+		// from a request body, and `columns['constructor']` resolves to `Object` —
+		// truthy — so the refusal below never ran. What followed was worse than an
+		// error: `Object.name` is the string `"Object"`, so the assignment rendered
+		// as `"Object" = ?` against a column of that name, and only then died in
+		// `valueChunk` on `column.config` being undefined. Same trap as
+		// `plan/params.ts`, `relations/filter.ts` and `runtime/database.ts`.
+		const column = Object.hasOwn(columns, field) ? columns[field] : undefined;
 		if (!column) throw new CompileError(`Unknown column "${field}" in update set.`);
 		writer.text(`${quoteIdentifier(column.name)} = `).chunk(valueChunk(column, value));
 	}

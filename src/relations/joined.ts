@@ -69,7 +69,12 @@ export function supportsJoined(
 ): boolean {
 	for (const [name, value] of Object.entries(config.with ?? {})) {
 		if (!value) continue;
-		const relation = tableConfig.relations[name];
+		// `hasOwn`: a prototype-member key resolved to a truthy function here and
+		// was rejected only by the `sourceColumns` test below. That happened to
+		// reach the same answer, but for the wrong reason — this is a support
+		// check, and "the relation does not exist" must not be spelled as
+		// "the relation exists but cannot be joined".
+		const relation = Object.hasOwn(tableConfig.relations, name) ? tableConfig.relations[name] : undefined;
 		if (!relation) return false;
 		// A junction relation needs a join in the inner select.
 		if (relation.throughTable) return false;

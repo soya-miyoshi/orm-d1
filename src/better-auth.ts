@@ -292,7 +292,15 @@ export const d1zzleAdapter = (
 			/** The d1zzle table for a Better Auth model name. */
 			const tableFor = (model: string): Table => {
 				const key = config.usePlural ? `${model}s` : model;
-				const t = config.schema[key] ?? config.schema[model];
+				// `hasOwn`, not a bare index: `schema` is a plain object the user
+				// wrote, so `schema['constructor']` is `Object` — truthy — and a
+				// plugin registering a model of that name would be handed a
+				// function where a table belongs. It then fails deep inside the
+				// query builder rather than here, where the message can name the
+				// option that is missing an entry.
+				const own = (name: string): Table | undefined =>
+					Object.hasOwn(config.schema, name) ? config.schema[name] : undefined;
+				const t = own(key) ?? own(model);
 				if (!t) {
 					throw new D1zzleAdapterError(
 						`The model "${model}" is not in the d1zzle adapter's \`schema\` option. `
@@ -317,7 +325,18 @@ export const d1zzleAdapter = (
 			 */
 			const columnFor = (model: string, table: Table, field: string): Column<any> => {
 				const key = getFieldName({ model, field });
-				const column = (getTableColumns(table) as Record<string, Column<any> | undefined>)[key];
+				// `hasOwn`: this is the adapter's whole field-validation boundary —
+				// every `where`, `select`, `sortBy`, `update` and `increment` key
+				// passes through it. `columns['constructor']` is `Object`, which is
+				// truthy, so a bare index sailed past the refusal below and handed
+				// a *function* to `eq()` as though it were a column.
+				//
+				// Defence in depth rather than a live hole: Better Auth's own
+				// `getFieldName` has the same bug one layer up and throws on such a
+				// name before we can look it up, which is why the test for this
+				// pins *their* error. If they fix it, this is what answers.
+				const columns = getTableColumns(table) as Record<string, Column<any> | undefined>;
+				const column = Object.hasOwn(columns, key) ? columns[key] : undefined;
 				if (!column) {
 					throw new D1zzleAdapterError(
 						`The field "${field}" does not exist on the d1zzle table "${getTableName(table)}" `
