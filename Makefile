@@ -10,6 +10,16 @@
 # triggers on `release: published`, not on a pushed tag. So this target's last
 # step is `gh release create`, and everything before it exists to make sure that
 # step cannot fire against a broken tree. See RELEASING.md.
+#
+# The gate itself is CI's, not this file's. `ci.yml` runs `npm run check` on
+# every push to main and `release.yml` runs it again immediately before
+# publishing, so running it a third time here bought nothing except a hard
+# dependency on a working local toolchain — and a weaker signal than either,
+# since CI publishes from ubuntu with npm 11 while a laptop is whatever it is.
+# What this target enforces instead is that HEAD is a commit CI has already
+# passed. The only thing that then reaches the registry unverified by `ci.yml`
+# is the version-bump commit, which changes two version strings and nothing
+# else, and `release.yml`'s own gate is the backstop for it.
 
 SHELL := /bin/bash
 .PHONY: release release-dry check major minor patch
@@ -45,13 +55,23 @@ release:
 		|| { echo "error: gh is not installed"; exit 1; }
 	@gh auth status >/dev/null 2>&1 \
 		|| { echo "error: gh is not authenticated; run 'gh auth login'"; exit 1; }
+	@# The gate. Release only a commit `ci.yml` has already passed — which also
+	@# means HEAD is pushed, since a run cannot exist for a commit GitHub has
+	@# never seen. `--commit` takes the full SHA.
+	@sha=$$(git rev-parse HEAD); \
+	concl=$$(gh run list --workflow=ci.yml --commit=$$sha --limit=1 \
+		--json conclusion --jq '.[0].conclusion' 2>/dev/null); \
+	test "$$concl" = "success" || { \
+		echo "error: ci.yml has not passed on HEAD ($${sha:0:12}): $${concl:-no run found}"; \
+		echo "hint:  push and let CI finish, then re-run. To exercise the publish"; \
+		echo "       path without releasing: gh workflow run release.yml"; \
+		exit 1; }
 	@# npm has no unpublish story worth relying on, so refuse a version that is
 	@# already on the registry rather than discovering it in the workflow.
 	@! npm view d1zzle@$(NEXT) version >/dev/null 2>&1 \
 		|| { echo "error: d1zzle@$(NEXT) is already published"; exit 1; }
 	@echo "==> releasing $(CURRENT) -> $(NEXT) ($(BUMP))"
 	npm run version:set $(NEXT)
-	npm run check
 	git commit -am "Release $(NEXT)"
 	git push
 	gh release create v$(NEXT) --generate-notes --title "v$(NEXT)"
