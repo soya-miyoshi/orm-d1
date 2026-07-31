@@ -9,7 +9,8 @@ After the feature iteration (`15f24ef`): **green, 594 passed / 4 skipped**.
 After the efficiency + bugs iteration (`516dbd5`): **green, 616 passed / 4 skipped**.
 After the security iteration (`60ff73f`): **green, 644 passed / 4 skipped**.
 After the iteration-4 feature pass (`91de9e1`): **green, 659 passed / 4 skipped**.
-After the iteration-5 efficiency + bugs pass (`efe70a4`): **green, 677 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
+After the iteration-5 efficiency + bugs pass (`efe70a4`): **green, 677 passed / 4 skipped**.
+After the iteration-6 security pass (`37db699`): **green, 702 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
 
 ## Rotation
 
@@ -17,8 +18,12 @@ One lens per iteration, rotating `feature` → `efficiency + bugs` → `security
 Advanced in every terminal case, including blocked and nothing-found, so a lens that keeps
 failing cannot starve the other two.
 
-- Next lens: **security**
-- Last ran: efficiency + bugs — 2026-07-30, merged `efe70a4` **over an unresolved round-2
+- Next lens: **feature**
+- Last ran: security — 2026-07-31, merged `37db699` — **approved at round 2**, the first
+  approval in six iterations. Small, surgical batch: two findings, both closed. The three
+  items recorded from it (`[F-077]`, `[F-078]`, `[F-079]`) are pre-existing incompleteness
+  the reviewer explicitly stated this diff did not open.
+- Ran before that: efficiency + bugs — 2026-07-30, merged `efe70a4` **over an unresolved round-2
   rejection** — the fifth in a row. Two clean closes (`[F-062]`, `[F-063]`), two partial
   (`[F-060]`, `[F-061]`). Open from it: `[F-068]` (a regression vs `main` — an expression
   index with a modifier can never converge), `[F-069]`, `[F-070]`, `[F-071]`, `[F-072]`.
@@ -640,7 +645,7 @@ unparseable DDL and interpolate an unescaped collation name.
 
 ## Findings — security lens (iteration 6)
 
-### [F-073] A hand-written integrity trigger is misread as d1zzle's own append-only guard, so the refusal that protects it never fires — status: todo — severity: **high** — area: kit/introspect
+### [F-073] A hand-written integrity trigger is misread as d1zzle's own append-only guard, so the refusal that protects it never fires — status: **done** (`37db699`, verified exhaustively in both directions across ~20 body shapes) — severity: **high** — area: kit/introspect
 - **Where**: `kit/src/core/introspect.ts:325` — `parts.every((s) => /^select\s+raise\s*\(\s*abort\b/.test(s))`
 - **Defect**: the regex is a **prefix** test, so `SELECT RAISE(ABORT, '…') WHERE <cond>` — the standard SQLite idiom for a conditional constraint trigger, and the only one available since trigger bodies have no bare `IF` — matches. The function's own doc comment (lines 303–307) states the opposite invariant: "only an **unconditional** abort counts… reading it as the guard reports a table as protected when it is not."
 - **Both consumers fail closed in the wrong direction**: `kit/src/core/apply.ts:100` (`introspect`'s `foreignTriggers` out-param) `continue`s on a "guard" so it is never recorded as foreign; `kit/src/core/apply.ts:307` (`checkForeignTriggerConflicts`, the last line of defence on the `migrate` path) does the same; and `introspect.ts:334` additionally stamps the table `appendOnly: true`.
@@ -650,7 +655,7 @@ unparseable DDL and interpolate an unescaped collation name.
 - **Fix**: anchor the whole body statement rather than its prefix. `blankLiterals` has already emptied the message string, so no parenthesis or comma can survive inside it: `/^select\s+raise\s*\(\s*abort\s*(?:,[^()]*)?\)$/`. Anything trailing the closing paren now fails the `$` anchor and the trigger is correctly reported as foreign.
 - **Prove it**: extend `kit/test/unit/diff.test.ts:1411` (`does not mistake a conditional validation trigger for the guard`, which already covers `WHEN`, `UPDATE OF`, `CASE` and "does something else as well" but **not** the `WHERE`-filtered form) with the filtered spelling asserting `false`; plus an end-to-end assertion in `kit/test/workers/foreign-schema.test.ts` that creating such a trigger and rebuilding the table makes `diffSnapshots` produce an error and `checkForeignTriggerConflicts` throw.
 
-### [F-074] Two unnamed expression indexes on one table collide on their derived name; the snapshot keeps only the last — status: todo — severity: **high** — area: kit/snapshot
+### [F-074] Two unnamed expression indexes on one table collide on their derived name; the snapshot keeps only the last — status: **done** (`37db699`, refusal only — the `indexName` rename remains open; see also `[F-077]`, `[F-078]`) — severity: **high** — area: kit/snapshot
 - **Where**: `src/schema/constraints.ts:145` renders every expression member as the literal string `expr`; `kit/src/core/snapshot.ts:258` then keys the snapshot's index map by that name, so the second declaration overwrites the first.
 - **Failure scenario** — the textbook case-insensitive-uniqueness pair: `uniqueIndex().on(sql\`lower(${t.email})\`)` and `uniqueIndex().on(sql\`lower(${t.username})\`)` on one table. `createSchema()` emits two statements both named `"users_expr_unique"`; the snapshot has **one** index; the generated migration creates only `lower("username")`. Case-insensitive uniqueness on `email` is gone, with no error and no warning.
 - **Why nothing catches it**: the two artifacts `generate` writes are self-consistent (one index in the snapshot, one in the SQL), so `check` compares the live DB against a snapshot that shares the bug, and `verify` replays the migration into a scratch DB and diffs it against the *same* `snapshotFromSchema` — both sides missing the constraint — and reports a match. CI stays green while two accounts register `Alice@x.com` and `alice@x.com`. **This is the exact shape of the failure the project exists to prevent.**
@@ -668,6 +673,44 @@ unparseable DDL and interpolate an unescaped collation name.
 - **Where**: `src/relations/filter.ts:428-432`
 - **Defect**: an unknown key in the object DSL throws a message enumerating every column and relation name of the table. The documented Pothos use case passes a user-controlled `where` straight in, and GraphQL servers commonly return `error.message` to the client, so `{ where: { zzz: 1 } }` returns the full column list of the backing table.
 - **Fails closed** (it throws), and the message is genuinely good for development — a hardening question rather than a defect. Worth a `__DEV__` gate on the enumeration.
+
+## Iteration 6 — **approved** and merged (`37db699`)
+
+The first round-2 approval in six iterations. The reviewer reproduced everything both
+commits claim and stated explicitly that **none of the three findings below is a hole opened
+by this diff** — `[F-077]` and `[F-078]` are pre-existing incompleteness the commit's own
+stated invariant does not reach, and `[F-079]` is residual narrowness in new code whose
+failure mode is a loud atomic rollback. They are recorded as ordinary `todo`s, not as
+objections merged over.
+
+Also confirmed by the reviewer, worth keeping: the `Object.create(null)` widening is
+downstream-safe — every consumer of the five constraint maps uses `Object.values`/`entries`/
+`keys` except two bracket reads in `diffIndexes`; there is no `hasOwnProperty`, `in`,
+`toStrictEqual`, `Object.assign`, `for…in` or `structuredClone` on them anywhere in
+`kit/src`; `JSON.stringify` → `parse` → re-stringify is byte-identical and `__proto__`
+survives as an own key, so the stored snapshot round-trips; and `check`/`verify` compare
+introspected-vs-stored (plain-vs-plain), so no null-prototype object reaches a deep-equal.
+
+### [F-077] The prototype-key fix is one-sided — `generate` and `push` still die on a constraint named `constructor` — status: todo — severity: high — area: kit/diff
+- **Where**: `kit/src/core/diff.ts:745` (and the mirror read at `:739`, which *is* fixed)
+- **Defect**: `snapshotFromSchema` now builds null-prototype maps, but the `before` side of every diff is a plain object — `JSON.parse` of the stored snapshot for `generate` (`kit/src/node/commands.ts:111`), `introspect()` for `push` (`:212`). `diffIndexes`'s second loop reads `before.indexes[name]`, which for a prototype key resolves to the *inherited* function.
+- **Failure scenario**: an existing `users` table gains `uniqueIndex('constructor').on(t.a)` — or any `toString`/`valueOf`/`hasOwnProperty` name that `pull` copied off a foreign database. `before.indexes['constructor']` is `Object`, which is truthy, so `canonicalIndex(Object)` dereferences `Object.columns`: `TypeError: Cannot read properties of undefined (reading 'map') at canonicalIndex (diff.ts:710) at diffIndexes (diff.ts:746)`. `generate` and `push` both exit with a bare `TypeError` and no mention of the index. Confirmed against a real `snapshotFromIntrospection` result and a JSON-round-tripped snapshot.
+- **Not a regression** — `main` crashed in both directions — but the fix stops one line short, and the add direction is the common one.
+- **Fix**: `Object.hasOwn(before.indexes, name) ? … : undefined` at both sites.
+
+### [F-078] The `__proto__` silent-drop is left in the two maps directly above the comment that describes it — status: todo — severity: high — area: kit/snapshot
+- **Where**: `kit/src/core/snapshot.ts:235` (`const result: Record<string, TableSnapshot> = {}`) and `:239` (`const columns: Record<string, ColumnSnapshot> = {}`), plus every map in `kit/src/core/introspect.ts` (330, 344, 357, 371, 372, 454)
+- **Defect**: the comment added at `snapshot.ts:244-253` argues that a constraint name is "attacker- or DB-controlled text" and that `map['__proto__'] = v` "silently sets the object's prototype instead of adding an entry, dropping the constraint with no error at all". That is equally true of the table and column maps left as plain literals immediately above it.
+- **Failure scenario A — a column disappears between the two emitters**: `createTable()` emits `create table "prefs" ("id" integer primary key not null, "__proto__" text not null)` while `generate()` emits `create table "prefs" ("id" integer primary key not null);`. A `NOT NULL` column present in `createSchema()`'s output is absent from the migration and from the snapshot, so nothing ever diffs it back.
+- **Failure scenario B — the flagship `docs/09` shape, via `pull`**: given a live `create unique index "__proto__" on users(email)`, `snapshotFromIntrospection` produces `Object.keys(tables.users.indexes) === []`. The index is invisible to every `Object.values` consumer, so `pull` writes a schema module without it, and the next rebuild of `users` re-creates the table from `Object.values(after.indexes)` and drops the UNIQUE constraint permanently — with `check` green throughout, because both sides share the blindness.
+- **Pre-existing**, but it is the flagship bug class, it sits inside the function this commit edits, and it is exactly the reasoning this commit wrote down.
+
+### [F-079] The guard-collision refusal is narrower than SQLite's trigger namespace — status: todo — severity: low — area: kit/diff
+- **Where**: `kit/src/core/diff.ts:617-619`
+- **Defect**: `foreignTriggersForTable.includes(guardName)` is keyed per table and compared case-sensitively, but SQLite trigger names are **database-global and case-insensitive**. Verified with `node:sqlite`: `create trigger "events_no_update" … on "audit"` succeeds, and a second `… on "events"` then fails with `trigger "events_no_update" already exists`.
+- **Failure scenario**: a hand-written trigger named `events_no_update` attached to `audit` — or a d1zzle guard left behind on a table renamed outside the kit, which keeps its name — then `events` gains `appendOnly: true`. `diffSnapshots` finds nothing under `foreignTriggers['events']` and emits the `create trigger` with `errors: []`, which fails on apply with precisely the "already exists" error this refusal exists to prevent. Same for a live `EVENTS_NO_UPDATE`.
+- **Fix**: the complete data is already in `options.foreignTriggers` — flattening its values covers it. Note the check guards only the in-place transition: the created-table path (`diff.ts:397`) and the rebuild path (`diff.ts:320`) emit `appendOnlyTrigger()` with no check at all.
+- **Low severity**: the batch is atomic, so this is a loud rollback rather than data loss, and it is the same outcome as before the fix.
 
 ## Audit areas
 
