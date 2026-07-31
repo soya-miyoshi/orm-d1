@@ -549,6 +549,10 @@ The design is written down in [`docs/`](./docs/README.md) — start with
 [01-principles](./docs/01-principles.md), then [02-d1-platform](./docs/02-d1-platform.md),
 which is where most of the non-obvious decisions come from.
 
+[11-security](./docs/11-security.md) is the one to read before wiring d1zzle to untrusted
+input: what the compiler guarantees, which three APIs opt out of it, and why the relational
+`where` is a query language rather than an input format.
+
 ## Development
 
 ```bash

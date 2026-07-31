@@ -1,9 +1,9 @@
 /**
  * The object filter DSL's field resolution.
  *
- * `docs/06` documents `where` as something you can hand straight from a JSON
- * body — it is the shape Pothos passes through — so "which keys resolve to a
- * column" is a trust boundary, not an ergonomic detail. The unknown-field
+ * `docs/11` documents `where` as something callers will hand straight from a
+ * JSON body — it is the shape Pothos passes through — so "which keys resolve to
+ * a column" is a trust boundary, not an ergonomic detail. The unknown-field
  * refusal is the only thing standing between a caller-supplied key and the
  * compiler, and a plain `columns[key]` read walks the prototype chain right
  * past it.

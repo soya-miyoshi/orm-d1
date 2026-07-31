@@ -417,11 +417,12 @@ export function compileFilter(
 		// `columns['constructor']` resolves to `Object` — truthy — and the
 		// unknown-field refusal below never runs. The filter then compiled to
 		// `? = ?` with a function in the parameter list, which `.bind()` rejects
-		// at run time. This DSL is documented as taking a `where` straight from
-		// JSON (and `JSON.parse` makes `__proto__` an *own* key, so
-		// `Object.entries` yields it), which makes every prototype member a
-		// spelling that turns a clean 400 into an unhandled 500. Same trap as
-		// `plan/params.ts` and `runtime/database.ts`.
+		// at run time. Callers hand this DSL a `where` straight from JSON (and
+		// `JSON.parse` makes `__proto__` an *own* key, so `Object.entries`
+		// yields it), which makes every prototype member a spelling that turns a
+		// clean 400 into an unhandled 500 — see `docs/11` for the boundary this
+		// sits on. Same trap as `plan/params.ts`, `plan/compile.ts`'s
+		// `writeAssignments`, `relations/query.ts` and `runtime/database.ts`.
 		if (Object.hasOwn(columns, key)) {
 			parts.push(compileColumnFilter(columns[key]!, value));
 			continue;

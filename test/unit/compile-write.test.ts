@@ -224,6 +224,48 @@ describe('update compilation', () => {
 	it('rejects an unknown column', () => {
 		expect(() => query.update(posts).set({ nope: 1 } as never).compile()).toThrow(CompileError);
 	});
+
+	/**
+	 * `set()` takes an object that routinely comes straight from a request body,
+	 * so "which keys resolve to a column" is a trust boundary — see `docs/11`.
+	 * A plain `columns[field]` read walks the prototype chain right past the
+	 * unknown-column refusal above.
+	 */
+	describe('prototype keys in set()', () => {
+		it.each(['constructor', 'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf'])(
+			'refuses "%s" instead of resolving it off the prototype',
+			(key) => {
+				expect(() => query.update(posts).set({ [key]: 1 } as never).compile())
+					.toThrow(/Unknown column/);
+			},
+		);
+
+		/**
+		 * The refusal has to be *ours*. Before the fix this did throw — but with
+		 * a `TypeError` from `valueChunk` reading `.config` off `Object`, after
+		 * the assignment had already rendered as `"Object" = ?` (`Object.name`
+		 * is the string `"Object"`). A caller cannot tell that apart from a
+		 * d1zzle crash, and `instanceof CompileError` is what an app branches on
+		 * to turn a bad request into a 400.
+		 */
+		it('refuses with a CompileError, not an internal TypeError', () => {
+			expect(() => query.update(posts).set({ constructor: 1 } as never).compile())
+				.toThrow(CompileError);
+		});
+
+		it('JSON.parse makes __proto__ an own key, and it is still refused', () => {
+			const patch = JSON.parse('{"__proto__": 1}');
+			expect(Object.hasOwn(patch, '__proto__')).toBe(true);
+			expect(() => query.update(posts).set(patch).compile()).toThrow(/Unknown column/);
+		});
+
+		it('still writes a real column that shadows a prototype name', () => {
+			// `hasOwn` is about where the key lives, not what it is spelled.
+			const shadow = sqliteTable('shadow', { constructor: text('constructor') });
+			expect(query.update(shadow).set({ constructor: 'x' }).compile().sql)
+				.toBe('update "shadow" set "constructor" = ?');
+		});
+	});
 });
 
 describe('delete compilation', () => {

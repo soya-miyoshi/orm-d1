@@ -153,6 +153,36 @@ describe('create', () => {
 			adapter.create({ model: 'user', data: { email: 'x@y.z', nickname: 'ada' } as never }),
 		).rejects.toThrow(/nickname[\s\S]*customers/);
 	});
+
+	/**
+	 * A field whose name is an inherited member of `Object.prototype` never
+	 * reaches us: Better Auth's own `getFieldName` resolves it off the chain
+	 * first and throws `Field function Object() { [native code] } not found in
+	 * model user` — its bug, and not one this adapter can intercept, since
+	 * `columnFor` has to call `getFieldName` before it can look anything up.
+	 *
+	 * Pinned as an upstream boundary rather than as our own refusal, because it
+	 * is the reason `columnFor`'s `hasOwn` guard cannot be demonstrated through
+	 * the factory. Asserted loosely — the exact wording is Better Auth's to
+	 * change, and if they fix it our guard is what answers instead.
+	 */
+	it('cannot reach our field check for a prototype-shadowing name (upstream throws first)', async () => {
+		const adapter = d1zzleAdapter(db, { schema: { user, session, account, verification } })({
+			...options,
+			user: {
+				fields: { image: 'avatarUrl' },
+				// `as const`: a property literally named `constructor` defeats the
+				// contextual typing that widens `'string'` to `DBFieldType` for
+				// every other key — the same prototype collision this test is about,
+				// showing up in the type system rather than at run time.
+				additionalFields: { constructor: { type: 'string' as const, required: false } },
+			},
+		} satisfies BetterAuthOptions);
+
+		await expect(
+			adapter.create({ model: 'user', data: { email: 'x@y.z', constructor: 'ada' } as never }),
+		).rejects.toThrow();
+	});
 });
 
 describe('findOne', () => {
