@@ -63,7 +63,12 @@ and the kit's type check.
 ## What is not built
 
 - Views, CTEs, window functions, set operations (`union` / `intersect` / `except`).
-- Zod / Valibot / ArkType adapters — the Drizzle ones work via `asDrizzleSchema()`.
+- Zod / Valibot / ArkType adapters — the Drizzle ones are *believed* to work via
+  `asDrizzleSchema()`, but no test imports them, so that is a survey rather than a result.
+  [10](./10-ecosystem-interop.md#p1--validator-adapters-test-only) has the plan.
+- An Auth.js / NextAuth adapter. `@auth/drizzle-adapter` drives Drizzle's query builder, so
+  the bridge cannot serve it and a native adapter is needed, the same way Better Auth got
+  one. Scoped in [10](./10-ecosystem-interop.md#p2--authjs--nextauth-a-native-adapter).
 - A native studio (see [09](./09-d1zzle-migrate.md#studio)).
 - Importing an existing `drizzle-kit` snapshot history. `pull` produces a baseline instead.
 - The benchmark harness from M1: bundle-size, cold-start and instantiation-count budgets are
@@ -207,6 +212,10 @@ baseline reset, and `check` catches a manual `wrangler d1 execute` ALTER.
 - Views, CTEs, window functions, set operations (`union` / `intersect` / `except`).
 - Zod / Valibot / ArkType schema adapters.
 - Custom column types beyond `$type<T>()`.
+- The rest of the adapter ecosystem, surveyed and prioritised in
+  [10](./10-ecosystem-interop.md#the-rest-of-the-ecosystem). Several entries there are
+  **declined** rather than deferred — an adapter that only runs in a Node process is not a
+  gap in a Workers-only ORM.
 
 ## Open questions
 
