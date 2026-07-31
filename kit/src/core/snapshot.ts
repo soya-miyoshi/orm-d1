@@ -241,11 +241,21 @@ export function snapshotFromSchema(
 			columns[column.name] = columnSnapshot(column);
 		}
 
-		const indexes: Record<string, IndexSnapshot> = {};
-		const foreignKeys: Record<string, ForeignKeySnapshot> = {};
-		const compositePrimaryKeys: Record<string, { name: string; columns: readonly string[] }> = {};
-		const uniqueConstraints: Record<string, { name: string; columns: readonly string[] }> = {};
-		const checkConstraints: Record<string, { name: string; value: string }> = {};
+		// `Object.create(null)`, not `{}`: a constraint's derived or explicit name
+		// is attacker- or DB-controlled text (`pull` on a foreign database emits
+		// whatever names it finds), and a plain object literal treats a name like
+		// `constructor` or `__proto__` specially — the former reads back an
+		// inherited function instead of `undefined`, so the collision check below
+		// would misfire on a name that was never actually used, and the latter
+		// silently sets the object's prototype instead of adding an entry,
+		// dropping the constraint with no error at all. A null-prototype object
+		// has no inherited keys and no `__proto__` accessor, so every name is
+		// just data.
+		const indexes: Record<string, IndexSnapshot> = Object.create(null);
+		const foreignKeys: Record<string, ForeignKeySnapshot> = Object.create(null);
+		const compositePrimaryKeys: Record<string, { name: string; columns: readonly string[] }> = Object.create(null);
+		const uniqueConstraints: Record<string, { name: string; columns: readonly string[] }> = Object.create(null);
+		const checkConstraints: Record<string, { name: string; value: string }> = Object.create(null);
 
 		for (const extra of getTableExtras(t)) {
 			switch (extra.kind) {
@@ -255,6 +265,17 @@ export function snapshotFromSchema(
 					const statement = createIndex(extra.meta, name);
 					const indexName = statement.match(/index (?:if not exists )?"((?:[^"]|"")+)"/)?.[1]
 						?.replaceAll('""', '"') ?? '';
+					if (Object.hasOwn(indexes, indexName)) {
+						const columns = extra.meta.columns.map((c) =>
+							isColumn(c) ? c.name : renderInline(c as never)
+						).join(', ');
+						throw new Error(
+							`"${name}" declares two indexes that both derive the name "${indexName}" `
+								+ `(the second is on "${columns}"). `
+								+ 'Give at least one an explicit name — an unnamed expression index is named "expr" '
+								+ 'whatever the expression is, so the second would silently replace the first.',
+						);
+					}
 					indexes[indexName] = {
 						name: indexName,
 						columns: extra.meta.columns.map((c) =>
@@ -269,6 +290,14 @@ export function snapshotFromSchema(
 				}
 				case 'primaryKey': {
 					const pkName = extra.meta.name ?? `${name}_pk`;
+					if (Object.hasOwn(compositePrimaryKeys, pkName)) {
+						const columns = extra.meta.columns.map((c) => c.name).join(', ');
+						throw new Error(
+							`"${name}" declares two primary keys that both derive the name "${pkName}" `
+								+ `(the second is on "${columns}"). `
+								+ 'Give at least one an explicit name.',
+						);
+					}
 					compositePrimaryKeys[pkName] = {
 						name: pkName,
 						columns: extra.meta.columns.map((c) => c.name),
@@ -277,6 +306,14 @@ export function snapshotFromSchema(
 				}
 				case 'unique': {
 					const uqName = uniqueConstraintName(extra.meta, name);
+					if (Object.hasOwn(uniqueConstraints, uqName)) {
+						const columns = extra.meta.columns.map((c) => c.name).join(', ');
+						throw new Error(
+							`"${name}" declares two unique constraints that both derive the name "${uqName}" `
+								+ `(the second is on "${columns}"). `
+								+ 'Give at least one an explicit name.',
+						);
+					}
 					uniqueConstraints[uqName] = { name: uqName, columns: extra.meta.columns.map((c) => c.name) };
 					break;
 				}
@@ -286,6 +323,14 @@ export function snapshotFromSchema(
 					// DDL's — or that omits the columns, as this one did — loses a
 					// constraint to a collision between two unnamed keys.
 					const fkName = foreignKeyName(extra.meta, name);
+					if (Object.hasOwn(foreignKeys, fkName)) {
+						const columns = extra.meta.columns.map((c) => c.name).join(', ');
+						throw new Error(
+							`"${name}" declares two foreign keys that both derive the name "${fkName}" `
+								+ `(the second is on "${columns}"). `
+								+ 'Give at least one an explicit name.',
+						);
+					}
 					foreignKeys[fkName] = {
 						name: fkName,
 						columns: extra.meta.columns.map((c) => c.name),
@@ -297,6 +342,14 @@ export function snapshotFromSchema(
 					break;
 				}
 				case 'check': {
+					if (Object.hasOwn(checkConstraints, extra.meta.name)) {
+						const value = renderInline(extra.meta.value);
+						throw new Error(
+							`"${name}" declares two check constraints both named "${extra.meta.name}" `
+								+ `(the second is "${value}"). `
+								+ 'Rename one — check() requires an explicit name, so both already have one.',
+						);
+					}
 					checkConstraints[extra.meta.name] = {
 						name: extra.meta.name,
 						value: renderInline(extra.meta.value),

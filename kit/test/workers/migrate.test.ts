@@ -7,7 +7,7 @@
  * seeded before a migration survives it.
  */
 import { env } from 'cloudflare:test';
-import { createSchema } from 'd1zzle/ddl';
+import { createSchema, tableOptions } from 'd1zzle/ddl';
 import { integer, real, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { applyMigrations, appliedMigrations, checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
@@ -407,6 +407,45 @@ describe('a rename in the same migration cannot bypass the foreign-trigger refus
 			"select name from sqlite_master where type = 'trigger' and name = 'orders_audit'",
 		);
 		expect(triggers).toHaveLength(1);
+	});
+});
+
+describe('an in-place append-only guard creation refuses to collide with a foreign trigger (gap 2)', () => {
+	it('errors naming the foreign trigger instead of emitting an unappliable create trigger', async () => {
+		const before = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: integer('balance') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+
+		// A hand-written trigger that happens to be named exactly what the
+		// `appendOnly` guard would be named, but is conditional (`WHEN`) — the
+		// anchoring's whole point is that this is NOT mistaken for the guard
+		// itself, so introspection correctly classifies it as foreign.
+		await DB.prepare(
+			'create trigger "accounts_no_update" before update on "accounts" '
+				+ 'when new.balance < old.balance '
+				+ "begin select raise(abort, 'balance may not decrease'); end",
+		).run();
+
+		// The schema now asks for `appendOnly: true` on the same table — a
+		// live `false -> true` transition, which fires an in-place `create
+		// trigger` rather than a rebuild.
+		const after = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: integer('balance') });
+
+		const foreignTriggers: Record<string, string[]> = {};
+		const live = await introspect(runner, foreignTriggers);
+		const diff = diffSnapshots(
+			live,
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: true }]])),
+			{ foreignTriggers },
+		);
+
+		expect(diff.errors).toHaveLength(1);
+		expect(diff.errors[0]).toMatch(/"accounts_no_update"/);
+		expect(diff.statements.some((s) => /create trigger "accounts_no_update"/.test(s.sql))).toBe(false);
+
+		// Nothing applied: the foreign trigger, and its behavior, are untouched.
+		await DB.prepare(`insert into accounts (id, balance) values (1, 10)`).run();
+		await expect(DB.prepare(`update accounts set balance = 5 where id = 1`).run())
+			.rejects.toThrow(/balance may not decrease/);
 	});
 });
 
