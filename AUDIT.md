@@ -10,7 +10,8 @@ After the efficiency + bugs iteration (`516dbd5`): **green, 616 passed / 4 skipp
 After the security iteration (`60ff73f`): **green, 644 passed / 4 skipped**.
 After the iteration-4 feature pass (`91de9e1`): **green, 659 passed / 4 skipped**.
 After the iteration-5 efficiency + bugs pass (`efe70a4`): **green, 677 passed / 4 skipped**.
-After the iteration-6 security pass (`37db699`): **green, 702 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
+After the iteration-6 security pass (`37db699`): **green, 702 passed / 4 skipped**.
+After the iteration-7 feature pass (`5051bc7`): **green, 718 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
 
 ## Rotation
 
@@ -18,8 +19,11 @@ One lens per iteration, rotating `feature` → `efficiency + bugs` → `security
 Advanced in every terminal case, including blocked and nothing-found, so a lens that keeps
 failing cannot starve the other two.
 
-- Next lens: **feature**
-- Last ran: security — 2026-07-31, merged `37db699` — **approved at round 2**, the first
+- Next lens: **efficiency + bugs**
+- Last ran: feature — 2026-07-31, merged `5051bc7` — **approved at round 2**, the second
+  approval in a row. Three findings in one file, all closed. `[F-082]` (widening
+  `db.run`/`all`/`get`) was parked as an API-surface question rather than batched.
+- Ran before that: security — 2026-07-31, merged `37db699` — **approved at round 2**, the first
   approval in six iterations. Small, surgical batch: two findings, both closed. The three
   items recorded from it (`[F-077]`, `[F-078]`, `[F-079]`) are pre-existing incompleteness
   the reviewer explicitly stated this diff did not open.
@@ -714,7 +718,7 @@ introspected-vs-stored (plain-vs-plain), so no null-prototype object reaches a d
 
 ## Findings — feature lens (iteration 7)
 
-### [F-080] `sql` binds an interpolated `undefined` instead of eliding it — status: todo — severity: **high** — area: sql — COMPAT-DEFECT
+### [F-080] `sql` binds an interpolated `undefined` instead of eliding it — status: **done** (`5051bc7`, byte-identical to Drizzle across 35 A/B inputs) — severity: **high** — area: sql — COMPAT-DEFECT
 - **Where**: `src/sql/sql.ts:201-204` (the `else` branch of `SQL.toQuery`)
 - **Defect**: Drizzle's `buildQueryFromSourceParams` has an explicit `if (chunk === undefined) return { sql: "", params: [] }` (`drizzle-orm/sql/sql.js:96`); d1zzle has no such branch, so an `undefined` hole becomes a bound parameter slot. Not an exotic input — it is the *designed* output of `and()`/`or()` over all-undefined operands and of Drizzle's `SQL.if()`, both of which exist to be interpolated conditionally.
 - **Failure scenario (query)**: `` sql`select 1 where ${and(maybeA, maybeB)}` `` with both filters absent gives Drizzle `{"sql":"select 1 where ","params":[]}` and d1zzle `{"sql":"select 1 where ?","params":[undefined]}`. The parameter reaches `D1PreparedStatement.bind(undefined)`.
@@ -722,7 +726,7 @@ introspected-vs-stored (plain-vs-plain), so no null-prototype object reaches a d
 - **Fix**: one line, before the `isSQLChunk` test — `if (value === undefined) continue;`.
 - **Prove it**: `render(sql\`select 1 where ${and(undefined, undefined)}\`)` → `{ sql: 'select 1 where ', params: [] }`; plus a `test/unit/ddl.test.ts` case asserting `check('c', sql\`${col} >= ${undefined}\`)` does **not** render `>= null`.
 
-### [F-081] `sql` does not expand an interpolated array into `(?, ?, ?)` — status: todo — severity: **high** — area: sql — COMPAT-DEFECT
+### [F-081] `sql` does not expand an interpolated array into `(?, ?, ?)` — status: **done** (`5051bc7`, recursive dispatch — but see `[F-087]`, `[F-089]`) — severity: **high** — area: sql — COMPAT-DEFECT
 - **Where**: `src/sql/sql.ts:201-204` (same branch)
 - **Defect**: Drizzle's renderer has a dedicated array case (`drizzle-orm/sql/sql.js:100-108`) emitting `(`, the elements separated by `, `, `)`. It is the mechanism Drizzle's own `inArray`/`notInArray` are built on (`conditions.js:150`), and therefore how ported user code spells a literal list. d1zzle binds the whole array to one slot.
 - **Failure scenario**: `` db.select().from(users).where(sql`${users.id} in ${ids}`) `` with `ids = [1,2,3]` gives Drizzle `id in (?, ?, ?)` / `[1,2,3]` and d1zzle `id in ?` / `[[1,2,3]]` → `D1zzleQueryError: near "?": syntax error` (on D1, `D1_TYPE_ERROR: Type 'object' not supported` fires first). This also reaches the `orderBy`/`extras` callbacks in `db.query`, whose operator bag *is* the d1zzle `sql` tag (`src/relations/query.ts:63-75`) — the exact spelling Pothos' drizzle plugin documents.
@@ -737,7 +741,7 @@ introspected-vs-stored (plain-vs-plain), so no null-prototype object reaches a d
 - **Why parked**: the fix widens three published method signatures to `CompiledQuery<TRow> | SQLChunk | string`, which is a change to the published API surface the sweep may not make. d1zzle's compiled-query contract for these names is documented at `docs/03-architecture.md:184`, so it is a widening rather than a redefinition — a `CompiledQuery` is distinguishable by `Array.isArray(q.parts)`.
 - **Question for the human**: widen the three signatures (matching Drizzle, and the reviewer sketched the guard), or keep the compiled-query-only contract and merely **throw with a message naming `db.execute()`** instead of letting a `TypeError` escape? The second is small and does not touch the signature.
 
-### [F-083] `sql.join`'s default separator is `', '`; Drizzle's is none — status: todo — severity: med — area: sql — COMPAT-DEFECT
+### [F-083] `sql.join`'s default separator is `', '`; Drizzle's is none — status: **done** (`5051bc7`, all ten call sites verified — see `[F-088]`) — severity: med — area: sql — COMPAT-DEFECT
 - **Where**: `src/sql/sql.ts:237`
 - **Defect**: Drizzle's `sql.join(chunks, separator)` inserts a separator only `if (i > 0 && separator !== void 0)` (`drizzle-orm/sql/sql.js:335-341`) — the no-argument form concatenates. d1zzle's inserts commas.
 - **Failure scenario (forward)**: the standard chunk-assembly idiom gives Drizzle `select * from "users" where "id" = 1` and d1zzle `select * from "users",  where "id" = 1`.
@@ -761,6 +765,40 @@ Only items not already on the recorded list:
 ### [F-086] `logger` is accepted and ignored — status: todo — severity: low — area: runtime — OFF-LENS from feature
 - **Where**: `src/runtime/database.ts:59`
 - **Defect**: `logger: true` is the single most common Drizzle debugging switch; silently discarding it means a user who sets it concludes no queries are running. `docs/08`'s Tier 2 says such options should carry a `__DEV__` warning; this one does not.
+
+## Iteration 7 — **approved** and merged (`5051bc7`)
+
+Second consecutive round-2 approval. The reviewer A/B'd 35 inputs against
+`drizzle-orm@1.0.0-rc.4` and confirmed every one byte-identical in both `sql` and `params`,
+verified the DDL claims against real SQLite, and re-measured the bundle from `git archive`
+exports of each ref. Net cost of the whole batch vs `main`: **+101 bytes** on `src/core.ts`
+and `src/index.ts`, +96 on `src/relations/index.ts`.
+
+Worth keeping from the verification: recursion depth throws at the same order of magnitude in
+both implementations (depth 10 000 → `RangeError` in each; a self-referential array likewise),
+and d1zzle is strictly better on the reverse case — it recurses per nesting *level* but
+iterates over elements, so a 200 000-element flat array renders where Drizzle's per-level
+spread throws. `check ("role" in ('admin', , 'member'))` and `check ("score" >= )` are both
+rejected loudly by SQLite (`near ",": syntax error`, `near ")": syntax error`), so the DDL hole
+is closed rather than moved. No injection on the newly-reachable inline path: a value
+containing `'); drop table …` renders as one properly-doubled literal.
+
+### [F-087] An *empty* interpolated array in a DDL predicate renders `()`, which SQLite accepts — status: todo — severity: med — area: sql/ddl
+- **Where**: `src/sql/sql.ts:198-204` (the array branch) + `src/ddl.ts:187` (`renderInline`)
+- **Defect**: the one place in the batch where a loud failure became a silent one, and it lands in bug class #1. Verified on SQLite 3.53.1 through both trees: `main` emitted `check ("role" not in '')` → **rejected**, `subqueries prohibited in CHECK constraints`; HEAD emits `check ("role" not in ())` → **accepted**, and admitted a row. Same for a partial index: `where "role" in ''` was rejected, `where "role" in ()` is accepted and the "unique" index then admits a duplicate.
+- **Failure scenario**: `check('role_ok', sql\`${c.role} not in ${ROLES}\`)` where `ROLES` is a config array that happens to be empty. `x NOT IN ()` is unconditionally true and `x IN ()` unconditionally false, so the CHECK is permanently inert and the partial unique index covers zero rows — and both are self-consistent, so introspection reads them back verbatim and `check`/`push` converge forever.
+- **Why it was not grounds for rejection**: `drizzle-orm` renders the identical `()` for an empty array (confirmed), so diverging here would break the `docs/08` reverse-alias invariant. The pre-fix behaviour was not safe, it was accidentally-loud garbage (`in ''`). The non-empty case — the common one — went from broken-and-loud to correct.
+- **Likely shape of a fix**: a `__DEV__` warning when an empty array is interpolated into a DDL context, rather than a rendering divergence.
+
+### [F-088] `sql.join`'s changed default needs a release note — status: needs-human — severity: low — area: release
+- `SQLTag.join`'s declared type is untouched (`separator?:` was already optional); only the runtime default changed, from `', '` to none. An existing d1zzle-native caller writing `sql.join(parts)` now gets `select a b from t` where it used to get `select a, b from t` — SQL that parses and returns one aliased column, with no type error and no deprecation. Correct under `docs/08` and `sql.join` is undocumented in `README.md`/`docs/`, so it is a release-note item rather than a defect. It is now reachable by user code through `callableOperators` (`src/relations/query.ts:75`), which is exactly where Drizzle parity matters.
+
+### [F-089] A hand-written `sql\`${col} in ${ids}\`` has no `json_each` fallback — status: todo — severity: low — area: sql
+- With 200 ids it now compiles cleanly to 200 `?` and fails at D1 with `too many SQL variables`. The budget guard lives in `InArray` (`src/sql/expressions.ts:155`), which a hand-written fragment does not go through. On `main` that expression never worked at all, and Drizzle behaves the same, so `[F-081]` did not open it so much as make it reachable.
+
+### [F-090] Two redundant `not.toContain` guards in the new DDL test — status: todo — severity: low — area: test-integrity
+- **Where**: `test/unit/ddl.test.ts:99`
+- The exact assertion `expect(ddl).toContain('check ("role" in (\'admin\', , \'member\'))')` carries the weight and is correct. The two `not.toContain` guards beside it are redundant, and `not.toContain('null, ')` is not load-bearing: the DDL *does* contain `"role" text not null` immediately before the constraint, and the assertion passes only because `createTable` joins members with `,\n\t` rather than `, `. It would fail spuriously if the DDL formatter ever emitted single-line output.
 
 ## Audit areas
 
