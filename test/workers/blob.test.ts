@@ -66,3 +66,45 @@ describe('blob columns', () => {
 		expect(row!.big).toBe(9007199254740993n);
 	});
 });
+
+/**
+ * A blob **default**, against real SQLite.
+ *
+ * The unit test asserts the DDL text; this asserts what the database actually
+ * stores, which is the claim that matters. The old rendering
+ * (`default '222,173,190,239'`) is *accepted* by SQLite — it is a perfectly
+ * legal text default on a blob-affinity column — so nothing failed loudly. The
+ * row simply came back as a 15-byte ASCII string instead of the 4 bytes the
+ * schema declared, and because `snapshotFromSchema` shares `literal()`, every
+ * generated artifact agreed with every other one.
+ */
+describe('blob defaults against D1', () => {
+	const defaulted = sqliteTable('blob_default', {
+		id: integer('id').primaryKey(),
+		payload: blob('payload', { mode: 'buffer' }).notNull().default(new Uint8Array([0xde, 0xad, 0xbe, 0xef])),
+	});
+
+	beforeEach(async () => {
+		await DB.prepare('drop table if exists "blob_default"').run();
+		for (const statement of createSchema([defaulted])) await DB.prepare(statement).run();
+	});
+
+	it('stores the declared bytes when the column is omitted', async () => {
+		await DB.prepare('insert into "blob_default" ("id") values (1)').run();
+
+		const [row] = await drizzle(DB).select().from(defaulted);
+
+		expect(Array.from(row!.payload)).toEqual([0xde, 0xad, 0xbe, 0xef]);
+		// What the old literal produced: the *text* "222,173,190,239", which is
+		// 15 bytes rather than 4.
+		expect(row!.payload.byteLength).toBe(4);
+	});
+
+	it('reports the blob literal back through introspection', async () => {
+		const [row] = await DB.prepare(
+			`select "dflt_value" as v from pragma_table_info('blob_default') where "name" = 'payload'`,
+		).all<{ v: string }>().then((r) => r.results);
+
+		expect(row!.v.toLowerCase()).toBe(`x'deadbeef'`);
+	});
+});

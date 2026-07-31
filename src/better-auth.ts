@@ -68,13 +68,13 @@ import {
 	inArray,
 	isNotNull,
 	isNull,
-	like,
 	lt,
 	lte,
 	ne,
 	notInArray,
 	or,
 } from './sql/expressions.js';
+import { exceedsBytes, MAX_PATTERN_BYTES } from './limits.js';
 import { count } from './sql/functions.js';
 import type { SQLChunk } from './sql/sql.js';
 import { sql } from './sql/sql.js';
@@ -163,8 +163,58 @@ const lowerEq = (column: Column<any>, value: unknown, negated: boolean): Conditi
 		? sql<boolean>`lower(${column}) <> lower(${value})`
 		: sql<boolean>`lower(${column}) = lower(${value})`;
 
-const lowerLike = (column: Column<any>, pattern: string): Condition =>
-	sql<boolean>`lower(${column}) like lower(${pattern})`;
+/**
+ * Escape the LIKE metacharacters in a *value* before it is wrapped in the
+ * wildcards the operator itself contributes.
+ *
+ * `contains` / `starts_with` / `ends_with` take their value straight from a
+ * caller — the admin plugin's user search is the documented case — and `%` and
+ * `_` are wildcards. Unescaped, `starts_with: '%'` matched every row instead of
+ * none, and `_` matched any single character. The value always *bound*, so this
+ * was never injection; it silently widened the predicate, which for a search
+ * over `user` is the difference between no results and the whole table.
+ *
+ * SQLite has no default escape character, so every site that uses this has to
+ * declare one with `ESCAPE` — see {@link patternCondition}. The backslash is
+ * escaped first, or it would double-escape the sequences added after it.
+ */
+const escapeLikeValue = (value: unknown): string =>
+	String(value).replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
+
+/**
+ * `column like <pattern> escape '\'`.
+ *
+ * Built here rather than through `like()` from `sql/expressions.ts` because
+ * that helper cannot declare an escape character — and neither can Drizzle's,
+ * which is why the Drizzle adapter has the same widening bug.
+ *
+ * The pattern-length check is reproduced rather than inherited for the same
+ * reason. D1 caps a LIKE pattern at 50 bytes and `like()` enforces that by
+ * throwing `CompileError` from deep inside the query builder — an unhandled
+ * throw out of an auth endpoint, naming neither the model nor the field. It is
+ * still a refusal (the limit is D1's, and quietly truncating would answer a
+ * different question), but it is now attributable, and it accounts for escaping
+ * having made the pattern longer than what the caller typed.
+ */
+const patternCondition = (
+	column: Column<any>,
+	w: CleanedWhere,
+	model: string,
+	insensitive: boolean,
+	wrap: (escaped: string) => string,
+): Condition => {
+	const pattern = wrap(escapeLikeValue(w.value));
+	if (exceedsBytes(pattern, MAX_PATTERN_BYTES)) {
+		throw new D1zzleAdapterError(
+			`"${w.operator}" on "${model}"."${column.name}" builds a ${pattern.length}-character LIKE pattern, `
+				+ `past D1's ${MAX_PATTERN_BYTES}-byte limit. Shorten the search term — note that a \`%\` or `
+				+ '`_` in it is escaped, which costs one character each — or match on a narrower field.',
+		);
+	}
+	return insensitive
+		? sql<boolean>`lower(${column}) like lower(${pattern}) escape '\\'`
+		: sql<boolean>`${column} like ${pattern} escape '\\'`;
+};
 
 const lowerIn = (column: Column<any>, values: readonly unknown[], negated: boolean): Condition => {
 	// An empty set is a constant, and `in ()` is a syntax error.
@@ -202,17 +252,11 @@ const toCondition = (column: Column<any>, w: CleanedWhere, model: string): Condi
 				? lowerIn(column, arrayValue(w, model), true)
 				: notInArray(column, arrayValue(w, model));
 		case 'contains':
-			return insensitive
-				? lowerLike(column, `%${String(w.value)}%`)
-				: like(column, `%${String(w.value)}%`);
+			return patternCondition(column, w, model, insensitive, (v) => `%${v}%`);
 		case 'starts_with':
-			return insensitive
-				? lowerLike(column, `${String(w.value)}%`)
-				: like(column, `${String(w.value)}%`);
+			return patternCondition(column, w, model, insensitive, (v) => `${v}%`);
 		case 'ends_with':
-			return insensitive
-				? lowerLike(column, `%${String(w.value)}`)
-				: like(column, `%${String(w.value)}`);
+			return patternCondition(column, w, model, insensitive, (v) => `%${v}`);
 		case 'lt':
 			return lt(column, w.value);
 		case 'lte':

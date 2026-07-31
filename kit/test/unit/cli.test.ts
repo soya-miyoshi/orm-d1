@@ -896,3 +896,43 @@ describe('verify', () => {
 		expect(result.differences.join('\n')).not.toMatch(/failed to apply/);
 	});
 });
+
+/**
+ * `--name` becomes the migration's file name.
+ *
+ * `migrationTag` builds the tag, `writeMigration` joins it onto the output
+ * folder and `readMigration` joins it back — so an unvalidated name is a path,
+ * not a label. `--name ../../../tmp/pwned` produced the tag
+ * `0003_../../../tmp/pwned` and wrote outside the migrations folder entirely.
+ * The name is normally hand-typed, which is why this survived; a CI job
+ * deriving it from a branch or PR title is the case nobody reads.
+ */
+describe('migration name validation', () => {
+	it('accepts the names the tool generates for itself', () => {
+		for (let i = 0; i < 20; i++) {
+			expect(() => migrationTag(i, migrationName(i))).not.toThrow();
+		}
+		expect(migrationTag(3, 'add_users')).toBe('0003_add_users');
+		expect(migrationTag(12, 'add-users-2')).toBe('0012_add-users-2');
+	});
+
+	it.each([
+		['../../../tmp/pwned', 'parent traversal'],
+		['..', 'bare parent'],
+		['a/b', 'forward slash'],
+		['a\\b', 'backslash'],
+		['a.sql', 'a dot, which also reaches `..`'],
+		['has space', 'a space'],
+		['', 'empty'],
+		[String.fromCharCode(0) + 'null', 'a NUL byte'],
+	])('refuses %j (%s)', (name) => {
+		expect(() => migrationTag(0, name)).toThrow(/Invalid migration name/);
+	});
+
+	it('refuses before anything is written, so the tag never reaches a path join', () => {
+		// The tag is what `join(out, `${tag}.sql`)` receives; asserting the throw
+		// rather than a sanitised value is deliberate — silently rewriting a name
+		// the caller chose would put the migration somewhere they did not ask for.
+		expect(() => migrationTag(0, '../escape')).toThrow(/only letters, digits, underscores and hyphens/);
+	});
+});
