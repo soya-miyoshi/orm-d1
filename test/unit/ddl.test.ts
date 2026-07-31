@@ -63,6 +63,28 @@ describe('ddl generation', () => {
 		expect(createTable(t)).toContain('check ("score" >= 0)');
 	});
 
+	it('elides an interpolated undefined instead of binding/inlining it as null', () => {
+		const t = sqliteTable('t', {
+			score: real('score'),
+		}, (c) => [
+			check('t_score_check', sql`${c.score} >= ${undefined}`),
+		]);
+
+		const ddl = createTable(t);
+		expect(ddl).not.toContain('>= null');
+		expect(ddl).toContain('check ("score" >= )');
+	});
+
+	it('expands an interpolated array into a parenthesized list in a check', () => {
+		const t = sqliteTable('t', {
+			role: text('role'),
+		}, (c) => [
+			check('t_role_check', sql`${c.role} in ${['admin', 'member']}`),
+		]);
+
+		expect(createTable(t)).toContain('check ("role" in (\'admin\', \'member\'))');
+	});
+
 	it('renders sql defaults inline and value defaults as literals', () => {
 		const t = sqliteTable('t', {
 			at: integer('at').notNull().default(sql`(unixepoch())`),
