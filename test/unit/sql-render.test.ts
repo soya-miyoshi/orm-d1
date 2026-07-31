@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { and } from '../../src/sql/expressions.js';
+import { coalesce } from '../../src/sql/functions.js';
 import { sql } from '../../src/sql/sql.js';
 
 describe('sql template rendering', () => {
@@ -38,6 +39,39 @@ describe('sql template rendering', () => {
 		const q = sql`select * where ${inner}`.toQuery();
 		expect(q.sql).toBe('select * where id in (?, ?)');
 		expect(q.params).toEqual([1, 2].map((v) => ({ k: 'const', v })));
+	});
+
+	it('expands an array of sql chunks', () => {
+		const q = sql`id in ${[sql`a`, sql`b`]}`.toQuery();
+		expect(q.sql).toBe('id in (a, b)');
+		expect(q.params).toEqual([]);
+	});
+
+	it('binds Uint8Array elements inside an array rather than expanding them', () => {
+		const a = new Uint8Array([1]);
+		const b = new Uint8Array([2]);
+		const q = sql`vals ${[a, b]}`.toQuery();
+		expect(q.sql).toBe('vals (?, ?)');
+		expect(q.params).toEqual([a, b].map((v) => ({ k: 'const', v })));
+	});
+
+	it('elides an undefined element inside an interpolated array, matching Drizzle', () => {
+		const q = sql`id in ${[1, undefined, 3]}`.toQuery();
+		expect(q.sql).toBe('id in (?, , ?)');
+		expect(q.params).toEqual([1, 3].map((v) => ({ k: 'const', v })));
+	});
+
+	it('recursively expands a nested array element', () => {
+		const q = sql`vals ${[[1, 2], [3, 4]]}`.toQuery();
+		expect(q.sql).toBe('vals ((?, ?), (?, ?))');
+		expect(q.params).toEqual([1, 2, 3, 4].map((v) => ({ k: 'const', v })));
+	});
+});
+
+describe('coalesce', () => {
+	it('joins its operands with a comma separator', () => {
+		const q = coalesce(sql`a`, sql`b`).toQuery();
+		expect(q.sql).toBe('coalesce(a, b)');
 	});
 });
 
