@@ -73,13 +73,24 @@ export class Executor implements QueryExecutor {
 		params: readonly D1Param[],
 		rowsReturned: number,
 	): void {
-		const event = buildEvent(query, sql, meta, now() - started, isDev() ? params : undefined);
-		if (isDev()) assertScan(event.rowsRead, rowsReturned, sql);
 		// Reached for every statement, batch members included, because `isDev()`
 		// forces the keyed read path — which is the same reason `onQuery` sees
 		// them all. Outside dev, `warn()` is inert and this is a counter bump.
+		// Unconditional, and first: the budget counts statements whether or not
+		// anyone is listening to them.
 		this.options.budget?.record(meta?.size_after);
-		this.options.onQuery?.(event);
+
+		// `executeRows` already gates its keyed path on this pair, but
+		// `executeRun` and `batch` call `#emit` unconditionally — so every
+		// insert, update, delete and batch member built a `QueryEvent`, with up
+		// to six conditional spreads, and dropped it unread. Nothing below has
+		// an effect when no one is listening, so the whole tail is skipped.
+		const onQuery = this.options.onQuery;
+		if (!onQuery && !isDev()) return;
+
+		const event = buildEvent(query, sql, meta, now() - started, isDev() ? params : undefined);
+		if (isDev()) assertScan(event.rowsRead, rowsReturned, sql);
+		onQuery?.(event);
 	}
 
 	#prepare(sql: string, params: readonly D1Param[]): D1PreparedStatement {

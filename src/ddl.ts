@@ -195,11 +195,33 @@ export const renderInline = (chunk: SQLChunk | string): string => {
 	});
 };
 
+/** SQLite's blob literal, `x'deadbeef'` — the only spelling for raw bytes. */
+const blobLiteral = (bytes: Uint8Array): string => {
+	let hex = '';
+	for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
+	return `x'${hex}'`;
+};
+
 export const literal = (value: unknown): string => {
 	if (value === null || value === undefined) return 'null';
 	if (typeof value === 'number') return String(value);
 	if (typeof value === 'boolean') return value ? '1' : '0';
 	if (typeof value === 'bigint') return value.toString();
+	// A blob has no string spelling to fall through to:
+	// `String(new Uint8Array([0xde, 0xad, 0xbe, 0xef]))` is `"222,173,190,239"`,
+	// so `blob().default(bytes)` rendered a *text* literal into `create table`.
+	// `snapshotFromSchema` calls this same function, so the snapshot recorded
+	// the same wrong text, the database was built from the same wrong DDL, and
+	// introspection read it back equal — self-consistent, permanently wrong,
+	// and invisible to `check` and `verify`. That is bug class #1, and it is
+	// why this branch exists rather than a cast at the call site.
+	if (value instanceof ArrayBuffer) return blobLiteral(new Uint8Array(value));
+	if (ArrayBuffer.isView(value)) {
+		// By byte range, not by element: a view may be a slice of a larger
+		// buffer, and anything wider than `Uint8Array` would otherwise hex each
+		// *element* rather than each byte.
+		return blobLiteral(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+	}
 	return `'${String(value).replaceAll("'", "''")}'`;
 };
 

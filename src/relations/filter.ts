@@ -413,15 +413,22 @@ export function compileFilter(
 				break;
 		}
 
-		const column = columns[key];
-		if (column) {
-			parts.push(compileColumnFilter(column, value));
+		// `hasOwn`, not a bare index: both bags are plain objects, so
+		// `columns['constructor']` resolves to `Object` — truthy — and the
+		// unknown-field refusal below never runs. The filter then compiled to
+		// `? = ?` with a function in the parameter list, which `.bind()` rejects
+		// at run time. This DSL is documented as taking a `where` straight from
+		// JSON (and `JSON.parse` makes `__proto__` an *own* key, so
+		// `Object.entries` yields it), which makes every prototype member a
+		// spelling that turns a clean 400 into an unhandled 500. Same trap as
+		// `plan/params.ts` and `runtime/database.ts`.
+		if (Object.hasOwn(columns, key)) {
+			parts.push(compileColumnFilter(columns[key]!, value));
 			continue;
 		}
 
-		const relation = relations[key];
-		if (relation) {
-			parts.push(compileRelationFilter(relation, value, table, columns, relations, config, depth));
+		if (Object.hasOwn(relations, key)) {
+			parts.push(compileRelationFilter(relations[key]!, value, table, columns, relations, config, depth));
 			continue;
 		}
 

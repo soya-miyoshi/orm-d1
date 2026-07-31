@@ -22,9 +22,32 @@ export const emptyJournal = (): Journal => ({ version: '7', dialect: 'sqlite', e
 export const nextIndex = (journal: Journal): number =>
 	journal.entries.reduce((max, entry) => Math.max(max, entry.idx + 1), 0);
 
+/**
+ * What a migration name may contain.
+ *
+ * The name becomes the tag, and the tag becomes a **path**: `writeMigration`
+ * joins it onto the output folder and `readMigration` joins it back. An
+ * unvalidated `--name ../../../tmp/pwned` produced the tag
+ * `0003_../../../tmp/pwned` and wrote outside the migrations folder entirely.
+ * The name is usually hand-typed, which is why this went unnoticed — but a CI
+ * job deriving `--name` from a branch or PR title is exactly the case where
+ * nobody is reading it.
+ *
+ * Checked here rather than at the flag, because `generate` and `pull` both
+ * build a tag and both take `--name`; this is the one place they share.
+ */
+const VALID_MIGRATION_NAME = /^[A-Za-z0-9_-]+$/;
+
 /** `0003_lively_moon` — the wrangler-compatible file naming. */
-export const migrationTag = (index: number, name: string): string =>
-	`${String(index).padStart(4, '0')}_${name}`;
+export const migrationTag = (index: number, name: string): string => {
+	if (!VALID_MIGRATION_NAME.test(name)) {
+		throw new Error(
+			`Invalid migration name ${JSON.stringify(name)}. It becomes the migration's file name, so it may `
+				+ 'contain only letters, digits, underscores and hyphens — no path separators, dots or spaces.',
+		);
+	}
+	return `${String(index).padStart(4, '0')}_${name}`;
+};
 
 export const appendEntry = (journal: Journal, tag: string, when: number): Journal => ({
 	...journal,

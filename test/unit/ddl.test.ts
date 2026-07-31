@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createIndexes, createSchema, createTable, dropTable } from '../../src/ddl.js';
+import { createIndexes, createSchema, createTable, dropTable, literal } from '../../src/ddl.js';
 import { blob, check, customType, integer, numeric, real, sql, sqliteTable, text, uniqueIndex } from '../../src/index.js';
 import { allTables, postTags, posts, users } from '../schema.js';
 
@@ -222,5 +222,67 @@ describe('customType', () => {
 
 		const t = sqliteTable('t', { tag: upper('tag').default('abc') });
 		expect(createTable(t)).toContain(`"tag" text default 'ABC'`);
+	});
+});
+
+/**
+ * A blob default has to reach the DDL as `x'…'`.
+ *
+ * `literal()` fell through to `'${String(value)}'` for anything it did not
+ * recognise, and `String(new Uint8Array([0xde, 0xad]))` is `"222,173"` — so
+ * `blob().default(bytes)` emitted a *text* literal into `create table`. What
+ * makes this bug class #1 rather than a cosmetic slip is that
+ * `snapshotFromSchema` calls the same `literal()`: the snapshot recorded the
+ * same wrong text, the database was built from the same wrong DDL, and
+ * introspection read it back equal. Every artifact agreed with every other and
+ * `check`/`verify` stayed green over a permanently corrupt default.
+ */
+describe('blob defaults', () => {
+	it('renders raw bytes as a SQLite blob literal', () => {
+		const t = sqliteTable('t', {
+			id: integer('id').primaryKey(),
+			payload: blob('payload', { mode: 'buffer' }).default(new Uint8Array([0xde, 0xad, 0xbe, 0xef])),
+		});
+
+		expect(createTable(t)).toContain(`"payload" blob default x'deadbeef'`);
+		// The precise old output, asserted so a regression cannot pass by
+		// merely being "some string".
+		expect(createTable(t)).not.toContain(`'222,173,190,239'`);
+	});
+
+	it('zero-pads each byte, so a leading nibble is never dropped', () => {
+		// `0x0a.toString(16)` is `'a'`; unpadded, four bytes would render as
+		// three hex digits and SQLite would reject the literal outright.
+		const t = sqliteTable('t', {
+			payload: blob('payload', { mode: 'buffer' }).default(new Uint8Array([0x00, 0x0a, 0xff, 0x01])),
+		});
+		expect(createTable(t)).toContain(`x'000aff01'`);
+	});
+
+	it('hexes the byte range of a view, not its elements', () => {
+		// A view onto a slice of a larger buffer: anything reading `.buffer`
+		// whole, or iterating elements of a wider typed array, gets this wrong.
+		const buffer = new Uint8Array([0x11, 0x22, 0x33, 0x44, 0x55]).buffer;
+		const t = sqliteTable('t', {
+			payload: blob('payload', { mode: 'buffer' }).default(new Uint8Array(buffer, 1, 3)),
+		});
+		expect(createTable(t)).toContain(`x'223344'`);
+	});
+
+	/**
+	 * `.default()` on a buffer blob is typed to `Uint8Array`, so an
+	 * `ArrayBuffer` cannot arrive that way. It still reaches `literal()`
+	 * through an interpolated `sql` fragment — `D1Param` admits it, and
+	 * `renderInline` inlines whatever a check or a partial-index predicate
+	 * bound — which is the path this covers.
+	 */
+	it('renders an ArrayBuffer reached through an interpolated fragment', () => {
+		expect(literal(new Uint8Array([0xca, 0xfe]).buffer)).toBe(`x'cafe'`);
+
+		const t = sqliteTable('t', {
+			payload: blob('payload', { mode: 'buffer' }),
+		}, (table) => [check('payload_check', sql`${table.payload} <> ${new Uint8Array([0x00, 0xff])}`)]);
+
+		expect(createTable(t)).toContain(`check ("payload" <> x'00ff')`);
 	});
 });

@@ -605,3 +605,95 @@ describe('the whole four-model shape', () => {
 		await expect(adapter.findOne({ model: 'session', where: [] })).rejects.toThrow(/session/);
 	});
 });
+
+/**
+ * LIKE metacharacters in a caller-supplied search value.
+ *
+ * `contains` / `starts_with` / `ends_with` are what the admin plugin's user
+ * search compiles to, and the value goes straight through from the caller. The
+ * value always *bound*, so this was never injection — but `%` and `_` are
+ * wildcards, and unescaped they widened the predicate instead of matching
+ * literally. `starts_with: '%'` matched every row rather than none.
+ */
+describe('LIKE wildcards in search values', () => {
+	const seed = async (adapter: ReturnType<typeof makeAdapter>): Promise<void> => {
+		for (const [i, name] of ['Ada', 'Bob', '100%', 'a_b'].entries()) {
+			await createUser(adapter, {
+				name,
+				email: `u${i}@example.com`,
+				createdAt: new Date(1_700_000_000_000 + i * 1000),
+			});
+		}
+	};
+
+	const namesMatching = async (
+		adapter: ReturnType<typeof makeAdapter>,
+		operator: 'contains' | 'starts_with' | 'ends_with',
+		value: string,
+	): Promise<unknown[]> => {
+		const rows = await adapter.findMany<Record<string, unknown>>({
+			model: 'user',
+			where: [{ field: 'name', operator, value }],
+			limit: 10,
+		});
+		return rows.map((r) => r.name).sort();
+	};
+
+	it('treats a bare % as a literal, not "match everything"', async () => {
+		const adapter = makeAdapter();
+		await seed(adapter);
+
+		// The bug: this returned all four users.
+		expect(await namesMatching(adapter, 'starts_with', '%')).toEqual([]);
+		expect(await namesMatching(adapter, 'contains', '%')).toEqual(['100%']);
+		expect(await namesMatching(adapter, 'ends_with', '%')).toEqual(['100%']);
+	});
+
+	it('treats a bare _ as a literal, not "any single character"', async () => {
+		const adapter = makeAdapter();
+		await seed(adapter);
+
+		// `a_b` as a pattern also matches nothing else here, so the fixture uses
+		// a row that contains a real underscore to tell the two readings apart.
+		expect(await namesMatching(adapter, 'contains', '_')).toEqual(['a_b']);
+		expect(await namesMatching(adapter, 'starts_with', 'a_')).toEqual(['a_b']);
+	});
+
+	it('still matches ordinary substrings', async () => {
+		const adapter = makeAdapter();
+		await seed(adapter);
+
+		expect(await namesMatching(adapter, 'contains', 'd')).toEqual(['Ada']);
+		expect(await namesMatching(adapter, 'starts_with', 'B')).toEqual(['Bob']);
+		expect(await namesMatching(adapter, 'ends_with', 'b')).toEqual(['Bob', 'a_b']);
+	});
+
+	it('treats a backslash literally, rather than as the escape character', async () => {
+		const adapter = makeAdapter();
+		await createUser(adapter, {
+			name: 'back\\slash',
+			email: 'bs@example.com',
+			createdAt: new Date(1_700_000_000_000),
+		});
+
+		expect(await namesMatching(adapter, 'contains', '\\')).toEqual(['back\\slash']);
+		expect(await namesMatching(adapter, 'contains', '\\s')).toEqual(['back\\slash']);
+	});
+
+	it('refuses a pattern past D1’s 50-byte cap, naming the model and field', async () => {
+		const adapter = makeAdapter();
+		await seed(adapter);
+
+		// Previously a bare `CompileError` from inside the query builder, naming
+		// neither — an unhandled throw out of an auth endpoint. Named in Better
+		// Auth's vocabulary (the *model* `user`, not the table `customers`),
+		// because that is what the caller passed in.
+		await expect(
+			adapter.findMany({
+				model: 'user',
+				where: [{ field: 'name', operator: 'contains', value: 'x'.repeat(60) }],
+				limit: 10,
+			}),
+		).rejects.toThrow(/"user"\."name".*50-byte/s);
+	});
+});
