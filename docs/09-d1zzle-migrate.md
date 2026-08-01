@@ -41,7 +41,7 @@ Deliberately mirrors `drizzle-kit`, so existing muscle memory and CI scripts tra
 
 ```
 d1zzle-migrate generate      # diff schema against last snapshot → new SQL migration
-d1zzle-migrate migrate       # apply pending migrations (--local | --remote)
+d1zzle-migrate migrate       # apply pending migrations (--local | --remote) (--env <name>)
 d1zzle-migrate push          # diff and apply directly, no migration file (dev only)
 d1zzle-migrate pull          # introspect a live database → schema.ts + snapshot
 d1zzle-migrate check         # detect drift and unapplied migrations; exit non-zero in CI
@@ -64,6 +64,7 @@ export default defineConfig({
   tableOptions: './src/table-options.ts',   // optional; see below
   out: './migrations',              // wrangler-compatible layout
   d1: {
+    env: 'stg',                     // optional; a wrangler [env.<name>] block
     databaseName: 'my-db',          // resolved from wrangler.jsonc when omitted
     accountId: process.env.CLOUDFLARE_ACCOUNT_ID,
     token: process.env.CLOUDFLARE_API_TOKEN,
@@ -86,6 +87,56 @@ file through a D1-shaped adapter.
 Reading `wrangler.jsonc` for the binding and database id by default matters more than it
 sounds: duplicated database configuration is a common source of "applied to the wrong
 database" incidents.
+
+### Environments
+
+Most real projects keep their databases in wrangler's named-environment blocks —
+`[[env.stg.d1_databases]]` in TOML, `env: { stg: { d1_databases } }` in JSON — with the
+top-level block holding a local placeholder. Reading only the top-level block therefore had
+the tool confidently applying `--remote` migrations to whatever the *local* entry named,
+while `wrangler --env stg` deployed against something else entirely. That is the incident
+class this whole file exists to prevent, so both spellings are parsed and the environment is
+selected the way wrangler selects it: `--env <name>`, then `CLOUDFLARE_ENV`, then `d1.env` in
+the config, then the top-level block.
+
+Two decisions follow from wrangler's actual inheritance rules, which were read out of
+wrangler 4's own `normalizeAndValidateEnvironment` rather than assumed:
+
+- **`d1_databases` is non-inheritable.** An environment that declares none gets *no* binding
+  from wrangler — only a warning. The faithful translation for a tool that writes to
+  databases is an **error**: a missing `env.<name>` block, or one without `d1_databases`,
+  stops the run. Silently resolving the top-level block instead would be the exact
+  wrong-database bug, and a warning is not enough when the consequence is an irreversible
+  write and the reader is CI.
+- **`account_id` is inheritable**, so it falls back to the top level. **`migrations_dir` is a
+  property of each `d1_databases` entry**, not a top-level key, so it is read from the
+  binding (the old top-level read is kept only so existing projects do not move).
+
+`CLOUDFLARE_ENV` disagreeing with `d1.env` is an error too. Wrangler has no `d1.env`, so
+there is no wrangler behaviour to mirror, and there is no defensible silent winner between a
+committed default and the deploy job's own variable.
+
+### Values, and where they come from
+
+One rule everywhere: **`d1zzle.config.ts` > environment variable > wrangler config.** The
+config file is first because a value written there is a deliberate per-repo decision, and it
+restricts nobody — it can read `process.env` itself. `CLOUDFLARE_D1_DATABASE_ID` joins
+`CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`, which is what lets a project that treats
+the id as a secret keep a placeholder in `wrangler.toml` and never rewrite the file just to
+migrate.
+
+**`${VAR}` interpolation of wrangler values was deliberately not implemented.** Wrangler does
+not interpolate its own config — verified: `parseTOML` is a bare parse, and `dotenv-expand`
+is applied only to `.env`/`.dev.vars`. A d1zzle that interpolated would read a *different*
+value than wrangler from the same line, which is a fresh instance of exactly the drift this
+change removes. A `database_id` still holding a `__PLACEHOLDER__`, or the local sentinel
+`"local"`, is rejected up front on `--remote` instead of becoming an unexplained API 404.
+
+Every command that touches a database prints the environment, binding, database name and —
+for `--remote` — the id and account, each with the source it was read from, before it acts.
+The id is masked to its last four characters: enough to tell staging from production in a CI
+log months later, without the tool printing into that log an id the project deliberately
+kept out of git.
 
 ## How `generate` works
 

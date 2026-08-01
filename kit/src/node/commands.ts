@@ -17,6 +17,7 @@ import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
 import { normalizeIndexColumn, snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
 import type { Snapshot } from '../core/snapshot.js';
+import { describeResolution } from './config.js';
 import type { Config } from './config.js';
 import { localRunner, remoteRunner, scratchRunner } from './runners.js';
 import {
@@ -52,19 +53,43 @@ export interface TargetFlags {
 export async function resolveRunner(ctx: CommandContext, flags: TargetFlags): Promise<SqlRunner> {
 	if (flags.local && flags.remote) throw new Error('Pass either --local or --remote, not both.');
 
+	// Before the runner exists, so the log says where this run was headed even
+	// when connecting to it fails.
+	for (const line of describeResolution(ctx.config, flags.remote === true)) ctx.log(line);
+
 	if (flags.remote) {
 		const { accountId, databaseId, token } = ctx.config.d1;
 		if (!accountId || !databaseId || !token) {
 			throw new Error(
-				'--remote needs accountId, databaseId and an API token. Set CLOUDFLARE_ACCOUNT_ID and '
-					+ 'CLOUDFLARE_API_TOKEN, or put them in d1zzle.config.ts.',
+				'--remote needs accountId, databaseId and an API token. Set CLOUDFLARE_ACCOUNT_ID, '
+					+ 'CLOUDFLARE_D1_DATABASE_ID and CLOUDFLARE_API_TOKEN, or put them in d1zzle.config.ts.',
 			);
 		}
+		const unusable = unusableRemoteId(databaseId);
+		if (unusable) throw new Error(unusable);
 		return remoteRunner({ accountId, databaseId, token });
 	}
 
 	return localRunner(ctx.cwd, ctx.config.d1.databaseName, ctx.config.d1.localFile);
 }
+
+/**
+ * A remote `database_id` that cannot possibly be one.
+ *
+ * Two shapes, both real: `"local"`, the sentinel a top-level block uses for the
+ * Miniflare database, and `__CLOUDFLARE_D1_DATABASE_ID__`, the placeholder a
+ * project commits when it treats the id as a secret and substitutes it at
+ * deploy time. Both reach the D1 API as a 404 whose message says nothing about
+ * configuration; naming the cause here costs one comparison.
+ */
+const unusableRemoteId = (databaseId: string): string | undefined => {
+	const placeholder = /^__.+__$/.test(databaseId);
+	if (!placeholder && databaseId !== 'local') return undefined;
+	return `--remote resolved database_id to "${databaseId}", which is a ${
+		placeholder ? 'placeholder' : 'local sentinel'
+	}, not a D1 database id. Set CLOUDFLARE_D1_DATABASE_ID, or point --env at the environment whose `
+		+ 'block holds the real id.';
+};
 
 export async function snapshotOfSchema(ctx: CommandContext): Promise<Snapshot> {
 	if (ctx.config.casing) configureCasing(ctx.config.casing);

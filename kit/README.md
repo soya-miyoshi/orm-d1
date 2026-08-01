@@ -17,6 +17,7 @@ export default defineConfig({
   tableOptions: './src/table-options.ts',  // optional: STRICT / WITHOUT ROWID / appendOnly
   out: './migrations',          // wrangler's layout, by default
   d1: {
+    env: 'stg',                 // optional: a wrangler [env.<name>] block
     localFile: './.dev.db',     // optional: an explicit file for --local
   },
 });
@@ -32,6 +33,64 @@ The database is read from `wrangler.jsonc` / `wrangler.toml` unless you override
 Duplicated database configuration is a common source of "applied to the wrong database"
 incidents, so there is only one place to state it.
 
+### Environments
+
+Wrangler's `[[env.<name>.d1_databases]]` (TOML) and `env: { <name>: { d1_databases } }`
+(JSON/JSONC) blocks are read, and selected the same way wrangler selects them:
+
+| | Which environment |
+| --- | --- |
+| 1 | `--env <name>` on the command line |
+| 2 | `CLOUDFLARE_ENV` |
+| 3 | `d1.env` in `d1zzle.config.ts` |
+| — | none of them: the **top-level** block, which is what `wrangler` uses without `--env` |
+
+`CLOUDFLARE_ENV` and `d1.env` disagreeing is an error rather than a preference — wrangler
+has no `d1.env`, so there is no precedent to copy, and picking either one silently is how a
+migration lands on production while the deploy goes to staging. `--env` settles it, exactly
+as it does for wrangler.
+
+**An environment that is missing, or that declares no `d1_databases`, is an error — it never
+falls back to the top-level block.** Wrangler classifies `d1_databases` as *non-inheritable*:
+an environment without its own gets no D1 binding at all. Falling back would therefore point
+d1zzle at a database wrangler would never have bound, and applying a migration is not
+undoable. `account_id` *is* inheritable in wrangler, so it does fall back. `migrations_dir`
+is a property of the individual binding, which is where it is read from.
+
+### Where each value comes from
+
+One rule for every value: **`d1zzle.config.ts` > environment variable > wrangler config.**
+The config file is first because a value written there is a deliberate per-repo decision —
+and it can always opt back into the environment itself (`accountId: process.env.…`).
+
+| Value | Environment variable |
+| --- | --- |
+| `d1.databaseId` | `CLOUDFLARE_D1_DATABASE_ID` |
+| `d1.accountId` | `CLOUDFLARE_ACCOUNT_ID` |
+| `d1.token` | `CLOUDFLARE_API_TOKEN` |
+
+`CLOUDFLARE_D1_DATABASE_ID` is the answer for projects that treat the id as a secret and
+commit a placeholder: point the variable at the real id and the migration step needs no
+rewritten `wrangler.toml`.
+
+**`${VAR}` inside the wrangler file is *not* expanded.** Wrangler does not expand its own
+config, so a d1zzle that did would read a different value than wrangler from the same line —
+a new instance of the drift this all exists to prevent. A `database_id` that is still a
+`__PLACEHOLDER__`, or the literal `local`, is rejected on `--remote` rather than sent to the
+API as a mystery 404.
+
+Every database-touching command prints what it resolved, and from where, before it acts —
+on `--local` as well as `--remote`, with the id masked to its last four characters:
+
+```
+Target: remote D1 (HTTP API)
+  environment    prd  ← --env
+  binding        DB  ← wrangler.toml [env.prd]
+  database_name  acme-db-prd  ← wrangler.toml [env.prd]
+  database_id    …1234  ← CLOUDFLARE_D1_DATABASE_ID
+  account_id     …f00d  ← CLOUDFLARE_ACCOUNT_ID
+```
+
 ## Commands
 
 ```
@@ -46,7 +105,8 @@ d1zzle-migrate up            # upgrade snapshot format after a kit version bump
 ```
 
 Flags: `--local` (default) targets the `.wrangler` SQLite state; `--remote` goes through
-the D1 HTTP API. `--accept-data-loss` is required for anything destructive.
+the D1 HTTP API. `--env <name>` picks a wrangler environment (see above).
+`--accept-data-loss` is required for anything destructive.
 
 ## What it does differently
 

@@ -17,10 +17,10 @@ const USAGE = `d1zzle-migrate — migrations for d1zzle on Cloudflare D1
 
 Usage
   d1zzle-migrate generate [--name <name>] [--accept-data-loss] [renames]
-  d1zzle-migrate migrate  [--local | --remote]
-  d1zzle-migrate push     [--local | --remote] [--accept-data-loss] [renames]
-  d1zzle-migrate pull     [--local | --remote] [--schema-out <file>] [--force]
-  d1zzle-migrate check    [--local | --remote]
+  d1zzle-migrate migrate  [--env <name>] [--local | --remote]
+  d1zzle-migrate push     [--env <name>] [--local | --remote] [--accept-data-loss] [renames]
+  d1zzle-migrate pull     [--env <name>] [--local | --remote] [--schema-out <file>] [--force]
+  d1zzle-migrate check    [--env <name>] [--local | --remote]
   d1zzle-migrate verify
   d1zzle-migrate up
 
@@ -30,6 +30,11 @@ Commands
 
 Options
   --config <path>       config file (default: d1zzle.config.ts)
+  --env <name>          wrangler environment: the [env.<name>] block whose
+                          d1_databases this run resolves. Spelled as wrangler
+                          spells it, and never falls back to the top-level
+                          block. Also read from CLOUDFLARE_ENV, or d1.env in
+                          d1zzle.config.ts.
   --local               act on the local .wrangler SQLite state (default)
   --remote              act on the remote D1 database over the HTTP API
   --accept-data-loss    allow destructive statements
@@ -169,6 +174,19 @@ export const asTargetFlags = (flags: Record<string, FlagValue>): TargetFlags => 
 	};
 };
 
+/**
+ * `--env` names a value, always. A bare `--env` parses as `true`, which is the
+ * shape that would otherwise be read as "no environment given" and silently
+ * resolve the top-level block — the wrong-database path this flag exists to
+ * close.
+ */
+export const environmentFlag = (flags: Record<string, FlagValue>): string | undefined => {
+	const value = flags['env'];
+	if (value === undefined) return undefined;
+	if (typeof value === 'string' && value !== '') return value;
+	throw new Error('--env expects an environment name, as in `--env stg`.');
+};
+
 export async function run(argv: readonly string[]): Promise<number> {
 	const { command, flags } = parseArgs(argv);
 
@@ -189,7 +207,11 @@ export async function run(argv: readonly string[]): Promise<number> {
 	}
 
 	const cwd = process.cwd();
-	const config = await loadConfig(cwd, typeof flags['config'] === 'string' ? flags['config'] : undefined);
+	const config = await loadConfig(
+		cwd,
+		typeof flags['config'] === 'string' ? flags['config'] : undefined,
+		environmentFlag(flags),
+	);
 	const ctx: CommandContext = { cwd, config, log: (message) => console.log(message), now: () => Date.now() };
 	const target = asTargetFlags(flags);
 
