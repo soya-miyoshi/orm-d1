@@ -668,12 +668,19 @@ export async function verify(ctx: CommandContext): Promise<VerifyResult> {
 			// `applied` counts what actually replayed, not what the journal
 			// lists: bailing at migration k and reporting the full length reads
 			// as a complete replay that merely disagreed with the schema.
-			return {
-				differences: [`${entry.tag} failed to apply: ${(error as Error).message}`],
-				corruption: [],
-				applied,
-				ok: false,
-			};
+			const difference = `${entry.tag} failed to apply: ${(error as Error).message}`;
+
+			// Say it out loud. This early return used to be the one exit from
+			// `verify` that wrote nothing at all, so the CLI turned a broken
+			// history into a bare exit 1 — indistinguishable from a crash, and
+			// silent about which migration stopped the replay.
+			ctx.log(`Mismatch: ${difference}`);
+			ctx.log(
+				`Replayed ${applied} of ${journal.entries.length} migration(s); `
+					+ `${entry.tag} would not apply, so the history does NOT add up to the schema.`,
+			);
+
+			return { differences: [difference], corruption: [], applied, ok: false };
 		}
 		applied++;
 	}

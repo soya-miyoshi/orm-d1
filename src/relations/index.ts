@@ -37,7 +37,7 @@ export type {
 	RelationsFilter,
 } from './filter.js';
 export { operators, RelationalQuery, RelationalQueryBuilder } from './query.js';
-export type { ExtrasArg, FindConfig, Operators, OrderByArg } from './query.js';
+export type { CountConfig, ExtrasArg, FindConfig, Operators, OrderByArg } from './query.js';
 
 // ----------------------------------------------------------------- types
 
@@ -179,6 +179,15 @@ export type TypedFindConfig<TRelations, TName, TRelationType extends 'one' | 'ma
 	}
 	& (TRelationType extends 'many' ? { limit?: number | Placeholder<number> } : {});
 
+/**
+ * `count`'s config, narrowed to one table: the same `where` `findMany` takes,
+ * so a list and its total can share one filter value instead of two spellings
+ * of it.
+ */
+export interface TypedCountConfig<TRelations, TName> {
+	where?: TypedRelationsFilter<TRelations, TName>;
+}
+
 export interface TypedRelationalQueryBuilder<TRelations, TName> {
 	findMany<TConfig extends TypedFindConfig<TRelations, TName>>(
 		config?: TConfig,
@@ -186,6 +195,8 @@ export interface TypedRelationalQueryBuilder<TRelations, TName> {
 	findFirst<TConfig extends TypedFindConfig<TRelations, TName>>(
 		config?: TConfig,
 	): RelationalQuery<FindResult<TRelations, TName, TConfig> | undefined>;
+	/** How many rows `findMany` would return with this filter and no limit. */
+	count(config?: TypedCountConfig<TRelations, TName>): RelationalQuery<number>;
 }
 
 /** `db.query`, keyed by the TypeScript names in the `defineRelations` schema. */

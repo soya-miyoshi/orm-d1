@@ -63,7 +63,14 @@ describe('verify', () => {
 		return { schema: './schema.ts', out, d1: {} } as Config;
 	};
 
-	const context = (config: Config) => ({ cwd: process.cwd(), config, log: () => {}, now: () => 0 });
+	const context = (config: Config, lines: string[] = []) => ({
+		cwd: process.cwd(),
+		config,
+		log: (message: string) => {
+			lines.push(message);
+		},
+		now: () => 0,
+	});
 
 	// The count is what actually replayed. Reporting the journal's length on the
 	// failure path reads as a complete replay that merely disagreed with the
@@ -79,5 +86,21 @@ describe('verify', () => {
 		expect(result.ok).toBe(false);
 		expect(result.applied).toBe(1);
 		expect(result.differences[0]).toMatch(/^0001_broken failed to apply/);
+	});
+
+	// The CLI turns `ok: false` into exit 1 and prints nothing of its own, so a
+	// failure path that logs nothing is a command that fails in total silence —
+	// which is what this one did: no tag, no reason, no exit-code explanation.
+	it('says which migration stopped the replay instead of failing silently', async () => {
+		const config = await project([
+			['0000_first', 'create table a (id integer primary key);'],
+			['0001_broken', 'create table a (id integer primary key);'],
+		]);
+
+		const lines: string[] = [];
+		await verify(context(config, lines));
+
+		expect(lines.join('\n')).toMatch(/0001_broken/);
+		expect(lines.join('\n')).toMatch(/does NOT add up to the schema/);
 	});
 });

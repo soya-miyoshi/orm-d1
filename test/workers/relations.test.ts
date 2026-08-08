@@ -288,6 +288,50 @@ describe('db.query', () => {
 	});
 });
 
+/**
+ * The point of `count` is that a page and its total can share one filter value.
+ * So every assertion here compares it against the `findMany` it is supposed to
+ * total — an implementation that quietly ignored the filter would still return
+ * a plausible number, and only the comparison catches that.
+ */
+describe('db.query.<table>.count', () => {
+	it('counts every row when given no filter', async () => {
+		expect(await db.query.posts.count()).toBe(3);
+		expect(await db.query.users.count()).toBe(2);
+	});
+
+	it('totals exactly what findMany returns, for the same filter object', async () => {
+		const where = { views: { gte: 5 } } as const;
+		const rows = await db.query.posts.findMany({ columns: { id: true }, where });
+		expect(await db.query.posts.count({ where })).toBe(rows.length);
+		expect(rows.length).toBe(2);
+	});
+
+	it('ignores limit and offset, which is the whole reason a page needs it', async () => {
+		const where = { authorId: 1 } as const;
+		const page = await db.query.posts.findMany({ columns: { id: true }, where, limit: 1 });
+		expect(page).toHaveLength(1);
+		expect(await db.query.posts.count({ where })).toBe(2);
+	});
+
+	it('takes a relation predicate, compiled the same way findMany compiles it', async () => {
+		const where = { posts: { title: 'third' } } as const;
+		const rows = await db.query.users.findMany({ columns: { id: true }, where });
+		expect(rows).toEqual([{ id: 2 }]);
+		expect(await db.query.users.count({ where })).toBe(1);
+	});
+
+	it('returns 0 rather than undefined when nothing matches', async () => {
+		expect(await db.query.posts.count({ where: { id: { in: [] } } })).toBe(0);
+	});
+
+	it('binds placeholders through execute(), like the find methods do', async () => {
+		const query = db.query.posts.count({ where: { authorId: ph('author') } as never });
+		expect(await query.execute({ author: 1 })).toBe(2);
+		expect(await query.execute({ author: 2 })).toBe(1);
+	});
+});
+
 describe('the filter DSL', () => {
 	it('reads a bare scalar as eq', async () => {
 		expect(await db.query.posts.findMany({ columns: { id: true }, where: { views: 50 } }))

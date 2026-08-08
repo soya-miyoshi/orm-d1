@@ -79,7 +79,7 @@ src/
   relations/
     define.ts           # defineRelations(), One/Many, the r.<table>.<column> builder
     filter.ts           # the where object DSL -> our expressions
-    query.ts            # RelationalQueryBuilder — findMany/findFirst
+    query.ts            # RelationalQueryBuilder — findMany/findFirst/count
     index.ts            # entry point: typed db.query, withRelations()
 ```
 

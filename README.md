@@ -430,6 +430,23 @@ users: {
 },
 ```
 
+`count` takes that same `where` — including relation keys — and answers how many rows
+`findMany` would return without a limit:
+
+```ts
+const where = { status: { in: ['paid', 'shipped'] } };
+
+const rows  = await db.query.orders.findMany({ where, orderBy: { id: 'desc' }, limit: 20 });
+const total = await db.query.orders.count({ where });
+```
+
+A paged list needs both halves, and the filter is the part that must not drift between
+them. Without `count` the total has to be rebuilt with the operator form
+(`db.select({ n: count() }).where(and(…))`), leaving the same predicate written twice in
+two dialects — editing one and not the other typechecks and silently pages wrong. It takes
+no `with`, `limit` or `offset`: relations are stitched rather than joined, so none of them
+can change the total.
+
 ```ts
 const db = drizzle({ client: env.DB, relations });   // primary form
 const db = drizzle(env.DB, { relations });           // binding-first, also fine

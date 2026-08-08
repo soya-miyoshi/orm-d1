@@ -107,6 +107,14 @@ export interface FindConfig {
 	comment?: string;
 }
 
+/**
+ * What `count` accepts — `findMany`'s config minus everything that cannot
+ * change a total: projection, relations, ordering, limit and offset.
+ */
+export interface CountConfig {
+	where?: RelationsFilter;
+}
+
 /** A column, as opposed to an already-built ordering fragment. */
 const isColumnLike = (value: unknown): value is Column<any> =>
 	typeof value === 'object' && value !== null && typeof (value as Column<any>).getSQLType === 'function';
@@ -368,6 +376,42 @@ export class RelationalQueryBuilder {
 
 	findMany(config: FindConfig = {}): RelationalQuery<Record<string, unknown>[]> {
 		return new RelationalQuery((input) => this.#run(config, [], false, undefined, input));
+	}
+
+	/**
+	 * `select count(*) from <table> where …`, taking the *same* object filter
+	 * `findMany` takes.
+	 *
+	 * Without it, a paged list has to express its filter twice — once as the
+	 * object form for `findMany`, once again with `eq`/`inArray`/`or` for a
+	 * `db.select({ n: count() })` — and the two are only ever equal by hand.
+	 * Editing one and not the other leaves the rows and the total disagreeing,
+	 * which typechecks, reads as correct, and silently breaks paging.
+	 *
+	 * `with` is deliberately not accepted: relations change no count here (they
+	 * are fetched and stitched, never joined into the parent), so taking the key
+	 * would only invite the reading that it filters. Filtering *by* a relation
+	 * is what `where` already does — a relation predicate compiles to the same
+	 * `exists (…)` subquery it does for `findMany`.
+	 */
+	count(config: CountConfig = {}): RelationalQuery<number> {
+		return new RelationalQuery(async (input) => {
+			const where = compileFilter(
+				config.where,
+				this.config.table,
+				this.config.columns,
+				this.config.relations,
+				this.schema,
+			);
+			const rows = await this.db.select({ count: count() })
+				.from(this.config.table as never)
+				.where(where)
+				.all(input) as { count: number }[];
+
+			// `count(*)` over no group always returns exactly one row, so the
+			// fallback is unreachable rather than a masked empty result.
+			return rows[0]?.count ?? 0;
+		});
 	}
 
 	findFirst(config: FindConfig = {}): RelationalQuery<Record<string, unknown> | undefined> {
