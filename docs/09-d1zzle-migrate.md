@@ -222,6 +222,38 @@ Two constraints follow:
   can fall back to it if the kit has a bug. That interoperability is worth more than a
   cleaner bespoke format.
 
+### Statements `/query` cannot carry
+
+`--remote` normally posts the batch to D1's `/query` endpoint. **D1 re-splits that string
+on semicolons**, with a splitter that does not know about compound statements — so a
+trigger body is cut in half:
+
+```sql
+create trigger "t_no_update" before update on "t" begin
+  select raise(abort, 't is append-only');   -- /query cuts here
+end;
+```
+
+and D1 answers `incomplete input: SQLITE_ERROR`. Measured against a real database, this
+happens for a whole batch, for a lone `create trigger`, on one line, and with the trailing
+semicolon removed — there is no way to phrase it that `/query` accepts, because the
+semicolon before `end` is required by SQLite's grammar. `wrangler d1 migrations apply`
+fails identically; it is the endpoint, not the client.
+
+This mattered because the kit **generates** those triggers: every `appendOnly` table gets
+one. Without a second route, `--remote` could not apply a schema the kit itself produced.
+
+So a batch containing such a statement goes through the **file-import endpoint** instead —
+the same four steps wrangler's `d1 execute --file` uses: `init` (announce an md5, get a
+presigned URL) → `PUT` the bytes → `ingest` → `poll` until `complete`. Cloudflare rolls the
+database back if ingestion fails part-way, so the script stays atomic — including scripts
+too large for one `/query` batch.
+
+The routing test is deliberately blunt: `splitStatements` has already stripped statement
+terminators, so any surviving `;` is inside a trigger body or a string literal. Both are
+safe to send through import; the cost of a false positive is one slower round trip, never
+a wrong result.
+
 ## `pull` — introspection
 
 Read `sqlite_master` plus the available pragmas, reconstruct the schema, and emit both a

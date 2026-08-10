@@ -15,6 +15,7 @@
  * `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_D1_DATABASE_ID` / `CLOUDFLARE_API_TOKEN`
  * are present and skips when they are not.
  */
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { remoteRunner } from '../../src/node/runners.js';
 
@@ -163,6 +164,147 @@ describe('batching', () => {
 });
 
 /**
+ * Statements `/query` cannot carry.
+ *
+ * `/query` re-splits the `sql` string on semicolons with a splitter that does
+ * not understand compound statements, so a trigger body is cut in half and D1
+ * answers `incomplete input: SQLITE_ERROR` — measured against a real database
+ * for a whole batch, for a lone `create trigger`, on one line, and with the
+ * trailing semicolon removed. Every `appendOnly` table the kit generates emits
+ * exactly that shape, so these go through the file-import endpoint instead.
+ */
+describe('statements that cannot go through /query', () => {
+	const TRIGGER = `create trigger "t_no_update" before update on "t" begin
+  select raise(abort, 't is append-only');
+end`;
+
+	/** Stub the four-step import handshake; returns the recorded calls. */
+	const stubImport = (opts: { uploadUrl?: string | null; ingestStatus?: string; pollStatuses?: string[] } = {}) => {
+		const calls: { url: string; body: unknown; method: string | undefined }[] = [];
+		const polls = [...(opts.pollStatuses ?? [])];
+		vi.stubGlobal('fetch', async (url: string, init: Call['init']) => {
+			// The presigned upload is a plain PUT to R2 carrying the SQL bytes,
+			// not JSON — so branch on the URL before trying to parse anything.
+			const isApi = url.startsWith('https://api.cloudflare.com');
+			const body = isApi && init.body ? JSON.parse(init.body) : undefined;
+			calls.push({ url, body, method: init.method });
+
+			if (!isApi) {
+				return {
+					ok: true,
+					status: 200,
+					statusText: 'OK',
+					headers: { get: (h: string) => (h.toLowerCase() === 'etag' ? '"' + EXPECTED_ETAG + '"' : null) },
+					json: async () => ({}),
+				};
+			}
+
+			const action = (body as { action?: string } | undefined)?.action;
+			const result = action === 'init'
+				? (opts.uploadUrl === null
+					? { filename: 'f.sql' }
+					: { upload_url: opts.uploadUrl ?? 'https://upload.example/f.sql', filename: 'f.sql' })
+				: action === 'ingest'
+				? { status: opts.ingestStatus ?? 'complete', at_bookmark: 'bm-1' }
+				: { status: polls.shift() ?? 'complete', at_bookmark: 'bm-2' };
+
+			return { ok: true, status: 200, statusText: 'OK', json: async () => ({ success: true, result }) };
+		});
+		return calls;
+	};
+
+	// md5 of the exact bytes the runner uploads for [TRIGGER].
+	const EXPECTED_ETAG = createHash('md5').update(Buffer.from(`${TRIGGER};`, 'utf8')).digest('hex');
+
+	it('routes a batch containing a trigger body to /import, not /query', async () => {
+		const calls = stubImport();
+		await remoteRunner(CONFIG).batch([TRIGGER]);
+
+		expect(calls.some((c) => c.url === ENDPOINT)).toBe(false);
+		expect(calls.map((c) => (c.body as { action?: string } | undefined)?.action).filter(Boolean))
+			.toEqual(['init', 'ingest']);
+	});
+
+	it('uploads the same bytes it announced, and says so with the md5', async () => {
+		const calls = stubImport();
+		await remoteRunner(CONFIG).batch([TRIGGER]);
+
+		const init = calls.find((c) => (c.body as { action?: string })?.action === 'init');
+		expect((init?.body as { etag: string }).etag).toBe(EXPECTED_ETAG);
+		const upload = calls.find((c) => c.url === 'https://upload.example/f.sql');
+		expect(upload?.method).toBe('PUT');
+		const ingest = calls.find((c) => (c.body as { action?: string })?.action === 'ingest');
+		expect(ingest?.body).toMatchObject({ action: 'ingest', filename: 'f.sql', etag: EXPECTED_ETAG });
+	});
+
+	it('skips the upload when D1 already holds the file', async () => {
+		// `init` without an `upload_url` is the retry path after a failed
+		// ingest: re-uploading identical bytes would just cost a round trip.
+		const calls = stubImport({ uploadUrl: null });
+		await remoteRunner(CONFIG).batch([TRIGGER]);
+		expect(calls.some((c) => c.method === 'PUT')).toBe(false);
+	});
+
+	it('polls until the server reports complete', async () => {
+		const calls = stubImport({ ingestStatus: 'processing', pollStatuses: ['processing', 'complete'] });
+		await remoteRunner(CONFIG).batch([TRIGGER]);
+		const actions = calls.map((c) => (c.body as { action?: string } | undefined)?.action).filter(Boolean);
+		expect(actions).toEqual(['init', 'ingest', 'poll', 'poll']);
+	});
+
+	it('throws when ingestion reports an error instead of silently continuing', async () => {
+		vi.stubGlobal('fetch', async (url: string, init: Call['init']) => {
+			if (!url.startsWith('https://api.cloudflare.com')) {
+				return {
+					ok: true,
+					status: 200,
+					statusText: 'OK',
+					headers: { get: () => null },
+					json: async () => ({}),
+				};
+			}
+			const action = (JSON.parse(init.body!) as { action?: string }).action;
+			const result = action === 'init'
+				? { upload_url: 'https://upload.example/f.sql', filename: 'f.sql' }
+				: { status: 'error', errors: ['near "end": syntax error'] };
+			return { ok: true, status: 200, statusText: 'OK', json: async () => ({ success: true, result }) };
+		});
+
+		await expect(remoteRunner(CONFIG).batch([TRIGGER]))
+			.rejects.toThrow('D1 import failed: near "end": syntax error');
+	});
+
+	it('refuses to ingest bytes whose etag does not match what it uploaded', async () => {
+		vi.stubGlobal('fetch', async (url: string, init: Call['init']) => {
+			if (!url.startsWith('https://api.cloudflare.com')) {
+				return {
+					ok: true,
+					status: 200,
+					statusText: 'OK',
+					headers: { get: (h: string) => (h.toLowerCase() === 'etag' ? '"deadbeef"' : null) },
+					json: async () => ({}),
+				};
+			}
+			return {
+				ok: true,
+				status: 200,
+				statusText: 'OK',
+				json: async () => ({ success: true, result: { upload_url: 'https://upload.example/f.sql', filename: 'f.sql' } }),
+			};
+		});
+
+		await expect(remoteRunner(CONFIG).batch([TRIGGER])).rejects.toThrow('corrupted');
+	});
+
+	it('leaves ordinary batches on /query', async () => {
+		const calls = stubFetch({ success: true, result: [{ results: [] }] });
+		await remoteRunner(CONFIG).batch(['create table "t" ("id" text primary key) strict']);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.url).toBe(ENDPOINT);
+	});
+});
+
+/**
  * The same runner against a real D1 database.
  *
  * Skipped unless all three credentials are set, so a normal `npm test` never
@@ -224,6 +366,25 @@ describe.skipIf(!hasCredentials)('against a real D1 database', () => {
 
 		const rows = await runner().all(`select "id" from "${TABLE}"`);
 		expect(rows).toEqual([]);
+	});
+
+	it('creates a trigger, which /query cannot express', async () => {
+		// The regression this whole import path exists for: every `appendOnly`
+		// table the kit generates carries a trigger whose body contains a
+		// semicolon, and `/query` cuts it in half.
+		await runner().batch([
+			`drop table if exists "${TABLE}"`,
+			`create table "${TABLE}" ("id" text primary key) strict`,
+			`create trigger "${TABLE}_no_update" before update on "${TABLE}" begin\n  select raise(abort, 'append-only');\nend`,
+		]);
+
+		const triggers = await runner().all<{ name: string }>(
+			`select name from sqlite_master where type = 'trigger' and name = '${TABLE}_no_update'`,
+		);
+		expect(triggers).toEqual([{ name: `${TABLE}_no_update` }]);
+
+		await runner().batch([`insert into "${TABLE}" ("id") values ('a')`]);
+		await expect(runner().batch([`update "${TABLE}" set "id" = 'b'`])).rejects.toThrow();
 	});
 
 	it('enforces STRICT, so the remote path agrees with the local one', async () => {

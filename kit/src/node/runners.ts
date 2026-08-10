@@ -3,6 +3,7 @@
  * remote D1 database over the HTTP API. Both are exposed as the same
  * `SqlRunner`, which is what keeps `--local` and `--remote` from drifting.
  */
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { SqlRunner } from '../core/apply.js';
@@ -129,7 +130,12 @@ export function remoteRunner(config: RemoteConfig): SqlRunner {
 	const endpoint =
 		`https://api.cloudflare.com/client/v4/accounts/${config.accountId}/d1/database/${config.databaseId}`;
 
-	const post = async (path: string, body: unknown): Promise<unknown[]> => {
+	/**
+	 * POST to the API and hand back `result` untouched. `/query` returns an
+	 * array of per-statement results; `/import` returns a single object, so the
+	 * shaping belongs to the caller.
+	 */
+	const postRaw = async (path: string, body: unknown): Promise<unknown> => {
 		const response = await fetch(`${endpoint}${path}`, {
 			method: 'POST',
 			headers: {
@@ -142,7 +148,7 @@ export function remoteRunner(config: RemoteConfig): SqlRunner {
 		const payload = await response.json() as {
 			success: boolean;
 			errors?: { message: string }[];
-			result?: { results?: unknown[] }[];
+			result?: unknown;
 		};
 
 		if (!response.ok || !payload.success) {
@@ -150,7 +156,74 @@ export function remoteRunner(config: RemoteConfig): SqlRunner {
 			throw new Error(`D1 API error: ${message}`);
 		}
 
-		return payload.result?.flatMap((r) => r.results ?? []) ?? [];
+		return payload.result;
+	};
+
+	const post = async (path: string, body: unknown): Promise<unknown[]> => {
+		const result = await postRaw(path, body) as { results?: unknown[] }[] | undefined;
+		return result?.flatMap((r) => r.results ?? []) ?? [];
+	};
+
+	/**
+	 * Import a whole SQL script through D1's file-ingestion endpoint.
+	 *
+	 * Four steps, the same ones wrangler's `d1 execute --file` uses:
+	 * `init` (announce the md5 and get a presigned URL) → `PUT` the bytes →
+	 * `ingest` → `poll` until the server says `complete`. Cloudflare rolls the
+	 * database back to its original state if ingestion fails part-way, so this
+	 * is atomic for the whole script — including scripts too large for one
+	 * `/query` batch.
+	 */
+	const importSql = async (sql: string): Promise<void> => {
+		const body = Buffer.from(sql, 'utf8');
+		const etag = createHash('md5').update(body).digest('hex');
+
+		const init = await postRaw('/import', { action: 'init', etag }) as {
+			upload_url?: string;
+			filename: string;
+		};
+
+		// No `upload_url` means D1 already has a file with this etag — the
+		// retry path after a failed ingest. Skip straight to ingesting it.
+		if (init.upload_url) {
+			const upload = await fetch(init.upload_url, {
+				method: 'PUT',
+				headers: { 'Content-Length': String(body.byteLength) },
+				body,
+			});
+			if (!upload.ok) {
+				throw new Error(`D1 import upload failed: ${upload.status} ${upload.statusText}`);
+			}
+			// The presigned PUT answers with the stored object's md5. A mismatch
+			// means the bytes on the far side are not the bytes we meant to run,
+			// and ingesting them would apply a script nobody wrote.
+			const returned = upload.headers.get('etag')?.replaceAll('"', '');
+			if (returned && returned !== etag) {
+				throw new Error(`D1 import upload corrupted: expected etag ${etag}, got ${returned}`);
+			}
+		}
+
+		let state = await postRaw('/import', {
+			action: 'ingest',
+			filename: init.filename,
+			etag,
+		}) as ImportState;
+
+		// The server answers `ingest` immediately for a small script and leaves
+		// a larger one processing; poll until it settles either way.
+		for (let attempt = 0; state.status !== 'complete'; attempt++) {
+			if (state.status === 'error') {
+				throw new Error(`D1 import failed: ${state.errors?.join('; ') ?? 'unknown error'}`);
+			}
+			if (attempt >= IMPORT_POLL_LIMIT) {
+				throw new Error(`D1 import did not finish after ${IMPORT_POLL_LIMIT} polls (status: ${state.status})`);
+			}
+			await new Promise((r) => setTimeout(r, IMPORT_POLL_INTERVAL_MS));
+			state = await postRaw('/import', {
+				action: 'poll',
+				current_bookmark: state.at_bookmark,
+			}) as ImportState;
+		}
 	};
 
 	return {
@@ -168,7 +241,47 @@ export function remoteRunner(config: RemoteConfig): SqlRunner {
 			// whose statements were all pragmas, which the caller filters out —
 			// would fail instead of being the no-op it is.
 			if (statements.length === 0) return;
-			await post('/query', { sql: statements.map((s) => `${s};`).join('\n') });
+			const sql = statements.map((s) => `${s};`).join('\n');
+			if (statements.some(needsImport)) {
+				await importSql(sql);
+				return;
+			}
+			await post('/query', { sql });
 		},
 	};
 }
+
+interface ImportState {
+	readonly status: string;
+	readonly at_bookmark?: string;
+	readonly errors?: string[];
+}
+
+const IMPORT_POLL_LIMIT = 60;
+const IMPORT_POLL_INTERVAL_MS = 1000;
+
+/**
+ * Whether a statement has to go through the import endpoint instead of
+ * `/query`.
+ *
+ * `/query` re-splits the `sql` string it is given on semicolons, with a
+ * splitter that does not know about compound statements. A trigger body is the
+ * one place a statement legitimately contains one:
+ *
+ *     create trigger "t" before update on "x" begin
+ *       select raise(abort, 'append-only');   ← /query cuts here
+ *     end;
+ *
+ * and the halves are not valid SQL, so D1 answers `incomplete input:
+ * SQLITE_ERROR` — for the whole batch, and for a lone `create trigger` sent by
+ * itself, on one line, with or without a trailing semicolon (all four measured
+ * against a real database). The kit emits exactly this shape for every
+ * `appendOnly` table, so without this route `--remote` cannot apply a schema
+ * the kit itself generated.
+ *
+ * The test is deliberately blunt: `splitStatements` already stripped the
+ * terminators, so any surviving `;` is inside a trigger body or a string
+ * literal. Both are safe to send through import — it costs a slower round trip,
+ * never a wrong result.
+ */
+const needsImport = (statement: string): boolean => statement.includes(';');
