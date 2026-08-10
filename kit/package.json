@@ -1,6 +1,6 @@
 {
 	"name": "d1zzle-migrate",
-	"version": "0.1.9",
+	"version": "0.1.10",
 	"description": "Migrations, introspection and drift detection for d1zzle on Cloudflare D1.",
 	"type": "module",
 	"license": "MIT",
@@ -35,7 +35,7 @@
 		"LICENSE"
 	],
 	"peerDependencies": {
-		"d1zzle": "^0.1.9"
+		"d1zzle": "^0.1.10"
 	},
 	"dependencies": {},
 	"devDependencies": {
