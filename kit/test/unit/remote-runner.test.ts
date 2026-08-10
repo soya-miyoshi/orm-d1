@@ -305,6 +305,62 @@ end`;
 });
 
 /**
+ * The ceiling the runner reports to `applyMigration`.
+ *
+ * `/query` caps a request at 100 statements and the apply layer used to split
+ * under that number unconditionally — losing atomicity at every split, even
+ * for migrations that were never going to touch `/query`.
+ */
+describe('atomicLimit', () => {
+	const runner = remoteRunner(CONFIG);
+	const plain = (n: number) => Array.from({ length: n }, (_, i) => `create table "t${i}" ("id" integer)`);
+	const TRIGGER = 'create trigger "t_no_update" before update on "t" begin select raise(abort, \'no\'); end';
+
+	it('reports /query\'s ceiling for a batch /query can carry', () => {
+		expect(runner.atomicLimit?.(plain(10))).toBe(100);
+	});
+
+	it('reports no ceiling when a trigger body forces the import route', () => {
+		expect(runner.atomicLimit?.([...plain(3), TRIGGER])).toBe(Infinity);
+	});
+
+	it('reports no ceiling past /query\'s limit, so a big migration stays one unit', () => {
+		// Over the limit `/query` would have to be split; import would not, and
+		// import rolls the whole script back on failure. Going wide beats going
+		// split.
+		expect(runner.atomicLimit?.(plain(101))).toBe(Infinity);
+		expect(runner.atomicLimit?.(plain(100))).toBe(100);
+	});
+
+	it('sends an over-limit batch through import as a single script', async () => {
+		const calls: { url: string; action: string | undefined }[] = [];
+		vi.stubGlobal('fetch', async (url: string, init: Call['init']) => {
+			const isApi = url.startsWith('https://api.cloudflare.com');
+			const action = isApi && init.body ? (JSON.parse(init.body) as { action?: string }).action : undefined;
+			calls.push({ url, action });
+			if (!isApi) {
+				return {
+					ok: true,
+					status: 200,
+					statusText: 'OK',
+					headers: { get: () => null },
+					json: async () => ({}),
+				};
+			}
+			const result = action === 'init'
+				? { upload_url: 'https://upload.example/f.sql', filename: 'f.sql' }
+				: { status: 'complete', at_bookmark: 'bm' };
+			return { ok: true, status: 200, statusText: 'OK', json: async () => ({ success: true, result }) };
+		});
+
+		await runner.batch(plain(150));
+
+		expect(calls.some((c) => c.url === ENDPOINT)).toBe(false);
+		expect(calls.filter((c) => c.action === 'ingest')).toHaveLength(1);
+	});
+});
+
+/**
  * The same runner against a real D1 database.
  *
  * Skipped unless all three credentials are set, so a normal `npm test` never

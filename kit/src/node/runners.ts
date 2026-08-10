@@ -32,6 +32,10 @@ export async function localRunner(cwd: string, databaseName?: string, localFile?
 	db.exec('pragma foreign_keys = on');
 
 	return {
+		// node:sqlite wraps the whole batch in one real transaction, however
+		// long it is — `/query`'s ceiling is not this path's problem, and
+		// splitting under it would give away atomicity for nothing.
+		atomicLimit: () => Infinity,
 		all: async <T>(sql: string) => db.prepare(sql).all() as T[],
 		batch: async (statements) => {
 			// node:sqlite has real transactions, so local apply is atomic too.
@@ -64,6 +68,7 @@ export async function scratchRunner(): Promise<SqlRunner> {
 	db.exec('pragma foreign_keys = on');
 
 	return {
+		atomicLimit: () => Infinity,
 		all: async <T>(sql: string) => db.prepare(sql).all() as T[],
 		// Atomic like every other runner, and for one concrete reason beyond the
 		// contract: a rebuild's first statement is `pragma defer_foreign_keys =
@@ -227,6 +232,11 @@ export function remoteRunner(config: RemoteConfig): SqlRunner {
 	};
 
 	return {
+		// `/query` caps a batch at QUERY_STATEMENT_LIMIT and loses atomicity at
+		// every split. Import has no such cap and rolls back as a unit, so a
+		// migration that has to use it — or that would not fit in one `/query`
+		// batch anyway — is better off going in whole.
+		atomicLimit: (statements) => (viaImport(statements) ? Infinity : QUERY_STATEMENT_LIMIT),
 		all: async <T>(sql: string) => await post('/query', { sql }) as T[],
 		// Cloudflare documents the `sql` field as "Supports multiple statements,
 		// joined by semicolons, which will be executed as a batch", and a batch
@@ -242,7 +252,7 @@ export function remoteRunner(config: RemoteConfig): SqlRunner {
 			// would fail instead of being the no-op it is.
 			if (statements.length === 0) return;
 			const sql = statements.map((s) => `${s};`).join('\n');
-			if (statements.some(needsImport)) {
+			if (viaImport(statements)) {
 				await importSql(sql);
 				return;
 			}
@@ -285,3 +295,19 @@ const IMPORT_POLL_INTERVAL_MS = 1000;
  * never a wrong result.
  */
 const needsImport = (statement: string): boolean => statement.includes(';');
+
+/**
+ * `/query`'s ceiling on statements per request. Mirrors
+ * `MAX_STATEMENTS_PER_BATCH`, but stated here because it belongs to this
+ * endpoint rather than to D1 — import has no equivalent limit.
+ */
+const QUERY_STATEMENT_LIMIT = 100;
+
+/**
+ * Whether a batch goes through file import rather than `/query`: because
+ * `/query` cannot express one of its statements, or because it cannot carry
+ * that many at once. The second case is not a workaround but an improvement —
+ * `/query` would force a split, and a split is where atomicity is lost.
+ */
+const viaImport = (statements: readonly string[]): boolean =>
+	statements.length > QUERY_STATEMENT_LIMIT || statements.some(needsImport);

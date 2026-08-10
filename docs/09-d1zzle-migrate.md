@@ -214,8 +214,15 @@ which D1 executes atomically. This is a real correctness improvement over emitti
 
 Two constraints follow:
 
-- A migration too large for one batch must be split, and **atomicity is then lost across
-  the split**. The CLI warns loudly and names the split point rather than hiding it.
+- A migration too large for one atomic unit must be split, and **atomicity is then lost
+  across the split**. The CLI warns loudly and names the split point rather than hiding it.
+  How large is "too large" is the *runner's* answer, not a constant: `atomicLimit(statements)`
+  returns `Infinity` for the local `node:sqlite` path (real transactions) and for any remote
+  batch that goes through file import (no statement ceiling, rolled back as a unit), and
+  `/query`'s 100 only when `/query` is actually the route. A remote migration is therefore
+  routed *wide before it is cut*: over 100 statements it goes through import in one piece
+  rather than being split into `/query`-sized halves. In practice the split warning is now
+  reachable only by a runner that declares a finite ceiling.
 - Applied migrations are tracked in a `d1_migrations` table. Using **wrangler's existing
   table and layout** means `d1zzle-migrate migrate` and `wrangler d1 migrations apply` stay
   interchangeable — teams can adopt the kit without giving up the wrangler workflow, and

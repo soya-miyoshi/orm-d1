@@ -25,9 +25,29 @@ export interface SqlRunner {
 	all<T = Record<string, unknown>>(sql: string): Promise<T[]>;
 	/** Run statements atomically. On D1 this is one `batch()`. */
 	batch(statements: readonly string[]): Promise<void>;
+	/**
+	 * How many of *these* statements this runner can run in one atomic unit.
+	 * `Infinity` means no split is needed; a finite number is a hard ceiling
+	 * the caller must pack under, accepting that atomicity is lost between
+	 * batches.
+	 *
+	 * It takes the statements because the answer depends on them: the remote
+	 * runner sends a batch containing a trigger body through D1's file-import
+	 * endpoint, which has no statement ceiling, and only falls back to
+	 * `/query`'s ceiling when it can use `/query` at all. Absent — for a runner
+	 * that does not care — means the conservative default below.
+	 */
+	atomicLimit?(statements: readonly string[]): number;
 }
 
-/** D1 caps a batch; beyond it atomicity is lost and the caller must be told. */
+/**
+ * The fallback ceiling for a runner that does not declare one.
+ *
+ * It is `/query`'s limit, not a property of D1 as such: the file-import
+ * endpoint has no statement ceiling and the local `node:sqlite` path has real
+ * transactions. Keeping the number here — rather than making it the rule —
+ * is what lets a runner say "not for these statements, I don't".
+ */
 export const MAX_STATEMENTS_PER_BATCH = 100;
 
 /**
@@ -222,12 +242,18 @@ export async function applyMigration(
 	// the whole point of riding along with the migration's own last effect.
 	// Handing it to `packIntoBatches` as one more (singleton-group) statement
 	// lets it spill into a new batch only when there truly is no room.
-	const batches = packIntoBatches([...statements, record], MAX_STATEMENTS_PER_BATCH);
+	//
+	// The ceiling comes from the runner, not from a constant here. A migration
+	// that goes through file import — or that runs against local SQLite — has
+	// no ceiling, and splitting it would give away atomicity for nothing.
+	const all = [...statements, record];
+	const limit = runner.atomicLimit?.(all) ?? MAX_STATEMENTS_PER_BATCH;
+	const batches = packIntoBatches(all, limit);
 
 	if (batches.length > 1) {
 		warnings.push(
 			`Migration "${tag}" has ${statements.length} statements and must be split into ${batches.length} `
-				+ `batches of up to ${MAX_STATEMENTS_PER_BATCH}. Atomicity is lost at each split; if it fails `
+				+ `batches of up to ${limit}. Atomicity is lost at each split; if it fails `
 				+ 'part-way, the database is left between states.',
 		);
 	}

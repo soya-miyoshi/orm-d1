@@ -105,6 +105,49 @@ describe('applyMigration batching', () => {
 		}
 	});
 
+	it('does not split at all for a runner that says it needs no ceiling', async () => {
+		// The local path and the remote import path both run any number of
+		// statements as one unit. Splitting them under `/query`'s ceiling used
+		// to give away atomicity for nothing.
+		const { runner, batches } = recordingRunner();
+		const unlimited: SqlRunner = { ...runner, atomicLimit: () => Infinity };
+		const statements = Array.from(
+			{ length: MAX_STATEMENTS_PER_BATCH * 3 },
+			(_, i) => `create table "t${i}" ("id" integer)`,
+		);
+
+		const warnings = await applyMigration(unlimited, 'm_unlimited', `${statements.join(';\n')};`);
+
+		expect(batches).toHaveLength(1);
+		expect(batches[0]).toHaveLength(statements.length + 1); // + the d1_migrations record
+		expect(warnings).toEqual([]);
+	});
+
+	it('honours a ceiling the runner reports for these particular statements', async () => {
+		const { runner, batches } = recordingRunner();
+		const picky: SqlRunner = { ...runner, atomicLimit: (s) => (s.length > 5 ? Infinity : 2) };
+
+		await applyMigration(picky, 'm_small_capped', 'create table "a" ("id" integer);\ncreate table "b" ("id" integer);');
+		// 2 statements + the record = 3, over the ceiling of 2 → split.
+		expect(batches.length).toBeGreaterThan(1);
+
+		batches.length = 0;
+		const many = Array.from({ length: 10 }, (_, i) => `create table "u${i}" ("id" integer)`);
+		await applyMigration(picky, 'm_large_uncapped', `${many.join(';\n')};`);
+		expect(batches).toHaveLength(1);
+	});
+
+	it('names the ceiling it actually used in the split warning', async () => {
+		const { runner } = recordingRunner();
+		const capped: SqlRunner = { ...runner, atomicLimit: () => 4 };
+		const statements = Array.from({ length: 9 }, (_, i) => `create table "v${i}" ("id" integer)`);
+
+		const warnings = await applyMigration(capped, 'm_capped', `${statements.join(';\n')};`);
+
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain('batches of up to 4');
+	});
+
 	it('appends the d1_migrations record to the final batch, not a separate one', async () => {
 		const { runner, batches } = recordingRunner();
 		const statements = Array.from({ length: MAX_STATEMENTS_PER_BATCH + 10 }, (_, i) => `create table "t${i}" ("id" integer)`);
