@@ -1,6 +1,6 @@
 {
 	"name": "d1zzle",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "A tiny, type-safe ORM built exclusively for Cloudflare D1 and Workers.",
 	"type": "module",
 	"license": "MIT",
