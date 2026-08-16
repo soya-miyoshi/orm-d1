@@ -72,10 +72,13 @@ naming the call and the reason it could not collapse, rather than leaving you wi
 
 ## Grouping writes so that they all succeed or all fail
 
-**Drizzle** exposes `db.transaction()` on its D1 driver. It is implemented by running
-`begin`, the callback's statements, and then `commit` or `rollback` as ordinary separate
-statements. This type-checks and usually appears to work; because D1 does not guarantee
-that those statements reach the same connection, it does not reliably produce atomicity.
+**Drizzle** exposes `db.transaction()` on its D1 driver, implemented by running `begin`,
+the callback's statements, and then `commit` or `rollback` as ordinary separate statements.
+It type-checks and usually appears to work. What it does not do is group the statements:
+D1 does not guarantee that consecutive statements reach the same connection, so the `begin`
+can apply to a connection none of the writes use, and each write commits by itself. When
+the third of five writes fails, the first two stay applied and the `rollback` has nothing
+to undo.
 
 **d1zzle** does not provide `transaction()`. Calling it throws immediately:
 
@@ -95,9 +98,8 @@ const [inserted, posts] = await db.batch([
 ]);
 ```
 
-The atomicity is D1's, and the suite checks it against a real binding rather than taking
-the documentation's word for it: a batch whose second statement violates a unique
-constraint leaves zero rows from the first.
+The atomicity is D1's, asserted against a real binding: in a batch whose second statement
+violates a unique constraint, the first statement leaves zero rows.
 
 Removing `transaction()` also removes the transaction and savepoint code from the bundle.
 
@@ -113,9 +115,8 @@ D1's `batch()` has no positional read mode; it returns one object per row, keyed
 name, and two columns named `id` occupy one key.
 
 **Drizzle** converts those objects back to arrays with `Object.keys(row).map(k => row[k])`.
-Drizzle's own source marks the function with a comment: *"It may cause issues with
-duplicated column names in join queries."* By the time the object exists, one of the two
-values is already gone.
+Drizzle's own source comments the function: *"It may cause issues with duplicated column
+names in join queries."* By the time the object exists, one of the two values is gone.
 
 **d1zzle** knows the projection while compiling, detects the collision then, and emits
 generated aliases (`c0`, `c1`, …) for the colliding columns only, so the returned keys are
@@ -169,11 +170,11 @@ includes the network), `d1DurationMs` and `sqlDurationMs` (D1's own, server-side
 `servedByPrimary`, `servedByRegion` and `attempts`. `durationMs - sqlDurationMs` is the
 network share.
 
-Two costs, stated because they are not free: `.raw()` carries no metadata, so installing
+Two costs. `.raw()` carries no metadata, so installing
 `onQuery` switches selects to the keyed read path, which allocates one object per row —
 which is why it is opt-in per database. And bound parameters are included only in
-development builds; they contain user data, and query logs are copied around.
-`test/workers/integration.test.ts` asserts the omission rather than assuming it.
+development builds, since they contain user data; `test/workers/integration.test.ts`
+asserts that a production build omits them.
 
 ## Building a query once per isolate instead of once per request
 

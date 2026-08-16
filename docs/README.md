@@ -6,18 +6,17 @@ shares no code with it and does not depend on it.
 
 ## Using d1zzle
 
-Written for someone with the library installed. Start here; the [README](../README.md) is
-the index of the same set.
+For someone with the library installed. The [README](../README.md) indexes the same set.
 
-| Doc | What it covers |
+| Doc | Contents |
 | --- | --- |
-| [12-drizzle-differences.md](./12-drizzle-differences.md) | Where behaviour departs from `drizzle-orm` on D1, case by case: what Drizzle does, what d1zzle does, and which property of the platform forces it. Ends with the table of which D1 limit is enforced where |
-| [13-relational-queries.md](./13-relational-queries.md) | `defineRelations`, the `db.query` filter DSL, `count`, and the two plans a `with` can run under |
-| [14-migrations.md](./14-migrations.md) | `d1zzle-migrate`, and what it does differently from `drizzle-kit` because the target is D1. Full CLI reference: [kit/README.md](../kit/README.md) |
-| [15-migrating-from-drizzle.md](./15-migrating-from-drizzle.md) | The one-line import change, the zero-diff path alias and its silent failure mode, and what is and is not supported |
-| [16-adapters.md](./16-adapters.md) | Pothos, and the native Better Auth adapter |
+| [12-drizzle-differences.md](./12-drizzle-differences.md) | Ten cases where behaviour departs from `drizzle-orm` on D1: the call, what Drizzle does with it, what d1zzle does. Ends with the table of which D1 limit is checked where |
+| [13-relational-queries.md](./13-relational-queries.md) | `defineRelations`, the `db.query` filter DSL, `count`, and the SQL each `with` strategy emits |
+| [15-migrating-from-drizzle.md](./15-migrating-from-drizzle.md) | The import change, the path alias, its silent failure mode, and the supported and unsupported lists |
+| [16-adapters.md](./16-adapters.md) | `@pothos/plugin-drizzle`, and the Better Auth adapter |
 | [17-entry-points.md](./17-entry-points.md) | The seven import paths, and which optional peer each one needs |
-| [18-beyond-drizzle.md](./18-beyond-drizzle.md) | What Drizzle has no spelling for: append-only tables and columns, `latestPerGroup`, `impact`, `backfill`, roundtrip drafts, vocabulary drift |
+| [18-beyond-drizzle.md](./18-beyond-drizzle.md) | Features with no spelling in Drizzle: append-only tables and columns, `latestPerGroup`, `impact`, `backfill`, roundtrip drafts, vocabulary drift |
+| [../kit/README.md](../kit/README.md) | `d1zzle-migrate`: configuration, environment resolution, commands, and what it does differently from `drizzle-kit` |
 
 ## The design, in order
 

@@ -1,5 +1,10 @@
 # d1zzle
 
+[![CI](https://github.com/soya-miyoshi/d1zzle/actions/workflows/ci.yml/badge.svg)](https://github.com/soya-miyoshi/d1zzle/actions/workflows/ci.yml)
+[![Release](https://github.com/soya-miyoshi/d1zzle/actions/workflows/release.yml/badge.svg)](https://github.com/soya-miyoshi/d1zzle/actions/workflows/release.yml)
+[![d1zzle on npm](https://img.shields.io/npm/v/d1zzle?label=d1zzle)](https://www.npmjs.com/package/d1zzle)
+[![d1zzle-migrate on npm](https://img.shields.io/npm/v/d1zzle-migrate?label=d1zzle-migrate)](https://www.npmjs.com/package/d1zzle-migrate)
+
 d1zzle is an ORM for Cloudflare D1. It supports D1 and nothing else. Its API is taken from
 Drizzle — the same schema DSL, the same query builder, the same inferred types — and the
 parts that exist to abstract over other databases are removed. `d1zzle-migrate` is the
@@ -35,58 +40,49 @@ export default {
 An existing `drizzle-orm/sqlite-core` schema file works after changing one import
 specifier; see [Migrating an existing project][migrating].
 
-## Documentation
-
-| Document | What it covers |
-| --- | --- |
-| [Differences from drizzle-orm on D1][differences] | Where the behaviour departs from `drizzle-orm` on D1, case by case — summarised below |
-| [Beyond Drizzle][beyond] | What has no spelling in Drizzle at all: append-only tables and columns, `latestPerGroup`, `impact`, `backfill`, roundtrip drafts |
-| [Relational queries][relational] | `defineRelations`, the `db.query` filter DSL, and the two plans a `with` can run under |
-| [Migrations][migrations] | `d1zzle-migrate`, and the five things it does differently from `drizzle-kit` because the target is D1 |
-| [Migrating an existing project][migrating] | The one-line import change, the zero-diff path alias, and what is and is not supported |
-| [Adapters: Pothos and Better Auth][adapters] | Being recognised by Drizzle's adapters, and the native Better Auth adapter |
-| [Entry points and dependencies][entry-points] | The seven import paths, and which two optional peers each one needs |
-| [D1 limits, and where each is enforced][limits] | What is checked while compiling, what after execution, and what is left to D1 |
-| [`d1zzle-migrate` CLI][kit] | Every command, flag and config key of the migration CLI |
-
-The design documents — the goals and the rules that break ties, the platform description
-most decisions come from, the compilation model, and what the compiler does and does not
-guarantee — are in [docs/][docs].
-
 ## Differences from drizzle-orm on D1
 
-The API is Drizzle's; the behaviour on D1 differs in ten places, all of them consequences
-of the same four properties of the platform. The database is reached over the network, so
-cost tracks the number of calls; a statement accepts at most 100 bound parameters;
-`batch()` is the only atomicity available, because there are no interactive transactions;
-and Worker startup CPU is billed, so library size is a per-request cost on cold isolates.
+The API is Drizzle's. The behaviour differs in ten places, each following from a property
+of D1: cost tracks round trips, a statement carries at most 100 bound parameters,
+`batch()` is the only atomicity, and Worker startup CPU is billed. Each row links to the
+case in full — the call, what `drizzle-orm@1.0.0-rc.4` does with it on D1, and what d1zzle
+does.
 
-Each case is written out in full — what `drizzle-orm@1.0.0-rc.4` does on D1, read from
-that version's own source, and what d1zzle does instead — in
-**[Differences from drizzle-orm on D1][differences]**.
-
-| Case | `drizzle-orm` on D1 | d1zzle |
+| The call | On `drizzle-orm@1.0.0-rc.4` | On d1zzle |
 | --- | --- | --- |
-| [Inserting more rows than one statement can carry][d-insert] | one statement, 2,000 parameters, `too many SQL variables` | chunked at compile time and submitted as one atomic `batch()` |
-| [Matching a column against a long list][d-inarray] | one parameter per value; over 100 values fails | collapses to `json_each(?)` past a threshold |
-| [Grouping writes so that they all succeed or all fail][d-batch] | `transaction()` emits `BEGIN`/`COMMIT`, which D1 does not honour | no `transaction()`; `batch()`, with typed per-statement results |
-| [A joined select inside `batch()` with two columns of the same name][d-collision] | the duplicate key is already lost when the row is converted | collision detected while compiling; aliases emitted |
-| [Reading from a replica, and reading your own writes][d-session] | no session API; use the binding directly | `withSession()` returns the same API, plus `bookmark()` |
-| [Seeing what a query cost][d-onquery] | `logger` gets SQL and params; selects lose D1's metadata | `onQuery` with `rowsRead` / `rowsWritten` / timings per statement |
-| [Building a query once per isolate][d-compile] | `.prepare()` needs a session, so SQL is built inside `fetch` | compilation is separate from execution; compile at module scope |
-| [D1's other limits][d-limits] | reported by D1, naming the constraint but not the call | checked while compiling, naming the lever |
-| [Plan-dependent limits][d-plan] | — | opt-in `plan: 'free' \| 'paid'` warnings in development |
-| [Bundle size][d-size] | 77.8 kB minified for driver + schema DSL | 44.1 kB — the dialect, transaction and prepared-statement layers are absent |
+| [`db.insert(users).values(rows)`][d-insert]<br>500 rows, 4 columns each | One statement carrying 2,000 bound parameters. D1 rejects it: `D1_ERROR: too many SQL variables`. Splitting the array is left to the caller, and the pieces are then separate writes — a failure in the fourth leaves the first three applied. | `floor(100 / 4) = 25` rows per statement, computed while compiling: 20 statements sent as one `batch()`. One round trip, and a conflict in the last chunk inserts nothing. `.returning()` rows come back in input order. |
+| [`where(inArray(users.id, ids))`][d-inarray]<br>201 ids | `in (?, ?, ?, …)` — one parameter per value, so the same 100-parameter limit rejects it. Staying under it means splitting the query and merging the results. | `in (select "value" from json_each(?))`: the list travels as one JSON parameter, so its length stops mattering. Under 30 values, and for `blob`s that have no JSON spelling, values are bound individually as before. |
+| [`db.transaction(async (tx) => …)`][d-batch] | Runs `begin`, your statements, then `commit` as separate statements. D1 does not guarantee they reach the same connection, so the `begin` can apply where the writes do not: a failure part-way leaves earlier writes applied and `rollback` with nothing to undo. | No `transaction()` — calling it throws, naming `db.batch([...])`. D1 executes a batch as one transaction, and the return value is one typed result per statement. |
+| [`db.batch([db.select({ a: users.id, b: posts.id })…])`][d-collision]<br>a join projecting two `id` columns | `batch()` returns keyed row objects, and two columns named `id` occupy one key. The conversion back to an array (`Object.keys(row).map(…)`) therefore runs on a row that is already one value short. Drizzle's source notes the case in a comment. | The collision is found while compiling, when the projection is still known, and the two columns are emitted as `c0`, `c1`. Both values arrive. |
+| [`db.withSession(bookmark)`][d-session] | Not available: `withSession` does not appear in the package. Reading from a replica means calling `env.DB.withSession()` directly and writing the SQL by hand. | Returns the same API — `select`, `insert`, `db.query` — plus `session.bookmark()`, so the consistency point can be stored in a cookie and passed back on the next request. |
+| [`drizzle(env.DB, { onQuery })`][d-onquery]<br>reading `rows_read` / `rows_written` | `logger` receives the SQL and its parameters. Selects read through `.raw()`, which returns rows without D1's `meta`, so the billed row counts never reach the caller. | `onQuery` fires once per executed statement — each member of a `batch()`, each chunk of a chunked insert — with `rowsRead`, `rowsWritten`, `durationMs`, `d1DurationMs`, `servedByPrimary` and `attempts`. |
+| [`query.select()…compile()`][d-compile]<br>building SQL once per isolate | `.prepare()` is a method on a builder that holds a session, and the session holds the binding. On Workers the binding arrives with the request, so the SQL string is built again inside every `fetch`. | Compilation is separate from execution: `query.select()` needs no binding, so a query compiles at module scope and is reused for the isolate's lifetime. Values arrive through `ph()` placeholders at `db.get(compiled, { email })`. |
+| [Exceeding another D1 limit][d-limits] | The statement is sent and D1's error comes back naming the constraint but not the call site: `too many SQL variables` does not say which `inArray`, and `too many arguments on function coalesce` does not say which `coalesce`. | The limits knowable at compile time are checked there, once per isolate, and the message names the call and the option that moves it (`maxParams`, `jsonEachThreshold`) — before the code ever runs against D1. |
+| [Free and paid plan caps][d-plan] | No plan awareness. 50 statements per Worker invocation and 500 MB on the free plan are found by hitting them. | `plan: 'free'` counts the statements an invocation has issued and reads `size_after` off each response, warning once in a development build at 90% of the cap. |
+| [Bundle size][d-size] | 77.8 kB minified, 22.2 kB gzipped, for driver + schema DSL: the dialect indirection, the transaction and savepoint subsystem, and prepared-statement abstractions covering sync and async drivers are all reachable from the entry point. | 44.1 kB / 15.3 kB for the same Worker, built the same way. None of those layers exist to be tree-shaken. |
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [Differences from drizzle-orm on D1][differences] | The ten cases above, each with the SQL and the error text, and the table of which D1 limit is checked where |
+| [Beyond Drizzle][beyond] | Features with no spelling in Drizzle: append-only tables and columns, `latestPerGroup`, `impact`, `backfill`, roundtrip drafts, vocabulary drift |
+| [Relational queries][relational] | `defineRelations`, the `db.query` filter DSL, `count`, and the SQL each of the two `with` strategies emits |
+| [Migrating an existing project][migrating] | The import change, the path alias, its silent failure mode, and the supported and unsupported lists |
+| [Adapters][adapters] | `@pothos/plugin-drizzle`, and the Better Auth adapter |
+| [Entry points and dependencies][entry-points] | The seven import paths, and which optional peer each needs |
+| [`d1zzle-migrate`][kit] | The CLI: configuration, environment resolution, commands, and what it does differently from `drizzle-kit` |
+| [Design documents][docs] | Why it is built this way: principles, the D1 platform, compilation, runtime, security |
 
 ## Scope
 
 Supported: Cloudflare D1, on Workers.
 
-Not supported, deliberately:
+Not supported, by decision:
 
 - **Other databases.** No Postgres, MySQL, better-sqlite3, `bun:sqlite`, or Durable Object
-  SQLite. Supporting a second backend reintroduces the abstraction that the bundle-size
-  difference above consists of. If you need portability, Drizzle is the answer.
+  SQLite. A second backend reinstates the abstraction layer that accounts for the
+  bundle-size difference in the table above. Drizzle covers portability.
 - **Interactive transactions.** D1 has none.
 - **A runtime migration engine.** Migrations are generated and applied by the CLI, never
   from inside a Worker.
@@ -101,15 +97,18 @@ npm test        # unit tests in Node, integration tests inside workerd against r
 npm run check   # typecheck + build + tests + kit typecheck + kit build
 ```
 
-Tests are in two layers, and the split is load-bearing: `test/unit/` and
-`kit/test/unit/` run in Node and assert on compilation output; `test/workers/` and
-`kit/test/workers/` run inside workerd against a real D1 binding, and every claim about
-SQLite's actual behaviour lives there.
+`npm run check` is what the CI badge above reports, on every push to `main` and every pull
+request.
 
-`d1zzle` and `d1zzle-migrate` are released together from one GitHub Release and published
-to npm with trusted publishing (OIDC, no long-lived token) and provenance attestations.
-`npm run version:set <version>` moves both packages and the kit's peer range together. See
-[RELEASING.md](./RELEASING.md).
+Tests are in two layers: `test/unit/` and `kit/test/unit/` run in Node and assert on
+compilation output; `test/workers/` and `kit/test/workers/` run inside workerd against a
+real D1 binding, and every claim about SQLite's or D1's actual behaviour is asserted
+there.
+
+`d1zzle` and `d1zzle-migrate` are published together from one GitHub Release — the Release
+badge above is that workflow — using npm trusted publishing (OIDC, no long-lived token),
+with provenance attestations. `npm run version:set <version>` moves both packages and the
+kit's peer range together. See [RELEASING.md](./RELEASING.md).
 
 ## Support and maintenance
 
@@ -122,10 +121,10 @@ things, and the distinction is what matters when deciding whether to depend on i
   on a patch for this repository expecting it to land.
 - **Issues are welcome, and a reply is not guaranteed.** A described bug or a reproduction
   is worth having written down; it helps anyone running a fork whether or not I answer.
-- **The security of this software is not guaranteed.** It is written carefully and tested
-  against a real D1 binding, and [11-security][security] documents what the compiler does
-  and does not guarantee, but that is not a substitute for reviewing the copy you run, and
-  no fix is promised on any timeline.
+- **The security of this software is not guaranteed.** It is tested against a real D1
+  binding, and [11-security][security] states what the compiler does and does not
+  guarantee, but that is not a substitute for reviewing the copy you run, and no fix is
+  promised on any timeline.
 
 **If you intend to depend on this, fork it and maintain your own copy.** You take on the
 risk and the maintenance deliberately, and the MIT license exists so that you can.
@@ -138,8 +137,7 @@ That is not the situation today.
 
 MIT — see [LICENSE](./LICENSE). The warranty and liability clauses mean what they say.
 
-<!-- Absolute URLs: npm rewrites relative links in a README, but resolves them against a
-     branch that may not exist, so these are spelled out to work on both sites. -->
+<!-- Absolute URLs: npm rewrites relative links against a branch that may not exist. -->
 
 [docs]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/README.md
 [kit]: https://github.com/soya-miyoshi/d1zzle/blob/main/kit/README.md
@@ -147,11 +145,9 @@ MIT — see [LICENSE](./LICENSE). The warranty and liability clauses mean what t
 [differences]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md
 [beyond]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/18-beyond-drizzle.md
 [relational]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/13-relational-queries.md
-[migrations]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/14-migrations.md
 [migrating]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/15-migrating-from-drizzle.md
 [adapters]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/16-adapters.md
 [entry-points]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/17-entry-points.md
-[limits]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#d1-limits-and-where-each-is-enforced
 [d-insert]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#inserting-more-rows-than-one-statement-can-carry
 [d-inarray]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#matching-a-column-against-a-long-list
 [d-batch]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#grouping-writes-so-that-they-all-succeed-or-all-fail

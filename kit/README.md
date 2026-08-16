@@ -24,14 +24,13 @@ export default defineConfig({
 ```
 
 `tableOptions` points at a module whose default export is `tableOptions([...])` from
-`d1zzle/ddl`, naming tables by object rather than by string. It is separate from the schema
-because none of `STRICT`, `WITHOUT ROWID` or the append-only trigger has a spelling in
-`drizzle-orm/sqlite-core`, and the schema DSL stays a strict subset of that so schema files
-remain readable by Drizzle's own tooling.
+`d1zzle/ddl` — `STRICT`, `WITHOUT ROWID` and the append-only trigger, which have no
+spelling in `drizzle-orm/sqlite-core` and therefore live outside the schema file. What
+each does, and what `generate` checks about it, is
+[18-beyond-drizzle](../docs/18-beyond-drizzle.md).
 
-The database is read from `wrangler.jsonc` / `wrangler.toml` unless you override it.
-Duplicated database configuration is a common source of "applied to the wrong database"
-incidents, so there is only one place to state it.
+The database is read from `wrangler.jsonc` / `wrangler.toml` unless overridden here, so
+the binding is stated in one place rather than two.
 
 ### Environments
 
@@ -120,51 +119,67 @@ What each is for, and why they exist rather than being assembled by hand, is
 
 ## What it does differently
 
-**Migrations are atomic.** Each migration file is split into statements and submitted as a
-single `batch()`, which D1 executes atomically. Emitting `BEGIN`/`COMMIT` — what a portable
-tool does — is not honoured by D1. If a migration is too large for one batch, the split is
-reported loudly rather than hidden, because atomicity is lost across it.
+**A migration is applied as one `batch()`.** D1 executes a batch atomically. The portable
+alternative — sending `BEGIN`, the statements, then `COMMIT` as separate `prepare()` calls
+— does not group them: D1 does not guarantee that consecutive statements reach the same
+connection, so the `BEGIN` may apply to a connection the writes never touch, and each write
+commits on its own. A migration that fails at statement 7 of 12 then leaves the first six
+applied and nothing to roll them back. When a migration exceeds what one batch can carry,
+the split point is printed, because atomicity is lost across it; a remote migration over
+100 statements is instead routed through the file-import endpoint, which Cloudflare rolls
+back as a unit.
 
-**Table recreation is implemented properly.** SQLite can only `ADD COLUMN`, `DROP COLUMN`,
-`RENAME COLUMN` and `RENAME TO`. Everything else — a type change, a new `NOT NULL`, a
-changed default, any constraint change — rebuilds the table. The column list in the
-`INSERT … SELECT` is always computed from the intersection of old and new columns; `SELECT *`
-is the classic corruption bug and never appears. Indexes are recreated, because they are
-dropped with the table.
+**Compound statements do not go through D1's `/query` endpoint.** `/query` re-splits the
+posted string on semicolons, and the splitter does not model compound statements:
 
-**Impossible migrations fail at `generate`, not at apply.** A new `NOT NULL` column with no
-default cannot be backfilled, so the kit refuses to write the migration and says why. So
-does rebuilding a table that another table references: D1 does not allow
-`PRAGMA foreign_keys = OFF` (it cannot be changed inside the implicit transaction D1 runs
-every statement in), and `defer_foreign_keys` — which D1 does accept — does not suppress
-`ON DELETE CASCADE`, so the `DROP TABLE` step would delete the referencing rows. Drop the
-foreign keys in one migration and rebuild in the next. This is the most surprising
-restriction in the tool, and it is a property of D1, not of the kit.
+```sql
+create trigger "t_no_update" before update on "t" begin
+  select raise(abort, 't is append-only');   -- /query splits here
+end;
+```
 
-**Local and remote share one code path.** Both are the same `SqlRunner` interface, so
-`--local` and `--remote` cannot drift apart.
+D1 answers `incomplete input: SQLITE_ERROR`. Measured against a real database, this
+reproduces for a whole batch, for a lone `create trigger`, on one line, and with the
+trailing semicolon removed; the semicolon before `end` is required by SQLite's grammar, so
+no phrasing of it succeeds. `wrangler d1 migrations apply` returns the same error — it is
+the endpoint, not the client. Such a batch is routed through the file-import endpoint
+(`init` → `PUT` → `ingest` → poll), the four steps `wrangler d1 execute --file` uses.
 
-**Drift is a first-class command.** `check` introspects the live database, diffs it against
-the snapshot the migrations imply, and reports unapplied migrations, manual `ALTER`s and
-anything else that would make the next generated migration compute from a false baseline.
+**Rebuilds compute the copied column list.** SQLite can only `ADD COLUMN`, `DROP COLUMN`,
+`RENAME COLUMN` and `RENAME TO`; a type change, a new `NOT NULL`, a changed default or any
+constraint change rebuilds the table. The column list in the `INSERT … SELECT` is the
+intersection of the old and new columns; `SELECT *` does not appear. Indexes are recreated,
+because they are dropped with the table.
 
-**`verify` asks a question `check` cannot.** `check` compares the live database against
-the snapshot; `verify` replays the migrations into an empty database and compares *that*
-against the schema. Neither subsumes the other. `generate` writes two artifacts from one
-diff — the SQL and the snapshot — and nothing forces them to agree: if the renderer drops a
-constraint, both are self-consistent, `check` compares a database against the snapshot that
-shares the bug, and CI stays green while the constraint is gone. Comparing two things that
-share no code path is what closes it. `verify` needs no database, so it runs anywhere.
+**Two rebuilds are refused at `generate` rather than emitted.** A new `NOT NULL` column
+with no default cannot be backfilled. And a table that another table references cannot be
+rebuilt in the same migration: D1 rejects `PRAGMA foreign_keys = OFF` (it cannot be changed
+inside the implicit transaction D1 runs every statement in), and `defer_foreign_keys`,
+which D1 accepts, postpones constraint checking without suppressing `ON DELETE CASCADE` —
+so the `DROP TABLE` step would delete rows out of every referencing table. `generate` names
+the tables holding the references and stops. Drop those foreign keys in one migration and
+rebuild in the next, or pass `--emit-roundtrip` for a draft of that sequence.
 
-**Wrangler stays interchangeable.** Migrations are written in wrangler's layout and
-recorded in wrangler's own `d1_migrations` table, so `d1zzle-migrate migrate` and
+**`--local` and `--remote` are one code path.** Both are the same `SqlRunner` interface.
+
+**`check` and `verify` compare different pairs.** `check` introspects the live database and
+diffs it against the snapshot the migrations imply, reporting unapplied migrations and
+manual changes — a `wrangler d1 execute` run against production would otherwise make the
+next generated migration compute from a false baseline. `verify` replays the migrations
+into an empty database and compares that against the schema. Neither subsumes the other:
+`generate` writes the SQL and the snapshot from one diff, and nothing forces them to agree,
+so a renderer that drops a constraint produces two self-consistent artifacts and `check`
+stays green. `verify` compares two sides that share no code path, and needs no database.
+
+**Migrations stay interchangeable with wrangler.** They are written in wrangler's layout
+and recorded in wrangler's own `d1_migrations` table, so `d1zzle-migrate migrate` and
 `wrangler d1 migrations apply` can be used against the same database.
 
 ## Studio
 
-Not implemented, on purpose. Use the Drizzle Studio browser extension — it introspects the
-live database and never loads a schema file, so it works with d1zzle unchanged — or
-Cloudflare's D1 console in the dashboard.
+Not implemented. The Drizzle Studio browser extension introspects the live database and
+never loads a schema file, so it works against a d1zzle project unchanged; Cloudflare's D1
+console covers ad-hoc queries.
 
 ## Programmatic use
 
