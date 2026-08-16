@@ -1300,7 +1300,7 @@ describe('joined strategy falls back rather than failing', () => {
 	it('takes 63 keys in one statement, and falls back at 64', async () => {
 		// Measured against D1 rather than reasoned about: 63 passes, 64 is
 		// rejected with `too many arguments on function json_object`. This is
-		// the limit doc 06 cites as a reason to prefer the split plan.
+		// the limit docs/03 cites as a reason to prefer the split plan.
 		expect(await joinedStatements((d) =>
 			d.query.owners.findMany({ with: { wide: { columns: wideColumns(63) } } })
 		)).toHaveLength(1);

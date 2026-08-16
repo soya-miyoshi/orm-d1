@@ -49,7 +49,7 @@ You are welcome to open an issue for a vulnerability, and for anything already p
 is probably the right call — it warns other people running forks. But please do not wait on
 a patch from here before protecting your own users. Fix it in your fork and tell them.
 
-[`docs/11-security.md`](./docs/11-security.md) documents what the compiler guarantees, which
+[`docs/07-security.md`](./docs/07-security.md) documents what the compiler guarantees, which
 APIs opt out of those guarantees, and where the trust boundaries sit. It is written for
 someone auditing their own copy, because that is the review that will actually happen.
 
@@ -70,8 +70,8 @@ npm run check   # typecheck → build → test → kit typecheck → kit build
 ```
 
 Tests run in two projects — Node for the pure layers, workerd with a real D1 binding for
-everything that touches the platform. [`docs/`](./docs/README.md) explains the design,
-including the places where the implementation deliberately departs from the documents.
+everything that touches the platform. [`docs/`](./docs/README.md) documents the library's
+behaviour, and [`kit/README.md`](./kit/README.md) the migration CLI.
 [`CLAUDE.md`](./CLAUDE.md) states the invariants that govern changes: no dependencies in
 `src/`, no symbol that Drizzle does not also have, and never loosening a test to reach
 green.

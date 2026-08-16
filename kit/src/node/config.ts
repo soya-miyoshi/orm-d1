@@ -39,7 +39,7 @@ export interface Config {
 	 * `STRICT` / `WITHOUT ROWID` / `appendOnly`.
 	 *
 	 * A separate module rather than part of the schema on purpose: none of the
-	 * three has a spelling in `drizzle-orm/sqlite-core`, and doc 08 keeps the
+	 * three has a spelling in `drizzle-orm/sqlite-core`, and docs/04 keeps the
 	 * schema DSL a strict subset of it so a schema file stays reverse-aliasable.
 	 * See `TableOptions` in `d1zzle/ddl`.
 	 */

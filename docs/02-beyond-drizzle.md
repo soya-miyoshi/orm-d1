@@ -1,6 +1,6 @@
 # 18 — Beyond Drizzle
 
-[12-drizzle-differences](./12-drizzle-differences.md) covers the same call behaving
+[01-differences](./01-differences.md) covers the same call behaving
 differently. This covers what has no spelling in `drizzle-orm` or `drizzle-kit`: six
 features that exist because the target is one database whose behaviour can be measured.
 
@@ -46,7 +46,7 @@ end;
 ```
 
 It is a separate module because a schema file must stay reverse-aliasable — every symbol
-it uses also exists in `drizzle-orm/sqlite-core` ([08](./08-drizzle-compatibility.md)) —
+it uses also exists in `drizzle-orm/sqlite-core` ([04-migrating-from-drizzle](./04-migrating-from-drizzle.md)) —
 and `strict`, `withoutRowid` and triggers do not exist there. Tables are keyed by object,
 so renaming a table is a type error rather than a dropped option.
 

@@ -169,7 +169,7 @@ describe('expression indexes whose text contains a paren or comma inside a strin
  *
  * `STRICT`, `WITHOUT ROWID` and the append-only trigger live in a sidecar
  * `tableOptions()` map rather than on `table()`, because none of them has a
- * spelling in `drizzle-orm/sqlite-core` and doc 08 keeps the schema DSL a
+ * spelling in `drizzle-orm/sqlite-core` and docs/04 keeps the schema DSL a
  * strict subset of it. That means two *separate* sources have to agree with
  * one live database, so the round trip matters more here than anywhere else:
  * if introspection cannot read an option back, `check` reports drift forever

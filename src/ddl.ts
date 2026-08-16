@@ -50,7 +50,7 @@ export interface DDLOptions {
  *
  * These live here rather than in the schema DSL on purpose. `STRICT`,
  * `WITHOUT ROWID` and triggers have no spelling in `drizzle-orm/sqlite-core`,
- * and doc 08 makes "every symbol a schema file uses also exists in Drizzle" a
+ * and docs/04 makes "every symbol a schema file uses also exists in Drizzle" a
  * standing constraint — it is what keeps a d1zzle schema reverse-aliasable and
  * therefore what lets `d1zzle-migrate studio` delegate to `drizzle-kit studio`.
  * Putting them on `table()` would break that for every user.

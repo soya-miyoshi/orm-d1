@@ -18,7 +18,7 @@ with `npm run test:unit`). Do not mutate tracked files, do not commit.
 Two halves with opposite constraints, and mixing them up is itself a defect:
 
 - `src/` — **ships to the Worker**. Austere: no Node builtins, no dependencies, every
-  byte counts (`docs/01-principles.md`). Runs in workerd.
+  byte counts (`CLAUDE.md`). Runs in workerd.
 - `kit/` — a **devDependency**, runs in Node, contributes zero bytes to the bundle.
   `kit/src/core/` is deliberately pure and Node-free so it can be tested *inside workerd
   against a real D1* (`kit/test/workers/`); `kit/src/node/` holds config, fs, runners.
@@ -33,7 +33,7 @@ report formatting, naming taste, or "consider extracting a helper" — that is n
 1. **A constraint that silently disappears.** This is the project's reason to exist:
    drizzle-kit dropped column-level `.unique()` on 64 tables and emitted DDL that was
    internally consistent, so the CI comparing generated-vs-committed stayed green
-   (`docs/09`, and acme's `docs/35`). Any change to DDL rendering, snapshotting, or
+   (`kit/README.md`, and acme's `docs/35`). Any change to DDL rendering, snapshotting, or
    diffing must be checked against the question *"what does this drop?"* — `unique`,
    composite primary keys, `check`, FK actions (`on delete` / `on update`), `not null`,
    defaults, collations, generated columns, partial-index `where`, `STRICT`,
@@ -53,10 +53,10 @@ report formatting, naming taste, or "consider extracting a helper" — that is n
    `--accept-data-loss`. `meta/` journal and snapshot must stay consistent with the
    emitted SQL.
 6. **Drizzle-compatibility subset.** d1zzle maintains "every symbol usable in a schema
-   file also exists in Drizzle" (`docs/08`). A new spelling in `sqlite-core` that Drizzle
-   lacks breaks that invariant and the reverse-alias story. Check `docs/08` before
+   file also exists in Drizzle" (`docs/04`). A new spelling in `sqlite-core` that Drizzle
+   lacks breaks that invariant and the reverse-alias story. Check `docs/04` before
    accepting new schema-facing API.
-7. **D1 platform limits** (`src/limits.ts`, `docs/02`): bound-parameter ceiling,
+7. **D1 platform limits** (`src/limits.ts`, `docs/01`): bound-parameter ceiling,
    statement size, batch size, subrequest count. A query builder that generates an
    unbounded `in (...)` or an unbounded batch is a production outage, not a style issue.
 8. **Efficiency, but only where it is real**: per-query allocations and string building

@@ -65,6 +65,5 @@ schema file also exists there with the same meaning. That is what makes the alia
 in both directions, and it is why `STRICT`, `WITHOUT ROWID` and the append-only trigger are
 configured in a separate `tableOptions` module rather than on the table.
 
-What each supported symbol maps to, and the compatibility target itself, is
-[08-drizzle-compatibility](./08-drizzle-compatibility.md). Where the *behaviour* differs
-once the imports are changed is [12-drizzle-differences](./12-drizzle-differences.md).
+Where the behaviour differs once the imports are changed is
+[01-differences](./01-differences.md).

@@ -245,7 +245,7 @@ const columnSnapshot = (column: Column<any>): ColumnSnapshot => ({
  *
  * `options` is the sidecar `tableOptions()` map. It is separate from the schema
  * module because `STRICT` / `WITHOUT ROWID` / triggers have no spelling in
- * `drizzle-orm/sqlite-core`, and doc 08 keeps the schema DSL a strict subset of
+ * `drizzle-orm/sqlite-core`, and docs/04 keeps the schema DSL a strict subset of
  * it — see the `TableOptions` docs in `d1zzle/ddl`.
  */
 export function snapshotFromSchema(

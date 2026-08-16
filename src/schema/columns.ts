@@ -566,7 +566,7 @@ export interface TextConfig<TEnum extends readonly string[], TMode extends 'text
  * to return strings, and `.$type<T>()` had nothing to narrow — which is what
  * the `json<T>()` helper was invented to work around. That helper does not
  * exist in `drizzle-orm/sqlite-core`, so reaching for it took a schema file
- * out of the Drizzle subset (doc 08) and broke reverse-aliasing.
+ * out of the Drizzle subset (docs/04) and broke reverse-aliasing.
  *
  * `[TMode] extends ['json']` rather than the naked `TMode extends 'json'`: a
  * naked type parameter distributes over unions, and the default is the union
@@ -702,7 +702,7 @@ export function boolean(name?: string): ColumnBuilder<Meta<boolean, 'SQLiteBoole
  * A `text` column carrying JSON. Equivalent to `text({ mode: 'json' })`.
  *
  * @deprecated **Not in `drizzle-orm/sqlite-core`.** Using it in a schema file
- * takes that file out of the Drizzle subset doc 08 requires, which breaks
+ * takes that file out of the Drizzle subset docs/04 requires, which breaks
  * reverse-aliasing and with it the `studio` delegation path. It existed
  * because `text(name, { mode: 'json' })` used to type its data as `string`
  * whatever the mode; that is fixed, so the portable spelling now carries the

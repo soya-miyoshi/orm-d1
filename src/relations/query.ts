@@ -134,7 +134,7 @@ const resolveOrderBy = (orderBy: OrderByArg | undefined, columns: Record<string,
 		.filter(([, direction]) => direction)
 		.map(([key, direction]) => {
 			// `hasOwn`, not a bare index: the object form of `orderBy` is part of
-			// the same JSON-shaped config as `where` (see `docs/11`), and
+			// the same JSON-shaped config as `where` (see `docs/07`), and
 			// `columns['constructor']` resolves to `Object` — truthy — so the
 			// refusal below never ran. `asc(Object)` then compiled to `? asc` with
 			// a *function* in the parameter list, which `bind()` rejects at

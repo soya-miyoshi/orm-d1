@@ -70,7 +70,7 @@ export type {
  * threadId: integer('thread_id').references((): AnySQLiteColumn => messages.id)
  * ```
  *
- * Our `Column` is the same type. Only the Drizzle spelling is exported: doc 08
+ * Our `Column` is the same type. Only the Drizzle spelling is exported: docs/04
  * requires every symbol a schema file mentions to exist in
  * `drizzle-orm/sqlite-core`, and while `AnySQLiteColumn` does, `AnyColumn` does
  * not — Drizzle keeps that one at the package root, so aliasing it here would

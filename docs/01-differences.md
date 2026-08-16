@@ -8,9 +8,9 @@ The differences all come from the same four properties of D1: the database is re
 the network, so cost tracks the number of calls; a statement accepts at most 100 bound
 parameters; `batch()` is the only atomicity available, because there are no interactive
 transactions; and Worker startup CPU is billed, so library size is a per-request cost on
-cold isolates. Each section names the property it depends on. The platform description
-they are drawn from is [02](./02-d1-platform.md), which also records what the suite
-observed running inside workerd against a real D1 binding.
+cold isolates. Each section names the property it depends on. Every claim below about
+what D1 does is asserted in `test/workers/`, which runs inside workerd against a real D1
+binding.
 
 ## Contents
 
@@ -275,7 +275,7 @@ These two numbers come from a one-off measurement, not from a tracked harness â€
 project's own design rules call that out as an outstanding gap. The size claim that *is*
 tested is which library ends up in the bundle, in
 `test/unit/module-resolution.test.ts`; see
-[15-migrating-from-drizzle](./15-migrating-from-drizzle.md).
+[04-migrating-from-drizzle](./04-migrating-from-drizzle.md).
 
 ## D1 limits, and where each is enforced
 
@@ -299,12 +299,11 @@ supplied through `ph()` is filled after compilation, so its length is left to D1
 
 Verify the current values against
 <https://developers.cloudflare.com/d1/platform/limits/> before relying on a specific
-number; the ones above were last checked on 2026-07-27. Full table:
-[02-d1-platform](./02-d1-platform.md#documented-limits).
+number; the ones above were last checked on 2026-07-27.
 
 ## What is not a difference
 
 The schema DSL, the query builder, the inferred types and the `db.query` interface are
-Drizzle's. What each supported symbol means, and the list of what is deliberately absent,
-is [08-drizzle-compatibility](./08-drizzle-compatibility.md); how Drizzle's own adapters
-still recognise a d1zzle table is [10-ecosystem-interop](./10-ecosystem-interop.md).
+Drizzle's. The supported and unsupported lists are in
+[04-migrating-from-drizzle](./04-migrating-from-drizzle.md); how Drizzle's own adapters
+still recognise a d1zzle table is [05-adapters](./05-adapters.md).

@@ -148,7 +148,7 @@ in every lens, append these two paragraphs:
 >   not exist today. Describe it and argue for it, but understand it will not be built by
 >   this sweep. See below.
 >
-> Note `docs/08`: a symbol usable in a schema must also exist in Drizzle. A proposal that
+> Note `docs/04`: a symbol usable in a schema must also exist in Drizzle. A proposal that
 > invents a spelling Drizzle lacks is a proposal to change what this ORM *is*.
 
 **`NEW-SURFACE` never reaches the coder.** Adding to the published API is forbidden here
@@ -296,6 +296,6 @@ will be — that is what the human skims when they come back.
 - Add a dependency, or bump one
 - Change the published API surface (`src/index.ts`, `src/sqlite-core.ts`, `kit` exports)
   or anything in `docs/` describing it — park it as `needs-human`
-- Add a schema-facing spelling that `drizzle-orm/sqlite-core` does not have (`docs/08`)
+- Add a schema-facing spelling that `drizzle-orm/sqlite-core` does not have (`docs/04`)
 - Release, version-bump, or touch `RELEASING.md` / `Makefile`
 - Copy another project's schema into this repo (see the fixture note in `AUDIT.md`)

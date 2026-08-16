@@ -227,7 +227,7 @@ describe('update compilation', () => {
 
 	/**
 	 * `set()` takes an object that routinely comes straight from a request body,
-	 * so "which keys resolve to a column" is a trust boundary — see `docs/11`.
+	 * so "which keys resolve to a column" is a trust boundary — see `docs/07`.
 	 * A plain `columns[field]` read walks the prototype chain right past the
 	 * unknown-column refusal above.
 	 */

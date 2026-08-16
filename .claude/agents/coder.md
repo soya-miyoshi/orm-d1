@@ -16,11 +16,11 @@ substitute.
 - **Never create a branch.** Commit to the current branch, and only when asked to commit.
 - **Never write to `.git/`.** Use git commands.
 - **`src/` ships to the Worker.** No Node builtins, no new dependencies, no bloat — the
-  runtime is deliberately austere (`docs/01-principles.md`). If a fix seems to need a
+  runtime carries no dependencies and no Node builtins (`CLAUDE.md`). If a fix seems to need a
   Node builtin in `src/`, stop and report.
 - **`kit/src/core/` must stay Node-free** — it is tested inside workerd against a real D1
   (`kit/test/workers/`). Node-only code belongs in `kit/src/node/`.
-- **Schema-facing API stays a subset of Drizzle** (`docs/08`): every symbol usable in a
+- **Schema-facing API stays a subset of Drizzle** (`docs/04`): every symbol usable in a
   schema file must also exist in Drizzle. Adding a spelling Drizzle lacks is out of scope
   for you — report it instead.
 - **Never weaken a test to make it pass.** If a test fails, either the change is wrong or

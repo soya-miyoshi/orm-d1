@@ -17,9 +17,6 @@ Drizzle `SQL` fragments built over d1zzle columns — `eq(users.id, 1)`, `inArra
 `` sql`…` `` — render correctly inside a d1zzle query, which is how an adapter's own
 predicates reach the database.
 
-The reasoning, and a survey of the rest of the ecosystem with what each one would cost, is
-[10-ecosystem-interop](./10-ecosystem-interop.md).
-
 ## Pothos
 
 `test/workers/pothos.test.ts` runs a GraphQL schema over a d1zzle database inside workerd

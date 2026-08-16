@@ -27,7 +27,7 @@ export default defineConfig({
 `d1zzle/ddl` — `STRICT`, `WITHOUT ROWID` and the append-only trigger, which have no
 spelling in `drizzle-orm/sqlite-core` and therefore live outside the schema file. What
 each does, and what `generate` checks about it, is
-[18-beyond-drizzle](../docs/18-beyond-drizzle.md).
+[02-beyond-drizzle](../docs/02-beyond-drizzle.md).
 
 The database is read from `wrangler.jsonc` / `wrangler.toml` unless overridden here, so
 the binding is stated in one place rather than two.
@@ -115,7 +115,7 @@ writes a draft sequence for a rebuild that was refused because the table has chi
 `backfill` takes `--table <name>` (repeatable) and `--file <path.sql>`. `impact` takes an
 optional `--table <name>`; without one it ranks every table in the schema by rebuild cost.
 What each is for, and why they exist rather than being assembled by hand, is
-[18-beyond-drizzle](../docs/18-beyond-drizzle.md).
+[02-beyond-drizzle](../docs/02-beyond-drizzle.md).
 
 ## What it does differently
 

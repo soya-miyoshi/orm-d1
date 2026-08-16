@@ -71,8 +71,8 @@ does.
 | [Migrating an existing project][migrating] | The import change, the path alias, its silent failure mode, and the supported and unsupported lists |
 | [Adapters][adapters] | `@pothos/plugin-drizzle`, and the Better Auth adapter |
 | [Entry points and dependencies][entry-points] | The seven import paths, and which optional peer each needs |
+| [Security][security] | What the compiler guarantees, the three APIs that opt out of it, and why the filter DSL is a trust boundary |
 | [`d1zzle-migrate`][kit] | The CLI: configuration, environment resolution, commands, and what it does differently from `drizzle-kit` |
-| [Design documents][docs] | Why it is built this way: principles, the D1 platform, compilation, runtime, security |
 
 ## Scope
 
@@ -122,7 +122,7 @@ things, and the distinction is what matters when deciding whether to depend on i
 - **Issues are welcome, and a reply is not guaranteed.** A described bug or a reproduction
   is worth having written down; it helps anyone running a fork whether or not I answer.
 - **The security of this software is not guaranteed.** It is tested against a real D1
-  binding, and [11-security][security] states what the compiler does and does not
+  binding, and [the security document][security] states what the compiler does and does not
   guarantee, but that is not a substitute for reviewing the copy you run, and no fix is
   promised on any timeline.
 
@@ -139,22 +139,21 @@ MIT — see [LICENSE](./LICENSE). The warranty and liability clauses mean what t
 
 <!-- Absolute URLs: npm rewrites relative links against a branch that may not exist. -->
 
-[docs]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/README.md
 [kit]: https://github.com/soya-miyoshi/d1zzle/blob/main/kit/README.md
-[security]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/11-security.md
-[differences]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md
-[beyond]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/18-beyond-drizzle.md
-[relational]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/13-relational-queries.md
-[migrating]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/15-migrating-from-drizzle.md
-[adapters]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/16-adapters.md
-[entry-points]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/17-entry-points.md
-[d-insert]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#inserting-more-rows-than-one-statement-can-carry
-[d-inarray]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#matching-a-column-against-a-long-list
-[d-batch]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#grouping-writes-so-that-they-all-succeed-or-all-fail
-[d-collision]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#a-joined-select-inside-batch-that-projects-two-columns-with-the-same-name
-[d-session]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#reading-from-a-replica-and-reading-your-own-writes
-[d-onquery]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#seeing-what-a-query-cost
-[d-compile]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#building-a-query-once-per-isolate-instead-of-once-per-request
-[d-limits]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#d1s-other-limits
-[d-plan]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#plan-dependent-limits
-[d-size]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#bundle-size
+[security]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/07-security.md
+[differences]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md
+[beyond]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/02-beyond-drizzle.md
+[relational]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/03-relational-queries.md
+[migrating]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/04-migrating-from-drizzle.md
+[adapters]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/05-adapters.md
+[entry-points]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/06-entry-points.md
+[d-insert]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#inserting-more-rows-than-one-statement-can-carry
+[d-inarray]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#matching-a-column-against-a-long-list
+[d-batch]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#grouping-writes-so-that-they-all-succeed-or-all-fail
+[d-collision]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#a-joined-select-inside-batch-that-projects-two-columns-with-the-same-name
+[d-session]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#reading-from-a-replica-and-reading-your-own-writes
+[d-onquery]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#seeing-what-a-query-cost
+[d-compile]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#building-a-query-once-per-isolate-instead-of-once-per-request
+[d-limits]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#d1s-other-limits
+[d-plan]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#plan-dependent-limits
+[d-size]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#bundle-size

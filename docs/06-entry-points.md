@@ -28,5 +28,4 @@ Verified against rc.1 and rc.4.
 There is no `eval`, no `new Function` and no `child_process` in either package, and `src/`
 uses no Node builtins.
 
-The module layout behind these entry points is [03-architecture](./03-architecture.md);
-what `d1zzle/drizzle` exists for is [16-adapters](./16-adapters.md).
+What `d1zzle/drizzle` exists for is [05-adapters](./05-adapters.md).

@@ -1,8 +1,10 @@
 # CLAUDE.md
 
 d1zzle — a type-safe ORM built **exclusively** for Cloudflare D1 and Workers, plus its
-migration CLI. Design docs are `docs/01`–`docs/10`; read the relevant one before changing
-behavior it describes.
+migration CLI. `docs/01`–`docs/07` は使う側向けのドキュメント（挙動の差、機能、
+移行、セキュリティ）で、`kit/README.md` が CLI のリファレンス。振る舞いを変えるなら
+先に該当のものを読み、変えたら直す。設計ドキュメントは 2026-08-16 に削除した ——
+判断の理由はコードのコメントとして、その判断の隣に置く。
 
 ## The split that governs everything
 
@@ -16,7 +18,7 @@ behavior it describes.
 
 - **`src/` に依存関係や `node:` ビルトインを足さない。** 必要に見えたら設計が
   間違っている。止めて報告する。
-- **スキーマに書ける記号は Drizzle にも存在しなければならない**（`docs/08`）。
+- **スキーマに書ける記号は Drizzle にも存在しなければならない**（`docs/04`）。
   既存の `drizzle-orm/sqlite-core` スキーマは import 指定子を変えるだけで動くのが
   この ORM の存在理由で、アダプタ（Pothos の drizzle plugin など）は Drizzle の
   *内部表現*を読む。Drizzle に無い綴りを `sqliteTable` 系に足すのは API 変更であり、
@@ -62,7 +64,7 @@ Drizzle 方言で書いてあるので互換性フィクスチャも兼ねてい
 
 ## この ORM で「バグ」が出る場所
 
-深刻な順。詳しくは `docs/05`（コンパイル）と `docs/09`（kit）。
+深刻な順。詳しくは `docs/01`（drizzle との差）と `kit/README.md`（kit）。
 
 1. **制約が黙って消える。** このプロジェクトが存在する理由そのもの —— drizzle-kit は
    64 表で列レベル `.unique()` を落とし、生成物同士は整合していたので CI は緑だった。
@@ -75,7 +77,7 @@ Drizzle 方言で書いてあるので互換性フィクスチャも兼ねてい
    left join が実質 inner になる、全 null の行がオブジェクトとして実体化する。
 4. **識別子のクォートと値のバインド。** 識別子は必ずクォートして内部のクォートを
    エスケープし、値は必ずバインドする（文字列連結しない）。
-5. **D1 のプラットフォーム上限**（`src/limits.ts`, `docs/02`）: バインドパラメータ数、
+5. **D1 のプラットフォーム上限**（`src/limits.ts`, `docs/01`）: バインドパラメータ数、
    ステートメントサイズ、batch サイズ、subrequest 数。無制限に伸びる `in (...)` や
    batch は本番障害であってスタイルの問題ではない。
 

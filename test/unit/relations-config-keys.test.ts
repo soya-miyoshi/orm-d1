@@ -2,7 +2,7 @@
  * Field resolution for the rest of the relational config — `orderBy` and `with`.
  *
  * `where` has its own suite (`relations-filter.test.ts`); these are the sibling
- * keys of the same object, arriving from the same place. `docs/11` documents
+ * keys of the same object, arriving from the same place. `docs/07` documents
  * the whole `FindConfig` as a trust boundary, so every key that resolves
  * against a bag of columns or relations has to refuse a prototype member
  * rather than pick one up off the chain.

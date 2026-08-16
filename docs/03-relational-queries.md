@@ -123,6 +123,6 @@ articles: {
 ## The filter DSL is a trust boundary
 
 Before passing a client-supplied object to `findMany`, read
-[11-security](./11-security.md#the-filter-dsl-is-a-query-language): the filter DSL is a
+[07-security](./07-security.md#the-filter-dsl-is-a-query-language): the filter DSL is a
 query language, and handing one an untrusted body delegates query construction to the
 caller.
