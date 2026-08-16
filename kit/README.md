@@ -102,11 +102,21 @@ d1zzle-migrate check         # detect drift and unapplied migrations; non-zero e
 d1zzle-migrate verify        # replay the migrations into an empty DB and compare with the
                              #   schema; needs no database at all, so it runs in CI
 d1zzle-migrate up            # upgrade snapshot format after a kit version bump
+d1zzle-migrate backfill      # run one-off statements against append-only tables, with
+                             #   their guards suspended and put back verbatim, in one batch
+d1zzle-migrate impact        # how many tables a rebuild of one table drags with it;
+                             #   --local/--remote adds row counts
 ```
 
 Flags: `--local` (default) targets the `.wrangler` SQLite state; `--remote` goes through
 the D1 HTTP API. `--env <name>` picks a wrangler environment (see above).
-`--accept-data-loss` is required for anything destructive.
+`--accept-data-loss` is required for anything destructive. `generate --emit-roundtrip`
+writes a draft sequence for a rebuild that was refused because the table has children.
+
+`backfill` takes `--table <name>` (repeatable) and `--file <path.sql>`. `impact` takes an
+optional `--table <name>`; without one it ranks every table in the schema by rebuild cost.
+What each is for, and why they exist rather than being assembled by hand, is
+[18-beyond-drizzle](../docs/18-beyond-drizzle.md).
 
 ## What it does differently
 

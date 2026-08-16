@@ -1,10 +1,27 @@
-# d1zzle — design documentation
+# d1zzle — documentation
 
 d1zzle is a type-safe SQL query builder / ORM built **exclusively** for Cloudflare D1
 running inside Cloudflare Workers. It takes its ergonomics and API shape from Drizzle, but
 shares no code with it and does not depend on it.
 
-## Read in this order
+## Using d1zzle
+
+Written for someone with the library installed. Start here; the [README](../README.md) is
+the index of the same set.
+
+| Doc | What it covers |
+| --- | --- |
+| [12-drizzle-differences.md](./12-drizzle-differences.md) | Where behaviour departs from `drizzle-orm` on D1, case by case: what Drizzle does, what d1zzle does, and which property of the platform forces it. Ends with the table of which D1 limit is enforced where |
+| [13-relational-queries.md](./13-relational-queries.md) | `defineRelations`, the `db.query` filter DSL, `count`, and the two plans a `with` can run under |
+| [14-migrations.md](./14-migrations.md) | `d1zzle-migrate`, and what it does differently from `drizzle-kit` because the target is D1. Full CLI reference: [kit/README.md](../kit/README.md) |
+| [15-migrating-from-drizzle.md](./15-migrating-from-drizzle.md) | The one-line import change, the zero-diff path alias and its silent failure mode, and what is and is not supported |
+| [16-adapters.md](./16-adapters.md) | Pothos, and the native Better Auth adapter |
+| [17-entry-points.md](./17-entry-points.md) | The seven import paths, and which optional peer each one needs |
+| [18-beyond-drizzle.md](./18-beyond-drizzle.md) | What Drizzle has no spelling for: append-only tables and columns, `latestPerGroup`, `impact`, `backfill`, roundtrip drafts, vocabulary drift |
+
+## The design, in order
+
+Why it is built the way it is. Read in this order.
 
 | Doc | What it covers |
 | --- | --- |
@@ -19,7 +36,6 @@ shares no code with it and does not depend on it.
 | [09-d1zzle-migrate.md](./09-d1zzle-migrate.md) | The migration CLI: commands, table recreation, drift detection |
 | [10-ecosystem-interop.md](./10-ecosystem-interop.md) | Being recognised by Drizzle's adapters: `entityKind`, symbols, the one gap that cannot be closed — and Better Auth, where being recognised is not enough and we ship a native adapter. Ends with a survey of the rest of the ecosystem and what each one would cost |
 | [11-security.md](./11-security.md) | What the compiler guarantees, the escape hatches that opt out of it, and why the filter DSL is a trust boundary rather than an input format |
-| [12-drizzle-differences.md](./12-drizzle-differences.md) | Where behaviour departs from `drizzle-orm` on D1, case by case: what Drizzle does, what d1zzle does, and which property of the platform forces it |
 
 ## The short version
 

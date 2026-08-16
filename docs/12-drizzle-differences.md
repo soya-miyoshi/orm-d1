@@ -24,6 +24,7 @@ observed running inside workerd against a real D1 binding.
 - [D1's other limits](#d1s-other-limits)
 - [Plan-dependent limits](#plan-dependent-limits)
 - [Bundle size](#bundle-size)
+- [D1 limits, and where each is enforced](#d1-limits-and-where-each-is-enforced)
 
 ## Inserting more rows than one statement can carry
 
@@ -217,7 +218,7 @@ statements, or shorten the fragment.
 ```
 
 The full list, and the limits deliberately left to D1, are in
-[D1 limits, and where each is enforced](../README.md#d1-limits-and-where-each-is-enforced).
+[D1 limits, and where each is enforced](#d1-limits-and-where-each-is-enforced) below.
 
 ## Plan-dependent limits
 
@@ -273,7 +274,32 @@ These two numbers come from a one-off measurement, not from a tracked harness �
 project's own design rules call that out as an outstanding gap. The size claim that *is*
 tested is which library ends up in the bundle, in
 `test/unit/module-resolution.test.ts`; see
-[Migrating an existing project](../README.md#migrating-an-existing-project).
+[15-migrating-from-drizzle](./15-migrating-from-drizzle.md).
+
+## D1 limits, and where each is enforced
+
+Checked while compiling, because compilation happens once per isolate and already walks
+the query:
+
+| Limit | Value | Handling |
+| --- | --- | --- |
+| Bound parameters per statement | 100 | drives insert chunking and the `inArray` strategy; an error only where neither applies |
+| SQL statement length | 100,000 bytes of text — bound parameters are sent separately | error naming `maxParams` as the lever |
+| Arguments to one SQL function | 32 | error |
+| `LIKE` / `GLOB` pattern | 50 bytes, when the pattern is a literal at the call site | error |
+| Columns per table | 100 | checked at `sqliteTable(…)` |
+
+Checked after execution, and only when `plan` is set: statements per Worker invocation and
+database size (see [Plan-dependent limits](#plan-dependent-limits)).
+
+Left to D1: maximum query duration (30 s), and maximum string / BLOB / row size
+(2,000,000 bytes), which is a property of the values rather than of the query. A pattern
+supplied through `ph()` is filled after compilation, so its length is left to D1 as well.
+
+Verify the current values against
+<https://developers.cloudflare.com/d1/platform/limits/> before relying on a specific
+number; the ones above were last checked on 2026-07-27. Full table:
+[02-d1-platform](./02-d1-platform.md#documented-limits).
 
 ## What is not a difference
 
