@@ -1,4 +1,4 @@
-# 17 — Entry points and dependencies
+# Entry points and dependencies
 
 | Import | Contents |
 | --- | --- |

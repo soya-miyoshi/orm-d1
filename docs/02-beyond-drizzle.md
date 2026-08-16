@@ -1,8 +1,9 @@
-# 18 — Beyond Drizzle
+# Beyond Drizzle
 
-[01-differences](./01-differences.md) covers the same call behaving
-differently. This covers what has no spelling in `drizzle-orm` or `drizzle-kit`: six
-features that exist because the target is one database whose behaviour can be measured.
+[01-differences](./01-differences.md) covers the same call behaving differently. This
+covers what has no spelling in `drizzle-orm` or `drizzle-kit`: seven features. Each is
+specific to D1 or to SQLite, which is why a library targeting several databases has no
+place to put it.
 
 ## Contents
 
@@ -51,9 +52,10 @@ and `strict`, `withoutRowid` and triggers do not exist there. Tables are keyed b
 so renaming a table is a type error rather than a dropped option.
 
 `appendOnly: true` blocks every `UPDATE`. A column list blocks only statements mentioning
-those columns, which leaves the rest of the row writable — a fee an outside processor
-confirms after the row is written, free text a deletion request has to clear. `DELETE` is
-allowed in both forms.
+those columns, which leaves the rest of the row writable. Two columns that have to stay
+writable on an otherwise frozen row: a fee an outside processor confirms after the row is
+written, and free text that a deletion request has to clear. `DELETE` is allowed in both
+forms.
 
 Two properties of `UPDATE OF`, both asserted against a real D1 binding in
 `kit/test/workers/roundtrip.test.ts` ("fires on mention, not on change, and never applies
@@ -115,11 +117,11 @@ where "d1zzle_latest"."__d1zzle_latest_rn" = ?
 The rank column is projected under a name no user column can collide with and is removed
 from the returned rows, so the result type is the table's own.
 
-The two hand-written alternatives it replaces: fetching every row and keeping the first
-seen per key in JavaScript transfers the whole history to return its last page; `order by
-… desc limit 1` per group is one query per group, and on a millisecond timestamp it is not
-deterministic — two rows recorded in the same millisecond come back in whichever order the
-scan produced.
+It replaces two hand-written alternatives, each with its own cost. Fetching every row and
+keeping the first seen per key in JavaScript transfers the whole history in order to return
+its last page. `order by … desc limit 1` per group is one query per group, and on a
+millisecond timestamp it is not deterministic: two rows recorded in the same millisecond
+come back in whichever order the scan produced.
 
 `tiebreak` is a required argument for that reason. `orderBy` alone accepts
 `[desc(recordedAt)]`, which is not a total order, and the result is then one of two rows
@@ -130,10 +132,10 @@ since only the caller knows which column is unique within a partition.
 ## `STRICT` and `WITHOUT ROWID`
 
 Both are options in the same sidecar module, and both are validated at `generate` against
-behaviour confirmed on D1: `WITHOUT ROWID` on a table with no primary key fails with
-`PRIMARY KEY missing`, and `STRICT` with a `NUMERIC` column fails with `unknown datatype`
-(`numeric()` is the only d1zzle column type that renders one). The alternative to checking
-is a migration that applies to production halfway and then fails.
+behaviour confirmed on D1. `WITHOUT ROWID` on a table with no primary key fails with
+`PRIMARY KEY missing`. `STRICT` with a `NUMERIC` column fails with `unknown datatype`;
+`numeric()` is the only d1zzle column type that renders one. The alternative to checking is
+a migration that applies to production halfway and then fails.
 
 ## `impact`
 

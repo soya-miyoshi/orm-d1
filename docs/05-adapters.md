@@ -1,4 +1,4 @@
-# 16 — Adapters: Pothos and Better Auth
+# Adapters: Pothos and Better Auth
 
 Drizzle has no public API for describing a schema, so adapters read its internals:
 `entityKind`, `Symbol.for('drizzle:Columns')`, `db._.relations`. d1zzle tables and columns

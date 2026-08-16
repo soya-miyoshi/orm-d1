@@ -1,4 +1,4 @@
-# 13 — Relational queries
+# Relational queries
 
 ```ts
 import { defineRelations, drizzle } from 'd1zzle';

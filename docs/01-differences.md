@@ -1,4 +1,4 @@
-# 12 — Differences from drizzle-orm on D1
+# Differences from drizzle-orm on D1
 
 Each item below states the case, what `drizzle-orm@1.0.0-rc.4` does on D1, and what d1zzle
 does. The Drizzle behaviour is read from that version's `d1/session.js`,
@@ -74,7 +74,8 @@ naming the call and the reason it could not collapse, rather than leaving you wi
 
 **Drizzle** exposes `db.transaction()` on its D1 driver, implemented by running `begin`,
 the callback's statements, and then `commit` or `rollback` as ordinary separate statements.
-It type-checks and usually appears to work. What it does not do is group the statements:
+It type-checks, and on the path where nothing fails it returns the same rows a real
+transaction would. What it does not do is group the statements:
 D1 does not guarantee that consecutive statements reach the same connection, so the `begin`
 can apply to a connection none of the writes use, and each write commits by itself. When
 the third of five writes fails, the first two stay applied and the `rollback` has nothing
@@ -172,16 +173,16 @@ const db = drizzle(env.DB, {
 });
 ```
 
-The event carries `rowsRead`, `rowsWritten`, `durationMs` (measured around the call, so it
-includes the network), `d1DurationMs` and `sqlDurationMs` (D1's own, server-side),
-`servedByPrimary`, `servedByRegion` and `attempts`. `durationMs - sqlDurationMs` is the
-network share.
+Always present on the event: `sql`, `kind`, `tables`, `durationMs` (measured around the
+call, so it includes the network), `rowsRead` and `rowsWritten`. The last two report 0 when
+the response carried no `meta`. Present only when D1 returned them, and therefore typed as
+optional: `d1DurationMs` and `sqlDurationMs` (D1's own, server-side), `servedByPrimary`,
+`servedByRegion` and `attempts`. `durationMs - sqlDurationMs` is the network share.
 
-Two costs. `.raw()` carries no metadata, so installing
-`onQuery` switches selects to the keyed read path, which allocates one object per row —
-which is why it is opt-in per database. And bound parameters are included only in
-development builds, since they contain user data; `test/workers/integration.test.ts`
-asserts that a production build omits them.
+Installing `onQuery` costs two things. `.raw()` carries no metadata, so it switches selects
+to the keyed read path, which allocates one object per row — which is why it is opt-in per
+database. And bound parameters are included only in development builds, since they contain
+user data; `test/workers/integration.test.ts` asserts that a production build omits them.
 
 ## Building a query once per isolate instead of once per request
 
@@ -221,7 +222,7 @@ isolate and already walks the whole query — and names the lever:
 ```
 A statement of 186040 characters exceeds D1's 100000-byte limit on SQL text. Bound
 parameters do not count toward it, so this is statement text: a very wide insert, or a
-large sql.raw(…) fragment. Lower maxParams (currently 100000) to chunk into shorter
+large sql.raw(…) fragment. Lower maxParams (currently 100) to chunk into shorter
 statements, or shorten the fragment.
 ```
 
@@ -247,11 +248,12 @@ round trips but not this count; the warning says so and suggests reducing the nu
 statements instead. The size warning fires past 90% of the cap, read from `size_after`,
 which D1 returns on every statement including reads.
 
-Each warning fires at most once per database object. Counting is per database object and
-shared with sessions derived from it, which is exact for the usual `drizzle(env.DB)`
-inside `fetch` and over-counts for a database hoisted to module scope and reused across
-requests — warning once is what keeps that case from being misleading, and the message
-says so. Left unset, neither warning fires.
+Each warning fires at most once per database object. Counting is per database object too,
+and is shared with the sessions derived from it. That is exact for the usual
+`drizzle(env.DB)` inside `fetch`. It over-counts for a database hoisted to module scope and
+reused across requests, which is why the warning fires once rather than per statement, and
+why the statement-count message says the number may span requests. Left unset, neither
+warning fires.
 
 `plan` does not change the bound-parameter budget. That is 100 on both plans; `maxParams`
 is the option that changes it.
@@ -278,8 +280,8 @@ On Workers the minified column is the relevant one, because startup CPU is bille
 parse time tracks uncompressed bytes; the 3 MB / 10 MB compressed limits are not a
 constraint for a library of this size.
 
-These two numbers come from a one-off measurement, not from a tracked harness — the
-project's own design rules call that out as an outstanding gap. The size claim that *is*
+These two numbers come from a one-off measurement. Nothing in CI re-measures them, so they
+can drift from the published packages as either library changes. The size claim that *is*
 tested is which library ends up in the bundle, in
 `test/unit/module-resolution.test.ts`; see
 [04-migrating-from-drizzle](./04-migrating-from-drizzle.md).

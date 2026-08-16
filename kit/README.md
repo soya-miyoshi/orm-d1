@@ -44,7 +44,7 @@ Wrangler's `[[env.<name>.d1_databases]]` (TOML) and `env: { <name>: { d1_databas
 | 3 | `d1.env` in `d1zzle.config.ts` |
 | — | none of them: the **top-level** block, which is what `wrangler` uses without `--env` |
 
-`CLOUDFLARE_ENV` and `d1.env` disagreeing is an error rather than a preference — wrangler
+`CLOUDFLARE_ENV` and `d1.env` disagreeing is an error rather than a preference. Wrangler
 has no `d1.env`, so there is no precedent to copy, and picking either one silently is how a
 migration lands on production while the deploy goes to staging. `--env` settles it, exactly
 as it does for wrangler.
@@ -153,9 +153,9 @@ because they are dropped with the table.
 
 **Two rebuilds are refused at `generate` rather than emitted.** A new `NOT NULL` column
 with no default cannot be backfilled. And a table that another table references cannot be
-rebuilt in the same migration: D1 rejects `PRAGMA foreign_keys = OFF` (it cannot be changed
-inside the implicit transaction D1 runs every statement in), and `defer_foreign_keys`,
-which D1 accepts, postpones constraint checking without suppressing `ON DELETE CASCADE` —
+rebuilt in the same migration. D1 rejects `PRAGMA foreign_keys = OFF`, which cannot be
+changed inside the implicit transaction D1 runs every statement in. `defer_foreign_keys`,
+which D1 does accept, postpones constraint checking without suppressing `ON DELETE CASCADE`,
 so the `DROP TABLE` step would delete rows out of every referencing table. `generate` names
 the tables holding the references and stops. Drop those foreign keys in one migration and
 rebuild in the next, or pass `--emit-roundtrip` for a draft of that sequence.

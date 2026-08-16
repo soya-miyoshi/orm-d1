@@ -1,4 +1,4 @@
-# 15 — Migrating an existing project
+# Migrating an existing project
 
 Change the import specifier:
 

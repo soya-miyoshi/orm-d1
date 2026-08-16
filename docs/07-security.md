@@ -1,4 +1,4 @@
-# 19 — Security
+# Security
 
 What d1zzle guarantees, what it does not, and where the boundary sits.
 
@@ -30,7 +30,8 @@ These hold for every query the builder emits.
 
 ## The escape hatches, and what they cost
 
-Three APIs hand you the pen. None of them can be made safe by d1zzle:
+Three APIs let text you supply reach the statement without being checked. None of them can
+be made safe by d1zzle:
 
 | API | What it skips |
 | --- | --- |
