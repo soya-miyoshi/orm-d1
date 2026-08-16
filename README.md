@@ -1,13 +1,9 @@
 # d1zzle
 
-*("dee-one-zzle" — D1, with Drizzle's ergonomics.)*
-
-A type-safe ORM built **exclusively** for Cloudflare D1 and Workers.
-
-It takes its API from Drizzle — the same schema DSL, the same query builder, the same
-inferred types — and drops everything that only exists to support other databases. What is
-left is tuned for the one platform it targets: D1's positional read path, its
-bound-parameter limit, its Sessions API, and its billing counters.
+d1zzle is an ORM for Cloudflare D1. It supports D1 and nothing else. Its API is taken from
+Drizzle — the same schema DSL, the same query builder, the same inferred types — and the
+parts that exist to abstract over other databases are removed. `d1zzle-migrate` is the
+migration CLI, installed separately and used only during development.
 
 ```bash
 npm install d1zzle
@@ -15,8 +11,7 @@ npm install -D d1zzle-migrate
 ```
 
 ```ts
-import { drizzle, eq } from 'd1zzle';
-import { integer, sqliteTable, text } from 'd1zzle';
+import { drizzle, eq, integer, sqliteTable, text } from 'd1zzle';
 
 export const users = sqliteTable('users', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -37,102 +32,263 @@ export default {
 };
 ```
 
-## Built for one database, and it shows
+An existing `drizzle-orm/sqlite-core` schema file works after changing one import
+specifier; see [Migrating an existing project](#migrating-an-existing-project).
 
-Targeting a single platform buys two things: everything that exists only to abstract over
-other databases is gone, and everything D1 offers that other databases have no analogue for
-can be first class.
+## Contents
 
-**Smaller.** Bundling an equivalent Worker — driver, schema DSL, and one
-`select().from(users).where(eq(...))` — with esbuild, minified:
+- [Differences from drizzle-orm on D1](#differences-from-drizzle-orm-on-d1)
+- [Relational queries](#relational-queries)
+- [Migrations](#migrations)
+- [Migrating an existing project](#migrating-an-existing-project)
+- [Ecosystem](#ecosystem)
+- [Entry points and dependencies](#entry-points-and-dependencies)
+- [D1 limits, and where each is enforced](#d1-limits-and-where-each-is-enforced)
+- [Scope](#scope)
+- [Development](#development)
+- [Support and maintenance](#support-and-maintenance)
 
-| | minified | gzipped |
+## Differences from drizzle-orm on D1
+
+The API is Drizzle's; the behaviour on D1 differs in ten places, all of them consequences
+of the same four properties of the platform. The database is reached over the network, so
+cost tracks the number of calls; a statement accepts at most 100 bound parameters;
+`batch()` is the only atomicity available, because there are no interactive transactions;
+and Worker startup CPU is billed, so library size is a per-request cost on cold isolates.
+
+Each case below is written out in full — what `drizzle-orm@1.0.0-rc.4` does on D1, read
+from that version's own source, and what d1zzle does instead — in
+**[Differences from drizzle-orm on D1](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md)**.
+
+| Case | `drizzle-orm` on D1 | d1zzle |
 | --- | --- | --- |
-| `drizzle-orm/d1` + `drizzle-orm/sqlite-core` | 77.8 kB | 22.2 kB |
-| `d1zzle` | 44.1 kB | 15.3 kB |
-| | **−43%** | **−31%** |
+| [Inserting more rows than one statement can carry](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#inserting-more-rows-than-one-statement-can-carry) | one statement, 2,000 parameters, `too many SQL variables` | chunked at compile time and submitted as one atomic `batch()` |
+| [Matching a column against a long list](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#matching-a-column-against-a-long-list) | one parameter per value; over 100 values fails | collapses to `json_each(?)` past a threshold |
+| [Grouping writes so that they all succeed or all fail](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#grouping-writes-so-that-they-all-succeed-or-all-fail) | `transaction()` emits `BEGIN`/`COMMIT`, which D1 does not honour | no `transaction()`; `batch()`, with typed per-statement results |
+| [A joined select inside `batch()` with two columns of the same name](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#a-joined-select-inside-batch-that-projects-two-columns-with-the-same-name) | the duplicate key is already lost when the row is converted | collision detected while compiling; aliases emitted |
+| [Reading from a replica, and reading your own writes](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#reading-from-a-replica-and-reading-your-own-writes) | no session API; use the binding directly | `withSession()` returns the same API, plus `bookmark()` |
+| [Seeing what a query cost](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#seeing-what-a-query-cost) | `logger` gets SQL and params; selects lose D1's metadata | `onQuery` with `rowsRead` / `rowsWritten` / timings per statement |
+| [Building a query once per isolate](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#building-a-query-once-per-isolate-instead-of-once-per-request) | `.prepare()` needs a session, so SQL is built inside `fetch` | compilation is separate from execution; compile at module scope |
+| [D1's other limits](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#d1s-other-limits) | reported by D1, naming the constraint but not the call | checked while compiling, naming the lever |
+| [Plan-dependent limits](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#plan-dependent-limits) | — | opt-in `plan: 'free' \| 'paid'` warnings in development |
+| [Bundle size](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#bundle-size) | 77.8 kB minified for driver + schema DSL | 44.1 kB — the dialect, transaction and prepared-statement layers are absent |
 
-To be fair to Drizzle: it is *not* a bloated package. It ships 25 MB across 718 export
-paths with `sideEffects: false`, and tree-shaking drops ~97% of that before it reaches your
-bundle. The difference is that tree-shaking removes what is unreachable, not what is
-generic — the dialect indirection, the session and transaction/savepoint subsystem, and the
-prepared-statement abstractions covering both sync and async drivers are all reachable from
-the SQLite entry, so no bundler can drop them. d1zzle removes them at the source. That is
-the whole 43%: portability has a floor, and the only way under it is to give up
-portability.
-
-On Workers the minified column is the one to watch. Startup CPU is billed and parse time
-tracks uncompressed bytes, so the 3 MB / 10 MB compressed limits are never the binding
-constraint for an ORM.
-
-**And D1-shaped, not SQLite-shaped.** Each of these exists because of a specific property
-of D1, and would be hard to justify in a portable ORM:
-
-| | why D1 makes it necessary or possible |
-| --- | --- |
-| Positional `.raw()` reads | `.all()` builds one keyed object per row and **silently collides duplicate column names** in joins |
-| `batch()` as the atomic primitive | it is D1's *only* atomicity guarantee, and one round trip |
-| No `transaction()` | D1 has no interactive transactions; a `BEGIN` may land on another connection |
-| Automatic insert chunking | the ~100 bound-parameter cap has no analogue in server-side SQLite |
-| `inArray` → `json_each` | collapses a long list to **one** parameter instead of N |
-| Sessions and bookmarks | D1's read replication has no analogue in a Postgres or MySQL driver |
-| `rows_read` / `rows_written` | D1's **billing units**, free on every response, and usually discarded |
-| Compile-once-per-isolate | module scope persists across requests in a Worker isolate |
-| Plan-aware limits | the free and paid plans differ, and only the caller knows which they are on |
-
-## Plans and limits
-
-D1's limits are enforced where they can be, rather than left to arrive as bare SQLite
-errors. Which mechanism applies depends on when the limit becomes knowable.
-
-**Compile time**, because compilation happens once per isolate and already walks the query,
-so the check is free and the message can name the offending call:
-
-| limit | value |
-| --- | --- |
-| Bound parameters per query | 100 — drives chunking rather than erroring, where it can |
-| SQL statement length | 100,000 bytes of *text*; bound parameters do not count |
-| Arguments per SQL function | 32 |
-| `LIKE` / `GLOB` pattern | 50 bytes, when the pattern is a literal |
-| Columns per table | 100, checked at `sqliteTable(…)` |
-
-The point is the message. `too many SQL variables` does not tell you which `inArray`
-produced it; a compile error does.
-
-**Runtime, and opt-in**, for the two limits that differ by plan. Neither can be known until
-a statement has already run, so they are dev-only warnings:
+## Relational queries
 
 ```ts
-const db = drizzle(env.DB, { plan: 'free' });   // or 'paid'
+import { defineRelations, drizzle } from 'd1zzle';
+
+export const relations = defineRelations({ users, posts }, (r) => ({
+  users: { posts: r.many.posts() },
+  posts: { author: r.one.users({ from: r.posts.authorId, to: r.users.id, optional: false }) },
+}));
+
+const db = drizzle({ client: env.DB, relations });   // or drizzle(env.DB, { relations })
+
+const rows = await db.query.users.findMany({
+  columns: { id: true, email: true },
+  with: { posts: { columns: { title: true }, where: { views: { gt: 100 } } } },
+  orderBy: { id: 'desc' },
+  limit: 10,
+});
 ```
 
-| | free | paid |
-| --- | --- | --- |
-| Queries per Worker invocation | 50 | 1,000 |
-| Database size | 500 MB | 10 GB |
+This is Drizzle v1's interface: `defineRelations`, the RQBv2 `db.query` config, and v1's
+`getTableConfig` shape. The v0 `relations()` API is not supported.
 
-The query counter includes **every member of a `batch()` individually**, which is how D1
-counts them — so batching is the fix for round trips, not for this limit. The size warning
-fires once past 90% of the cap, read from `meta.size_after`, which D1 returns on every
-statement including reads. Both warn **once**: past the line every subsequent statement is
-also past it.
+The join is stated once, with `from`/`to` on either side; the other side picks it up.
+`optional: false` on a `one` relation removes `| null` from the inferred type.
 
-Counting is per database object, and shared with any session `withSession()` derives, since
-the limit belongs to the invocation rather than the session. That is exact for the usual
-`drizzle(env.DB)`-inside-`fetch` shape and over-counts for a database hoisted to module
-scope — warning once is what keeps that case from being misleading, and the message says so.
+`where` is an object DSL. A bare scalar means equality, so `{ id: 1 }` is
+`{ id: { eq: 1 } }`. Besides the per-column operators (`eq` `ne` `gt` `gte` `lt` `lte`
+`in` `notIn` `like` `ilike` `notLike` `notIlike` `isNull` `isNotNull`) there are `AND`,
+`OR`, `NOT`, a `RAW` escape hatch, and relation keys: `{ posts: { views: { gt: 100 } } }`
+filters users by their posts, compiled as a correlated `exists` in the parent's own query.
 
-Left unset, neither warning fires: guessing would either cry wolf on a paid database or stay
-silent on a free one, and nothing in the binding reveals the plan.
+Every operator accepts a `ph()` placeholder except `in` and `notIn`, which take a literal
+array or a subquery — `in (…)` renders one parameter per value, so the count is part of
+the SQL text and a placeholder filled after compilation could only ever fill one slot.
+Passing one is a `CompileError` naming the column.
 
-Note that `plan` does **not** change the bound-parameter budget. That is 100 on both plans;
-`maxParams` remains the way to change it. See
-[docs/02](./docs/02-d1-platform.md#documented-limits) for the full table, including the
-limits deliberately left to D1.
+`count` takes the same `where`, including relation keys, and answers how many rows
+`findMany` would return without a limit:
 
-## Migrating from Drizzle
+```ts
+const where = { status: { in: ['paid', 'shipped'] } };
 
-Change the import specifier. That is the whole migration:
+const rows  = await db.query.orders.findMany({ where, orderBy: { id: 'desc' }, limit: 20 });
+const total = await db.query.orders.count({ where });
+```
+
+It accepts no `with`, `limit` or `offset`: relations are stitched rather than joined, so
+none of them changes the total.
+
+### How a `with` is executed
+
+Two plans, selected with `relationalStrategy`. Both return identical results — the workers
+suite runs a matrix of queries through each and deep-compares them against a real D1
+database — so the choice affects timing only.
+
+```ts
+const db = drizzle({ client: env.DB, relations });                              // 'split' (default)
+const db = drizzle({ client: env.DB, relations, relationalStrategy: 'joined' });
+```
+
+`'split'` runs one query per relation level and stitches the rows in JavaScript. Levels
+cost round trips; rows do not — two parents or two thousand, a level is one query with an
+`in`, which collapses to `json_each` past the parameter budget.
+
+```sql
+select "id", "email" from "users"
+select "id", "title" from "posts" where "author_id" in (?, ?)
+```
+
+`'joined'` answers the whole tree in one statement, each relation a correlated subquery
+wrapped in `json_group_array` / `json_object` — the shape Drizzle v1 produces on SQLite.
+SQLite has no `LATERAL`, so it is a correlated subquery rather than the lateral join
+Drizzle emits on Postgres; the two are equivalent here.
+
+```sql
+select "d0"."id",
+  (select json_group_array(json_object('id', "id", 'title', "title"))
+   from (select "d1"."id" as "id", "d1"."title" as "title"
+         from "posts" as "d1" where "d0"."id" = "d1"."author_id") as "t") as "posts"
+from "users" as "d0"
+```
+
+Neither dominates. Joined makes one call and runs the inner query once per outer row;
+split makes one call per level and does one index scan each. The default is split because
+its failure modes are visible: `rows_read` is predictable, no function-argument cap
+constrains the projection, and the SQL in a log is readable.
+
+`'joined'` falls back to split, per query and silently, for anything it cannot express as
+a correlated subquery:
+
+| Falls back when | Why |
+| --- | --- |
+| a relation goes `through` a junction table | needs a join inside the inner select |
+| a payload holds a `blob` column | `json_object` rejects binary — *JSON cannot hold BLOB values* |
+| a payload is wider than 63 keys | `json_object` costs 2 arguments per key against SQLite's 127-argument cap |
+| a nested `limit`/`offset` is a placeholder | split cannot take one, and the strategy must not change which queries are legal |
+
+Three further properties of the split plan:
+
+- Relations at the same level are fetched concurrently, so round trips scale with the
+  *depth* of the `with` tree, not the number of relations in it.
+- A nested `limit`/`offset` is a page per parent, taken with a `row_number()` window so
+  the level stays one query. One query per parent would be an unbounded fan-out against
+  the Workers subrequest limit.
+- Join keys are fetched whether or not you selected them, and removed from the rows before
+  they are returned. A parent with no children gets `[]` for a `many` and `null` for a
+  `one`, never a missing key. A `where` on a child narrows the children, not the parents.
+
+Many-to-many is declared with `.through()` on both ends:
+
+```ts
+articles: {
+  tags: r.many.tags({
+    from: r.articles.id.through(r.articleTags.articleId),
+    to: r.tags.id.through(r.articleTags.tagId),
+  }),
+},
+```
+
+Before passing a client-supplied object to `findMany`, read
+[docs/11-security](./docs/11-security.md#the-filter-dsl-is-a-query-language): the filter
+DSL is a query language, and handing one an untrusted body delegates query construction to
+the caller.
+
+## Migrations
+
+`d1zzle-migrate` is a devDependency. It runs in Node and adds nothing to the Worker
+bundle. Full documentation is in [kit/README.md](./kit/README.md).
+
+```bash
+npx d1zzle-migrate generate   # diff the schema against the last snapshot → a SQL migration
+npx d1zzle-migrate migrate    # apply pending migrations (--local | --remote)
+npx d1zzle-migrate check      # drift and unapplied migrations; non-zero exit for CI
+npx d1zzle-migrate verify     # replay migrations into an empty DB and compare with the schema
+```
+
+The command surface mirrors `drizzle-kit` (`generate` `migrate` `push` `pull` `check`
+`up`, plus `verify`), and migrations are written in wrangler's layout and recorded in
+wrangler's own `d1_migrations` table, so `d1zzle-migrate migrate` and
+`wrangler d1 migrations apply` remain interchangeable on the same database.
+
+What differs, and why:
+
+**Applying a migration is atomic.** A migration file is split into statements and
+submitted as one `batch()`. Emitting `BEGIN`/`COMMIT` around the statements — what a
+portable tool does — is not honoured by D1, so a failure halfway through leaves the
+database half-migrated. When a migration is too large for one atomic unit the CLI reports
+the split point rather than hiding it; a remote migration over 100 statements is routed
+through the file-import endpoint, which Cloudflare rolls back as a unit, instead of being
+cut in half.
+
+**Some statements cannot go through D1's `/query` endpoint at all.** D1 re-splits the
+posted string on semicolons with a splitter that does not know about compound statements,
+so a trigger body is cut before its `end`:
+
+```sql
+create trigger "t_no_update" before update on "t" begin
+  select raise(abort, 't is append-only');   -- /query cuts here
+end;
+```
+
+D1 answers `incomplete input: SQLITE_ERROR`. Measured against a real database, this happens
+for a whole batch, for a lone `create trigger`, on one line, and with the trailing
+semicolon removed; the semicolon before `end` is required by SQLite's grammar, so there is
+no phrasing `/query` accepts. `wrangler d1 migrations apply` fails identically — it is the
+endpoint, not the client. `d1zzle-migrate` routes such a batch through the file-import
+endpoint (`init` → `PUT` → `ingest` → poll), the same four steps `wrangler d1 execute
+--file` uses.
+
+**Table rebuilds are checked before they are written.** SQLite can only `ADD COLUMN`,
+`DROP COLUMN`, `RENAME COLUMN` and `RENAME TO`; a type change, a new `NOT NULL`, a changed
+default or any constraint change rebuilds the table. SQLite's standard recipe for that
+begins with `PRAGMA foreign_keys = OFF`, which D1 rejects — it cannot be changed inside the
+implicit transaction D1 runs every statement in. `defer_foreign_keys`, which D1 does
+accept, postpones constraint checking but does not suppress `ON DELETE CASCADE`, so the
+`DROP TABLE` step would delete rows out of every referencing table. Therefore a table that
+another table references cannot be rebuilt in one migration: `generate` refuses and names
+the tables holding the references, instead of emitting SQL that destroys data on apply.
+Drop the referencing foreign keys in one migration and rebuild in the next. The same rule
+applies to a new `NOT NULL` column with no default — it cannot be backfilled, so it fails
+at `generate` rather than at apply. In the rebuild itself, the column list in
+`INSERT … SELECT` is always computed from the intersection of the old and new columns;
+`SELECT *` never appears.
+
+**`verify` exists because `check` cannot catch a renderer bug.** `generate` writes two
+artifacts from one diff — the SQL and the snapshot — and nothing forces them to agree. If
+the renderer drops a constraint, both are self-consistent, `check` compares the live
+database against the snapshot that shares the omission, and CI stays green with the
+constraint gone. This is the failure the project started from: on one 64-table schema,
+`drizzle-kit` dropped column-level `.unique()` and the generated-versus-committed CI check
+stayed green because both artifacts shared the bug. `verify` replays the migrations into
+an empty database and compares *that* against the schema, so the two sides share no code
+path. It needs no database and runs in CI.
+
+**Drift is a command.** `check` introspects the live database, diffs it against the
+snapshot the migrations imply, and reports unapplied migrations and manual changes — the
+`wrangler d1 execute` someone ran against production that would otherwise make the next
+generated migration compute from a false baseline.
+
+**One target, printed before it acts.** The database is read from `wrangler.jsonc` /
+`wrangler.toml`, including named environment blocks, selected the way wrangler selects
+them (`--env`, then `CLOUDFLARE_ENV`, then `d1.env`, then top level). An environment that
+declares no `d1_databases` is an error rather than a fallback to the top-level block,
+because wrangler treats that binding as non-inheritable and the fallback would apply a
+migration to a database wrangler would never have bound. Every database-touching command
+prints the environment, binding, database name, and — for `--remote` — the account and the
+database id masked to its last four characters, each with the source it was read from.
+
+There is no `studio`. The Drizzle Studio browser extension introspects the live database
+and never loads a schema file, so it works against a d1zzle project unchanged;
+Cloudflare's D1 console covers ad-hoc queries.
+
+## Migrating an existing project
+
+Change the import specifier:
 
 ```diff
 - import { drizzle } from 'drizzle-orm/d1';
@@ -140,7 +296,7 @@ Change the import specifier. That is the whole migration:
 + import { drizzle, sqliteTable, text, integer } from 'd1zzle';
 ```
 
-For a **zero-diff** migration, alias the modules instead of editing files:
+For a zero-diff migration, alias the modules instead of editing files:
 
 ```jsonc
 // tsconfig.json
@@ -156,68 +312,68 @@ For a **zero-diff** migration, alias the modules instead of editing files:
 }
 ```
 
-**Point at the `.js`, not the `.d.ts`.** This is the detail that matters, and getting it
-wrong fails *silently* — your build succeeds, your types are d1zzle's, your editor is
-happy, and your Worker runs on `drizzle-orm`. esbuild (wrangler's bundler) honours `paths`
-for real module resolution, but it cannot bundle a declaration file, so it falls through to
-node resolution and finds the real `drizzle-orm` — which is installed by definition, since
-you are migrating off it. TypeScript picks up the sibling `.d.ts` from the `.js` path on
-its own, so types are unaffected.
+Point at the `.js`, not the `.d.ts`. Getting this wrong fails silently: the build
+succeeds, the types are d1zzle's, the editor is satisfied, and the Worker runs on
+`drizzle-orm`. esbuild — wrangler's bundler — honours `paths` for module resolution but
+cannot bundle a declaration file, so it falls through to node resolution and finds the real
+`drizzle-orm`, which is installed by definition during a migration. TypeScript picks up the
+sibling `.d.ts` from the `.js` path on its own, so types are unaffected. Set `baseUrl` as
+well; a relative `./node_modules/…` path resolved without it depends on the bundler's
+working directory.
 
-Set `baseUrl` as well. A relative `./node_modules/…` path resolved without it depending on
-the bundler's working directory, and `baseUrl` removes the ambiguity.
-
-Measured on the recipe above, bundling a two-import Worker:
+Bundling a two-import Worker with each target, unminified — these numbers identify which
+library ended up in the bundle rather than measure its size:
 
 | `paths` target | bundle | contains |
 | --- | --- | --- |
-| `dist/index.d.ts` | 175 kb | `drizzle-orm` — the mapping did nothing |
-| `dist/index.js` | 81 kb | d1zzle |
+| `dist/index.d.ts` | 175 kB | `drizzle-orm` — the mapping did nothing |
+| `dist/index.js` | 81 kB | d1zzle |
 
-`test/unit/module-resolution.test.ts` bundles that fixture and asserts it, because nothing
-else in the suite exercises resolution.
+`test/unit/module-resolution.test.ts` bundles that fixture and asserts it.
 
-(These two numbers are unminified, and are here to show *which library ended up in the
-bundle* rather than to size it — the minified comparison is
-[above](#built-for-one-database-and-it-shows).)
-
-Supported unchanged: `sqliteTable` · every column type and `mode` · `.notNull()`
+**Supported unchanged:** `sqliteTable` · every column type and `mode` · `.notNull()`
 `.primaryKey({ autoIncrement })` `.default()` `.$defaultFn()` `.$onUpdate()` `.$type<T>()`
 `.references()` `.unique()` `.generatedAlwaysAs()` · `index()` `uniqueIndex()`
 `primaryKey()` `foreignKey()` `unique()` `check()` · both table-extras forms · the `sql`
 tag · the comparison and aggregate operators · `defineRelations()` and `db.query` ·
 `InferSelectModel` / `InferInsertModel`.
 
-d1zzle presents **Drizzle v1's** interface: `defineRelations`, the RQBv2 `db.query`
-config, and v1's `getTableConfig` shape. The v0 `relations()` API is not supported.
+**Not supported:**
 
-Not supported, deliberately: **`transaction()`**. D1 has no interactive transactions, so
-d1zzle's `transaction()` throws with a pointer to `batch()`, which *is* atomic. See
-[docs/02](./docs/02-d1-platform.md#no-interactive-transactions).
+- `transaction()` — throws, with a pointer to `batch()`.
+- The v0 `relations()` API, and the `where`/`orderBy` callback forms. d1zzle presents v1's
+  interface only. The old `schema` option is accepted and ignored.
+- Views, CTEs and set operations. They are absent rather than silently no-op.
+- Drizzle's execution plan for relational queries is not adopted, only its interface.
 
-## Works with the Drizzle ecosystem
+The schema DSL is a strict subset of `drizzle-orm/sqlite-core`: every symbol usable in a
+schema file also exists there with the same meaning. That is what makes the aliasing work
+in both directions, and it is why `STRICT`, `WITHOUT ROWID` and the append-only trigger are
+configured in a separate `tableOptions` module rather than on the table.
 
-A d1zzle schema is not merely similar to a Drizzle schema — Drizzle's own code recognises
-it. Tables are instances of classes whose `entityKind` chain matches Drizzle's, and they
-carry Drizzle's symbols, so this all works on d1zzle objects:
+## Ecosystem
+
+Drizzle has no public API for describing a schema, so adapters read its internals:
+`entityKind`, `Symbol.for('drizzle:Columns')`, `db._.relations`. d1zzle tables and columns
+carry those, so Drizzle's own helpers work on them:
 
 ```ts
 import { getTableColumns, getTableName, is } from 'drizzle-orm';
 import { SQLiteInteger, SQLiteTable } from 'drizzle-orm/sqlite-core';
 
-is(users, SQLiteTable);   // true
-is(users.id, SQLiteInteger); // true
-getTableColumns(users);   // { id, email, name }
+is(users, SQLiteTable);       // true
+is(users.id, SQLiteInteger);  // true
+getTableColumns(users);       // { id, email, name }
 ```
 
-`defineRelations` produces the same plain `{ table, name, relations }` record Drizzle v1
-does, and `db._.relations` is what adapters read. Drizzle `SQL` fragments built over
-d1zzle columns — `eq(users.id, 1)`, `inArray(...)`, `sql\`…\`` — render correctly inside
-a d1zzle query, which is how an adapter's own predicates reach the database.
+Drizzle `SQL` fragments built over d1zzle columns — `eq(users.id, 1)`, `inArray(...)`,
+`` sql`…` `` — render correctly inside a d1zzle query, which is how an adapter's own
+predicates reach the database.
 
-**Verified against `@pothos/plugin-drizzle`.** `test/workers/pothos.test.ts` runs a real
-GraphQL schema over a d1zzle database inside workerd, resolving nested lists and
-`select`-level extras. Two things it needs:
+### Pothos
+
+`test/workers/pothos.test.ts` runs a GraphQL schema over a d1zzle database inside workerd
+with `@pothos/plugin-drizzle`. Two substitutions are required:
 
 ```ts
 import type { PothosRelations } from 'd1zzle/drizzle';
@@ -230,58 +386,34 @@ const builder = new SchemaBuilder<{ DrizzleRelations: PothosRelations<typeof rel
 });
 ```
 
-- **`getTableConfig`** must be ours. Drizzle's derives constraints by *running* a table's
-  `ExtraConfigBuilder`, which a d1zzle table does not have, so on our tables it reports
-  the columns and every other field empty — and the plugin cannot find a composite
-  primary key. Ours reads our own constraint records. The plugin takes `getTableConfig`
-  from its own config, so this substitution is all that is needed.
-- **`asPothosRelations`** re-prototypes the relations onto Drizzle's `One`/`Many`. The
-  plugin is duck-typed everywhere except `relationField instanceof Many`, which decides
-  whether a field is a GraphQL list; `instanceof` consults the right-hand constructor, so
-  no structural match can satisfy it. Without this, every `many` resolves as a single
-  object. It is `asDrizzleRelations` doing the same work, typed as `PothosRelations` so the
-  value lines up with the generic.
+- `getTableConfig` must be d1zzle's. Drizzle's derives constraints by running a table's
+  `ExtraConfigBuilder`, which a d1zzle table does not have, so it reports the columns and
+  leaves every other field empty — and the plugin then cannot find a composite primary key.
+  The plugin reads `getTableConfig` from its own config, so substituting it is enough.
+- `asPothosRelations` re-prototypes the relations onto Drizzle's `One`/`Many`. The plugin
+  is duck-typed everywhere except `relationField instanceof Many`, which decides whether a
+  field is a GraphQL list. `instanceof` consults the right-hand constructor, so no
+  structural match satisfies it; without this, every `many` relation resolves as a single
+  object.
 
-`asDrizzleSchema` / `asDrizzleTable` are **identity at runtime** — the objects already
-satisfy every check Drizzle makes of them. They exist because Drizzle's `Column` class
-declares a `protected` member, and TypeScript only accepts protected members from the same
-declaration, so no independent implementation can be assignable to it. `asDrizzleSchema`
-computes the equivalent Drizzle types from the metadata each column already carries;
-`test/unit/drizzle-types.test.ts` asserts that `InferSelectModel` / `InferInsertModel`
-applied to the result match our own inference field for field.
+`asDrizzleSchema` / `asDrizzleTable` are identity functions at runtime. They exist because
+Drizzle's `Column` declares a `protected` member, and TypeScript accepts protected members
+only from the declaring class, so no independent implementation is assignable — they
+compute the equivalent Drizzle types from metadata the columns already carry.
+`asDrizzleRelations` is the one export that does runtime work, for the `instanceof` reason
+above.
 
-`asDrizzleRelations` is the exception: it is the one export that does real work and the one
-that needs `drizzle-orm`'s classes at runtime, for the `instanceof` reason above.
+Pothos' relation types are checked rather than opted out of:
+`test/unit/pothos-types.test.ts` pins the negative controls — an unknown column, an
+unknown property on a resolver's row, a resolver whose return type disagrees with its
+field, and an undeclared relation name are each rejected. `client` and `getTableConfig`
+still require casts, because they slot against Drizzle's database and table classes and
+the protected-member rule applies there.
 
-**Pothos' types are not opted out of.** Earlier versions of this README said
-`DrizzleRelations: never` was permanent, on the grounds that Pothos' generic slots against
-`TablesRelationalConfig`, whose `table` is Drizzle's `Table` class. That was wrong. The
-protected-member rule applies to Drizzle's `Column`/`Table` *classes*, but v1's
-`TableRelationalConfig` asks only for `{ table; name; relations }`, and its `table` is
-`SchemaEntry` — `Table<any> | View<…>` — which `ToDrizzleTable` already produces. Nothing
-in that interface is ever compared nominally, so `PothosRelations<typeof relations>` fills
-the slot outright.
+### Better Auth
 
-What that buys is the whole GraphQL layer back under compile-time checking. The typing is
-genuine rather than vacuous, and `test/unit/pothos-types.test.ts` pins it with negative
-controls — an unknown column, an unknown property on a resolver's row, a resolver whose
-return type disagrees with its field, and an undeclared relation name are each rejected:
-
-```ts
-t.exposeString('nope_not_a_column')          // rejected
-t.string({ resolve: (row) => row.notAColumn })  // rejected
-t.boolean({ resolve: (row) => row.title })   // rejected — string vs boolean
-t.relation('definitely_not_a_relation')      // rejected
-```
-
-`client` and `getTableConfig` still take casts — those slot against Drizzle's own database
-and table *classes*, which are subject to the protected-member rule. `relations` and every
-builder call above it are checked.
-
-## Better Auth
-
-[Better Auth](https://www.better-auth.com) runs on d1zzle directly — `d1zzle/better-auth`
-is a native adapter, not a shim over the Drizzle one:
+`d1zzle/better-auth` is a Better Auth database adapter written against
+`createAdapterFactory`, not a shim over the Drizzle one:
 
 ```ts
 import { betterAuth } from 'better-auth';
@@ -296,279 +428,111 @@ const auth = betterAuth({
 });
 ```
 
-Write the four tables with `sqliteTable` as you would any other — the schema in Better
-Auth's Drizzle docs ports over unchanged — and generate the migration with
-`d1zzle-migrate`. Model names map to tables through `schema`; field names map to columns
-through Better Auth's own `fields` option, so `fields: { image: 'avatarUrl' }` reaches an
-`avatar_url` column with nothing extra on our side.
+Write the four tables with `sqliteTable` as usual — the schema in Better Auth's Drizzle
+documentation ports over unchanged — and generate the migration with `d1zzle-migrate`.
+Model names map to tables through `schema`; field names map to columns through Better
+Auth's own `fields` option.
 
-**Why a separate adapter rather than the Drizzle one.** Everything under *Works with the
-Drizzle ecosystem* above is about being **read**: an adapter inspects a schema, and
-d1zzle's objects answer the way Drizzle's would. Better Auth's Drizzle adapter instead
-**executes** through drizzle-orm — `db.insert(t).values(…)`, `eq()`, `and()`, its dialect
-and session layer. `asDrizzleSchema()` retypes a schema; it cannot retype a runtime, and a
-d1zzle table fails there on the first write. But Better Auth does not require that path:
+The reason for a separate adapter: everything in the section above is about being *read*.
+Better Auth's Drizzle adapter instead *executes* through drizzle-orm — `db.insert(t)
+.values(…)`, `eq()`, `and()`, its dialect and session layer. `asDrizzleSchema()` retypes a
+schema; it cannot retype a runtime, and a d1zzle table fails there on the first write.
 `createAdapterFactory` takes ten methods over `{ model, where, data }` and supplies the
-mapping, id generation and transforms itself. That is the seam, and it needs no Drizzle at
-all.
+mapping, id generation and transforms itself, so it needs no Drizzle at all.
 
-**Single-statement `consumeOne` / `incrementOne`.** Better Auth's fallbacks for these are
-built on transactions, which [D1 does not have](./docs/02-d1-platform.md), so a fallback
-would leave a read-then-write gap in exactly the operations whose whole point is that only
-one caller wins — consuming a verification token, decrementing a guarded counter. Both are
-implemented instead as one `RETURNING` statement pinned to a single row, which D1 executes
-atomically. `test/workers/better-auth.test.ts` races them against real D1 and asserts the
-counts.
+`consumeOne` and `incrementOne` are implemented as one `RETURNING` statement pinned to a
+single row. Better Auth's fallbacks for them are built on transactions, which D1 does not
+have, and a fallback would leave a read-then-write gap in exactly the operations where
+only one caller may win — consuming a verification token, decrementing a guarded counter.
+`test/workers/better-auth.test.ts` races them against real D1 and asserts the counts.
 
-`experimental.joins` is not supported (the adapter raises a named error rather than quietly
-dropping the joined models), and there is no `createSchema` for `@better-auth/cli generate`
-— in a d1zzle project the schema file is what `d1zzle-migrate` diffs against, so generating
-it from Better Auth's model list would invert the source of truth. `better-auth` is an
-optional peer; see [docs/10](./docs/10-ecosystem-interop.md#better-auth--where-the-bridge-stops-being-the-answer).
+`experimental.joins` is not supported: the adapter raises a named error rather than
+dropping the joined models. There is no `createSchema` for `@better-auth/cli generate`,
+because in a d1zzle project the schema file is what `d1zzle-migrate` diffs against, and
+generating it from Better Auth's model list would invert the source of truth.
 
-## What is different, and why
-
-**Reads are positional.** D1's `.all()` builds one keyed object per row, and silently
-collides duplicate column names in joins. d1zzle knows the projection at compile time, so
-it reads `.raw()` and maps by index. Inside `batch()`, where `raw()` is unavailable,
-colliding projections are aliased `c0…cN` at compile time.
-
-**A query compiles once per isolate, not once per request.** Builders are immutable and
-memoise their own compilation. Because compiling needs no database, a query can be built at
-module scope and reused for the isolate's lifetime:
-
-```ts
-import { eq, ph, query } from 'd1zzle';
-
-const byEmail = query.select().from(users).where(eq(users.email, ph('email'))).compile();
-
-export default {
-  async fetch(request: Request, env: Env) {
-    const user = await drizzle(env.DB).get(byEmail, { email: 'a@b.c' });
-  },
-};
-```
-
-**`batch()` is the atomic primitive.** One round trip, all-or-nothing, tuple-typed results:
-
-```ts
-const [inserted, posts] = await db.batch([
-  db.insert(users).values({ email: 'a@b.c' }).returning(),
-  db.select().from(postsTable).where(eq(postsTable.authorId, 1)),
-]);
-```
-
-**Bulk inserts are chunked for you.** D1 caps bound parameters per statement (~100), so a
-500-row insert is compiled into several statements and submitted as one `batch()` — still
-atomic, still one round trip, with `.returning()` results concatenated in order.
-
-**Sessions are first class.** D1's read replication has no analogue in other drivers:
-
-```ts
-const session = db.withSession(bookmark ?? 'first-unconstrained');
-const rows = await session.select().from(users);
-response.headers.set('Set-Cookie', `d1_bookmark=${session.bookmark()}; Path=/; HttpOnly`);
-```
-
-**Billing units are surfaced.** `rows_read` / `rows_written` are what D1 charges for:
-
-```ts
-const db = drizzle(env.DB, {
-  onQuery: (event) => {
-    if (event.rowsRead > 1000) console.warn(`${event.rowsRead} rows read: ${event.sql}`);
-  },
-});
-```
-
-Parameters are never included outside `__DEV__` — query logs end up where query logs end up.
-
-**D1's other limits are compile errors, not SQLite errors**, and the two that differ by
-plan are opt-in dev warnings. See [Plans and limits](#plans-and-limits) above.
-
-## Relational queries
-
-```ts
-import { defineRelations, drizzle } from 'd1zzle';
-
-export const relations = defineRelations({ users, posts }, (r) => ({
-  users: { posts: r.many.posts() },
-  posts: { author: r.one.users({ from: r.posts.authorId, to: r.users.id, optional: false }) },
-}));
-
-const db = drizzle({ client: env.DB, relations });
-
-const rows = await db.query.users.findMany({
-  columns: { id: true, email: true },
-  with: { posts: { columns: { title: true }, where: { views: { gt: 100 } } } },
-  orderBy: { id: 'desc' },
-  limit: 10,
-});
-```
-
-The join is stated once, with `from`/`to` on either side; the opposite side picks it up.
-`optional: false` on a `one` promises the row is there, which takes `| null` off the
-inferred type.
-
-`where` is an object DSL. A bare scalar means `eq`, so `{ id: 1 }` is `{ id: { eq: 1 } }`.
-Beyond the per-column operators (`eq` `ne` `gt` `gte` `lt` `lte` `in` `notIn` `like`
-`ilike` `notLike` `notIlike` `isNull` `isNotNull`) there are `AND` / `OR` / `NOT`, a `RAW`
-escape hatch, and **relation keys** — `{ posts: { views: { gt: 100 } } }` filters users by
-their posts as a correlated `exists`, in the parent's own query.
-
-Every operator takes a `ph()` placeholder except `in` and `notIn`, which take a literal
-array or a subquery. `in (…)` renders one bound parameter per value, so the arity is part
-of the SQL text and a placeholder — filled after compilation — can only ever fill one slot.
-Passing one is a `CompileError` naming the column rather than D1's `Type 'object' not
-supported`.
-
-A relation may also carry its own `where`, which narrows the target rows **wherever it is
-used** — traversed with `with:`, or matched as a relation key in a filter:
-
-```ts
-users: {
-  popularPosts: r.many.posts({ from: r.users.id, to: r.posts.authorId, where: { views: { gte: 50 } } }),
-},
-```
-
-`count` takes that same `where` — including relation keys — and answers how many rows
-`findMany` would return without a limit:
-
-```ts
-const where = { status: { in: ['paid', 'shipped'] } };
-
-const rows  = await db.query.orders.findMany({ where, orderBy: { id: 'desc' }, limit: 20 });
-const total = await db.query.orders.count({ where });
-```
-
-A paged list needs both halves, and the filter is the part that must not drift between
-them. Without `count` the total has to be rebuilt with the operator form
-(`db.select({ n: count() }).where(and(…))`), leaving the same predicate written twice in
-two dialects — editing one and not the other typechecks and silently pages wrong. It takes
-no `with`, `limit` or `offset`: relations are stitched rather than joined, so none of them
-can change the total.
-
-```ts
-const db = drizzle({ client: env.DB, relations });   // primary form
-const db = drizzle(env.DB, { relations });           // binding-first, also fine
-```
-
-### How a `with` is executed
-
-Two plans, chosen with `relationalStrategy`. Both return identical results — the
-workers suite runs a matrix of queries through each and deep-compares them against a
-real D1 database — so this is a performance switch and nothing else.
-
-```ts
-const db = drizzle({ client: env.DB, relations });                              // 'split' (default)
-const db = drizzle({ client: env.DB, relations, relationalStrategy: 'joined' });
-```
-
-**`'split'`** runs one query per relation level and stitches the rows in JS. Levels cost
-round trips; rows do not — two parents or two thousand, a level is still one query with an
-`IN`, which collapses to `json_each` past the bound-parameter budget.
-
-```sql
-select "id", "email" from "users"
-select "id", "title" from "posts" where "author_id" in (?, ?)
-```
-
-**`'joined'`** answers the whole tree in one statement, each relation a correlated
-subquery wrapped in `json_group_array` / `json_object` — the shape Drizzle v1 produces on
-SQLite.
-
-```sql
-select "d0"."id",
-  (select json_group_array(json_object('id', "id", 'title', "title"))
-   from (select "d1"."id" as "id", "d1"."title" as "title"
-         from "posts" as "d1" where "d0"."id" = "d1"."author_id") as "t") as "posts"
-from "users" as "d0"
-```
-
-Neither dominates. Joined makes one call and runs the inner query once per outer row;
-split makes one call per level and does one index scan each. Latency and row counts decide
-it, so measure rather than assume — the default is split because its failure modes are all
-visible.
-
-Joined falls back to split, per query and silently, for anything it cannot express as a
-correlated subquery:
-
-| Falls back when | Why |
-| --- | --- |
-| a relation goes `through` a junction | needs a join inside the inner select |
-| a relation payload holds a `blob` column | `json_object` rejects binary — *JSON cannot hold BLOB values* |
-| a payload is wider than 63 keys | `json_object` costs 2 arguments per key against SQLite's 127-argument cap |
-| a nested `limit`/`offset` is a placeholder | split cannot take one, and the strategy must not change which queries are legal |
-
-Because SQLite has no `LATERAL`, this is a correlated subquery rather than the lateral
-join Drizzle emits on Postgres. The two are equivalent here.
-
-Many-to-many is declared with `.through()` on both ends:
-
-```ts
-articles: {
-  tags: r.many.tags({
-    from: r.articles.id.through(r.articleTags.articleId),
-    to: r.tags.id.through(r.articleTags.tagId),
-  }),
-},
-```
-
-Children are fetched with split queries and stitched in JS — predictable `rows_read`, no
-cap on how wide a child projection can be, and readable SQL in the log. Relations at the
-same level are fetched concurrently, so the query's *depth* is what costs round trips. A
-nested `limit`/`offset` is a page *per parent*, taken with a `row_number()` window so it
-stays one query rather than one per parent.
-
-## Entry points
+## Entry points and dependencies
 
 | Import | Contents |
 | --- | --- |
 | `d1zzle` | schema, queries, runtime, relations |
-| `d1zzle/core` | the same, minus relations — for the smallest possible bundle |
+| `d1zzle/core` | the same, minus relations — the smallest entry |
 | `d1zzle/sqlite-core` | the Drizzle-named schema surface, for import aliasing |
-| `d1zzle/ddl` | schema → `CREATE TABLE` / `CREATE INDEX` |
+| `d1zzle/ddl` | schema → `CREATE TABLE` / `CREATE INDEX`, and `tableOptions()` |
 | `d1zzle/relations` | `defineRelations()`, `db.query`, the filter DSL |
 | `d1zzle/drizzle` | the bridge to `drizzle-orm`: `asDrizzleSchema`, `asDrizzleRelations` |
-| `d1zzle/better-auth` | `d1zzleAdapter()` — a Better Auth database adapter |
+| `d1zzle/better-auth` | `d1zzleAdapter()` |
 
-**Zero runtime dependencies**, and `"dependencies": {}` in `package.json`. `drizzle-orm`
-and `better-auth` are optional peers, and each cost is confined to one entry point:
+`package.json` declares `"dependencies": {}`. `drizzle-orm` and `better-auth` are optional
+peers, and each is confined to one entry point:
 
-- `d1zzle`, `d1zzle/core`, `d1zzle/sqlite-core`, `d1zzle/ddl` and `d1zzle/relations` never
-  import either one, at runtime or for types. A Worker that does not do adapter interop
-  never loads them, and they can be absent from `node_modules` entirely.
-- `d1zzle/drizzle` imports `drizzle-orm`'s **types** for `asDrizzleSchema` /
-  `asDrizzleTable`, and its `One`/`Many` **classes** at runtime for `asDrizzleRelations`.
-  Importing that module is what makes `drizzle-orm` required, which is why nothing else
-  re-exports it — `d1zzle`'s own entry does not reach it.
+- `d1zzle`, `d1zzle/core`, `d1zzle/sqlite-core`, `d1zzle/ddl` and `d1zzle/relations` import
+  neither, at runtime or for types. Both can be absent from `node_modules`.
+- `d1zzle/drizzle` imports `drizzle-orm`'s types for `asDrizzleSchema` / `asDrizzleTable`,
+  and its `One`/`Many` classes at runtime for `asDrizzleRelations`. Importing that module
+  is what makes `drizzle-orm` required, which is why nothing else re-exports it.
 - `d1zzle/better-auth` imports `createAdapterFactory` from `better-auth/adapters` at
-  runtime. Same rule: nothing else reaches it, so only a project that calls
-  `d1zzleAdapter()` needs `better-auth` installed.
+  runtime. Only a project calling `d1zzleAdapter()` needs `better-auth` installed.
 
 The peer range is `>=1.0.0-rc.1`: d1zzle presents v1's interface, and `asDrizzleRelations`
-prototypes onto v1's `OneV2`/`ManyV2` classes. On v0 it would silently prototype onto the
-wrong ones. Verified against rc.1 and rc.4.
+prototypes onto v1's `OneV2` / `ManyV2`. On v0 it would prototype onto the wrong classes.
+Verified against rc.1 and rc.4.
 
-## d1zzle-migrate
+There is no `eval`, no `new Function` and no `child_process` in either package, and `src/`
+uses no Node builtins.
 
-Migrations, introspection and drift detection — a devDependency that adds nothing to the
-Worker bundle. See [kit/README.md](./kit/README.md).
+## D1 limits, and where each is enforced
 
-```bash
-npx d1zzle-migrate generate   # diff the schema against the last snapshot → a SQL migration
-npx d1zzle-migrate migrate    # apply pending migrations (--local | --remote)
-npx d1zzle-migrate check      # detect drift and unapplied migrations; non-zero exit for CI
-```
+Checked while compiling, because compilation happens once per isolate and already walks
+the query:
+
+| Limit | Value | Handling |
+| --- | --- | --- |
+| Bound parameters per statement | 100 | drives insert chunking and the `inArray` strategy; an error only where neither applies |
+| SQL statement length | 100,000 bytes of text — bound parameters are sent separately | error naming `maxParams` as the lever |
+| Arguments to one SQL function | 32 | error |
+| `LIKE` / `GLOB` pattern | 50 bytes, when the pattern is a literal at the call site | error |
+| Columns per table | 100 | checked at `sqliteTable(…)` |
+
+Checked after execution, and only when `plan` is set: statements per Worker invocation and
+database size (see
+[Plan-dependent limits](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md#plan-dependent-limits)).
+
+Left to D1: maximum query duration (30 s), and maximum string / BLOB / row size
+(2,000,000 bytes), which is a property of the values rather than of the query. A pattern
+supplied through `ph()` is filled after compilation, so its length is left to D1 as well.
+
+Verify the current values against
+<https://developers.cloudflare.com/d1/platform/limits/> before relying on a specific
+number; the ones above were last checked on 2026-07-27. Full table:
+[docs/02](./docs/02-d1-platform.md#documented-limits).
+
+## Scope
+
+Supported: Cloudflare D1, on Workers.
+
+Not supported, deliberately:
+
+- **Other databases.** No Postgres, MySQL, better-sqlite3, `bun:sqlite`, or Durable Object
+  SQLite. Supporting a second backend reintroduces the abstraction that the bundle-size
+  difference above consists of. If you need portability, Drizzle is the answer.
+- **Interactive transactions.** D1 has none.
+- **A runtime migration engine.** Migrations are generated and applied by the CLI, never
+  from inside a Worker.
+- **Query result caching.** Workers have the Cache API and KV.
+- **Runtime schema validation.** Zod and Valibot adapters would be a separate package.
 
 ## Documentation
 
-The design is written down in [`docs/`](./docs/README.md) — start with
-[01-principles](./docs/01-principles.md), then [02-d1-platform](./docs/02-d1-platform.md),
-which is where most of the non-obvious decisions come from.
-
-[11-security](./docs/11-security.md) is the one to read before wiring d1zzle to untrusted
-input: what the compiler guarantees, which three APIs opt out of it, and why the relational
-`where` is a query language rather than an input format.
+The design is written down in [`docs/`](./docs/README.md):
+[01-principles](./docs/01-principles.md) states the goals and the rules that break ties;
+[02-d1-platform](./docs/02-d1-platform.md) is the platform description most decisions come
+from, including the table of what the test suite observed against a real D1 database;
+[11-security](./docs/11-security.md) states what the compiler guarantees, which three APIs
+opt out of it, and why the relational `where` is a query language rather than an input
+format;
+[12-drizzle-differences](https://github.com/soya-miyoshi/d1zzle/blob/main/docs/12-drizzle-differences.md)
+is the long form of the differences table above.
 
 ## Development
 
@@ -578,38 +542,39 @@ npm test        # unit tests in Node, integration tests inside workerd against r
 npm run check   # typecheck + build + tests + kit typecheck + kit build
 ```
 
-`d1zzle` and `d1zzle-migrate` are released together from one GitHub Release, published to npm
-with trusted publishing (OIDC — no tokens) and provenance attestations. `npm run version:set
-<version>` moves both packages and the kit's peer range in lockstep. See
+Tests are in two layers, and the split is load-bearing: `test/unit/` and
+`kit/test/unit/` run in Node and assert on compilation output; `test/workers/` and
+`kit/test/workers/` run inside workerd against a real D1 binding, and every claim about
+SQLite's actual behaviour lives there.
+
+`d1zzle` and `d1zzle-migrate` are released together from one GitHub Release and published
+to npm with trusted publishing (OIDC, no long-lived token) and provenance attestations.
+`npm run version:set <version>` moves both packages and the kit's peer range together. See
 [RELEASING.md](./RELEASING.md).
 
 ## Support and maintenance
 
-**This project is maintained, but it is not open to contributions.** Those are two
-different things, and the distinction is what matters if you are deciding whether to depend
-on it.
+This project is maintained, but it is not open to contributions. Those are two different
+things, and the distinction is what matters when deciding whether to depend on it.
 
 - **Pull requests are very unlikely to be merged**, and feature requests are very unlikely
   to be accepted. Reviewing a patch properly means owning it afterwards, and that is the
-  part I (soya-miyoshi) cannot take on at the moment — so please do not spend an evening on
-  a patch for this repository expecting it to land.
-- **Issues are welcome — I just cannot guarantee a reply.** A described bug or a
-  reproduction is worth having written down, and it helps everyone running a fork whether
-  or not I answer. No triage promise, no timeline; not a closed door either.
-- **I cannot guarantee the security of this software.** It is written carefully and tested
+  part I (soya-miyoshi) cannot take on at the moment — so please do not spend an evening
+  on a patch for this repository expecting it to land.
+- **Issues are welcome, and a reply is not guaranteed.** A described bug or a reproduction
+  is worth having written down; it helps anyone running a fork whether or not I answer.
+- **The security of this software is not guaranteed.** It is written carefully and tested
   against a real D1 binding, and [11-security](./docs/11-security.md) documents what the
-  compiler does and does not guarantee — but nothing here is a substitute for reviewing the
-  copy you run, and no fix is guaranteed to ship on any timeline.
+  compiler does and does not guarantee, but that is not a substitute for reviewing the copy
+  you run, and no fix is promised on any timeline.
 
-**If you intend to depend on this, fork it and maintain your own copy.** You are taking on
-the risk and the maintenance yourself, deliberately, and the MIT license exists precisely
-so you can. [CONTRIBUTING](./CONTRIBUTING.md) covers what a usable fork needs — read it
-before opening anything.
+**If you intend to depend on this, fork it and maintain your own copy.** You take on the
+risk and the maintenance deliberately, and the MIT license exists so that you can.
+[CONTRIBUTING](./CONTRIBUTING.md) covers what a usable fork needs.
 
-If enough funding or a volunteer maintainer appears, the contribution side of this can
-change. That is not the situation today.
+If funding or a volunteer maintainer appears, the contribution side of this can change.
+That is not the situation today.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE). It is worth reading the warranty and liability clauses in
-this case; they mean what they say.
+MIT — see [LICENSE](./LICENSE). The warranty and liability clauses mean what they say.
