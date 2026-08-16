@@ -117,6 +117,8 @@ export { InsertBuilder } from './builders/insert.js';
 export { UpdateBuilder } from './builders/update.js';
 export { DeleteBuilder } from './builders/delete.js';
 export { query } from './builders/root.js';
+export type { LatestPerGroupConfig } from './builders/window.js';
+export { latestPerGroup } from './builders/window.js';
 
 // runtime
 export type { D1zzleOptions, D1zzleSession } from './runtime/database.js';

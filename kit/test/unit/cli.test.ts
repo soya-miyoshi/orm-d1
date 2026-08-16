@@ -170,6 +170,33 @@ describe('argument parsing', () => {
 			.toMatchObject({ acceptDataLoss: true });
 	});
 
+	// `--emit-roundtrip` is a boolean, so it has to survive the same
+	// `=true`/`=false` coercion the other booleans needed.
+	it('carries --emit-roundtrip through as a boolean', () => {
+		expect(asTargetFlags(parseArgs(['generate', '--emit-roundtrip']).flags))
+			.toMatchObject({ emitRoundtrip: true });
+		expect(asTargetFlags(parseArgs(['generate', '--emit-roundtrip=true']).flags))
+			.toMatchObject({ emitRoundtrip: true });
+		expect(asTargetFlags(parseArgs(['generate', '--emit-roundtrip=false']).flags))
+			.toMatchObject({ emitRoundtrip: false });
+		// Absent reads as `false`, the same as every other boolean flag here.
+		expect(asTargetFlags(parseArgs(['generate']).flags).emitRoundtrip).toBe(false);
+	});
+
+	// `--table` repeats: `backfill` suspends more than one guard in a batch.
+	it('accumulates repeated --table flags', () => {
+		expect(parseArgs(['backfill', '--table', 'a', '--table', 'b', '--file', 'x.sql']).flags)
+			.toMatchObject({ table: ['a', 'b'], file: 'x.sql' });
+		expect(parseArgs(['backfill', '--table', 'a', '--file', 'x.sql']).flags)
+			.toMatchObject({ table: 'a' });
+	});
+
+	it('names the new commands in its own help text', () => {
+		const { command } = parseArgs(['impact', '--table', 'clubs']);
+		expect(command).toBe('impact');
+		expect(parseArgs(['backfill']).command).toBe('backfill');
+	});
+
 	it('rejects a boolean flag spelled in a way parseArgs does not coerce', () => {
 		// Anything parseArgs did not turn into an actual boolean must fail
 		// loudly in asTargetFlags rather than silently default to false —

@@ -300,40 +300,85 @@ export const parseTableOptions = (sql: string): { strict: boolean; withoutRowid:
  * hand-written equivalent and report drift against a database that is in fact
  * protected.
  *
- * But only an *unconditional* abort counts. A validation trigger that aborts
- * on some rows — a `WHEN` clause, or a body that does anything else besides
- * raise — leaves UPDATE working, and reading it as the guard reports a table
- * as protected when it is not. That is the direction that costs something, so
- * the looseness stops here: no `WHEN`, and every body statement is a raise.
+ * But only an abort that is unconditional *per row* counts. A validation
+ * trigger that aborts on some rows — a `WHEN` clause, or a body that does
+ * anything else besides raise — leaves UPDATE working, and reading it as the
+ * guard reports a table as protected when it is not. That is the direction
+ * that costs something, so the looseness stops here: no `WHEN`, and every body
+ * statement is a raise.
+ *
+ * `BEFORE UPDATE OF <columns>` *is* the guard, narrowed. It freezes those
+ * columns for every row, which is the same promise over a smaller surface, so
+ * it is reported as the list rather than as `true`. Returning `true` for it
+ * would claim protection the table does not have; returning `false` would hide
+ * d1zzle's own trigger from `apply`, which reads anything unrecognised as a
+ * foreign trigger it must refuse to touch.
+ *
+ * @returns `false` when this is not the guard, `true` for a whole-table guard,
+ * or the sorted column list for a scoped one.
  */
-export const isAppendOnlyTrigger = (sql: string, tableName: string): boolean => {
-	const text = blankLiterals(sql).toLowerCase().replaceAll(/\s+/g, ' ');
+export const appendOnlyTriggerGuard = (sql: string, tableName: string): boolean | string[] => {
+	// Two views of the same string: `scan` has literals blanked and whitespace
+	// collapsed so keywords can be found, `source` is the same collapse without
+	// the case folding, so a column name keeps the case it was declared with.
+	// Offsets line up because both transforms are length-preserving per run.
+	const source = blankLiterals(sql).replaceAll(/\s+/g, ' ');
+	const text = source.toLowerCase();
 	const quoted = tableName.toLowerCase();
-	if (!/\bbefore\s+update\s+on\s+/.test(text)) return false;
-	if (!new RegExp(`\\bon\\s+["'\`\\[]?${quoted.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}["'\`\\]]?\\b`).test(text)) {
-		return false;
-	}
 
 	const begin = text.indexOf(' begin ');
 	const end = text.lastIndexOf(' end');
 	if (begin < 0 || end < begin) return false;
-	// A `WHEN` (or an `UPDATE OF <columns>`) makes the guard conditional.
-	if (/\bwhen\b|\bupdate\s+of\b/.test(text.slice(0, begin))) return false;
+	const header = text.slice(0, begin);
+
+	// A `WHEN` clause makes the guard conditional on the row, which `UPDATE OF`
+	// does not: `OF` narrows *which columns* are frozen, and every one of them
+	// stays frozen for every row.
+	if (/\bwhen\b/.test(header)) return false;
+
+	const head = /\bbefore\s+update\s+(?:of\s+(.+?)\s+)?on\s+/.exec(header);
+	if (!head) return false;
+	if (!new RegExp(`\\bon\\s+["'\`\\[]?${quoted.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}["'\`\\]]?\\b`).test(header)) {
+		return false;
+	}
 
 	const body = text.slice(begin + ' begin '.length, end);
 	const parts = body.split(';').map((s) => s.trim()).filter(Boolean);
-	return parts.length > 0
+	const aborts = parts.length > 0
 		&& parts.every((s) => /^select\s+raise\s*\(\s*abort\s*(?:,[^()]*)?\)$/.test(s));
+	if (!aborts) return false;
+
+	if (head[1] === undefined) return true;
+	// Slice the column list out of the case-preserving view, at the offsets the
+	// lowercased match reported.
+	const listStart = head.index + head[0].indexOf(head[1]);
+	const columns = source.slice(listStart, listStart + head[1].length)
+		.split(',')
+		.map((c) => unquote(c.trim()))
+		.filter(Boolean);
+	// A guard that names no column would freeze nothing; treat the trigger as
+	// something else rather than reporting protection that is not there.
+	return columns.length > 0 ? columns.sort() : false;
 };
+
+/**
+ * Whether the table carries *some* append-only guard, whole-table or scoped.
+ *
+ * `apply` uses this to tell d1zzle's own trigger apart from ones the schema
+ * does not know about; for that question the column list does not matter.
+ */
+export const isAppendOnlyTrigger = (sql: string, tableName: string): boolean =>
+	appendOnlyTriggerGuard(sql, tableName) !== false;
 
 export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): Snapshot {
 	const tables: Record<string, TableSnapshot> = {};
 	const indexSql = new Map<string, string | null>();
-	const appendOnly = new Set<string>();
+	const appendOnly = new Map<string, boolean | string[]>();
 	for (const row of input.master) {
 		if (row.type === 'index') indexSql.set(row.name, row.sql);
-		if (row.type === 'trigger' && row.sql && isAppendOnlyTrigger(row.sql, row.tbl_name)) {
-			appendOnly.add(row.tbl_name);
+		if (row.type === 'trigger' && row.sql) {
+			const guard = appendOnlyTriggerGuard(row.sql, row.tbl_name);
+			if (guard !== false) appendOnly.set(row.tbl_name, guard);
 		}
 	}
 
@@ -466,7 +511,7 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			uniqueConstraints,
 			checkConstraints: parseChecks(createSql, row.name),
 			...parseTableOptions(createSql),
-			appendOnly: appendOnly.has(row.name),
+			appendOnly: appendOnly.get(row.name) ?? false,
 		};
 	}
 

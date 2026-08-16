@@ -11,22 +11,31 @@ import { resolve } from 'node:path';
 import type { DiffOptions } from './core/diff.js';
 import { loadConfig } from './node/config.js';
 import type { CommandContext, TargetFlags } from './node/commands.js';
-import { check, generate, migrate, pull, push, up, verify } from './node/commands.js';
+import { backfillCommand, check, generate, impact, migrate, pull, push, up, verify } from './node/commands.js';
 
 const USAGE = `d1zzle-migrate — migrations for d1zzle on Cloudflare D1
 
 Usage
-  d1zzle-migrate generate [--name <name>] [--accept-data-loss] [renames]
+  d1zzle-migrate generate [--name <name>] [--accept-data-loss] [--emit-roundtrip] [renames]
   d1zzle-migrate migrate  [--env <name>] [--local | --remote]
   d1zzle-migrate push     [--env <name>] [--local | --remote] [--accept-data-loss] [renames]
   d1zzle-migrate pull     [--env <name>] [--local | --remote] [--schema-out <file>] [--force]
   d1zzle-migrate check    [--env <name>] [--local | --remote]
   d1zzle-migrate verify
   d1zzle-migrate up
+  d1zzle-migrate backfill --table <name> [--table <name>…] --file <path.sql>
+                          [--env <name>] [--local | --remote]
+  d1zzle-migrate impact   [--table <name>] [--env <name>] [--local | --remote]
 
 Commands
   check     does the live database match the snapshot? (drift, unapplied)
   verify    do the migrations still add up to the schema? (needs no database)
+  backfill  run one-off statements against append-only tables, guards suspended
+              and put back verbatim, all in one batch. Use it to fill a column
+              added to a table whose UPDATE is blocked by a trigger.
+  impact    how many tables a rebuild of one table drags with it. Reads the
+              schema, so it answers before the change exists; --local/--remote
+              adds row counts, the other half of what a rebuild costs.
 
 Options
   --config <path>       config file (default: d1zzle.config.ts)
@@ -38,6 +47,8 @@ Options
   --local               act on the local .wrangler SQLite state (default)
   --remote              act on the remote D1 database over the HTTP API
   --accept-data-loss    allow destructive statements
+  --emit-roundtrip      when generate refuses because a table has children, write a
+                          three-pass draft to <out>/roundtrip/. Not a migration.
   --name <name>         name for the generated migration
   --schema-out <file>   where \`pull\` writes the schema module
   --force               let \`pull\` overwrite an existing schema file
@@ -59,7 +70,7 @@ interface Args {
  * because a flag's shape is fixed by the command it belongs to, not by
  * whatever a caller happens to pass on the command line.
  */
-const BOOLEAN_FLAGS = new Set(['local', 'remote', 'accept-data-loss', 'force', 'help']);
+const BOOLEAN_FLAGS = new Set(['local', 'remote', 'accept-data-loss', 'emit-roundtrip', 'force', 'help']);
 
 export function parseArgs(argv: readonly string[]): Args {
 	const [command = 'help', ...rest] = argv;
@@ -169,6 +180,7 @@ export const asTargetFlags = (flags: Record<string, FlagValue>): TargetFlags => 
 		local: asBooleanFlag(flags, 'local'),
 		remote: asBooleanFlag(flags, 'remote'),
 		acceptDataLoss: asBooleanFlag(flags, 'accept-data-loss'),
+		emitRoundtrip: asBooleanFlag(flags, 'emit-roundtrip'),
 		...(typeof flags['name'] === 'string' ? { name: flags['name'] } : {}),
 		...(renames ? { renames } : {}),
 	};
@@ -261,6 +273,26 @@ export async function run(argv: readonly string[]): Promise<number> {
 		case 'up':
 			await up(ctx);
 			return 0;
+		case 'impact': {
+			await impact(ctx, {
+				...target,
+				...(typeof flags['table'] === 'string' ? { table: flags['table'] } : {}),
+			});
+			return 0;
+		}
+		case 'backfill': {
+			const tables = asList(flags['table']);
+			const file = typeof flags['file'] === 'string' ? flags['file'] : undefined;
+			if (tables.length === 0 || !file) {
+				console.error(
+					'backfill needs at least one --table and a --file.\n'
+						+ '  d1zzle-migrate backfill --table transactions --file ./drizzle/manual/fees.sql',
+				);
+				return 1;
+			}
+			await backfillCommand(ctx, { ...target, tables, file });
+			return 0;
+		}
 		case 'studio':
 			console.error(
 				'd1zzle-migrate does not ship a studio. Use the Drizzle Studio browser extension — it\n'

@@ -80,8 +80,16 @@ export interface TableOptions {
 	 * `DELETE` stays allowed: what an append-only table protects is that a
 	 * recorded fact is never rewritten, and dropping a tenant, expiring a
 	 * retention window or tearing down a test database are all legitimate.
+	 *
+	 * `true` guards every column. A column list guards only those, leaving the
+	 * rest writable — for the columns an outside system confirms after the row
+	 * is written, and for free text a deletion request has to be able to clear.
+	 * See `appendOnlyTrigger` for how `UPDATE OF` behaves.
+	 *
+	 * An empty array is rejected rather than read as "guard nothing": a flag
+	 * that silently protects nothing is the one outcome worth failing over.
 	 */
-	readonly appendOnly?: boolean;
+	readonly appendOnly?: boolean | readonly string[];
 }
 
 /** Marks the value a sidecar module default-exports, so the kit can find it. */
@@ -109,12 +117,63 @@ export const isTableOptionsMap = (value: unknown): value is TableOptionsMap =>
 /** The append-only guard's trigger name, derived so every emitter agrees. */
 export const appendOnlyTriggerName = (tableName: string): string => `${tableName}_no_update`;
 
-export const appendOnlyTrigger = (tableName: string): string =>
-	`create trigger ${quoteIdentifier(appendOnlyTriggerName(tableName))}\n`
-	+ `before update on ${quoteIdentifier(tableName)}\n`
-	+ 'begin\n'
-	+ `\tselect raise(abort, ${literal(`${tableName} is append-only: UPDATE is prohibited`)});\n`
-	+ 'end';
+/**
+ * The guarded column list, normalised: sorted and de-duplicated.
+ *
+ * `BEFORE UPDATE OF` treats its column list as a set — SQLite fires the trigger
+ * when a listed column appears in the statement's `SET` clause, in any order.
+ * Normalising here means reordering the array in a schema does not re-render
+ * the trigger, so `diff` stays quiet and `introspect` can compare list to list
+ * without caring how either side was spelled.
+ */
+export const normalizeAppendOnlyColumns = (columns: readonly string[]): string[] =>
+	[...new Set(columns)].sort();
+
+/**
+ * The append-only setting as one comparable string, so a snapshot diff can ask
+ * "did this change?" without deep-equalling an array.
+ *
+ * `''` off · `'*'` every column · otherwise the sorted column list.
+ * `*` cannot collide with a column list because it is not a legal identifier
+ * here — an unquoted `*` never reaches this from a schema.
+ */
+export const appendOnlyKey = (value: boolean | readonly string[] | undefined): string =>
+	!value ? '' : value === true ? '*' : normalizeAppendOnlyColumns(value).join(',');
+
+/** The list to hand `appendOnlyTrigger`, or `undefined` for a whole-table guard. */
+export const appendOnlyColumns = (
+	value: boolean | readonly string[] | undefined,
+): string[] | undefined => (!value || value === true ? undefined : normalizeAppendOnlyColumns(value));
+
+/**
+ * `BEFORE UPDATE … RAISE(ABORT)`, optionally narrowed to a set of columns.
+ *
+ * With no column list the guard is unconditional: no `UPDATE` touches the table
+ * at all. With one, SQLite fires only when a listed column appears in the
+ * statement's `SET` clause — which lets a table keep its derived values frozen
+ * while still accepting writes to the columns nothing derives from (a fee that
+ * the payment processor confirms later, free text that a deletion request has
+ * to be able to clear).
+ *
+ * Two properties of `UPDATE OF` are worth knowing before choosing a list:
+ *
+ *   - It fires on **mention, not on change**. `set amount = amount` aborts.
+ *     Code that rewrites every column on every save cannot be used against a
+ *     column-scoped table.
+ *   - A statement that touches both a guarded and an unguarded column aborts
+ *     whole. Nothing is partially applied.
+ */
+export const appendOnlyTrigger = (tableName: string, columns?: readonly string[]): string => {
+	const of = columns && columns.length > 0
+		? ` of ${normalizeAppendOnlyColumns(columns).map(quoteIdentifier).join(', ')}`
+		: '';
+	const what = of ? `these columns of ${tableName} are` : `${tableName} is`;
+	return `create trigger ${quoteIdentifier(appendOnlyTriggerName(tableName))}\n`
+		+ `before update${of} on ${quoteIdentifier(tableName)}\n`
+		+ 'begin\n'
+		+ `\tselect raise(abort, ${literal(`${what} append-only: UPDATE is prohibited`)});\n`
+		+ 'end';
+};
 
 export const dropAppendOnlyTrigger = (tableName: string): string =>
 	`drop trigger if exists ${quoteIdentifier(appendOnlyTriggerName(tableName))}`;
@@ -384,7 +443,40 @@ export function createSchema(
 	for (const t of tables) statements.push(...createIndexes(t, options));
 	// Triggers last: they reference the table, so it has to exist first.
 	for (const t of tables) {
-		if (perTable?.byTable[getTableName(t)]?.appendOnly) statements.push(appendOnlyTrigger(getTableName(t)));
+		const appendOnly = perTable?.byTable[getTableName(t)]?.appendOnly;
+		if (!appendOnly) continue;
+		const columns = appendOnly === true ? undefined : assertAppendOnlyColumns(t, appendOnly);
+		statements.push(appendOnlyTrigger(getTableName(t), columns));
 	}
 	return statements;
+}
+
+/**
+ * Reject a column list that names something the table does not have.
+ *
+ * **SQLite will not do this for us.** `create trigger … before update of
+ * nosuchcol on t` is accepted without a word, and the resulting trigger simply
+ * never fires — the table reads as guarded and is not. Verified against
+ * sqlite3 directly; it is the same failure shape as docs/35 (a constraint that
+ * is silently absent), so it is caught where the schema is declared instead.
+ */
+export function assertAppendOnlyColumns(t: Table, columns: readonly string[]): string[] {
+	const name = getTableName(t);
+	if (columns.length === 0) {
+		throw new Error(
+			`tableOptions: "${name}" declares appendOnly: [] — an empty column list guards nothing. `
+			+ 'Use `true` to guard every column, or name the columns to guard.',
+		);
+	}
+	const known = new Set(Object.values(getTableColumns(t)).map((c) => (c as Column).name));
+	const unknown = normalizeAppendOnlyColumns(columns).filter((c) => !known.has(c));
+	if (unknown.length > 0) {
+		throw new Error(
+			`tableOptions: "${name}" declares appendOnly columns that do not exist: ${unknown.join(', ')}. `
+			+ `SQLite accepts \`before update of\` on unknown columns without error, and the trigger then `
+			+ `never fires — the table would read as guarded while every UPDATE went through. `
+			+ `Known columns: ${[...known].sort().join(', ')}.`,
+		);
+	}
+	return normalizeAppendOnlyColumns(columns);
 }

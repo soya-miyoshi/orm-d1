@@ -8,17 +8,38 @@
  */
 import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName } from 'd1zzle/ddl';
 import type { TableOptionsMap } from 'd1zzle/ddl';
+import { appendOnlyKey, assertAppendOnlyColumns } from 'd1zzle/ddl';
 import type { Column, Table } from 'd1zzle';
 import { getTableColumns, getTableExtras, getTableName, isColumn } from 'd1zzle';
 
 /**
+ * What a table's `appendOnly` option becomes in the snapshot.
+ *
+ * The column list is validated here as well as in `createSchema`, because the
+ * snapshot is written by `generate` before any DDL is rendered: without this a
+ * typo'd column name would be recorded as the guard, and SQLite accepts such a
+ * trigger silently (see `assertAppendOnlyColumns`).
+ */
+const appendOnlySnapshotValue = (
+	t: Table,
+	value: boolean | readonly string[] | undefined,
+): boolean | readonly string[] => {
+	if (!value) return false;
+	if (value === true) return true;
+	return assertAppendOnlyColumns(t, value);
+};
+
+/**
  * `2` added `strict`, `withoutRowid` and `appendOnly` to `TableSnapshot`.
+ * `3` widened `appendOnly` from `boolean` to `boolean | string[]`.
  *
  * A version-1 snapshot simply lacks the three fields, and they read as `false`,
- * which is exactly what a database written before they existed looks like. So
- * the bump is for diagnostics and `up`, not for correctness of the read path.
+ * which is exactly what a database written before they existed looks like. A
+ * version-2 snapshot only ever holds `true` or `false`, which version 3 still
+ * reads unchanged. So both bumps are for diagnostics and `up`, not for
+ * correctness of the read path.
  */
-export const SNAPSHOT_VERSION = '2';
+export const SNAPSHOT_VERSION = '3';
 
 export interface ColumnSnapshot {
 	readonly name: string;
@@ -149,10 +170,14 @@ export interface TableSnapshot {
 	 * changing either forces a full table rebuild. `appendOnly` is a separate
 	 * trigger object, so it can be added or dropped in place — but it *is*
 	 * dropped along with the table, so a rebuild has to re-emit it.
+	 *
+	 * `appendOnly` is `true` for a whole-table guard, or the list of columns a
+	 * column-scoped guard covers. Narrowing or widening that list is also a
+	 * trigger-only change.
 	 */
 	readonly strict?: boolean;
 	readonly withoutRowid?: boolean;
-	readonly appendOnly?: boolean;
+	readonly appendOnly?: boolean | readonly string[];
 }
 
 export interface Snapshot {
@@ -370,7 +395,7 @@ export function snapshotFromSchema(
 			checkConstraints,
 			strict: perTable?.strict ?? false,
 			withoutRowid: perTable?.withoutRowid ?? false,
-			appendOnly: perTable?.appendOnly ?? false,
+			appendOnly: appendOnlySnapshotValue(t, perTable?.appendOnly),
 		};
 	}
 
@@ -499,8 +524,11 @@ export interface CanonicalTable {
 	/** Part of the `CREATE TABLE`, so a change here means a rebuild. */
 	readonly strict: boolean;
 	readonly withoutRowid: boolean;
-	/** A separate trigger object; changes without touching the table. */
-	readonly appendOnly: boolean;
+	/**
+	 * A separate trigger object; changes without touching the table.
+	 * Canonicalised by `appendOnlyKey` so a column list compares as a string.
+	 */
+	readonly appendOnly: string;
 }
 
 /**
@@ -656,7 +684,7 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 			.sort(),
 		strict: table.strict ?? false,
 		withoutRowid: table.withoutRowid ?? false,
-		appendOnly: table.appendOnly ?? false,
+		appendOnly: appendOnlyKey(table.appendOnly),
 	};
 };
 

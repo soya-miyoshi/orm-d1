@@ -68,6 +68,27 @@ export async function writeMigration(out: string, tag: string, sql: string): Pro
 	return path;
 }
 
+/**
+ * A roundtrip draft, written **outside** the migrations directory.
+ *
+ * `migrate` applies what the journal lists, and a draft is deliberately not in
+ * it — but a draft sitting next to real migrations still invites being run, so
+ * it goes in its own folder with `draft` in the name. The three passes it
+ * contains are not applyable as one file.
+ */
+export async function writeRoundtripDraft(
+	out: string,
+	table: string,
+	contents: string,
+	at: number,
+): Promise<string> {
+	const dir = join(out, 'roundtrip');
+	await mkdir(dir, { recursive: true });
+	const path = join(dir, `${at}_${table}.draft.sql`);
+	await writeFile(path, `${contents}\n`);
+	return path;
+}
+
 export async function readMigration(out: string, tag: string): Promise<string> {
 	return readFile(join(out, `${tag}.sql`), 'utf8');
 }

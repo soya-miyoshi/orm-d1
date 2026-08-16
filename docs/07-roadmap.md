@@ -63,6 +63,9 @@ and the kit's type check.
 ## What is not built
 
 - Views, CTEs, window functions, set operations (`union` / `intersect` / `except`).
+  One exception: `latestPerGroup` (`src/builders/window.ts`) compiles a `row_number()`
+  window internally. It is a single named query, not a composable `over()` — the general
+  window surface is still unbuilt.
 - Zod / Valibot / ArkType adapters — the Drizzle ones are *believed* to work via
   `asDrizzleSchema()`, but no test imports them, so that is a survey rather than a result.
   [10](./10-ecosystem-interop.md#p1--validator-adapters-test-only) has the plan.
@@ -210,6 +213,9 @@ baseline reset, and `check` catches a manual `wrangler d1 execute` ALTER.
   [09](./09-d1zzle-migrate.md#studio) — the delegation path is gated on verifying Drizzle
   Studio's licensing terms.
 - Views, CTEs, window functions, set operations (`union` / `intersect` / `except`).
+  One exception: `latestPerGroup` (`src/builders/window.ts`) compiles a `row_number()`
+  window internally. It is a single named query, not a composable `over()` — the general
+  window surface is still unbuilt.
 - Zod / Valibot / ArkType schema adapters.
 - Custom column types beyond `$type<T>()`.
 - The rest of the adapter ecosystem, surveyed and prioritised in

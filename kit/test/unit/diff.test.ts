@@ -4,7 +4,7 @@ import type { Column } from 'd1zzle';
 import { describe, expect, it } from 'vitest';
 import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { applicableStatements, splitStatements } from '../../src/core/sql.js';
-import { hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
+import { appendOnlyTriggerGuard, hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
 import { assertRoundTrip, emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
 import type { Snapshot } from '../../src/core/snapshot.js';
 
@@ -1530,10 +1530,6 @@ describe('reading table options back out of a CREATE TABLE', () => {
 			+ "BEGIN SELECT RAISE(ABORT, 'kind required'); END";
 		expect(isAppendOnlyTrigger(when, 'events')).toBe(false);
 
-		const columns = 'CREATE TRIGGER validate BEFORE UPDATE OF "kind" ON "events" '
-			+ "BEGIN SELECT RAISE(ABORT, 'no'); END";
-		expect(isAppendOnlyTrigger(columns, 'events')).toBe(false);
-
 		// Aborts, but only down one branch of the CASE.
 		const branch = 'CREATE TRIGGER validate BEFORE UPDATE ON "events" BEGIN '
 			+ "SELECT CASE WHEN new.kind IS NULL THEN RAISE(ABORT, 'no') END; END";
@@ -1553,6 +1549,121 @@ describe('reading table options back out of a CREATE TABLE', () => {
 
 	it('still recognises d1zzle\'s own generated guard after the anchor tightening', () => {
 		expect(isAppendOnlyTrigger(appendOnlyTrigger('events'), 'events')).toBe(true);
+	});
+
+	// A rebuild drops the table and its trigger with it. Re-emitting the guard
+	// as `true` when it was scoped would silently widen it; forgetting the list
+	// is the same bug the whole-table version had before it was covered.
+	describe('a column-scoped guard survives a rebuild', () => {
+		const guarded = (appendOnly: boolean | string[], checkValue: string) => ({
+			version: '3',
+			dialect: 'sqlite',
+			id: '',
+			prevId: '',
+			origin: 'schema',
+			tables: {
+				t: {
+					name: 't',
+					columns: {
+						id: { name: 'id', type: 'text', notNull: true, primaryKey: true },
+						amount: { name: 'amount', type: 'integer', notNull: true, primaryKey: false },
+						fee: { name: 'fee', type: 'integer', notNull: false, primaryKey: false },
+					},
+					indexes: {},
+					foreignKeys: {},
+					compositePrimaryKeys: {},
+					uniqueConstraints: {},
+					checkConstraints: { t_amount_check: { name: 't_amount_check', value: checkValue } },
+					appendOnly,
+				},
+			},
+		}) as never;
+
+		it('re-emits the column list, not a whole-table guard', () => {
+			const { statements } = diffSnapshots(
+				guarded(['amount'], '"amount" > 0'),
+				guarded(['amount'], '"amount" >= 0'),
+				{},
+			);
+			const created = statements.filter((s) => s.sql.startsWith('create trigger'));
+			expect(created).toHaveLength(1);
+			expect(created[0]!.sql).toContain('before update of "amount" on "t"');
+		});
+
+		it('narrowing the list is reported as removing a protection', () => {
+			const { statements } = diffSnapshots(
+				guarded(true, '"amount" > 0'),
+				guarded(['amount'], '"amount" > 0'),
+				{},
+			);
+			const drop = statements.find((s) => s.sql.startsWith('drop trigger'));
+			expect(drop).toMatchObject({ destructive: true });
+			expect(drop!.reason).toContain('no longer covers');
+			expect(drop!.reason).toContain('fee');
+		});
+
+		it('widening the list is not destructive', () => {
+			const { statements } = diffSnapshots(
+				guarded(['amount'], '"amount" > 0'),
+				guarded(['amount', 'fee'], '"amount" > 0'),
+				{},
+			);
+			expect(statements.find((s) => s.sql.startsWith('drop trigger'))).toMatchObject({
+				destructive: false,
+			});
+			expect(statements.find((s) => s.sql.startsWith('create trigger'))!.sql)
+				.toContain('before update of "amount", "fee" on "t"');
+		});
+
+		it('reordering the list is not a change at all', () => {
+			const { statements } = diffSnapshots(
+				guarded(['amount', 'fee'], '"amount" > 0'),
+				guarded(['fee', 'amount'], '"amount" > 0'),
+				{},
+			);
+			expect(statements).toEqual([]);
+		});
+	});
+
+	// `BEFORE UPDATE OF` used to be lumped in with `WHEN` as "conditional, so not
+	// the guard". It is a different kind of conditional: `WHEN` decides per row,
+	// `OF` decides per column and freezes the ones it names for every row. Reading
+	// it as `false` hid d1zzle's own trigger from `apply`, which treats anything
+	// it does not recognise as a foreign trigger it must not touch.
+	describe('column-scoped guards', () => {
+		it('reports the column list instead of true', () => {
+			const scoped = 'CREATE TRIGGER g BEFORE UPDATE OF "kind", "amount" ON "events" '
+				+ "BEGIN SELECT RAISE(ABORT, 'no'); END";
+			expect(appendOnlyTriggerGuard(scoped, 'events')).toEqual(['amount', 'kind']);
+			expect(isAppendOnlyTrigger(scoped, 'events')).toBe(true);
+		});
+
+		it('round-trips what the generator emits, in normalised order', () => {
+			const sql = appendOnlyTrigger('events', ['kind', 'amount']);
+			expect(sql).toContain('before update of "amount", "kind" on "events"');
+			expect(appendOnlyTriggerGuard(sql, 'events')).toEqual(['amount', 'kind']);
+		});
+
+		it('keeps the case a column was declared with', () => {
+			const sql = appendOnlyTrigger('events', ['recordedAt']);
+			expect(appendOnlyTriggerGuard(sql, 'events')).toEqual(['recordedAt']);
+		});
+
+		it('reads an unquoted list, and one with odd spacing', () => {
+			const scoped = 'CREATE TRIGGER g BEFORE UPDATE OF kind ,  amount ON "events" '
+				+ "BEGIN SELECT RAISE(ABORT, 'no'); END";
+			expect(appendOnlyTriggerGuard(scoped, 'events')).toEqual(['amount', 'kind']);
+		});
+
+		it('a WHEN clause still disqualifies it, column list or not', () => {
+			const both = 'CREATE TRIGGER g BEFORE UPDATE OF "kind" ON "events" WHEN new.kind IS NULL '
+				+ "BEGIN SELECT RAISE(ABORT, 'no'); END";
+			expect(appendOnlyTriggerGuard(both, 'events')).toBe(false);
+		});
+
+		it('a whole-table guard is still true, not a list', () => {
+			expect(appendOnlyTriggerGuard(appendOnlyTrigger('events'), 'events')).toBe(true);
+		});
 	});
 });
 

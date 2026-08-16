@@ -2,6 +2,8 @@
  * The commands. Each one is a plain async function over a `Config` plus flags,
  * so they are callable from a script as well as from the CLI.
  */
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { configureCasing, getTableName, isTable } from 'd1zzle';
 import { validateTableOptions } from 'd1zzle/ddl';
 import {
@@ -11,7 +13,13 @@ import {
 	MAX_STATEMENTS_PER_BATCH,
 } from '../core/apply.js';
 import type { SqlRunner } from '../core/apply.js';
-import { applicableStatements, isPragma, packIntoBatches } from '../core/sql.js';
+import { applicableStatements, isPragma, packIntoBatches, splitStatements } from '../core/sql.js';
+import { backfill } from '../core/backfill.js';
+import { impactOf, impactRanking, impactWithRows } from '../core/impact.js';
+import { renderRoundtrip, roundtripPlan } from '../core/roundtrip.js';
+import { vocabularyWarnings } from '../core/vocabulary.js';
+import type { TableImpact } from '../core/impact.js';
+import type { BackfillResult } from '../core/backfill.js';
 import { diffSnapshots, renderMigration } from '../core/diff.js';
 import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
@@ -31,6 +39,7 @@ import {
 	unreadableMigrations,
 	writeJournal,
 	writeMigration,
+	writeRoundtripDraft,
 	writeSnapshot,
 } from './store.js';
 
@@ -47,6 +56,8 @@ export interface TargetFlags {
 	readonly acceptDataLoss?: boolean;
 	readonly name?: string;
 	readonly renames?: DiffOptions;
+	/** Write the three-pass draft when a rebuild is refused. */
+	readonly emitRoundtrip?: boolean;
 }
 
 /** Pick the database to act on. Ambiguity here is how the wrong one gets hit. */
@@ -132,13 +143,56 @@ export interface GenerateResult {
 	readonly destructive: readonly string[];
 }
 
+/** Table names quoted at the start of a `recreateTable` refusal. */
+const refusedTables = (errors: readonly string[]): string[] => {
+	const names = new Set<string>();
+	for (const error of errors) {
+		const match = /^"([^"]+)" has to be recreated because /.exec(error);
+		if (match) names.add(match[1]!);
+	}
+	return [...names];
+};
+
+async function writeRoundtripDrafts(
+	ctx: CommandContext,
+	previous: Snapshot,
+	next: Snapshot,
+	errors: readonly string[],
+): Promise<string[]> {
+	const written: string[] = [];
+	for (const table of refusedTables(errors)) {
+		let plan;
+		try {
+			plan = roundtripPlan(previous, next, table);
+		} catch {
+			// The refusal was for something other than children — a foreign
+			// trigger, say. Nothing to draft.
+			continue;
+		}
+		const path = await writeRoundtripDraft(ctx.config.out, table, renderRoundtrip(plan), ctx.now());
+		written.push(path);
+	}
+	return written;
+}
+
 export async function generate(ctx: CommandContext, flags: TargetFlags = {}): Promise<GenerateResult> {
 	const previous = await readLatestSnapshot(ctx.config.out);
 	const next = await snapshotOfSchema(ctx);
 	const diff = diffSnapshots(previous, next, flags.renames ?? {});
 
 	if (diff.errors.length > 0) {
-		throw new Error(`Cannot generate a safe migration:\n  - ${diff.errors.join('\n  - ')}`);
+		// The refusal names the tables that block the rebuild. When the caller
+		// asked for it, write the three-pass draft alongside the message rather
+		// than leaving them to work the ordering out from the error text.
+		const drafted = flags.emitRoundtrip
+			? await writeRoundtripDrafts(ctx, previous, next, diff.errors)
+			: [];
+		const hint = flags.emitRoundtrip
+			? drafted.length > 0
+				? `\n\nDrafts written:\n  - ${drafted.join('\n  - ')}\nThey are not migrations. Read the header.`
+				: '\n\nNo draft could be written: the refusal does not name a table with children.'
+			: '\n\nRe-run with --emit-roundtrip for a draft of the three-pass rebuild.';
+		throw new Error(`Cannot generate a safe migration:\n  - ${diff.errors.join('\n  - ')}${hint}`);
 	}
 
 	const destructive = diff.statements
@@ -155,6 +209,11 @@ export async function generate(ctx: CommandContext, flags: TargetFlags = {}): Pr
 	// Printed before the "nothing to generate" line, which is exactly the case
 	// a constraint rename produces and the one that most needs explaining.
 	for (const warning of diff.warnings) ctx.log(`  ! ${warning}`);
+	// A vocabulary that was widened in one table and not its siblings. Reported
+	// on the whole schema rather than on the diff: the divergence is usually
+	// introduced by the very migration being generated, but it survives every
+	// later one, so it has to be visible on a run that changes nothing else.
+	for (const warning of vocabularyWarnings(next)) ctx.log(`  ! ${warning}`);
 
 	if (diff.statements.length === 0) {
 		ctx.log('No schema changes; nothing to generate.');
@@ -718,6 +777,87 @@ export async function verify(ctx: CommandContext): Promise<VerifyResult> {
 // ------------------------------------------------------------------------ up
 
 /** Rewrite snapshots in the current format after a kit version bump. */
+/**
+ * Run one-off statements against append-only tables, guards suspended.
+ *
+ * The SQL comes from a file rather than the command line: a backfill is worth
+ * reviewing before it runs, and a file is the thing a reviewer can be pointed
+ * at. Statements are split on `;` at the top level, the same way a migration
+ * file is.
+ */
+export async function backfillCommand(
+	ctx: CommandContext,
+	flags: TargetFlags & { readonly tables: readonly string[]; readonly file: string },
+): Promise<BackfillResult> {
+	const runner = await resolveRunner(ctx, flags);
+	const sql = await readFile(resolve(ctx.cwd, flags.file), 'utf8');
+	const statements = splitStatements(sql);
+	if (statements.length === 0) {
+		throw new Error(`backfill: ${flags.file} contains no statements.`);
+	}
+
+	const result = await backfill(runner, { tables: flags.tables, statements });
+	for (const [table, columns] of Object.entries(result.suspended)) {
+		const what = columns === true ? 'every column' : (columns as string[]).join(', ');
+		ctx.log(`Suspended the append-only guard on "${table}" (${what}) and put it back.`);
+	}
+	ctx.log(`Ran ${statements.length} statement(s) from ${flags.file}.`);
+	return result;
+}
+
+/**
+ * How many tables a rebuild of `table` drags with it.
+ *
+ * Reads the schema, not the database, so it answers before the change exists
+ * and runs where no database does. `--local` / `--remote` adds row counts,
+ * which is the other half of the cost: the closure says how many tables have
+ * to be taken apart, the row counts say how long the copy takes.
+ */
+export async function impact(
+	ctx: CommandContext,
+	flags: TargetFlags & { readonly table?: string | undefined } = {},
+): Promise<TableImpact[]> {
+	const snapshot = await snapshotOfSchema(ctx);
+
+	if (!flags.table) {
+		const ranking = impactRanking(snapshot);
+		ctx.log(`Rebuild cost across ${Object.keys(snapshot.tables).length} tables, most expensive first:`);
+		for (const entry of ranking) {
+			if (entry.closure.length === 0) continue;
+			ctx.log(`  ${entry.table.padEnd(40)} ${String(entry.closure.length).padStart(3)}`);
+		}
+		const free = ranking.filter((e) => e.closure.length === 0).map((e) => e.table);
+		ctx.log(`  ${free.length} table(s) have no children and can be rebuilt on their own.`);
+		return ranking;
+	}
+
+	const wantsRows = flags.local === true || flags.remote === true;
+	const entry = wantsRows
+		? await impactWithRows(snapshot, flags.table, await resolveRunner(ctx, flags))
+		: impactOf(snapshot, flags.table);
+
+	if (entry.closure.length === 0) {
+		ctx.log(`Nothing references "${entry.table}": it can be rebuilt on its own.`);
+	} else {
+		ctx.log(
+			`Rebuilding "${entry.table}" means dropping and restoring the foreign keys of `
+				+ `${entry.closure.length} table(s):`,
+		);
+		for (const name of entry.closure) {
+			const count = entry.rows?.[name];
+			ctx.log(`  ${name}${count === undefined ? '' : `  (${count.toLocaleString()} rows)`}`);
+		}
+	}
+	if (entry.directReferences.length > 0) {
+		ctx.log(`Referenced directly by ${entry.directReferences.length}: ${entry.directReferences.join(', ')}`);
+	}
+	const own = entry.rows?.[entry.table];
+	if (own !== undefined) {
+		ctx.log(`"${entry.table}" itself holds ${own.toLocaleString()} row(s), all of which a rebuild copies.`);
+	}
+	return [entry];
+}
+
 export async function up(ctx: CommandContext): Promise<number> {
 	const journal = await readJournal(ctx.config.out);
 	let migrated = 0;

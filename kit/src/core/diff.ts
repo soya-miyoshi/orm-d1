@@ -9,7 +9,13 @@
  * from the intersection of old and new columns. `SELECT *` is the classic
  * corruption bug and never appears here.
  */
-import { appendOnlyTrigger, appendOnlyTriggerName, dropAppendOnlyTrigger } from 'd1zzle/ddl';
+import {
+	appendOnlyColumns,
+	appendOnlyKey,
+	appendOnlyTrigger,
+	appendOnlyTriggerName,
+	dropAppendOnlyTrigger,
+} from 'd1zzle/ddl';
 import type { ColumnSnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
 
@@ -59,6 +65,21 @@ const columnDefinition = (column: ColumnSnapshot): string => {
 };
 
 const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/** The columns an `appendOnlyKey` covers, resolving `'*'` against the table. */
+const guardedColumns = (key: string, all: readonly string[]): string[] =>
+	key === '' ? [] : key === '*' ? [...all] : key.split(',');
+
+/**
+ * Columns the old guard protected that the new one does not.
+ *
+ * Empty when the guard only widens, which is what separates "this narrows a
+ * protection, say so" from "this adds one, no comment needed".
+ */
+const guardedColumnsLost = (before: string, after: string, all: readonly string[]): string[] => {
+	const kept = new Set(guardedColumns(after, all));
+	return guardedColumns(before, all).filter((c) => !kept.has(c));
+};
 
 /** Can this column be appended with `ALTER TABLE … ADD COLUMN`? */
 const isAddable = (column: ColumnSnapshot): string | undefined => {
@@ -317,7 +338,10 @@ const recreateTable = (
 	// append-only table the first time it was rebuilt for any other reason —
 	// the failure mode being that nothing fails, and UPDATEs start working.
 	if (after.appendOnly) {
-		statements.push({ sql: appendOnlyTrigger(after.name), destructive: false });
+		statements.push({
+			sql: appendOnlyTrigger(after.name, appendOnlyColumns(after.appendOnly)),
+			destructive: false,
+		});
 	}
 
 	// No closing pragma: it is scoped to this transaction and, per D1's docs,
@@ -371,7 +395,7 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 				// name in the same diff, which is the same test the in-place
 				// transition below uses (`next.appendOnly`), just against the
 				// renamed identity instead of the unchanged one.
-				const staysAppendOnly = after.tables[renamed]?.appendOnly === true;
+				const staysAppendOnly = Boolean(after.tables[renamed]?.appendOnly);
 				statements.push({
 					sql: dropAppendOnlyTrigger(name),
 					destructive: !staysAppendOnly,
@@ -394,7 +418,12 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		for (const index of Object.values(t.indexes)) {
 			statements.push({ sql: createIndexFromSnapshot(index, name), destructive: false });
 		}
-		if (t.appendOnly) statements.push({ sql: appendOnlyTrigger(name), destructive: false });
+		if (t.appendOnly) {
+			statements.push({
+				sql: appendOnlyTrigger(name, appendOnlyColumns(t.appendOnly)),
+				destructive: false,
+			});
+		}
 	}
 
 	// 3. Dropped tables, children before parents — the reverse of creation
@@ -603,7 +632,22 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		// its own object, so unlike STRICT / WITHOUT ROWID this needs no rebuild —
 		// and dropping it is destructive only in the sense that it removes a
 		// protection, which is worth saying out loud rather than doing quietly.
-		if ((previous.appendOnly ?? false) !== (next.appendOnly ?? false)) {
+		const previousGuard = appendOnlyKey(previous.appendOnly);
+		const nextGuard = appendOnlyKey(next.appendOnly);
+		if (previousGuard !== nextGuard) {
+			// A guard that is only being *narrowed* still has to be dropped first:
+			// the trigger's name is derived from the table, so `create trigger`
+			// would fail on apply with "already exists".
+			if (previousGuard && nextGuard) {
+				const lost = guardedColumnsLost(previousGuard, nextGuard, Object.keys(next.columns));
+				statements.push({
+					sql: dropAppendOnlyTrigger(name),
+					destructive: lost.length > 0,
+					...(lost.length > 0
+						? { reason: `"${name}"'s append-only guard no longer covers ${lost.join(', ')}` }
+						: {}),
+				});
+			}
 			if (next.appendOnly) {
 				// The trigger this would create is named `<table>_no_update`
 				// (`appendOnlyTrigger`). If that name is already taken by a trigger
@@ -616,7 +660,7 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 				// refusal above.
 				const foreignTriggersForTable = options.foreignTriggers?.[liveTableNames[name] ?? name] ?? [];
 				const guardName = appendOnlyTriggerName(name);
-				if (foreignTriggersForTable.includes(guardName)) {
+				if (!previousGuard && foreignTriggersForTable.includes(guardName)) {
 					errors.push(
 						`"${name}" is becoming append-only, but a trigger named "${guardName}" already exists and `
 							+ 'd1zzle did not create it. Creating the guard would fail on apply because the name is '
@@ -624,7 +668,10 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 							+ 'across rebuilds.',
 					);
 				} else {
-					statements.push({ sql: appendOnlyTrigger(name), destructive: false });
+					statements.push({
+						sql: appendOnlyTrigger(name, appendOnlyColumns(next.appendOnly)),
+						destructive: false,
+					});
 				}
 			} else {
 				statements.push({

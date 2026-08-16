@@ -187,14 +187,26 @@ describe('table options against a real D1 database', () => {
 		b: text('b').notNull(),
 	}, (t) => [primaryKey({ columns: [t.a, t.b] })]);
 
+	// A column-scoped guard: the amount is the recorded fact, the fee is
+	// confirmed by the payment processor after the row is written.
+	const charges = sqliteTable('charges', {
+		id: text('id').primaryKey(),
+		amount: integer('amount').notNull(),
+		fee: integer('fee'),
+		note: text('note'),
+	});
+
 	const options = tableOptions([
 		[ledger, { strict: true, appendOnly: true }],
 		[pairs, { strict: true, withoutRowid: true }],
+		[charges, { strict: true, appendOnly: ['amount'] }],
 	]);
-	const tables = [ledger, pairs];
+	const tables = [ledger, pairs, charges];
 
 	beforeEach(async () => {
-		for (const name of ['ledger', 'pairs']) await DB.prepare(`drop table if exists "${name}"`).run();
+		for (const name of ['ledger', 'pairs', 'charges']) {
+			await DB.prepare(`drop table if exists "${name}"`).run();
+		}
 		for (const statement of createSchema(tables, {}, options)) await DB.prepare(statement).run();
 	});
 
@@ -225,6 +237,60 @@ describe('table options against a real D1 database', () => {
 		expect(left[0]!.n).toBe(0);
 	});
 
+	// The whole point of the column list: D1 has to enforce it exactly as
+	// sqlite3 does, or the guard is either useless or blocks the write it was
+	// narrowed to permit.
+	it('a column-scoped guard freezes only the columns it names', async () => {
+		await DB.prepare(`insert into "charges" ("id", "amount") values ('a', 1000)`).run();
+
+		// The guarded column is frozen.
+		await expect(DB.prepare(`update "charges" set "amount" = 2 where "id" = 'a'`).run())
+			.rejects.toThrow();
+
+		// The unguarded ones are writable — this is what the narrowing buys.
+		await DB.prepare(`update "charges" set "fee" = 36, "note" = 'x' where "id" = 'a'`).run();
+		const [row] = await runner.all<{ amount: number; fee: number; note: string }>(
+			`select "amount", "fee", "note" from "charges" where "id" = 'a'`,
+		);
+		expect(row).toMatchObject({ amount: 1000, fee: 36, note: 'x' });
+	});
+
+	it('fires on mention, not on change, and never applies a statement in part', async () => {
+		await DB.prepare(`insert into "charges" ("id", "amount") values ('b', 1000)`).run();
+
+		// Setting the guarded column to the value it already holds still aborts:
+		// SQLite decides on the SET clause, not on the outcome.
+		await expect(DB.prepare(`update "charges" set "amount" = "amount" where "id" = 'b'`).run())
+			.rejects.toThrow();
+
+		// A statement touching both a guarded and an unguarded column aborts
+		// whole — the fee must not land while the amount is rejected.
+		await expect(
+			DB.prepare(`update "charges" set "fee" = 99, "amount" = 1 where "id" = 'b'`).run(),
+		).rejects.toThrow();
+		const [row] = await runner.all<{ amount: number; fee: number | null }>(
+			`select "amount", "fee" from "charges" where "id" = 'b'`,
+		);
+		expect(row).toMatchObject({ amount: 1000, fee: null });
+	});
+
+	// Why `assertAppendOnlyColumns` exists: D1 will not catch this for us.
+	it('D1 accepts a guard naming a column that does not exist, and it never fires', async () => {
+		await DB.prepare(
+			`create trigger "charges_typo" before update of "amonut" on "charges" `
+				+ `begin select raise(abort, 'nope'); end`,
+		).run();
+		await DB.prepare(`insert into "charges" ("id", "amount") values ('c', 5)`).run();
+		// No error on create, and no protection either.
+		await DB.prepare(`update "charges" set "fee" = 1 where "id" = 'c'`).run();
+		await DB.prepare(`drop trigger "charges_typo"`).run();
+	});
+
+	it('reads a column-scoped guard back as its column list', async () => {
+		const live = await introspect(runner);
+		expect(live.tables.charges).toMatchObject({ appendOnly: ['amount'] });
+	});
+
 	it('reports no drift in either direction', async () => {
 		const live = await introspect(runner);
 		const expected = snapshotFromSchema(tables, '', options);
@@ -233,7 +299,9 @@ describe('table options against a real D1 database', () => {
 		// outer beforeEach is gone by now, so compare like with like.
 		const only = (s: typeof live) => ({
 			...s,
-			tables: Object.fromEntries(Object.entries(s.tables).filter(([n]) => n === 'ledger' || n === 'pairs')),
+			tables: Object.fromEntries(
+				Object.entries(s.tables).filter(([n]) => n === 'ledger' || n === 'pairs' || n === 'charges'),
+			),
 		});
 
 		expect(diffSnapshots(only(live), only(expected)).statements).toEqual([]);
