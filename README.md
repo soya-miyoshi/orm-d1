@@ -52,7 +52,7 @@ does.
 | --- | --- | --- |
 | [`db.insert(users).values(rows)`][d-insert]<br>500 rows, 4 columns each | One statement carrying 2,000 bound parameters. D1 rejects it: `D1_ERROR: too many SQL variables`. Splitting the array is left to the caller, and the pieces are then separate writes — a failure in the fourth leaves the first three applied. | `floor(100 / 4) = 25` rows per statement, computed while compiling: 20 statements sent as one `batch()`. One round trip, and a conflict in the last chunk inserts nothing. `.returning()` rows come back in input order. |
 | [`where(inArray(users.id, ids))`][d-inarray]<br>201 ids | `in (?, ?, ?, …)` — one parameter per value, so the same 100-parameter limit rejects it. Staying under it means splitting the query and merging the results. | `in (select "value" from json_each(?))`: the list travels as one JSON parameter, so its length stops mattering. Under 30 values, and for `blob`s that have no JSON spelling, values are bound individually as before. |
-| [`db.transaction(async (tx) => …)`][d-batch] | Runs `begin`, your statements, then `commit` as separate statements. D1 does not guarantee they reach the same connection, so the `begin` can apply where the writes do not: a failure part-way leaves earlier writes applied and `rollback` with nothing to undo. | No `transaction()` — calling it throws, naming `db.batch([...])`. D1 executes a batch as one transaction, and the return value is one typed result per statement. |
+| [`db.transaction(async (tx) => …)`][d-batch] | Runs `begin`, your statements, then `commit` as separate statements. D1 does not guarantee they reach the same connection, so the `begin` can apply where the writes do not: a failure part-way leaves earlier writes applied and `rollback` with nothing to undo. | **Not implemented.** The method exists only to throw `NoTransactionsError`, whose message names the replacement. `db.batch([...])` is the atomic primitive: D1 runs a batch as one transaction and returns one typed result per statement. |
 | [`db.batch([db.select({ a: users.id, b: posts.id })…])`][d-collision]<br>a join projecting two `id` columns | `batch()` returns keyed row objects, and two columns named `id` occupy one key. The conversion back to an array (`Object.keys(row).map(…)`) therefore runs on a row that is already one value short. Drizzle's source notes the case in a comment. | The collision is found while compiling, when the projection is still known, and the two columns are emitted as `c0`, `c1`. Both values arrive. |
 | [`db.withSession(bookmark)`][d-session] | Not available: `withSession` does not appear in the package. Reading from a replica means calling `env.DB.withSession()` directly and writing the SQL by hand. | Returns the same API — `select`, `insert`, `db.query` — plus `session.bookmark()`, so the consistency point can be stored in a cookie and passed back on the next request. |
 | [`drizzle(env.DB, { onQuery })`][d-onquery]<br>reading `rows_read` / `rows_written` | `logger` receives the SQL and its parameters. Selects read through `.raw()`, which returns rows without D1's `meta`, so the billed row counts never reach the caller. | `onQuery` fires once per executed statement — each member of a `batch()`, each chunk of a chunked insert — with `rowsRead`, `rowsWritten`, `durationMs`, `d1DurationMs`, `servedByPrimary` and `attempts`. |
@@ -60,6 +60,26 @@ does.
 | [Exceeding another D1 limit][d-limits] | The statement is sent and D1's error comes back naming the constraint but not the call site: `too many SQL variables` does not say which `inArray`, and `too many arguments on function coalesce` does not say which `coalesce`. | The limits knowable at compile time are checked there, once per isolate, and the message names the call and the option that moves it (`maxParams`, `jsonEachThreshold`) — before the code ever runs against D1. |
 | [Free and paid plan caps][d-plan] | No plan awareness. 50 statements per Worker invocation and 500 MB on the free plan are found by hitting them. | `plan: 'free'` counts the statements an invocation has issued and reads `size_after` off each response, warning once in a development build at 90% of the cap. |
 | [Bundle size][d-size] | 77.8 kB minified, 22.2 kB gzipped, for driver + schema DSL: the dialect indirection, the transaction and savepoint subsystem, and prepared-statement abstractions covering sync and async drivers are all reachable from the entry point. | 44.1 kB / 15.3 kB for the same Worker, built the same way. None of those layers exist to be tree-shaken. |
+
+## Drizzle APIs that do not exist here
+
+Absent, not stubbed to a no-op. The first two throw an error naming the replacement; the
+rest are simply not exported, so a call to them does not type-check.
+
+| In `drizzle-orm` | In d1zzle | Instead |
+| --- | --- | --- |
+| `db.transaction(cb)` | throws `NoTransactionsError` | `db.batch([...])` — one round trip, atomic |
+| `experimental.joins` (Better Auth adapter) | throws `D1zzleAdapterError`, naming the models the call asked to join | turn the option off; Better Auth then fetches related rows with follow-up queries |
+| `relations()` (the v0 API), and the `where` / `orderBy` callback forms | not exported | `defineRelations()` and the v1 object DSL |
+| Views (`sqliteView`), CTEs, `union` / `intersect` / `except` | not exported | `db.execute(sql, params)` for the statement you need |
+| `.prepare()` on a query builder | not implemented | `query.select()…compile()` at module scope, then `db.get(compiled, input)` |
+| `logger`, and the v0 `schema` option | accepted and ignored, with no warning | `onQuery` for query logging; `relations` for the schema |
+| `drizzle-kit studio` | `d1zzle-migrate` has no `studio` command | the Drizzle Studio browser extension, which introspects the live database, or Cloudflare's D1 console |
+
+`transaction()` is a method that only throws rather than an absent one for a single
+reason: `db.transaction is not a function` says nothing about what to use instead, and the
+thrown message does. It costs one error class in the bundle; the transaction and savepoint
+subsystem it would otherwise pull in is not there.
 
 ## Documentation
 
@@ -83,7 +103,6 @@ Not supported, by decision:
 - **Other databases.** No Postgres, MySQL, better-sqlite3, `bun:sqlite`, or Durable Object
   SQLite. A second backend reinstates the abstraction layer that accounts for the
   bundle-size difference in the table above. Drizzle covers portability.
-- **Interactive transactions.** D1 has none.
 - **A runtime migration engine.** Migrations are generated and applied by the CLI, never
   from inside a Worker.
 - **Query result caching.** Workers have the Cache API and KV.

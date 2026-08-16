@@ -52,13 +52,19 @@ library ended up in the bundle rather than measure its size:
 tag · the comparison and aggregate operators · `defineRelations()` and `db.query` ·
 `InferSelectModel` / `InferInsertModel`.
 
-**Not supported:**
+**Not supported.** What each missing API does when you call it, so a port fails in a way
+you can read:
 
-- `transaction()` — throws, with a pointer to `batch()`.
-- The v0 `relations()` API, and the `where`/`orderBy` callback forms. d1zzle presents v1's
-  interface only. The old `schema` option is accepted and ignored.
-- Views, CTEs and set operations. They are absent rather than silently no-op.
-- Drizzle's execution plan for relational queries is not adopted, only its interface.
+| Call | What happens |
+| --- | --- |
+| `db.transaction(cb)` | Throws `NoTransactionsError`, whose message names `db.batch([...])`. Nothing else of the transaction machinery is present. |
+| `.prepare()` on a builder | Not a method; `query.select()…compile()` replaces it. |
+| `relations()` (v0), and the `where` / `orderBy` callback forms | Not exported. `defineRelations()` and the v1 object DSL are the interface. |
+| The v0 `schema` option, and `logger` | Accepted and ignored, with no warning. Use `relations` and `onQuery`. |
+| Views (`sqliteView`), CTEs, `union` / `intersect` / `except` | Not exported, so a schema or query using them does not compile. `db.execute(sql, params)` is the escape hatch. |
+
+Drizzle's execution plan for relational queries is not adopted either, only its interface;
+the plans d1zzle runs are in [03-relational-queries](./03-relational-queries.md).
 
 The schema DSL is a strict subset of `drizzle-orm/sqlite-core`: every symbol usable in a
 schema file also exists there with the same meaning. That is what makes the aliasing work

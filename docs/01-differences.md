@@ -80,7 +80,10 @@ can apply to a connection none of the writes use, and each write commits by itse
 the third of five writes fails, the first two stay applied and the `rollback` has nothing
 to undo.
 
-**d1zzle** does not provide `transaction()`. Calling it throws immediately:
+**d1zzle** has no `transaction()`. There is no transaction object, no savepoint, and no
+code in the bundle that emits `BEGIN`. What remains under the name is a three-line method
+whose whole body throws, so that a call ported from Drizzle produces an explanation rather
+than `TypeError: db.transaction is not a function`:
 
 ```
 d1zzle does not provide transaction(). D1 has no interactive transactions: statements in
@@ -101,7 +104,11 @@ const [inserted, posts] = await db.batch([
 The atomicity is D1's, asserted against a real binding: in a batch whose second statement
 violates a unique constraint, the first statement leaves zero rows.
 
-Removing `transaction()` also removes the transaction and savepoint code from the bundle.
+What `batch()` does not give you is the part of a transaction that reads before it decides:
+every statement is fixed before the batch is sent, so "read a row, then write depending on
+it" is two round trips and a race between them. Where only one caller may win, express it
+as one statement — a conditional `UPDATE … WHERE`, an `INSERT … ON CONFLICT`, or a
+`RETURNING` that reports whether the row was taken.
 
 ## A joined select inside `batch()` that projects two columns with the same name
 
