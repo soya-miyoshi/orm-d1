@@ -16,9 +16,9 @@
  */
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
+import { applyMigrations, checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
-import { diffSnapshots } from '../../src/core/diff.js';
+import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { createTableFromSnapshot, typeAffinity } from '../../src/core/snapshot.js';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -140,6 +140,46 @@ describe('introspecting a database orm-d1 did not write', () => {
 
 		const rendered = createTableFromSnapshot(live.tables['people']!);
 		expect(rendered).toContain('collate nocase');
+	});
+
+	it('[F-106] does not attribute a COLLATE inside a column-level CHECK to the column, and the rebuild applies', async () => {
+		// On `main` this applied cleanly. The regression: a `COLLATE` living
+		// inside the CHECK's own sub-expression used to be captured as the
+		// column's own, so the next rebuild invented `COLLATE NOCASE` over a
+		// live BINARY column with a unique index on it — and applying that
+		// against real D1 fails with a UNIQUE constraint violation, since
+		// 'active' and 'ACTIVE' only collide once NOCASE is (wrongly) added.
+		await DB.prepare('drop table if exists "q"').run();
+		await DB.prepare(
+			'create table "q" ("id" integer primary key, "status" text not null '
+				+ 'constraint "q_check_1" check ("status" collate nocase in (\'active\',\'closed\')))',
+		).run();
+		await DB.prepare('create unique index "q_status" on "q" ("status")').run();
+		await DB.prepare('insert into "q" ("id", "status") values (1, \'active\'), (2, \'ACTIVE\')').run();
+
+		const live = await introspect(runner);
+		const status = live.tables['q']!.columns['status']!;
+		expect(status.collate).toBeUndefined();
+
+		// A rebuild forced for an unrelated reason must not resurrect a
+		// COLLATE the column never had.
+		const changed = structuredClone(live) as typeof live;
+		(changed.tables['q']!.columns as Record<string, { type: string }>)['id']!.type = 'text';
+		const { statements, errors } = diffSnapshots(live, changed);
+		expect(errors).toEqual([]);
+
+		// The rebuild's CHECK clause legitimately still says `collate nocase` —
+		// that belongs to the sub-expression, not the column. What must not
+		// appear is a `COLLATE` on the column's own definition line.
+		const createTemp = statements.find((s) => s.sql.includes('create table "__new_q"'));
+		const statusLine = createTemp?.sql.split('\n').find((line) => line.trim().startsWith('"status"'));
+		expect(statusLine).not.toContain('collate');
+
+		// On the regression this migration fails to apply at all: D1 rejects it
+		// with a UNIQUE constraint violation once the invented COLLATE NOCASE
+		// makes 'active' and 'ACTIVE' collide.
+		const sql = renderMigration({ statements, errors, warnings: [] });
+		await expect(applyMigrations(runner, [{ tag: 'm_q_rebuild', sql }])).resolves.toBeDefined();
 	});
 
 	it('does not mistake a hand-written conditional guard for the append-only trigger', async () => {

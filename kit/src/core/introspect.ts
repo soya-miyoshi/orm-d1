@@ -174,30 +174,74 @@ export const parseColumnCollation = (sql: string, columnName: string): string | 
 	// top-level comma (the next column, or a table-level constraint) or the
 	// closing paren of the column list — crossing nested parens rather than
 	// stopping at their first `)`, the same balanced scan `parseGenerated` uses
-	// for its expression. `[^,]*?` here used to stop at the *first* `collate`
-	// found anywhere later in the text, which is also legal inside a
-	// `unique (…)`/`primary key (…)`/`check (…)` clause's indexed-column
-	// grammar (`unique ("email" collate nocase)` is the standard idiom for
-	// case-insensitive uniqueness) — misattributing that constraint's
-	// collation to the column itself. It also stopped scanning at the first
-	// comma even *inside* a call, e.g. `check (substr("email", 1, 1) <> '@')
-	// collate nocase`, missing a collation that genuinely belongs to the
-	// column because a comma inside `substr(...)` looked like the column
-	// definition's end.
+	// for its expression.
+	//
+	// A `COLLATE` is only ever the column's own when it sits at the *top
+	// level* of this span (paren depth 0): a `constraint … check (…)` or
+	// `generated always as (…)` opens a paren immediately after the keyword,
+	// so anything inside it — including a `collate` the sub-expression itself
+	// uses, e.g. `check ("status" collate nocase in (...))` — sits at depth
+	// >= 1 and is skipped ([F-106]; a version of this function that matched
+	// `collate` anywhere in the whole span misattributed that one to the
+	// column, and a rebuild that believed it invented `COLLATE NOCASE` over a
+	// live BINARY column, which then fails to apply against a unique index).
+	// `unique ("email" collate nocase)` at the *table* level is unreachable
+	// here regardless, since it comes after the span's closing top-level
+	// comma/paren.
+	//
+	// Depth is only counted outside a quoted identifier: `"a("` is a legal
+	// column name whose embedded `(` must not desynchronise the counter, or
+	// the span never returns to depth 0 and swallows everything after it,
+	// including a table-level `unique(...)` clause ([F-108]).
 	let depth = 0;
 	let i = anchor.index + anchor[0].length;
+	let collate: string | undefined;
 	while (i < scan.length) {
 		const ch = scan[i];
-		if (ch === '(') depth++;
-		else if (ch === ')') {
+		if (ch === '"') {
+			// Skip the whole quoted identifier verbatim, `""` escape included,
+			// so nothing inside it is ever inspected as structure.
+			i++;
+			while (i < scan.length) {
+				if (scan[i] === '"') {
+					if (scan[i + 1] === '"') {
+						i += 2;
+						continue;
+					}
+					i++;
+					break;
+				}
+				i++;
+			}
+			continue;
+		}
+		if (ch === '(') {
+			depth++;
+			i++;
+			continue;
+		}
+		if (ch === ')') {
 			if (depth === 0) break;
 			depth--;
-		} else if (ch === ',' && depth === 0) break;
+			i++;
+			continue;
+		}
+		if (ch === ',' && depth === 0) break;
+		if (depth === 0 && collate === undefined) {
+			// A bare name or a quoted one (`collate "NOCASE"` is legal SQLite).
+			const rest = scan.slice(i);
+			const match = /^collate\s+("(?:[^"]|"")*"|\w+)/i.exec(rest);
+			if (match) {
+				const name = match[1]!;
+				collate = name.startsWith('"') ? name.slice(1, -1).replaceAll('""', '"') : name;
+				i += match[0].length;
+				continue;
+			}
+		}
 		i++;
 	}
 
-	const match = /\bcollate\s+(\w+)/i.exec(scan.slice(anchor.index + anchor[0].length, i));
-	return match?.[1];
+	return collate;
 };
 
 export const parseGenerated = (
