@@ -6,7 +6,7 @@ import { quoteIdentifier } from '../sql/sql.js';
 import type { Column, ColumnBuilder, ColumnMeta, ReferentialAction } from './columns.js';
 import { isColumn } from './columns.js';
 import type { TableExtra } from './constraints.js';
-import { foreignKeyName, indexName, isTableExtra, uniqueConstraintName } from './constraints.js';
+import { indexName, isTableExtra, uniqueConstraintName } from './constraints.js';
 import {
 	DrizzleBaseName,
 	DrizzleColumns,
@@ -438,20 +438,43 @@ export const getTableConfig = (t: Table): TableConfig => {
 				});
 				break;
 			}
-			case 'foreignKey':
+			case 'foreignKey': {
+				const fkForeignTable = extra.meta.foreignColumns[0]?.table as Table | undefined;
+				// Drizzle's `ForeignKey.getName()` for a table-level `foreignKey()`
+				// (`drizzle-orm/sqlite-core/foreign-keys.ts`): `name ?? \`${table}_${cols}_${foreignTable}_${foreignCols}_fk\``
+				// — the same shape as the inline `.references()` case above
+				// (`[F-015]`), but over every column in a (possibly multi-column)
+				// composite key rather than just one. This is only the
+				// `getTableConfig()` introspection surface; `foreignKeyName()`
+				// (`src/schema/constraints.ts`), which DDL rendering and the
+				// kit's snapshot diff both key on, is untouched — it derives
+				// `${table}_${cols}_fk` deliberately, without the foreign side,
+				// so two unnamed FKs to different tables over the same local
+				// columns still collide there the same way Drizzle's own
+				// `${table}_${cols}_fk`-shaped *index* names do; that is a
+				// snapshot-identity concern orthogonal to what an adapter reading
+				// `getTableConfig()` expects `getName()` to say.
+				const drizzleName = extra.meta.name
+					?? [
+						name,
+						...extra.meta.columns.map((c) => c.name),
+						fkForeignTable ? getTableName(fkForeignTable) : '',
+						...extra.meta.foreignColumns.map((c) => c.name),
+					].join('_') + '_fk';
 				foreignKeys.push(
 					buildForeignKey(
 						t,
-						foreignKeyName(extra.meta, name),
+						drizzleName,
 						extra.meta.name,
 						extra.meta.columns,
-						extra.meta.foreignColumns[0]?.table as Table | undefined,
+						fkForeignTable,
 						extra.meta.foreignColumns,
 						extra.meta.onUpdate,
 						extra.meta.onDelete,
 					),
 				);
 				break;
+			}
 			case 'check':
 				checks.push({ name: extra.meta.name, table: t, value: extra.meta.value });
 				break;

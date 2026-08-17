@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { min as drizzleMin, max as drizzleMax, sql as drizzleSql } from 'drizzle-orm';
+import { integer as drizzleInteger, sqliteTable as drizzleSqliteTable } from 'drizzle-orm/sqlite-core';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import { integer, sql, sqliteTable } from '../../src/index.js';
+import type { DecodedChunk } from '../../src/sql/functions.js';
 import { avg, count, max, min, sum } from '../../src/sql/functions.js';
 
 describe('sum() / avg() decode', () => {
@@ -45,16 +48,43 @@ describe('min() / max() decode', () => {
 	});
 
 	it('decodes a non-Column operand through String, matching drizzle-orm', () => {
+		// Compare against real drizzle-orm's own min()/max() for the same
+		// shape of operand, rather than a hardcoded literal — this is what
+		// Drizzle itself actually decodes a non-Column expression to.
+		const dt = drizzleSqliteTable('t', { n: drizzleInteger('n') });
+		const theirMin = drizzleMin(drizzleSql`${dt.n} + 1`);
+		const theirMax = drizzleMax(drizzleSql`${dt.n} + 1`);
+		const theirMinDecoded = (theirMin as unknown as { decoder: { mapFromDriverValue(v: unknown): unknown } })
+			.decoder.mapFromDriverValue(7);
+		const theirMaxDecoded = (theirMax as unknown as { decoder: { mapFromDriverValue(v: unknown): unknown } })
+			.decoder.mapFromDriverValue(7);
+
 		const expr = sql<number>`${t.n} + 1`;
-		expect(min(expr).decode(7)).toBe('7');
-		expect(typeof min(expr).decode(7)).toBe('string');
-		expect(max(expr).decode(7)).toBe('7');
-		expect(typeof max(expr).decode(7)).toBe('string');
+		expect(min(expr).decode(7)).toBe(theirMinDecoded);
+		expect(typeof min(expr).decode(7)).toBe(typeof theirMinDecoded);
+		expect(max(expr).decode(7)).toBe(theirMaxDecoded);
+		expect(typeof max(expr).decode(7)).toBe(typeof theirMaxDecoded);
 	});
 
 	it('decodes null/undefined to null for either operand shape', () => {
 		expect(min(t.n).decode(null)).toBeNull();
 		expect(min(t.n).decode(undefined)).toBeNull();
 		expect(min(sql<number>`${t.n}`).decode(null)).toBeNull();
+	});
+
+	it('types a Column operand through the column\'s own decoded type', () => {
+		expectTypeOf(min(t.n)).toEqualTypeOf<DecodedChunk<number | null>>();
+		expectTypeOf(max(t.n)).toEqualTypeOf<DecodedChunk<number | null>>();
+	});
+
+	it('types a non-Column expression as `string | null`, not the fragment\'s own type', () => {
+		// The type-level half of the finding this file guards against:
+		// `min(sql<number>\`…\`)` must type as `string | null` per Drizzle's own
+		// overload (`(T extends AnyColumn ? T['_']['data'] : string) | null`),
+		// even though the fragment itself is typed `sql<number>`, and even
+		// though decoding through `String` at runtime is asserted above.
+		const expr = sql<number>`${t.n} + 1`;
+		expectTypeOf(min(expr)).toEqualTypeOf<DecodedChunk<string | null>>();
+		expectTypeOf(max(expr)).toEqualTypeOf<DecodedChunk<string | null>>();
 	});
 });

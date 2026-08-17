@@ -1499,6 +1499,14 @@ describe('snapshot and DDL agree, table for table', () => {
 			id: integer('id').primaryKey(),
 			amount: customType<string>({ dataType: () => 'varchar(10)' })('amount').notNull(),
 		}),
+		// `[F-012]`: `getSQLType()` folds in the length (`text(255)`), but DDL
+		// and snapshot rendering read `declaredType ?? type` directly and stay
+		// bare `text` — this pins that the snapshot round-trip agrees with the
+		// bare spelling regardless of what `getSQLType()` now reports.
+		'a length-bearing text column': sqliteTable('lt', {
+			id: integer('id').primaryKey(),
+			name: text('name', { length: 255 }).notNull(),
+		}),
 	};
 
 	for (const [description, table] of Object.entries(fixtures)) {
@@ -2096,6 +2104,19 @@ describe('table options that SQLite would reject', () => {
 			b: blob('b'),
 		});
 		expect(validateTableOptions(t, { strict: true, withoutRowid: true })).toBeUndefined();
+	});
+
+	it('accepts STRICT with a length-bearing text column (getSQLType() says text(255), DDL emits bare text)', () => {
+		// `[F-012]`: `getSQLType()` is Drizzle-faithful and includes the length,
+		// but STRICT's own check (`typeName()`) reads `declaredType ?? type`
+		// directly, never `getSQLType()`, so a `text({length})` column stays
+		// STRICT-legal — this pins that decoupling.
+		const t = sqliteTable('with_len', {
+			id: text('id').primaryKey(),
+			name: text('name', { length: 255 }),
+		});
+		expect(t.name.getSQLType()).toBe('text(255)');
+		expect(validateTableOptions(t, { strict: true })).toBeUndefined();
 	});
 
 	it('refuses AUTOINCREMENT on a WITHOUT ROWID table', () => {

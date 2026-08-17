@@ -261,6 +261,23 @@ describe('the column surface adapters read', () => {
 		expect(d1.isLengthExact).toBe(dzCol.isLengthExact);
 	});
 
+	// `[F-012]`: getSQLType() is Drizzle-faithful and includes the length —
+	// DDL/snapshot rendering reads `declaredType ?? type` separately and is
+	// unaffected (see `test/unit/ddl.test.ts` and `kit/test/unit/`).
+	it('folds text length into getSQLType(), matching drizzle-orm exactly', () => {
+		const d1 = sqliteTable('a', { long: text('long', { length: 255 }) }).long;
+		const dzCol = dz.sqliteTable('a', { long: dz.text('long', { length: 255 }) }).long;
+		expect(d1.getSQLType()).toBe('text(255)');
+		expect(d1.getSQLType()).toBe(dzCol.getSQLType());
+	});
+
+	it('drops length from getSQLType() for a json-mode text column, matching drizzle-orm', () => {
+		const d1 = sqliteTable('a', { j: text('j', { mode: 'json' }) }).j;
+		const dzCol = dz.sqliteTable('a', { j: dz.text('j', { mode: 'json' }) }).j;
+		expect(d1.getSQLType()).toBe('text');
+		expect(d1.getSQLType()).toBe(dzCol.getSQLType());
+	});
+
 	it('exposes enum values, defaults and uniqueness', () => {
 		expect(users.role.enumValues).toEqual(['admin', 'member']);
 		expect(users.role.hasDefault).toBe(true);

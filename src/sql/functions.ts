@@ -59,11 +59,24 @@ export const avg = (operand: Column<any> | SQLChunk): DecodedChunk<string | null
 const minMaxDecoder = (operand: Column<any> | SQLChunk) =>
 	isColumn(operand) ? passthroughDecoder(operand) : String;
 
-export const min = <T>(operand: Column<any> | SQLChunk<T>): DecodedChunk<T | null> =>
-	withDecode<T | null>(sql`min(${operand})`, nullable(minMaxDecoder(operand)));
+// Matches Drizzle's own overload
+// (`(T extends AnyColumn ? T['_']['data'] : string) | null`,
+// `drizzle-orm/sql/functions/aggregate.d.ts`): a Column operand types as the
+// column's own decoded type, anything else types as `string | null` — this
+// has to be an overload pair, not a single generic, or `min(sql<number>\`…\`)`
+// would type-check as `number | null` while decoding through `String` at
+// runtime (the mismatch this fixes).
+export function min<C extends Column<any>>(operand: C): DecodedChunk<C['_']['data'] | null>;
+export function min(operand: SQLChunk): DecodedChunk<string | null>;
+export function min(operand: Column<any> | SQLChunk): DecodedChunk<unknown> {
+	return withDecode(sql`min(${operand})`, nullable(minMaxDecoder(operand)));
+}
 
-export const max = <T>(operand: Column<any> | SQLChunk<T>): DecodedChunk<T | null> =>
-	withDecode<T | null>(sql`max(${operand})`, nullable(minMaxDecoder(operand)));
+export function max<C extends Column<any>>(operand: C): DecodedChunk<C['_']['data'] | null>;
+export function max(operand: SQLChunk): DecodedChunk<string | null>;
+export function max(operand: Column<any> | SQLChunk): DecodedChunk<unknown> {
+	return withDecode(sql`max(${operand})`, nullable(minMaxDecoder(operand)));
+}
 
 export const coalesce = <T>(...operands: (Column<any> | SQLChunk<T> | T)[]): SQLChunk<T> => {
 	// D1 caps any single SQL function at 32 arguments. `coalesce` is the only

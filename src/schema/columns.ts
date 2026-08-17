@@ -248,15 +248,23 @@ export class Column<M extends ColumnMeta = ColumnMeta> extends SQLiteColumnEntit
 	}
 
 	getSQLType(): string {
-		// `[F-012]` tried appending `text({length})`'s length here
-		// (`text(5)`, matching drizzle-kit's type string) and was reverted: a
-		// STRICT table's DDL is checked against this exact string
-		// (`typeName()` in `src/ddl.ts`), and real SQLite's STRICT mode rejects
-		// any decorated type name — `TEXT(5)` fails with `unknown datatype`
-		// just like `NUMERIC` does. Emitting it would make `createSchema`
-		// produce DDL that D1 refuses to run for any STRICT table with a
-		// `text({length})` column. See `[F-012]` in `AUDIT.md`.
-		return this.config.declaredType ?? this.config.type;
+		// Drizzle-faithful, including the length: `drizzle-orm/sqlite-core`'s
+		// `SQLiteText.getSQLType()` returns `text${length ? `(${length})` : ''}`
+		// (truthy check — `length: 0` is treated as "no length"), and its
+		// `SQLiteTextJson.getSQLType()` (`mode: 'json'`) always returns bare
+		// `text`, dropping length entirely. `[F-012]` once tried making DDL
+		// rendering itself emit this decorated string and reverted it — real
+		// SQLite's STRICT mode rejects any decorated type name (`TEXT(5)`
+		// fails with `unknown datatype`), so `src/ddl.ts`'s `typeName()` and
+		// `kit/src/core/snapshot.ts`'s DDL rendering read
+		// `declaredType ?? type` directly and never call this method — this
+		// method itself is free to be Drizzle-faithful. See `[F-012]` in
+		// `AUDIT.md`.
+		const base = this.config.declaredType ?? this.config.type;
+		if (base === 'text' && this.config.mode !== 'json' && this.config.length) {
+			return `text(${this.config.length})`;
+		}
+		return base;
 	}
 
 	/** Drizzle's `Column['length']` — set for `text(name, { length })`. */
