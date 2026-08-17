@@ -14,6 +14,7 @@
  * filter DSL instead of a callback, an object form for `orderBy`, a callback
  * form for `extras` — not the executor itself.
  */
+import { isDev } from '../dev.js';
 import type { OrmD1Database, RelationalStrategy } from '../runtime/database.js';
 import type { Column } from '../schema/columns.js';
 import type { Table } from '../schema/table.js';
@@ -142,9 +143,15 @@ const resolveOrderBy = (orderBy: OrderByArg | undefined, columns: Record<string,
 			// as `relations/filter.ts`, which guards the sibling `where`.
 			const column = Object.hasOwn(columns, key) ? columns[key] : undefined;
 			if (!column) {
+				// Same `__DEV__` gate `relations/filter.ts` uses for the sibling
+				// `where`: the full column list is useful in development but a
+				// schema-disclosure leak once a GraphQL server surfaces
+				// `error.message` to the client in production.
 				throw new Error(
-					`Cannot order by "${key}": it is not a column of this table. `
-						+ `Columns: ${Object.keys(columns).join(', ')}.`,
+					isDev()
+						? `Cannot order by "${key}": it is not a column of this table. `
+							+ `Columns: ${Object.keys(columns).join(', ')}.`
+						: `Cannot order by "${key}": it is not a column of this table.`,
 				);
 			}
 			return direction === 'desc' ? desc(column) : asc(column);
@@ -447,9 +454,15 @@ export class RelationalQueryBuilder {
 				// the caller's mistake, and reads as an orm-d1 bug report.
 				const relation = Object.hasOwn(this.config.relations, name) ? this.config.relations[name] : undefined;
 				if (!relation) {
+					// Same `__DEV__` gate `relations/filter.ts` uses for the sibling
+					// `where`, and `orderBy` above: the full relation list is useful
+					// in development but a schema-disclosure leak once a GraphQL
+					// server surfaces `error.message` to the client in production.
 					throw new Error(
-						`"${this.config.name}" has no relation named "${name}". `
-							+ `Relations: ${Object.keys(this.config.relations).join(', ') || '(none)'}.`,
+						isDev()
+							? `"${this.config.name}" has no relation named "${name}". `
+								+ `Relations: ${Object.keys(this.config.relations).join(', ') || '(none)'}.`
+							: `"${this.config.name}" has no relation named "${name}".`,
 					);
 				}
 				if (!relation.sourceColumns || !relation.targetColumns) {

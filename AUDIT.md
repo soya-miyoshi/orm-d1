@@ -11,18 +11,18 @@ After the security iteration (`60ff73f`): **green, 644 passed / 4 skipped**.
 After the iteration-4 feature pass (`91de9e1`): **green, 659 passed / 4 skipped**.
 After the iteration-5 efficiency + bugs pass (`efe70a4`): **green, 677 passed / 4 skipped**.
 After the iteration-6 security pass (`37db699`): **green, 702 passed / 4 skipped**.
-After the iteration-8 efficiency + bugs pass: **green, 908 passed / 5 skipped**.
+After the iteration-8 efficiency + bugs pass: **green, 1066 passed / 5 skipped**.
 After the iteration-7 feature pass (`5051bc7`): **green, 718 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
 After the standing-authorization batch (2026-08-18, this session — 12 findings: `[F-009]`, `[F-011]`, `[F-012]`, `[F-014]`, `[F-015]`, `[F-016]`, `[F-032]`, `[F-052]`, `[F-053]`, `[F-094]`, `[F-095]`, `[F-096]`): **green, 944 passed / 7 skipped** (`npm run test:unit` + `npm run test:workers`). Minified `dist/core.js` is 42,853 bytes (+468 vs the 42,385-byte baseline this run started from — `[F-009]`'s `String` decode and `[F-012]`'s `text(n)` length rendering are both in `src/`; `[F-094]` is type-only and cost nothing; `[F-095]`'s `assertSameDrizzle` lives in `src/drizzle.ts`, a separate entry point not counted in this measurement).
 After the reviewer-rejection follow-up (2026-08-18, this session — verified every claim against installed `drizzle-orm@1.0.0-rc.4`/`drizzle-kit@1.0.0-rc.4` source): **green, 949 passed / 5 skipped** (`npm run test:unit` + `npm run test:workers`). `[F-012]` reverted in full (STRICT tables reject decorated type names; `text({length})` renders bare `text` again everywhere). `[F-052]` corrected: `primaryKeys[i].name` is now `undefined` for an unnamed PK (matching real `PrimaryKey.name`), with `getName()`/`isNameExplicit` added to both `primaryKeys` and `uniqueConstraints`. `[F-094]`'s `$inferInsert` optional half now spells `| undefined` explicitly, matching Drizzle exactly under `exactOptionalPropertyTypes`; its test is now comparative against real `drizzle-orm`. `[F-095]`'s docstring/docs no longer overclaim what `assertSameDrizzle` proves about a third-party adapter's own resolution, and the `docs/05-adapters.md` recipe no longer breaks on a child-declared or `One`-first relation. `[F-116]` (new): `min()`/`max()` now decode a non-Column operand through `String`, matching `drizzle-orm/sql/functions/aggregate.js`. Minified `dist/core.js` is 42,927 bytes (+74 vs the prior 42,853 — the `[F-012]` revert removes bytes, `[F-052]`'s `getName()` closures and `[F-116]`'s `minMaxDecoder` add more than that back; `[F-094]`/`[F-095]` are type-only/docs and cost nothing).
 After a second review pass (2026-08-18, this session): **green, 957 passed / 5 skipped** (`npm run test:unit` + `npm run test:workers`). `[F-116]`'s `min`/`max` fix was runtime-only — the declared *type* still let `min(sql<number>\`…\`)` type-check as `number | null` while decoding through `String`; `src/sql/functions.ts` now overloads `min`/`max` (`C extends Column<any>` → the column's decoded type, any other `SQLChunk` → `string | null`), matching Drizzle's own conditional-type overload exactly, and `test/unit/functions.test.ts`'s non-Column case is now comparative against real `drizzle-orm`'s `min`/`max` rather than a hardcoded `'7'`. This session's earlier `[F-116]` insertion had also destroyed the `### [F-010]` heading, gluing its title onto `[F-116]`'s last bullet and orphaning its body under the wrong finding — restored intact and swept the rest of the file for the same damage (none found). `[F-012]`'s "reverted in full" turned out to be one step too cautious: `getSQLType()` is restored to Drizzle-faithful (`text({length})` → `text(255)`, `mode: 'json'` drops the length, matching `drizzle-orm/sqlite-core`'s `SQLiteText`/`SQLiteTextJson` exactly), since DDL/snapshot rendering never called `getSQLType()` at all — `src/ddl.ts`'s `typeName()` and `kit/src/core/snapshot.ts` both read `declaredType ?? type` directly, so they were never at risk from `getSQLType()`'s own answer. Finally, `src/schema/table.ts`'s `getTableConfig()` now derives an unnamed table-level `foreignKey()`'s `getName()` the same way Drizzle's own `ForeignKey.getName()` does (`${table}_${cols}_${foreignTable}_${foreignCols}_fk`, over every column of a composite key) instead of `foreignKeyName()`'s shorter DDL-facing `${table}_${cols}_fk` — `foreignKeyName()` itself, and every DDL/snapshot caller of it, is untouched. Minified `dist/core.js` is 43,113 bytes (+186 vs the prior 42,927 — the `min`/`max` overload split and `getSQLType()`'s length branch are both in `src/`; the `getTableConfig()` FK-name change lives in the same file but only in an introspection code path that was already present). **Correction (round-3 reviewer)**: summed against this file's own running deltas (468 + 74 + 186 = 728) overstates the true growth against `main` — measured directly, `dist/core.js` on `main` is 42,609 bytes, so the real delta from `main` to this batch's 43,113 is **+504**, not +728; the per-entry deltas above are each individually accurate against their own immediately-prior measurement, they just don't sum straight to the `main` baseline because of rounding/measurement drift across sessions.
 After the standing-authorization batch closing `[F-001]`, `[F-022]`, `[F-023]`, `[F-031]`
 (blocked), `[F-037]`, `[F-054]`, `[F-072]`, `[F-076]`, `[F-090]`, `[F-097]` (this session,
-2026-08-18): **green, 908 passed / 5 skipped** (`npm run test:unit` + `npm run test:workers`).
+2026-08-18): **green, 1066 passed / 5 skipped** (`npm run test:unit` + `npm run test:workers`).
 `npm run check` exits 0. New: a synthetic 37-table regression harness
 (`kit/test/workers/large-synthetic-schema.test.ts`) asserting fidelity directly against real
 SQLite pragmas, and a bundle-size ceiling gate (`test/unit/module-resolution.test.ts`) seeded
-from a real re-measurement — `orm-d1`'s driver+schema bundle is 51.7 kB minified / 17.7 kB
+from a real re-measurement — `orm-d1`'s driver+schema bundle is 54.2 kB minified / 18.7 kB
 gzipped today (`docs/01-differences.md` and `README.md` corrected to match; both had been
 carrying a stale 44.1 kB / 15.3 kB figure). `[F-031]` (`ConcurrencyGate`) is **not** fixed —
 `kit/src/core/apply.ts` was excluded from this batch's edits (concurrent work by another
@@ -465,27 +465,49 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 - **Fix**: at `diff.ts:334`, mark it `destructive: true` with the reason from line 512 unless the guard is re-created under the new name in the same diff — non-destructive only when `after.tables[renamed]?.appendOnly === true`.
 - **Prove it**: `kit/test/unit/diff.test.ts` — the pair above, asserting `diff.statements.some(s => s.destructive)` in *both* the in-place and the renamed case, and that renaming an append-only table that *stays* append-only emits `drop trigger` + `create trigger` with neither marked destructive.
 
-### [F-037] `AUDIT.md` names a private product and its schema shape, in a repo that is published to npm — status: **done** (this batch — standing authorization, 2026-08-18) — severity: med — area: privacy
+### [F-037] `AUDIT.md` names a private product and its schema shape, in a repo that is published to npm — status: **needs-human** — severity: med — area: privacy
 - **Where**: this file — the `[F-001]` block and the fixture note near the end
-- **What it discloses**: the downstream project's name, its container mount paths, and structural facts about its schema — 64 tables, `strict: true` on all 64, `withoutRowid` and `appendOnly` drawn from a `hardening.ts` roster. No table or column names leak, and `AUDIT.md` is excluded from the npm tarball (`files` does not list it), so this was disclosure of a customer name and coarse schema shape rather than of the schema itself.
-- **Not yet published**: `AUDIT.md` first appears in `c9aabd7`, which is on no remote branch — `origin/main` is still `a027589`. It would have become a disclosure the moment these commits were pushed. The authors already flagged fixture privacy in the note at the end of this file; the metadata in the same file was the part that had not been scrubbed.
-- **Resolved (two halves, per the standing authorization)**:
-  1. **Packaging, verified rather than assumed**: `package.json`'s `files` field
-     (root package) lists only `dist`, `docs`, `README.md`, `LICENSE` — no `AUDIT.md`,
-     no `.claude/`. `kit/package.json`'s `files` lists only `dist`, `README.md`,
-     `LICENSE`. Neither package ships an `.npmignore` (none needed — `files` is an
-     allowlist). `npm pack --dry-run` at the repo root and inside `kit/` were both run
-     directly: 163 files / 209.8 kB and 4 files / 5.5 kB respectively, `AUDIT.md`
-     absent from both listings. No packaging change was needed.
-  2. **Scrubbed this file**: the downstream project's real name and its container
-     mount paths (the `[F-001]` block's "Where the path points" and "Fixture shape"
-     notes, and the fixture-privacy note near the end of this file) are replaced with
-     generic descriptions — "a downstream project", "that project's schema
-     directory" — while every finding's technical content (the bug, the mechanism,
-     the table/constraint counts) stays intact. `[F-001]` itself is now superseded by
-     a synthetic in-repo harness (see its own entry), so the scrubbed recipe is kept
-     only as a record of the approach that was tried and rejected, not as a live plan
-     that still needs the name to be useful.
+- **What it discloses**: the downstream project's private product name, its container
+  mount paths, and structural facts about its schema — 64 tables, `strict: true` on all
+  64, `withoutRowid` and `appendOnly` drawn from a `hardening.ts` roster. No table or
+  column names leak, and `AUDIT.md` is excluded from the npm tarball (`files` does not
+  list it), so this is disclosure of a private product name and coarse schema shape
+  rather than of the schema itself.
+- **Already published — this is not a hypothetical, it already happened**: the earlier
+  version of this entry claimed `AUDIT.md` "is on no remote branch" and would only
+  "become a disclosure … if … pushed". That claim is **false** and was not re-verified
+  before being written down. `c9aabd7` (the commit that first added the un-scrubbed
+  content to this file) is an ancestor of `origin/main` —
+  `git merge-base --is-ancestor c9aabd7 origin/main` exits `0` — and is inside the
+  pushed tag `v0.1.6` (and every tag since). `git show origin/main:AUDIT.md | grep -c
+  acme` returns `4`. The private product name, its container mount paths, and the
+  `hardening.ts`-derived roster of which tables are `strict`/`withoutRowid`/`appendOnly`
+  are on `origin/main` right now and inside a tag anyone who fetched it already has.
+- **Scrubbing the working tree does not undo this.** Editing this file going forward
+  (done, below) only stops the *next* push from repeating the disclosure — it cannot
+  retract what `origin/main` and `v0.1.6`+ already carry. Only rewriting the published
+  history (force-pushing a rewritten `main`, deleting/re-cutting the affected tags) would
+  do that, and that is not a decision this sweep will make unilaterally: it breaks
+  anyone who has already fetched, and re-tagging a released version has consequences
+  beyond this repo.
+- **Question for the human**: the disclosure already happened on `origin/main` and in
+  `v0.1.6` onward. Options: (a) accept it as already-public and just stop repeating it
+  going forward — the name and paths are not credentials; (b) rewrite and force-push the
+  affected history and re-cut the affected tags, accepting the fallout for anyone who
+  already pulled; (c) something narrower, e.g. treat only the product name as sensitive
+  and decide whether that alone is worth a history rewrite. The sweep will not decide
+  this on its own.
+- **Scrubbed this file going forward** (does not address the already-published copies
+  above): the downstream project's real name and its container mount paths (the
+  `[F-001]` block's "Where the path points" and "Fixture shape" notes, and the
+  fixture-privacy note near the end of this file) are replaced with generic
+  descriptions — "a downstream project", "that project's schema directory" — while every
+  finding's technical content (the bug, the mechanism, the table/constraint counts)
+  stays intact. `[F-001]` itself is now superseded by a synthetic in-repo harness (see
+  its own entry), so the scrubbed recipe is kept only as a record of the approach that
+  was tried and rejected, not as a live plan that still needs the name to be useful.
+  Packaging was re-verified rather than assumed — see the `npm pack --dry-run` figures
+  recorded in this batch's fixes; `AUDIT.md` is absent from both tarballs.
 
 ### [F-038] `importModule` writes a copy of the user's schema into their source tree — status: todo — severity: low — area: kit/node
 - **Where**: `kit/src/node/import.ts:79-85`

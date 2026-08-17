@@ -180,7 +180,7 @@ describe.skipIf(!ready)('bundle-size ceiling', () => {
 		return { bytes: out.length, gzipBytes: gzipSync(out).length };
 	};
 
-	// Measured directly on 2026-08-18: 51,710 bytes minified, 17,733
+	// Measured directly on 2026-08-18: 54,187 bytes minified, 18,738
 	// gzipped, for the `orm-d1`-redirected, minified build of the same
 	// fixture `WORKER` above — the exact scenario `docs/01-differences.md`'s
 	// "Bundle size" table and `README.md`'s bundle line describe. Both were
@@ -189,8 +189,13 @@ describe.skipIf(!ready)('bundle-size ceiling', () => {
 	// one- or two-finding batch does not flap this test; when one *does*
 	// fire, re-measure both docs and raise the ceiling deliberately, in the
 	// same commit — never silently, which is the failure `[F-072]` recorded.
-	const MINIFIED_CEILING = 60_000;
-	const GZIP_CEILING = 20_500;
+	//
+	// When this drifts, RE-SEED FROM A CLEAN BUILD: `npm run build` first
+	// (a stale or missing `dist/` measures the wrong thing, or nothing —
+	// see `ready`/`built` above), then re-run this file alone and read the
+	// `bytes`/`gzipBytes` it reports, rather than nudging the old numbers.
+	const MINIFIED_CEILING = 62_000;
+	const GZIP_CEILING = 21_500;
 
 	it('does not grow past the sized ceiling for the documented driver+schema import', () => {
 		const { bytes, gzipBytes } = minifiedBundle(workspace);

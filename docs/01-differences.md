@@ -273,8 +273,8 @@ Bundling a Worker that imports the driver and the schema DSL and runs one
 | | minified | gzipped |
 | --- | --- | --- |
 | `drizzle-orm/d1` + `drizzle-orm/sqlite-core` | 77.8 kB | 22.2 kB |
-| `orm-d1` | 51.7 kB | 17.7 kB |
-| | −34% | −20% |
+| `orm-d1` | 54.2 kB | 18.7 kB |
+| | −30% | −16% |
 
 Drizzle ships 25 MB across 718 export paths with `sideEffects: false`, and tree-shaking
 removes about 97% of it before it reaches a bundle. The remaining difference is code that
@@ -295,6 +295,18 @@ commit that also raises the ceiling and is expected to update this line. The
 doesn't own) and can still drift as that package changes. The size claim that is
 *separately* tested is which library ends up in the bundle at all, in the same file;
 see [04-migrating-from-drizzle](./04-migrating-from-drizzle.md).
+
+**Known scope limitation of this gate, not a bug**: the ceiling is measured against
+one fixture Worker (`select().from(users).where(eq(...))` through `drizzle()` +
+`sqliteTable`), bundled with esbuild's default tree-shaking. Because the package sets
+`sideEffects: false`, a new export added anywhere in `src/` that this fixture never
+imports is tree-shaken out of the bundle before the gate ever sees it — the gate does
+not fail just because a new export exists, only because the fixture's own reachable
+code grows. Separately, the gate only ever bundles the `orm-d1` (core) and
+`orm-d1/sqlite-core` entry points; it does not measure `orm-d1/ddl`, `orm-d1/drizzle`,
+or `orm-d1/better-auth` at all, so a regression confined to one of those entry points
+would not move this number or trip this gate. Neither is fixed here — redesigning the
+gate to cover every entry point and every export is out of scope for this pass.
 
 ## D1 limits, and where each is enforced
 

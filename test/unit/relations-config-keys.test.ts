@@ -11,7 +11,8 @@
  * while the query is being built — nothing needs to execute, and the stub
  * returning no rows is what keeps this a unit test.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { setDev } from '../../src/dev.js';
 import { drizzle } from '../../src/index.js';
 import * as schema from '../schema.js';
 
@@ -92,5 +93,60 @@ describe('prototype keys in with', () => {
 
 	it('still traverses a real relation', async () => {
 		await expect(db.query.users.findMany({ with: { posts: true } })).resolves.toEqual([]);
+	});
+});
+
+/**
+ * Same trust boundary and the same `__DEV__` gate as `where`
+ * (`relations-filter.test.ts`'s "schema disclosure" suite): `orderBy` and
+ * `with` are sibling keys of the same caller-supplied `FindConfig`, so a
+ * message that enumerates every column or relation name is exactly as much
+ * of a schema-disclosure leak here as it is on `where`.
+ */
+describe('schema disclosure through orderBy/with refusals', () => {
+	afterEach(() => setDev(false));
+
+	it('does not enumerate columns when __DEV__ is off (orderBy)', async () => {
+		setDev(false);
+		await expect(db.query.users.findMany({ orderBy: { zzz: 'asc' } } as never))
+			.rejects.toThrow(/Cannot order by "zzz"/);
+		try {
+			await db.query.users.findMany({ orderBy: { zzz: 'asc' } } as never);
+			throw new Error('expected findMany to throw');
+		} catch (err) {
+			expect((err as Error).message).not.toMatch(/Columns:/);
+		}
+	});
+
+	it('still enumerates columns when __DEV__ is on (orderBy)', async () => {
+		setDev(true);
+		try {
+			await db.query.users.findMany({ orderBy: { zzz: 'asc' } } as never);
+			throw new Error('expected findMany to throw');
+		} catch (err) {
+			expect((err as Error).message).toMatch(/Columns:/);
+		}
+	});
+
+	it('does not enumerate relations when __DEV__ is off (with)', async () => {
+		setDev(false);
+		await expect(db.query.users.findMany({ with: { zzz: true } } as never))
+			.rejects.toThrow(/has no relation named "zzz"/);
+		try {
+			await db.query.users.findMany({ with: { zzz: true } } as never);
+			throw new Error('expected findMany to throw');
+		} catch (err) {
+			expect((err as Error).message).not.toMatch(/Relations:/);
+		}
+	});
+
+	it('still enumerates relations when __DEV__ is on (with)', async () => {
+		setDev(true);
+		try {
+			await db.query.users.findMany({ with: { zzz: true } } as never);
+			throw new Error('expected findMany to throw');
+		} catch (err) {
+			expect((err as Error).message).toMatch(/Relations:/);
+		}
 	});
 });

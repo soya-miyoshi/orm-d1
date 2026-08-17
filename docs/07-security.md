@@ -111,10 +111,20 @@ spelled: a real column named `constructor` still works. The sites are pinned by
 
 ## Error messages disclose schema
 
-An unknown filter field is refused with the list of columns and relations that would have
-been valid — useful for a developer typo, useful to a probing client. **Do not forward
-orm-d1 error messages to untrusted callers.** `CompileError` and `OrmD1QueryError` are the
-two to catch; the latter also carries `.sql`.
+An unknown `where` field, an unresolvable `orderBy` key, and an unknown `with` relation name
+are each refused with the list of columns or relations that would have been valid —
+useful for a developer typo, useful to a probing client. All three are gated behind the same
+`__DEV__` flag `dev.ts` uses for its other diagnostics (`src/relations/filter.ts` for
+`where`, `src/relations/query.ts` for `orderBy` and `with`): with `__DEV__` off (the default
+in a production build, where bundlers replace the bare identifier with `false`), the message
+states only that the field, key, or relation was not found, without listing what would have
+been valid. Enable it explicitly with `setDev(true)` — never automatically from
+`NODE_ENV` or similar, since a Worker has no reliable equivalent — to get the full list back
+during development. **Even with `__DEV__` off, do not forward orm-d1 error messages to
+untrusted callers**: the *fact* that a field was rejected, and its name (echoed back from
+the caller's own input), are still disclosed, which can itself be enough to probe for valid
+field names by trial and error. `CompileError` and `OrmD1QueryError` are the two to catch;
+the latter also carries `.sql`.
 
 Compile-time refusals are reachable from caller-controlled input in a few places by size
 rather than by content — an `inArray` list past the bound-parameter budget, a `like` pattern

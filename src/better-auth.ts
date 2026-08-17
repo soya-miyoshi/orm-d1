@@ -227,6 +227,19 @@ const patternCondition = (
  * either way. So instead of silently overflowing D1's bound-parameter budget
  * as a bare `too many SQL variables` from SQLite, this names the limit the
  * same way `InArray` does above the threshold it *can* chunk past.
+ *
+ * **Scope of the guard below**: `this.values.length > ctx.maxParams` counts
+ * only the values bound by *this* `LowerIn` clause, not the bound-parameter
+ * count of the whole statement it ends up in. A `where` combining this
+ * clause with others (another `LowerIn`, an `inArray`, several `eq`s) can
+ * still pass this check individually while the statement as a whole exceeds
+ * D1's limit and fails at execution with SQLite's bare `too many SQL
+ * variables` — the exact failure this guard exists to name in advance. A
+ * true fix would need to be statement-aware (know the running total across
+ * every clause as the query is assembled), which this chunk cannot see in
+ * isolation; making the *docstring* honest about that scope, rather than
+ * silently claiming statement-wide coverage it doesn't have, is deliberately
+ * the fix applied here.
  */
 class LowerIn implements SQLChunk<boolean> {
 	constructor(

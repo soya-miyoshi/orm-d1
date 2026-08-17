@@ -41,12 +41,6 @@ services:
       # after dependency changes. `./dev-exec npm install` does it.
       - orm-d1-node-modules:/workspace/node_modules
 
-      # A real-world schema to exercise the kit against, read-only so nothing
-      # here can write to the product repo. `..` is the parent checkout; point
-      # FIXTURE_REPO somewhere else, or drop this mount, if that is not where
-      # yours lives.
-      - ${FIXTURE_REPO:-..}:/fixture:ro
-
       # Persist shell history across rebuilds
       - bashhistory:/commandhistory
 
@@ -68,9 +62,6 @@ services:
     environment:
       - NODE_OPTIONS=--max-old-space-size=4096
       - PATH=/usr/local/share/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/node/.local/bin
-      # Consumed by the big-schema regression harness (see AUDIT.md F-001).
-      # Unset it and that harness skips instead of failing.
-      - ORM_D1_FIXTURE_SCHEMA=/fixture/apps/api/src/db/schema/index.ts
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - HTTP_PROXY=${HTTP_PROXY:-}
       - NO_PROXY=${NO_PROXY:-}

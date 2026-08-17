@@ -1,11 +1,22 @@
 /**
- * F-022: SQLite's rowid-alias matching is case-insensitive — `INTEGER PRIMARY
- * KEY` and `int PRIMARY KEY` (any case, any surrounding whitespace) are the
- * same rowid alias. `Column.config.hasDefault` used a case-sensitive `===
- * 'integer'` comparison, so a `customType` declaring the type as `'INTEGER'`
- * was reported as *not* defaultable even though real SQLite auto-assigns it
- * on insert. This is exactly the shape only a real D1 can confirm — the
- * defect is entirely about what SQLite itself accepts.
+ * F-022: SQLite's rowid-alias matching is case-insensitive for the type
+ * keyword `INTEGER` itself — `INTEGER PRIMARY KEY` and `integer primary key`
+ * (any case, any surrounding whitespace) are the same rowid alias. This is
+ * narrower than "any case of any abbreviation": SQLite requires the declared
+ * type to be exactly the word `INTEGER` (case-insensitively) — `INT PRIMARY
+ * KEY`, `int primary key`, and other abbreviations are NOT recognized as the
+ * rowid alias, and such a column stores an ordinary (possibly NULL) value
+ * rather than aliasing the rowid. `Column.config.hasDefault` used to compare
+ * with a case-sensitive `=== 'integer'`, so a `customType` declaring the type
+ * as `'INTEGER'` (uppercase) was reported as *not* defaultable even though
+ * real SQLite auto-assigns it on insert. The fix is `.toLowerCase() ===
+ * 'integer'` — case-insensitive equality against the exact word `integer`,
+ * never a prefix/abbreviation match — so a future reader must not "fix" this
+ * to also accept `int`: that would report a column as defaultable when
+ * SQLite does not treat it as the rowid alias, and `db.insert()` omitting a
+ * value for it would get NULL instead of an auto-assigned id. This is
+ * exactly the shape only a real D1 can confirm — the defect is entirely
+ * about what SQLite itself accepts.
  */
 import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
