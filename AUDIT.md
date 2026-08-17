@@ -11,6 +11,7 @@ After the security iteration (`60ff73f`): **green, 644 passed / 4 skipped**.
 After the iteration-4 feature pass (`91de9e1`): **green, 659 passed / 4 skipped**.
 After the iteration-5 efficiency + bugs pass (`efe70a4`): **green, 677 passed / 4 skipped**.
 After the iteration-6 security pass (`37db699`): **green, 702 passed / 4 skipped**.
+After the iteration-8 efficiency + bugs pass: **green, 908 passed / 5 skipped**.
 After the iteration-7 feature pass (`5051bc7`): **green, 718 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
 
 ## Rotation
@@ -19,8 +20,15 @@ One lens per iteration, rotating `feature` → `efficiency + bugs` → `security
 Advanced in every terminal case, including blocked and nothing-found, so a lens that keeps
 failing cannot starve the other two.
 
-- Next lens: **efficiency + bugs**
-- Last ran: feature — 2026-07-31, merged `5051bc7` — **approved at round 2**, the second
+- Next lens: **security**
+- Last ran: efficiency + bugs — 2026-08-17, merged `<MERGE_SHA>` **over an unresolved round-2
+  rejection**. Five findings batched; `[F-098]` (rename FK repointing), `[F-099]` (right/full
+  join nullability, runtime + type), `[F-100]` (the `pull` warning half) and `[F-102]`
+  (`Column.name` memoization, 18.13 → 9.26 µs/op) all confirmed closed against real
+  reproductions. `[F-101]` (column `COLLATE`) is **partial and opened `[F-106]`–`[F-109]`**;
+  `[F-106]` is a regression vs `main` that produces a migration which cannot be applied,
+  and is the highest-value open item in this file.
+- Ran before that: feature — 2026-07-31, merged `5051bc7` — **approved at round 2**, the second
   approval in a row. Three findings in one file, all closed. `[F-082]` (widening
   `db.run`/`all`/`get`) was parked as an API-surface question rather than batched.
 - Ran before that: security — 2026-07-31, merged `37db699` — **approved at round 2**, the first
@@ -883,6 +891,94 @@ deletes user code) → `[F-091]`, `[F-093]` (new surface).
 - **Failure scenario**: Workers bill startup CPU and parse time tracks uncompressed bytes, so this is a per-cold-isolate cost paid by every adopter. `[F-072]` in this file is the shape of the problem already biting: a batch's bundle cost was reported against the previous commit rather than `main`, because measuring is a manual step someone has to remember and get right.
 - **Fix**: extend `test/unit/module-resolution.test.ts` — which already measures — to assert a byte ceiling per entry, seeded at today's measurement rather than at the aspirational target, and run it from `npm run check`. Ratcheting down to 20 KB is a separate question; this item only stops the number from moving without anyone noticing.
 - **Prove it**: add an export to `src/core.ts` that pushes the entry over the ceiling and confirm `npm run check` fails naming the entry, the ceiling and the measured size; revert and it passes.
+
+## Findings — iteration 8 (efficiency + bugs)
+
+Lens: **efficiency + bugs**, branch `sweep/efficiency-bugs-20260817-125622`.
+
+### [F-098] A table rename leaves every referencing FK pointing at the old name — status: **done** (`e949b1d`, confirmed closed by both review rounds against real reproductions) — severity: **high** — area: kit/diff — lens: efficiency + bugs
+- **Where**: `kit/src/core/diff.ts:407`
+- **Defect**: `effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: false }` renames only the table's own entry; every other table's `ForeignKeySnapshot.tableTo` / `ColumnSnapshot.references.tableTo` (and the renamed table's own self-references) still names the old table, while SQLite's `ALTER TABLE … RENAME TO` rewrites every `REFERENCES` clause since 3.25.
+- **Failure scenario**: (A) `users` → `people` with `posts.author_id references users.id`: `requiresRecreate` reports `a foreign key changes`, so `generate` emits a full `__new_posts` copy + `drop table "posts"` (destructive, needs `--accept-data-loss`) for a schema that is already correct; with a third level (`comments`) `dependentTables` refuses and `generate` throws — the rename cannot be expressed at all. (B) self-referencing `nodes(parent_id → nodes.id)` renamed to `trees` errors with a remedy ("drop the foreign key, or migrate the child table in the same migration") that is impossible for a self-reference.
+- **Fix**: in step 1 of `diffSnapshots`, after building `effectiveBefore`, repoint every `tableTo` matching a renamed source across **all** tables, including the renamed table itself — mirroring what the `ALTER` actually does.
+- **Prove it**: `kit/test/unit/diff.test.ts`, next to `applies explicit renames instead of dropping and recreating`: assert the `users`→`people` diff collapses to exactly `['alter table "users" rename to "people"']` with no errors, plus a self-FK case asserting `errors` is empty.
+
+### [F-099] `nullableTables` misses tables joined before a `right`/`full` join, so they materialise as an object of nulls — status: **done** (`e949b1d`, runtime + type level, confirmed byte-for-byte against `drizzle-orm`'s fold by round 2) — severity: **high** — area: sql/compile — lens: efficiency + bugs
+- **Where**: `src/plan/compile.ts:146` (and `explicitNullableGroups` at `:202`, which shares the same set)
+- **Defect**: `right`/`full` add only `plan.from` to `nullableTables`; Drizzle marks **every** table already in the map nullable (`drizzle-orm/sqlite-core/query-builders/select.js:111-121`).
+- **Failure scenario**: `db.select().from(users).innerJoin(profiles, …).rightJoin(events, …)`. For an `events` row with no matching user the driver returns all-null for `users.*` and `profiles.*`; orm-d1 maps `users: null` but `profiles: { id: null, userId: null, bio: null }` where Drizzle returns `profiles: null`. The declared type is non-null, so `if (row.profiles) use(row.profiles.id)` compiles, the guard passes, and `id` is silently `null`. Same for `.innerJoin(profiles).fullJoin(events)`.
+- **Fix**: track nullability as an ordered map as Drizzle does — start `{ [from]: notNull }` and fold each join in declaration order: `left` → that table nullable; `inner`/`cross` → not-null; `right` → all existing nullable + this one not-null; `full` → all existing nullable + this one nullable. `AddJoin` needs the same treatment so `rightJoin`/`fullJoin` widen previously joined entries, not just `baseRow`.
+- **Prove it**: `test/unit/compile-select.test.ts` — build the plan above, feed `compiled.map([[null,null,null,null,null,7,null]])`, assert `rows[0].profiles === null`.
+
+### [F-100] `pull` drops `STRICT`, `WITHOUT ROWID` and the append-only guard — status: **done** (`e949b1d`, warning half only, confirmed) / **needs-human** (the `tableOptions` sidecar) — severity: **high** — area: kit/node — lens: efficiency + bugs
+- **Where**: `kit/src/node/commands.ts:371` (`renderSchemaModule`), `pull` at `:349`
+- **Defect**: `snapshotFromIntrospection` records `strict` / `withoutRowid` / `appendOnly` correctly and `pull` journals that snapshot, but the rendered schema module has no spelling for any of them and no companion `tableOptions([...])` module is written, so the next `snapshotOfSchema` reads all three as `false`.
+- **Failure scenario**: a live `STRICT, WITHOUT ROWID` table with an append-only trigger is pulled as a plain `sqliteTable`; the very next `generate`, with no schema edit at all, emits a `__new_reads` rebuild + `drop table "reads"` and `drop trigger if exists "reads_no_update"`. `WITHOUT ROWID` is lost with no line naming it (the first `requiresRecreate` reason wins), and the single `--accept-data-loss` the operator supplies for the `drop table` takes the append-only guard with it. The onboarding command turns a protected, strictly-typed ledger into an ordinary writable table.
+- **Fix (this iteration)**: make `pull` refuse or loudly warn when the introspected snapshot carries any `strict` / `withoutRowid` / `appendOnly` the rendered module cannot express, naming the tables and the options.
+- **Question for the human**: should `pull` also render a `tableOptions([...])` sidecar next to `--schema-out` and populate `config.tableOptions`? That is new CLI output surface and a design decision, so only the warning half is batched.
+- **Prove it**: `kit/test/unit` — feed introspection of the `STRICT, WITHOUT ROWID` + trigger table through `snapshotFromIntrospection` → `renderSchemaModule` and assert the warning names the table and each unexpressible option.
+
+### [F-101] Column-level `COLLATE` is never captured, so `check` is blind to it and any rebuild drops it — status: **partial** (`e949b1d`, `991f1b6`) — **opened four new defects, see `[F-106]`–`[F-109]`; `[F-106]` is a regression vs `main`** — severity: **high** — area: kit/introspect — lens: efficiency + bugs
+- **Where**: `kit/src/core/introspect.ts:470-496`, `kit/src/core/snapshot.ts:44-67`
+- **Defect**: `ColumnSnapshot` has no `collate` field; `snapshotFromIntrospection` reads index-member collations but never a column's own, and `columnDefinition` / `createTableFromSnapshot` never emit one. Index members were fixed for this exact reason (`[F-061]`); columns were not.
+- **Failure scenario**: a foreign schema with `email text collate nocase not null` and a unique index on it. `orm-d1-kit check` prints "Up to date, no drift" even after the column is rebuilt as `BINARY` by hand — the command whose job is to notice a silently-dropped constraint cannot see this one. Any diff that rebuilds `users` emits `"email" text not null` with no collation, so the unique index is recreated over a `BINARY` column and `alice@x.com` / `Alice@x.com` both insert.
+- **Fix**: add `collate?: string` to `ColumnSnapshot`; parse it in `snapshotFromIntrospection` from the column's own definition in `createSql` (the same `columnDefinitionStart` anchoring `hasAutoincrement` / `parseGenerated`, on `blankLiterals(createSql)`); emit it in `createTableFromSnapshot` and `columnDefinition`; fold case in `canonicalTable` so `NOCASE` / `NoCase` compare equal. The schema DSL cannot declare it (`docs/04` — Drizzle has no `.collate()`), so schema-side `undefined` means "not stated", and a live non-`BINARY` collation against an unstated one is **reported**, not dropped.
+- **Prove it**: `kit/test/workers/foreign-schema.test.ts` — create the table against the real D1 binding, `introspect()`, assert `columns.email.collate === 'nocase'`, then assert `createTableFromSnapshot` still contains `collate nocase`.
+
+### [F-102] `Column.name` re-runs `toSnakeCase` on every read — status: **done** (`e949b1d`, `991f1b6`; measured 18.13 → 9.26 µs/op for a 31-column `compileSelect` under `snake_case`, memo versioned so `resetCasing` still latches) — severity: med — area: efficiency — lens: efficiency + bugs
+- **Where**: `src/schema/columns.ts:257` (getter), `applyCasing` at `:137`
+- **Defect**: the getter runs a regex `.match()` + `.map()` + `.join()` on every access, and is read twice per column per compile (62 reads for a 31-column `compileSelect`), for a value that provably cannot change — `configureCasing` (`:97-114`) throws if the mode is set after `casingObserved` latches.
+- **Failure scenario**: measured on this checkout, `compileSelect` over 31 columns costs 9.3 µs/op at `casing: 'preserve'` and 18.8 µs/op at `casing: 'snake_case'` — ~9 µs of pure re-derivation per query on a runtime billed for request CPU.
+- **Fix**: memoize on the instance — `#resolvedName: string | undefined; get name() { return this.#resolvedName ??= this.config.explicitName ?? applyCasing(this.config.fieldName); }`. `withTable` builds a fresh `Column` from the same config, so an alias re-resolves once and no stale value leaks. `resetCasing` is `@internal` test-only and must clear the cached names (or the affected tests rebuild their tables, which `test/unit/casing.test.ts` already does).
+- **Prove it**: `test/unit/casing.test.ts` — instrument the getter with a counting wrapper and assert one `compileSelect` over an N-column table performs at most N `applyCasing` calls, keeping the existing byte-identical-to-`drizzle-orm/casing` assertions.
+
+### [F-103] `assertRoundTrip`'s invariant is weaker than it reads — constraint order differs between the two renderers — status: todo — severity: low — area: kit/render — OFF-LENS from efficiency + bugs
+- **Where**: `kit/src/core/diff.ts:53` (`columnDefinition`), `kit/src/core/snapshot.ts:410` (`createTableFromSnapshot`) vs `orm-d1/ddl`'s `createTable`
+- The snapshot path groups all uniques → all FKs → all checks; `createTable` walks `extras` in declaration order. Semantically irrelevant to SQLite, but `assertRoundTrip` only passes for schemas that happen to declare extras in the grouped order.
+
+### [F-104] Per-row closure allocation on the positional read path — status: todo — severity: low (**unmeasured**) — area: efficiency — OFF-LENS from efficiency + bugs
+- **Where**: `src/plan/mapper.ts:175`
+- One `(index) => row[index]` closure per row on the non-flat path, and `readRow` calls `read(index)` twice per column of a nullable group (inside `columnIndexes.every`, then in the recursive build). Hoisting a mutable `current` row would make the reader monomorphic and allocation-free per row.
+
+### [F-105] `dropKeys` uses `delete row[key]` per row — status: todo — severity: low (**unmeasured**) — area: efficiency — OFF-LENS from efficiency + bugs
+- **Where**: `src/relations/query.ts:761`
+- `delete` at every relational level transitions each freshly built result object into V8 dictionary mode immediately before it is returned and JSON-serialised.
+
+## Round-2 objections merged unresolved — iteration 8
+
+The round-2 reviewer **rejected** and the batch was merged anyway under the sweep rule
+(rejected after two rounds + green gate → merge, record the objection). These are now
+claims about code on `main`, recorded verbatim in substance. **`[F-106]` is the highest-value
+open item in this file**: it is a regression this batch introduced, and its symptom is a
+migration that cannot be applied at all.
+
+### [F-106] A `COLLATE` inside a *column-level* `CHECK` or generated expression is attributed to the column, so the next rebuild invents `COLLATE NOCASE` and the migration fails on apply — status: todo — severity: **high** — area: kit/introspect — REGRESSION vs `main`
+- **Where**: `kit/src/core/introspect.ts:168-200` (`parseColumnCollation`)
+- **Defect**: the balanced scan closed the table-level `unique (…)` case, but the span is still the whole column definition, so a `COLLATE` belonging to a sub-expression *inside* that definition is captured as the column's own.
+- **Failure scenario**: live `create table "q" ("id" integer primary key, "status" text not null constraint "q_check_1" check ("status" collate nocase in ('active','closed')))` with `create unique index "q_status" on "q" ("status")` and rows `(1,'active'), (2,'ACTIVE')` — both legal, the column is BINARY. `introspect()` returns `status.collate === 'nocase'`; `pull` prints a false warning; any ordinary edit that forces a rebuild emits `"status" text collate nocase not null`, and applying it against real D1 gives **`D1_ERROR: UNIQUE constraint failed: q.status: SQLITE_CONSTRAINT`** — the whole `batch()` rolls back and the migration can never apply. On `main` the identical scenario applies cleanly. Without a unique index the failure is quieter and worse: `where status = 'ACTIVE'` silently starts matching `'active'`. Same mis-attribution for `"b" integer generated always as ("a" collate nocase = 'x') virtual`.
+- **Fix**: attribute a `COLLATE` only when it sits at the top level of the column definition — outside any parenthesised sub-expression and outside a `constraint …`/`check (…)`/`generated always as (…)` clause.
+- **Prove it**: `kit/test/workers/foreign-schema.test.ts` — create the `q` table above against the real binding, assert `columns.status.collate === undefined`, and assert the generated rebuild applies without error.
+
+### [F-107] The carried-over collation survives exactly one migration; the second rebuild drops it silently and `check` reports zero drift — status: todo — severity: **high** — area: kit/node
+- **Where**: `kit/src/node/commands.ts:229` (`writeSnapshot({ ...next })`), `kit/src/core/diff.ts:328`
+- **Defect**: `recreateTable`'s carry-over reads `before.collate`, but `generate` writes the schema-derived `next` as the new baseline, which structurally has no `collate`, so the live collation leaves the `meta/` chain after the first `generate` while the database still has it.
+- **Failure scenario**: proven end-to-end on real D1 with `"email" text collate nocase not null` + a unique index. `generate` #1 correctly emits `collate nocase`; `generate` #2 emits `"email" text not null`, after which `Alice@x.com` inserts next to `alice@x.com` with no error and `diffSnapshots(live, expected)` returns **0 drift statements** — `check` says "Up to date, no drift" over a unique constraint that changed meaning. This is `kit/README.md`'s founding failure mode reproduced inside the fix meant to prevent it.
+- **Fix**: apply the same copy-on-write `recreateTable` already does to the snapshot `generate` writes.
+- **Related**: the `origin`-keyed exemption does catch introspection-to-introspection collation drift, but **only** in the window between `pull` and the first `generate`; after that both sides fold to `undefined` and no command can ever see a column collation again.
+
+### [F-108] `parseColumnCollation`'s depth counter is desynchronised by a quoted identifier containing a paren — status: todo — severity: med — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:187-197`
+- **Failure scenario**: `create table "t" ("a(" text, "b" text generated always as ("a(" || 'x') virtual, "email" text not null, unique ("email" collate nocase))` → `parseColumnCollation(sql, 'b')` returns `'nocase'`: the `(` inside `"a("` increments depth, which never returns to 0, so the span runs to end-of-string and swallows the table-level `unique(...)` — the exact class `[F-101]`'s round-1 gap 3 was supposed to close. `hasAutoincrement` already has a test for a column named `a(`, so this is in scope.
+- **Also**: `collate "NOCASE"` (quoted collation name, legal SQLite) returns `undefined`, so the collation is invisible and a rebuild drops it. And the anchor takes the *first* match, so `create table "posts" ("author_id" integer references "users"("id"), "id" text collate nocase primary key)` anchors on the FK's `("id")` and returns `undefined` — shared with `hasAutoincrement`/`parseGenerated`, so pre-existing rather than new.
+
+### [F-109] `columnDefinition` (the `ALTER TABLE … ADD COLUMN` renderer) still drops `collate` — status: todo — severity: low — area: kit/diff
+- **Where**: `kit/src/core/diff.ts:53`
+- `[F-101]`'s stated fix was "emit it in `createTableFromSnapshot` **and `columnDefinition`**"; only the former landed. Unreachable today — in `generate`/`push`/`verify` the `after` side is schema-derived and added columns never carry a collation, and `roundtripPlan`'s legs add no columns — so it affects only `check`'s printed drift. Recorded so it is not mistaken for done.
+
+### [F-110] The `pull` warning does not name `config.tableOptions` — status: todo — severity: low — area: kit/node
+- **Where**: `kit/src/node/commands.ts`, warning text
+- The warning names what is lost but not `config.tableOptions` (`kit/README.md:17`), the one mechanism the kit already has to express `strict` / `withoutRowid` / `appendOnly`. Related to `[F-100]`'s parked sidecar question.
+
 
 ## Audit areas
 

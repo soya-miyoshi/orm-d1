@@ -16,7 +16,7 @@ import {
 	appendOnlyTriggerName,
 	dropAppendOnlyTrigger,
 } from 'orm-d1/ddl';
-import type { ColumnSnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
+import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
 
 export interface Statement {
@@ -147,7 +147,12 @@ const escapeRegExp = (value: string): string => value.replaceAll(/[.*+?^${}()|[\
 const withoutLiterals = (text: string): string => text.replaceAll(/'(?:[^']|'')*'/g, "''");
 
 /** Everything about a table that a plain ALTER cannot change. */
-const requiresRecreate = (before: TableSnapshot, after: TableSnapshot, columnRenames: Record<string, string>): string | undefined => {
+const requiresRecreate = (
+	before: TableSnapshot,
+	after: TableSnapshot,
+	columnRenames: Record<string, string>,
+	afterIsSchemaDerived: boolean,
+): string | undefined => {
 	// Canonical, not raw: an introspected snapshot spells the same constraints
 	// differently to a schema-derived one, and comparing raw shapes reported
 	// permanent false drift. See `canonicalTable`.
@@ -167,7 +172,7 @@ const requiresRecreate = (before: TableSnapshot, after: TableSnapshot, columnRen
 			if (referent) return `column "${name}" is dropped but ${referent} still refers to it`;
 			continue;
 		}
-		const difference = columnDifference(column, target);
+		const difference = columnDifference(column, target, afterIsSchemaDerived);
 		if (difference) return `column "${name}" ${difference}`;
 	}
 	if (a.primaryKey !== b.primaryKey) return 'the primary key changes';
@@ -243,6 +248,17 @@ const recreateTable = (
 	reason: string,
 	dependents: Record<string, TableSnapshot> = {},
 	foreignTriggers: readonly string[] = [],
+	/**
+	 * Whether `after` is schema-derived — the same reading `columnDifference`
+	 * (`snapshot.ts`) already committed to when it exempted an unstated
+	 * `after.collate` as "not expressible", not "changed to binary". A rebuild
+	 * that renders `after` as-is would then quietly drop a live collation the
+	 * guard just asserted was unchanged — the column becomes BINARY the moment
+	 * anything else about the table forces a recreate. So when `after` cannot
+	 * state a collation at all, a `before` column's stated collation is carried
+	 * into the rebuilt table rather than dropped.
+	 */
+	afterIsSchemaDerived = true,
 ): { statements: Statement[]; errors: string[] } => {
 	const errors: string[] = [];
 
@@ -305,7 +321,24 @@ const recreateTable = (
 		}
 	}
 
-	const body = createTableFromSnapshot({ ...after, name: temporary });
+	// Carry a `before` column's stated collation into the rebuild when `after`
+	// does not state one and structurally cannot (schema-derived) — otherwise
+	// the rebuild silently makes the column BINARY (see the parameter doc
+	// above and `columnDifference` in `snapshot.ts`).
+	let rebuiltColumns = after.columns;
+	if (afterIsSchemaDerived) {
+		for (const [beforeName, beforeColumn] of Object.entries(before.columns)) {
+			if (!beforeColumn.collate) continue;
+			const target = columnRenames[beforeName] ?? beforeName;
+			const afterColumn = rebuiltColumns[target];
+			if (afterColumn && !afterColumn.collate) {
+				if (rebuiltColumns === after.columns) rebuiltColumns = { ...after.columns };
+				rebuiltColumns[target] = { ...afterColumn, collate: beforeColumn.collate };
+			}
+		}
+	}
+
+	const body = createTableFromSnapshot({ ...after, name: temporary, columns: rebuiltColumns });
 	const statements: Statement[] = [
 		// Not `foreign_keys = OFF`: D1 runs every query in an implicit
 		// transaction and refuses to change that pragma inside one, so the old
@@ -407,6 +440,39 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: false };
 		} else {
 			effectiveBefore[name] = t;
+		}
+	}
+
+	// 1b. SQLite's `ALTER TABLE … RENAME TO` rewrites every `REFERENCES` clause
+	// naming the renamed table (since SQLite 3.25), including a table's own
+	// self-references. `effectiveBefore` above only renamed the table's own
+	// entry, leaving every *other* table's `ForeignKeySnapshot.tableTo` /
+	// `ColumnSnapshot.references.tableTo` pointing at the old name — which
+	// makes an otherwise-pure rename look like "a foreign key changes" and
+	// forces a destructive rebuild (or an unresolvable refusal for a
+	// self-reference) for a schema that the rename alone already satisfies.
+	// Repoint them here, across all tables in `effectiveBefore` (the renamed
+	// table included), before anything downstream compares foreign keys.
+	if (Object.keys(renamedTables).length > 0) {
+		const repoint = (tableTo: string): string => renamedTables[tableTo] ?? tableTo;
+		for (const name of Object.keys(effectiveBefore)) {
+			const t = effectiveBefore[name]!;
+			let changed = false;
+			const columns: Record<string, ColumnSnapshot> = { ...t.columns };
+			for (const [colName, col] of Object.entries(columns)) {
+				if (col.references && renamedTables[col.references.tableTo]) {
+					columns[colName] = { ...col, references: { ...col.references, tableTo: repoint(col.references.tableTo) } };
+					changed = true;
+				}
+			}
+			const foreignKeys: Record<string, ForeignKeySnapshot> = { ...t.foreignKeys };
+			for (const [fkName, fk] of Object.entries(foreignKeys)) {
+				if (renamedTables[fk.tableTo]) {
+					foreignKeys[fkName] = { ...fk, tableTo: repoint(fk.tableTo) };
+					changed = true;
+				}
+			}
+			if (changed) effectiveBefore[name] = { ...t, columns, foreignKeys };
 		}
 	}
 
@@ -527,7 +593,10 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		const renamedConstraints = comparableNames
 			? constraintNames(previous).filter((n) => !constraintNames(next).includes(n))
 			: [];
-		if (renamedConstraints.length > 0 && requiresRecreate(previous, next, columnRenames) === undefined) {
+		if (
+			renamedConstraints.length > 0
+			&& requiresRecreate(previous, next, columnRenames, after.origin === 'schema') === undefined
+		) {
 			warnings.push(
 				`"${name}": constraint ${renamedConstraints.map((n) => `"${n}"`).join(', ')} was renamed, which `
 					+ 'needs no migration — SQLite does not store the declared name. The database keeps the old '
@@ -560,12 +629,21 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		 */
 		const unaddable = added.map(([columnName, column]) => ({ columnName, blocker: isAddable(column) }))
 			.find((c) => c.blocker);
-		const reason = requiresRecreate(previous, next, columnRenames)
+		const afterIsSchemaDerived = after.origin === 'schema';
+		const reason = requiresRecreate(previous, next, columnRenames, afterIsSchemaDerived)
 			?? (unaddable && `column "${unaddable.columnName}" cannot be added in place: ${unaddable.blocker}`);
 
 		if (reason) {
 			const foreignTriggersForTable = options.foreignTriggers?.[liveTableNames[name] ?? name] ?? [];
-			const recreated = recreateTable(previous, next, columnRenames, reason, after.tables, foreignTriggersForTable);
+			const recreated = recreateTable(
+				previous,
+				next,
+				columnRenames,
+				reason,
+				after.tables,
+				foreignTriggersForTable,
+				afterIsSchemaDerived,
+			);
 			statements.push(...recreated.statements);
 			errors.push(...recreated.errors);
 

@@ -4,7 +4,7 @@ import type { Column } from 'orm-d1';
 import { describe, expect, it } from 'vitest';
 import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { applicableStatements, splitStatements } from '../../src/core/sql.js';
-import { appendOnlyTriggerGuard, hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
+import { appendOnlyTriggerGuard, hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseColumnCollation, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
 import { assertRoundTrip, emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
 import type { Snapshot } from '../../src/core/snapshot.js';
 
@@ -34,6 +34,37 @@ describe('parsing a CREATE TABLE', () => {
 		expect(() => hasAutoincrement(sql, 'a(')).not.toThrow();
 		expect(hasAutoincrement(sql, 'a(')).toBe(true);
 		expect(parseGenerated(sql, 'a(')).toBeUndefined();
+	});
+
+	it('does not attribute a table-level UNIQUE clause\'s COLLATE to the column itself', () => {
+		// `unique ("email" collate nocase)` is the standard idiom for
+		// case-insensitive email uniqueness — the indexed-column grammar SQLite
+		// allows `COLLATE` on in a `unique (…)`, `primary key (…)`, or
+		// `check (…)` clause, not just on the column definition. `[^,]*?` used to
+		// keep scanning right past the column definition's own end and pick up
+		// this one instead, reporting a collation the column does not have.
+		const sql = 'create table "u1" ("id" integer primary key, "email" text not null, unique ("email" collate nocase))';
+		expect(parseColumnCollation(sql, 'email')).toBeUndefined();
+	});
+
+	it('does not attribute a table-level CHECK clause\'s COLLATE to the column it names', () => {
+		const sql = 'create table "u2" ("a" text, "b" text, check ("a" = "b" collate nocase))';
+		expect(parseColumnCollation(sql, 'a')).toBeUndefined();
+		expect(parseColumnCollation(sql, 'b')).toBeUndefined();
+	});
+
+	it('still finds a genuine column COLLATE that comes before a comma inside a function call', () => {
+		// The mirror false negative: `[^,]*?` stopped at the first comma it saw
+		// at all, including one nested inside `substr(...)`, so a collation
+		// stated *after* such a call on the column's own definition was missed.
+		const sql = 'create table "u3" ("id" integer primary key, '
+			+ '"email" text check (substr("email", 1, 1) <> \'@\') collate nocase not null)';
+		expect(parseColumnCollation(sql, 'email')).toBe('nocase');
+	});
+
+	it('still finds an ordinary column-level COLLATE', () => {
+		const sql = 'create table "u4" ("id" integer primary key, "email" text collate nocase not null)';
+		expect(parseColumnCollation(sql, 'email')).toBe('nocase');
 	});
 });
 
@@ -163,6 +194,145 @@ describe('diffing snapshots', () => {
 
 		expect(diffSnapshots(preDescCollate, fresh).statements).toEqual([]);
 		expect(diffSnapshots(fresh, preDescCollate).statements).toEqual([]);
+	});
+
+	it('does not force a destructive recreate for a live non-BINARY column collation the schema DSL cannot express (F-101)', () => {
+		// A table pulled from a live DB with `email text collate nocase` gets
+		// `collate: 'nocase'` on that column in the introspected snapshot. The
+		// schema DSL has no `.collate()`, so every schema-derived snapshot of
+		// the same table has `collate: undefined` on `email` forever. Diffing
+		// the two must not read that as "changed to binary" and force a
+		// destructive drop+recreate on the very first `generate` after `pull`.
+		const t = sqliteTable('people', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		});
+		const schemaSide = snapshotOf(t);
+		const liveSide: Snapshot = {
+			...schemaSide,
+			origin: 'introspection',
+			tables: {
+				people: {
+					...schemaSide.tables['people']!,
+					columns: {
+						...schemaSide.tables['people']!.columns,
+						email: { ...schemaSide.tables['people']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		const { statements } = diffSnapshots(liveSide, schemaSide);
+		expect(statements).toEqual([]);
+	});
+
+	it('still reports a genuine collation mismatch between two stated values', () => {
+		// The exemption is one-directional: a real value on the schema side that
+		// genuinely differs from the live database's real value must still be
+		// caught, so this is not a blanket "ignore collate" escape hatch.
+		const t = sqliteTable('people', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		});
+		const base = snapshotOf(t);
+		const before: Snapshot = {
+			...base,
+			origin: 'introspection',
+			tables: {
+				people: {
+					...base.tables['people']!,
+					columns: {
+						...base.tables['people']!.columns,
+						email: { ...base.tables['people']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+		const after: Snapshot = {
+			...base,
+			origin: 'introspection',
+			tables: {
+				people: {
+					...base.tables['people']!,
+					columns: {
+						...base.tables['people']!.columns,
+						email: { ...base.tables['people']!.columns['email']!, collate: 'rtrim' },
+					},
+				},
+			},
+		};
+
+		const { statements } = diffSnapshots(before, after);
+		expect(statements.some((s) => s.reason?.includes('collation'))).toBe(true);
+	});
+
+	it('carries a live collation into a rebuild the schema DSL cannot state, instead of dropping it (F-101 follow-up)', () => {
+		// A rebuild forced for an unrelated reason (here: `id` changes type) must
+		// not read `columnDifference`'s "unstated = unchanged" exemption as
+		// license to render the rebuilt table without the collation: the
+		// rebuild reads `after`, which structurally never carries one, so
+		// rendering `after` as-is silently turned a `uniqueIndex` over a
+		// case-insensitive column into one over a BINARY column — nothing
+		// failed, `alice@x.com` and `Alice@x.com` just both became insertable.
+		const before = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [uniqueIndex('users_email_idx').on(c.email)]);
+		const after = sqliteTable('users', {
+			id: text('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [uniqueIndex('users_email_idx').on(c.email)]);
+
+		const schemaAfter = snapshotOf(after);
+		const liveBefore: Snapshot = {
+			...snapshotOf(before),
+			origin: 'introspection',
+			tables: {
+				users: {
+					...snapshotOf(before).tables['users']!,
+					columns: {
+						...snapshotOf(before).tables['users']!.columns,
+						email: { ...snapshotOf(before).tables['users']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		const { statements, errors } = diffSnapshots(liveBefore, schemaAfter);
+		expect(errors).toEqual([]);
+
+		const createTemp = statements.find((s) => s.sql.includes('create table "__new_users"'));
+		expect(createTemp?.sql).toContain('"email" text collate nocase not null');
+	});
+
+	it('detects introspection-to-introspection collation drift instead of exempting it (F-101 follow-up)', () => {
+		// Right after `pull`, both sides of `check` are `origin: 'introspection'`
+		// — `undefined` there genuinely means BINARY, not "the schema DSL cannot
+		// say". Keying the exemption on `b.collate === undefined` alone (rather
+		// than on `after.origin`) hid a hand-rebuilt production table gaining a
+		// real collation the pulled baseline never had.
+		const t = sqliteTable('people', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		});
+		const base = snapshotOf(t);
+		const pulledBaseline: Snapshot = { ...base, origin: 'introspection' };
+		const liveWithHandAddedCollation: Snapshot = {
+			...base,
+			origin: 'introspection',
+			tables: {
+				people: {
+					...base.tables['people']!,
+					columns: {
+						...base.tables['people']!.columns,
+						email: { ...base.tables['people']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		const { statements } = diffSnapshots(liveWithHandAddedCollation, pulledBaseline);
+		expect(statements.some((s) => s.reason?.includes('collation'))).toBe(true);
 	});
 
 	it('drops a removed table, and marks it destructive', () => {
@@ -774,6 +944,52 @@ describe('diffing snapshots', () => {
 			'alter table "users" rename to "people"',
 			'alter table "people" rename column "name" to "full_name"',
 		]);
+	});
+
+	it('repoints a referencing foreign key to the renamed table, instead of forcing a rebuild', () => {
+		// F-098: SQLite's `ALTER TABLE … RENAME TO` rewrites every `REFERENCES`
+		// clause naming the renamed table (since 3.25). `posts.author_id`
+		// references `users.id`; renaming `users` to `people` alone must not
+		// look like "a foreign key changes" on `posts`.
+		const users = sqliteTable('users', { id: integer('id').primaryKey() });
+		const posts = sqliteTable('posts', {
+			id: integer('id').primaryKey(),
+			authorId: integer('author_id').references(() => users.id),
+		});
+
+		const people = sqliteTable('people', { id: integer('id').primaryKey() });
+		const postsAfter = sqliteTable('posts', {
+			id: integer('id').primaryKey(),
+			authorId: integer('author_id').references(() => people.id),
+		});
+
+		const { statements, errors } = diffSnapshots(
+			snapshotOf(users, posts),
+			snapshotOf(people, postsAfter),
+			{ renamedTables: { users: 'people' } },
+		);
+
+		expect(errors).toEqual([]);
+		expect(statements.map((s) => s.sql)).toEqual(['alter table "users" rename to "people"']);
+	});
+
+	it('repoints a self-referencing foreign key across a rename', () => {
+		// F-098: a self-referencing table must also have its own reference
+		// repointed, not just other tables' references to it.
+		const nodes = sqliteTable('nodes', {
+			id: integer('id').primaryKey(),
+			parentId: integer('parent_id').references((): Column<any> => nodes.id),
+		});
+		const trees = sqliteTable('trees', {
+			id: integer('id').primaryKey(),
+			parentId: integer('parent_id').references((): Column<any> => trees.id),
+		});
+
+		const { errors } = diffSnapshots(snapshotOf(nodes), snapshotOf(trees), {
+			renamedTables: { nodes: 'trees' },
+		});
+
+		expect(errors).toEqual([]);
 	});
 
 	it('leaves the rename to the rebuild when the table is also recreated', () => {

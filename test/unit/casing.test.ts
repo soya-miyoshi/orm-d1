@@ -5,10 +5,11 @@
  * SQL that is wrong rather than SQL that fails to build — so both bad orders
  * throw at the point of the mistake.
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { toSnakeCase as drizzleToSnakeCase } from 'drizzle-orm/casing';
+import * as columns from '../../src/schema/columns.js';
 import { applyCasing, configureCasing, isColumn, resetCasing } from '../../src/schema/columns.js';
-import { integer, sqliteTable, text } from '../../src/index.js';
+import { integer, query, sqliteTable, text } from '../../src/index.js';
 
 afterEach(() => resetCasing());
 
@@ -92,5 +93,33 @@ describe('configureCasing', () => {
 		}
 		expect(applyCasing('user’sName')).toBe('users_name');
 		expect(applyCasing('some name')).toBe('some_name');
+	});
+
+	// F-102: `Column.name` used to re-run `applyCasing` (Drizzle's tokenising
+	// regex) on every read. `.name` is read repeatedly compiling a single
+	// query — once per rendered reference, again assigning the output name,
+	// again in any nested projection — so an unmemoized getter paid the regex
+	// cost that many times over for the same column.
+	it('memoizes the resolved name, so compiling a select over N columns runs applyCasing at most N times', () => {
+		configureCasing('snake_case');
+		const t = sqliteTable('t', {
+			firstName: text(),
+			lastName: text(),
+			emailAddress: text(),
+			isActive: integer(),
+		});
+		const columnCount = Object.values(t).filter(isColumn).length;
+
+		// Reading `.name` once per column first forces every memo to be filled
+		// before the spy starts counting, so the query compilation below is what
+		// gets measured — not the initial resolution this same table needs
+		// regardless of memoization.
+		for (const column of Object.values(t)) if (isColumn(column)) void column.name;
+
+		const spy = vi.spyOn(columns, 'applyCasing');
+		query.select().from(t).compile();
+
+		expect(spy).not.toHaveBeenCalled();
+		spy.mockRestore();
 	});
 });

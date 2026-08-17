@@ -405,6 +405,105 @@ describe('rendering a schema module from a snapshot', () => {
 		},
 	});
 
+	// F-100: `pull` renders a plain `sqliteTable` with no way to spell
+	// `strict`, `withoutRowid` or `appendOnly` — losing any of them silently
+	// would mean the next `generate` proposes rebuilding/dropping it with
+	// nothing naming what happened. Warn loudly instead, naming the table and
+	// every option it cannot express.
+	it('warns, naming the table and every option, when strict/withoutRowid/appendOnly cannot be expressed', async () => {
+		const { unexpressibleTableOptionWarnings } = await import('../../src/node/commands.js');
+		const snapshot = {
+			...snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }),
+			tables: {
+				reads: {
+					name: 'reads',
+					columns: { id: column('id', 'integer', { primaryKey: true }) },
+					indexes: {},
+					foreignKeys: {},
+					compositePrimaryKeys: {},
+					uniqueConstraints: {},
+					checkConstraints: {},
+					strict: true,
+					withoutRowid: true,
+					appendOnly: true,
+				},
+			},
+		};
+
+		const warnings = unexpressibleTableOptionWarnings(snapshot as never);
+
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain('"reads"');
+		expect(warnings[0]).toContain('strict');
+		expect(warnings[0]).toContain('withoutRowid');
+		expect(warnings[0]).toContain('appendOnly');
+	});
+
+	it('does not warn for a table with none of the unexpressible options', async () => {
+		const { unexpressibleTableOptionWarnings } = await import('../../src/node/commands.js');
+		const warnings = unexpressibleTableOptionWarnings(
+			snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }) as never,
+		);
+		expect(warnings).toEqual([]);
+	});
+
+	// F-101: a live non-BINARY column collation is introspected correctly, but
+	// the schema DSL has no `.collate()` to render it back — the rendered
+	// module states nothing, so the information would vanish silently. `pull`
+	// warns instead, naming the table and column.
+	it('warns, naming the table and column, when a non-BINARY column collation cannot be expressed', async () => {
+		const { unexpressibleTableOptionWarnings } = await import('../../src/node/commands.js');
+		const snapshot = {
+			...snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }),
+			tables: {
+				people: {
+					name: 'people',
+					columns: {
+						id: column('id', 'integer', { primaryKey: true }),
+						email: column('email', 'text', { collate: 'nocase' }),
+					},
+					indexes: {},
+					foreignKeys: {},
+					compositePrimaryKeys: {},
+					uniqueConstraints: {},
+					checkConstraints: {},
+				},
+			},
+		};
+
+		const warnings = unexpressibleTableOptionWarnings(snapshot as never);
+
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain('"people"');
+		expect(warnings[0]).toContain('"email"');
+		expect(warnings[0]).toContain('nocase');
+	});
+
+	it('does not warn about a BINARY (or unstated) column collation', async () => {
+		const { unexpressibleTableOptionWarnings } = await import('../../src/node/commands.js');
+		const snapshot = {
+			...snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }),
+			tables: {
+				people: {
+					name: 'people',
+					columns: {
+						id: column('id', 'integer', { primaryKey: true }),
+						email: column('email', 'text', { collate: 'binary' }),
+						name: column('name', 'text', {}),
+					},
+					indexes: {},
+					foreignKeys: {},
+					compositePrimaryKeys: {},
+					uniqueConstraints: {},
+					checkConstraints: {},
+				},
+			},
+		};
+
+		const warnings = unexpressibleTableOptionWarnings(snapshot as never);
+		expect(warnings).toEqual([]);
+	});
+
 	it('imports every factory it uses, blob included', async () => {
 		const { renderSchemaModule } = await import('../../src/node/commands.js');
 		const rendered = renderSchemaModule(snapshotOf({

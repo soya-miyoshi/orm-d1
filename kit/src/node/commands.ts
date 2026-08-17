@@ -364,7 +364,54 @@ export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promis
 
 	const schema = renderSchemaModule(snapshot);
 	ctx.log(`Introspected ${Object.keys(snapshot.tables).length} tables.`);
+	for (const warning of unexpressibleTableOptionWarnings(snapshot)) ctx.log(`  ! ${warning}`);
 	return { snapshot, schema };
+}
+
+/**
+ * F-100: `strict`, `withoutRowid` and `appendOnly` are captured correctly by
+ * `snapshotFromIntrospection`, but the rendered schema module (plain
+ * `sqliteTable` calls) has no spelling for any of them — no
+ * `tableOptions([...])` sidecar is written. Left silent, the very next
+ * `generate` against the rendered module reads all three back as `false` and
+ * proposes rebuilding/dropping them with nothing naming what is being lost.
+ * This does not block `pull` — it only warns, loudly, naming every affected
+ * table and every option it cannot express.
+ *
+ * F-101: the same gap applies per column, to a non-BINARY `COLLATE`. Drizzle
+ * (and so this schema DSL) has no `.collate()` spelling, so a live column's
+ * collation is introspected correctly but can never be re-stated in a schema
+ * module. `columnDifference` (`core/snapshot.ts`) already knows not to treat
+ * that specific direction (a real live value, an unstatable schema side) as
+ * a forced destructive recreate — but silently tolerating it would make the
+ * information vanish with no trace, so it is surfaced here instead, at the
+ * one moment it is still known: `pull` time.
+ */
+export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
+	const warnings: string[] = [];
+	for (const table of Object.values(snapshot.tables)) {
+		const lost: string[] = [];
+		if (table.strict) lost.push('strict');
+		if (table.withoutRowid) lost.push('withoutRowid');
+		if (table.appendOnly) lost.push('appendOnly');
+		if (lost.length > 0) {
+			warnings.push(
+				`"${table.name}" is ${lost.join(', ')} in the live database, but the rendered schema module has no way `
+					+ `to express ${lost.length > 1 ? 'any of them' : 'that'} — the next generate against this schema `
+					+ `will propose dropping ${lost.length > 1 ? 'them' : 'it'} unless you account for ${
+						lost.length > 1 ? 'them' : 'it'
+					} by hand.`,
+			);
+		}
+		for (const column of Object.values(table.columns)) {
+			if (!column.collate || column.collate.toLowerCase() === 'binary') continue;
+			warnings.push(
+				`"${table.name}"."${column.name}" is collate ${column.collate} in the live database, but the schema `
+					+ `DSL has no way to express a column collation — the rendered schema module will not state it.`,
+			);
+		}
+	}
+	return warnings;
 }
 
 /** Turn an introspected snapshot back into a schema module. */

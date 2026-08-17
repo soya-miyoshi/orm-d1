@@ -152,6 +152,54 @@ const columnDefinitionStart = (columnName: string): string =>
 export const hasAutoincrement = (sql: string, columnName: string): boolean =>
 	new RegExp(`${columnDefinitionStart(columnName)}[^,]*autoincrement`, 'i').test(sql);
 
+/**
+ * A column's own `COLLATE` clause, from the `CREATE TABLE` text — no pragma
+ * reports it (`pragma table_info`'s `notnull`/`pk`/`dflt_value` say nothing
+ * about collation). Anchored on the column *definition* the same way
+ * `hasAutoincrement`/`parseGenerated` are, over `blankLiterals` so a string
+ * default containing the word `collate` cannot be mistaken for the clause.
+ *
+ * Kept in the raw case the DDL text used (mirroring `parseIndexCollations`,
+ * which does the same for an index member) — normalising away case
+ * differences is `canonicalTable`'s job at comparison time, not this
+ * function's, so a schema-side spelling and a live one still round-trip
+ * byte-for-byte through `createTableFromSnapshot`.
+ */
+export const parseColumnCollation = (sql: string, columnName: string): string | undefined => {
+	const scan = blankLiterals(sql);
+	const anchor = new RegExp(columnDefinitionStart(columnName), 'i').exec(scan);
+	if (!anchor) return undefined;
+
+	// The column definition's own span: from right after its name to the next
+	// top-level comma (the next column, or a table-level constraint) or the
+	// closing paren of the column list — crossing nested parens rather than
+	// stopping at their first `)`, the same balanced scan `parseGenerated` uses
+	// for its expression. `[^,]*?` here used to stop at the *first* `collate`
+	// found anywhere later in the text, which is also legal inside a
+	// `unique (…)`/`primary key (…)`/`check (…)` clause's indexed-column
+	// grammar (`unique ("email" collate nocase)` is the standard idiom for
+	// case-insensitive uniqueness) — misattributing that constraint's
+	// collation to the column itself. It also stopped scanning at the first
+	// comma even *inside* a call, e.g. `check (substr("email", 1, 1) <> '@')
+	// collate nocase`, missing a collation that genuinely belongs to the
+	// column because a comma inside `substr(...)` looked like the column
+	// definition's end.
+	let depth = 0;
+	let i = anchor.index + anchor[0].length;
+	while (i < scan.length) {
+		const ch = scan[i];
+		if (ch === '(') depth++;
+		else if (ch === ')') {
+			if (depth === 0) break;
+			depth--;
+		} else if (ch === ',' && depth === 0) break;
+		i++;
+	}
+
+	const match = /\bcollate\s+(\w+)/i.exec(scan.slice(anchor.index + anchor[0].length, i));
+	return match?.[1];
+};
+
 export const parseGenerated = (
 	sql: string,
 	columnName: string,
@@ -493,6 +541,7 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 				default: column.dflt_value === null ? undefined : defaultExpression(column.dflt_value),
 				generated,
 				references: undefined,
+				collate: parseColumnCollation(createSql, column.name),
 			};
 		}
 

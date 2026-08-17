@@ -146,9 +146,26 @@ const inheritedNullable = (t: Table, prefix: string): string[] =>
 const nullableTables = (plan: SelectPlan): Set<string> => {
 	const tables = new Set<string>();
 	if (!plan.from) return tables;
+	// An ordered fold matching Drizzle's own
+	// (`drizzle-orm/sqlite-core/query-builders/select.js:111-121`): each join
+	// is applied in declaration order against everything already known, not
+	// just `plan.from` — a `right`/`full` join nullifies every table already
+	// in the accumulator, not only the first one.
+	const seen = new Set<string>([getTableName(plan.from)]);
 	for (const join of plan.joins) {
-		if (join.type === 'left' || join.type === 'full') tables.add(getTableName(join.table));
-		if (join.type === 'right' || join.type === 'full') tables.add(getTableName(plan.from));
+		const name = getTableName(join.table);
+		seen.add(name);
+		if (join.type === 'left') {
+			tables.add(name);
+		} else if (join.type === 'inner' || join.type === 'cross') {
+			tables.delete(name);
+		} else if (join.type === 'right') {
+			for (const t of seen) tables.add(t);
+			tables.delete(name);
+		} else if (join.type === 'full') {
+			for (const t of seen) tables.add(t);
+			tables.add(name);
+		}
 	}
 	return tables;
 };

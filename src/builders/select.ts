@@ -103,7 +103,11 @@ type AddJoin<
 > = Simplify<
 	Omit<S, 'joined' | 'baseRow'> & {
 		baseRow: TBaseNullable extends true ? S['baseRow'] | null : S['baseRow'];
-		joined: S['joined'] & {
+		// TBaseNullable also matches the runtime fold in `nullableTables`
+		// (src/plan/compile.ts): a right/full join nullifies every table
+		// already joined before it, not only the base table, so every
+		// existing entry in `joined` needs the same `| null` widening.
+		joined: (TBaseNullable extends true ? { [K in keyof S['joined']]: S['joined'][K] | null } : S['joined']) & {
 			[K in NameOf<T>]: TNullable extends true ? InferSelect<T> | null : InferSelect<T>;
 		};
 	}
