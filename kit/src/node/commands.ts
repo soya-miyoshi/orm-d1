@@ -20,7 +20,7 @@ import { renderRoundtrip, roundtripPlan } from '../core/roundtrip.js';
 import { vocabularyWarnings } from '../core/vocabulary.js';
 import type { TableImpact } from '../core/impact.js';
 import type { BackfillResult } from '../core/backfill.js';
-import { diffSnapshots, renderMigration } from '../core/diff.js';
+import { carryForwardCollations, diffSnapshots, renderMigration } from '../core/diff.js';
 import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
 import { normalizeIndexColumn, snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
@@ -226,7 +226,12 @@ export async function generate(ctx: CommandContext, flags: TargetFlags = {}): Pr
 	const sql = renderMigration(diff);
 
 	const path = await writeMigration(ctx.config.out, tag, sql);
-	await writeSnapshot(ctx.config.out, index, { ...next, id: tag, prevId: previous.id });
+	// [F-107]: `next` is schema-derived and cannot state a `collate` at all;
+	// persist it with any live `collate` carried forward from `previous`, or
+	// the very next `generate` sees a baseline that was never told about it
+	// and drops it with zero drift reported.
+	const persisted = carryForwardCollations(previous, next, flags.renames ?? {});
+	await writeSnapshot(ctx.config.out, index, { ...persisted, id: tag, prevId: previous.id });
 	await writeJournal(ctx.config.out, appendEntry(journal, tag, ctx.now()));
 
 	ctx.log(`Wrote ${path} (${diff.statements.length} statements).`);

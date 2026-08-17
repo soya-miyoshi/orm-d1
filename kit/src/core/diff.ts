@@ -52,6 +52,7 @@ const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
 const columnDefinition = (column: ColumnSnapshot): string => {
 	let ddl = `${quote(column.name)} ${column.declaredType ?? column.type}`;
+	if (column.collate) ddl += ` collate ${column.collate}`;
 	if (column.notNull) ddl += ' not null';
 	if (column.unique) ddl += ' unique';
 	if (column.generated) ddl += ` generated always as (${column.generated.as}) ${column.generated.mode}`;
@@ -241,6 +242,70 @@ const dependentTables = (
 	return found;
 };
 
+/**
+ * Carry a `before` column's stated `collate` onto the matching `after`
+ * column wherever `after` does not state one — the schema DSL has no
+ * `.collate()` spelling (`docs/04`), so an `after` column can never state a
+ * collation on its own; without this, any recreation of the schema-derived
+ * snapshot loses the live collation the moment nothing else about the
+ * column changes it. Returns `afterColumns` unchanged (same reference) when
+ * there is nothing to carry, so callers can cheaply detect "no-op".
+ */
+const carryForwardCollation = (
+	beforeColumns: Record<string, ColumnSnapshot>,
+	afterColumns: Record<string, ColumnSnapshot>,
+	columnRenames: Record<string, string>,
+): Record<string, ColumnSnapshot> => {
+	let result = afterColumns;
+	for (const [beforeName, beforeColumn] of Object.entries(beforeColumns)) {
+		if (!beforeColumn.collate) continue;
+		const target = columnRenames[beforeName] ?? beforeName;
+		const afterColumn = result[target];
+		if (afterColumn && !afterColumn.collate) {
+			if (result === afterColumns) result = { ...afterColumns };
+			result[target] = { ...afterColumn, collate: beforeColumn.collate };
+		}
+	}
+	return result;
+};
+
+/**
+ * [F-107]: `recreateTable` carries a live `collate` into the *rebuilt table
+ * body* it renders, but `generate` persists the schema-derived `after`
+ * snapshot as-is as the new baseline (`meta/<n>_snapshot.json`) — which
+ * structurally has no `collate` on any column, regardless of whether this
+ * diff even touched the table. The very next `generate`, seeing that
+ * baseline, believes the column was always BINARY and silently drops the
+ * live collation with zero drift reported. Apply the same carry-forward to
+ * the whole snapshot the caller is about to persist, not just to tables a
+ * recreate happens to rebuild.
+ */
+export const carryForwardCollations = (before: Snapshot, after: Snapshot, options: DiffOptions = {}): Snapshot => {
+	const renamedTables = options.renamedTables ?? {};
+	const renamedColumns = options.renamedColumns ?? {};
+	let tables = after.tables;
+
+	for (const [beforeName, beforeTable] of Object.entries(before.tables)) {
+		const targetName = renamedTables[beforeName] ?? beforeName;
+		const afterTable = tables[targetName];
+		if (!afterTable) continue;
+
+		const columnRenames: Record<string, string> = {};
+		for (const [key, value] of Object.entries(renamedColumns)) {
+			const [table, column] = key.split('.');
+			if (table === targetName && column) columnRenames[column] = value;
+		}
+
+		const columns = carryForwardCollation(beforeTable.columns, afterTable.columns, columnRenames);
+		if (columns !== afterTable.columns) {
+			if (tables === after.tables) tables = { ...after.tables };
+			tables[targetName] = { ...afterTable, columns };
+		}
+	}
+
+	return tables === after.tables ? after : { ...after, tables };
+};
+
 const recreateTable = (
 	before: TableSnapshot,
 	after: TableSnapshot,
@@ -325,18 +390,9 @@ const recreateTable = (
 	// does not state one and structurally cannot (schema-derived) — otherwise
 	// the rebuild silently makes the column BINARY (see the parameter doc
 	// above and `columnDifference` in `snapshot.ts`).
-	let rebuiltColumns = after.columns;
-	if (afterIsSchemaDerived) {
-		for (const [beforeName, beforeColumn] of Object.entries(before.columns)) {
-			if (!beforeColumn.collate) continue;
-			const target = columnRenames[beforeName] ?? beforeName;
-			const afterColumn = rebuiltColumns[target];
-			if (afterColumn && !afterColumn.collate) {
-				if (rebuiltColumns === after.columns) rebuiltColumns = { ...after.columns };
-				rebuiltColumns[target] = { ...afterColumn, collate: beforeColumn.collate };
-			}
-		}
-	}
+	const rebuiltColumns = afterIsSchemaDerived
+		? carryForwardCollation(before.columns, after.columns, columnRenames)
+		: after.columns;
 
 	const body = createTableFromSnapshot({ ...after, name: temporary, columns: rebuiltColumns });
 	const statements: Statement[] = [

@@ -2,11 +2,12 @@ import { blob, check, customType, foreignKey, index, integer, numeric, primaryKe
 import { appendOnlyTrigger, tableOptions, validateTableOptions } from 'orm-d1/ddl';
 import type { Column } from 'orm-d1';
 import { describe, expect, it } from 'vitest';
-import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
+import { carryForwardCollations, diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { applicableStatements, splitStatements } from '../../src/core/sql.js';
 import { appendOnlyTriggerGuard, hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseColumnCollation, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
 import { assertRoundTrip, emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
 import type { Snapshot } from '../../src/core/snapshot.js';
+import { roundtripPlan } from '../../src/core/roundtrip.js';
 
 const indexOn = (name: string, column: Column<any>) => index(name).on(column);
 
@@ -65,6 +66,74 @@ describe('parsing a CREATE TABLE', () => {
 	it('still finds an ordinary column-level COLLATE', () => {
 		const sql = 'create table "u4" ("id" integer primary key, "email" text collate nocase not null)';
 		expect(parseColumnCollation(sql, 'email')).toBe('nocase');
+	});
+
+	it('[F-106] does not attribute a COLLATE inside a column-level CHECK to the column itself', () => {
+		// The whole sub-expression sits inside the `check (...)`'s own
+		// parentheses — depth >= 1 from the column definition's point of view —
+		// so it is not the column's own COLLATE, unlike the test above where
+		// `collate nocase` comes back out to depth 0 after the check closes.
+		const sql = 'create table "q" ("id" integer primary key, "status" text not null '
+			+ 'constraint "q_check_1" check ("status" collate nocase in (\'active\',\'closed\')))';
+		expect(parseColumnCollation(sql, 'status')).toBeUndefined();
+	});
+
+	it('[F-106] does not attribute a COLLATE inside a generated column\'s expression to the column itself', () => {
+		const sql = 'create table "g" ("a" text, "b" integer generated always as ("a" collate nocase = \'x\') virtual)';
+		expect(parseColumnCollation(sql, 'b')).toBeUndefined();
+	});
+
+	it('[F-108] a quoted identifier containing "(" does not desynchronise the depth counter', () => {
+		const sql = 'create table "t" ("a(" text, "b" text generated always as ("a(" || \'x\') virtual, '
+			+ '"email" text not null, unique ("email" collate nocase))';
+		// Used to run to end-of-string and swallow the table-level unique(...).
+		expect(parseColumnCollation(sql, 'b')).toBeUndefined();
+		expect(parseColumnCollation(sql, 'email')).toBeUndefined();
+	});
+
+	it('[F-108] parses a quoted collation name', () => {
+		const sql = 'create table "u5" ("id" integer primary key, "email" text collate "NOCASE" not null)';
+		expect(parseColumnCollation(sql, 'email')).toBe('NOCASE');
+	});
+
+	it('does not read a COLLATE mentioned only in a "--" comment as the column\'s own', () => {
+		const sql = 'create table "c1" ("id" integer primary key, '
+			+ '"note" text -- TODO: collate nocase before launch\n\tnot null)';
+		expect(parseColumnCollation(sql, 'note')).toBeUndefined();
+	});
+
+	it('does not read a COLLATE mentioned only in a "/* */" comment as the column\'s own', () => {
+		const sql = 'create table "c1" ("id" integer primary key, "note" text /* TODO: collate nocase */ not null)';
+		expect(parseColumnCollation(sql, 'note')).toBeUndefined();
+	});
+
+	it('an unbalanced "(" inside a "--" comment does not desynchronise the depth counter', () => {
+		const sql = 'create table "c1" ("id" integer primary key, '
+			+ '"note" text -- legacy (was varchar\n\tcollate nocase)';
+		expect(parseColumnCollation(sql, 'note')).toBe('nocase');
+	});
+
+	it('a stray \'"\' inside a "--" comment does not swallow the rest of the column span', () => {
+		const sql = 'create table "c1" ("id" integer primary key, '
+			+ '"note" text -- see the "spec\n\t\tcollate nocase not null)';
+		expect(parseColumnCollation(sql, 'note')).toBe('nocase');
+	});
+
+	it('a backtick-quoted identifier containing "(" does not desynchronise the depth counter', () => {
+		const sql = 'create table "t" (`a(` text, "note" text check (`x(` <> \'\') collate nocase)';
+		expect(parseColumnCollation(sql, 'note')).toBe('nocase');
+	});
+
+	it('a bracket-quoted identifier containing "(" does not desynchronise the depth counter', () => {
+		const sql = 'create table "t" ([a(] text, "note" text check ([x(] <> \'\') collate nocase)';
+		expect(parseColumnCollation(sql, 'note')).toBe('nocase');
+	});
+
+	it('[F-108 in parseGenerated] a quoted identifier containing "(" inside another column does not '
+		+ 'swallow the rest of the table body into the generated expression', () => {
+		const sql = 'create table "t" ("a(" text, "b" text generated always as ("a(" || \'x\') virtual, '
+			+ '"email" text not null, unique ("email" collate nocase)) virtual';
+		expect(parseGenerated(sql, 'b')).toEqual({ as: '"a(" || \'x\'', mode: 'virtual' });
 	});
 });
 
@@ -305,6 +374,42 @@ describe('diffing snapshots', () => {
 		expect(createTemp?.sql).toContain('"email" text collate nocase not null');
 	});
 
+	it('[F-107] carries a live collation into the snapshot generate persists, not just the rebuilt table body', () => {
+		// `recreateTable` above only fixes what the rebuild *renders*. `generate`
+		// separately persists the schema-derived `after` snapshot as the new
+		// `meta/` baseline, which structurally has no `collate` on any column —
+		// so without carrying it forward there too, the very next `generate`
+		// reads that baseline, believes the column was always BINARY, and drops
+		// the live collation with zero drift ever reported again.
+		const t = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [uniqueIndex('users_email_idx').on(c.email)]);
+
+		const schemaAfter = snapshotOf(t);
+		const liveBefore: Snapshot = {
+			...snapshotOf(t),
+			origin: 'introspection',
+			tables: {
+				users: {
+					...snapshotOf(t).tables['users']!,
+					columns: {
+						...snapshotOf(t).tables['users']!.columns,
+						email: { ...snapshotOf(t).tables['users']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		const persisted = carryForwardCollations(liveBefore, schemaAfter);
+		expect(persisted.tables['users']!.columns['email']!.collate).toBe('nocase');
+
+		// A second round trip off that persisted baseline must still see it —
+		// this is the "second generate drops it silently" scenario.
+		const roundTwo = carryForwardCollations(persisted, snapshotOf(t));
+		expect(roundTwo.tables['users']!.columns['email']!.collate).toBe('nocase');
+	});
+
 	it('detects introspection-to-introspection collation drift instead of exempting it (F-101 follow-up)', () => {
 		// Right after `pull`, both sides of `check` are `origin: 'introspection'`
 		// — `undefined` there genuinely means BINARY, not "the schema DSL cannot
@@ -333,6 +438,50 @@ describe('diffing snapshots', () => {
 
 		const { statements } = diffSnapshots(liveWithHandAddedCollation, pulledBaseline);
 		expect(statements.some((s) => s.reason?.includes('collation'))).toBe(true);
+	});
+
+	it("[roundtrip] a restore leg keeps the live collation legs 1 and 2 preserve, not just the detach/rebuild pair", () => {
+		// `roundtripPlan`'s restore legs merge a restored table straight out of
+		// the schema-derived `after` snapshot, which structurally cannot state a
+		// `collate` (Drizzle has no `.collate()`). Legs 1 and 2 diff against
+		// `detachedBefore`/`detachedAfter`, which still carry the live collation
+		// forward from `before`, so only a restore leg (3+) can lose it.
+		//
+		// `rt_orgs` is the roundtrip target; `rt_users` (which points at it, and
+		// carries a live `collate` on a column unrelated to the FK) sits in its
+		// closure, so leg 3 has to rebuild `rt_users` to put its foreign key
+		// back.
+		const orgs = sqliteTable('rt_orgs', {
+			id: integer('id').primaryKey(),
+			name: text('name').notNull(),
+		});
+		const users = sqliteTable('rt_users', {
+			id: integer('id').primaryKey(),
+			orgId: integer('org_id').notNull().references(() => orgs.id),
+			email: text('email').notNull(),
+		});
+
+		const after = snapshotOf(orgs, users);
+		const before: Snapshot = {
+			...after,
+			origin: 'introspection',
+			tables: {
+				...after.tables,
+				rt_users: {
+					...after.tables['rt_users']!,
+					columns: {
+						...after.tables['rt_users']!.columns,
+						email: { ...after.tables['rt_users']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		const plan = roundtripPlan(before, after, 'rt_orgs');
+		const restoreLeg = plan.legs.find((leg) => leg.title.startsWith('3.'));
+		expect(restoreLeg).toBeDefined();
+		expect(restoreLeg!.errors).toEqual([]);
+		expect(restoreLeg!.statements.some((s) => /collate\s+nocase/i.test(s.sql))).toBe(true);
 	});
 
 	it('drops a removed table, and marks it destructive', () => {
@@ -425,6 +574,35 @@ describe('diffing snapshots', () => {
 		const { errors } = diffSnapshots(snapshotOf(before), snapshotOf(after));
 		expect(errors).toHaveLength(1);
 		expect(errors[0]).toMatch(/cannot be backfilled/);
+	});
+
+	it('[F-109] renders a COLLATE on an ADD COLUMN, not just on a fresh CREATE TABLE', () => {
+		// Unreachable through `generate`/`push`/`verify` today — the schema DSL
+		// has no `.collate()`, so a schema-derived `after` never states one on a
+		// newly added column — but `check`'s printed drift can still construct
+		// this pair directly (an `after` built from a hand-edited/introspected
+		// snapshot), and `columnDefinition` silently dropped it.
+		const before = sqliteTable('users', { id: integer('id').primaryKey() });
+		const afterSnapshot = snapshotOf(sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email'),
+		}));
+
+		const withCollate: Snapshot = {
+			...afterSnapshot,
+			tables: {
+				users: {
+					...afterSnapshot.tables['users']!,
+					columns: {
+						...afterSnapshot.tables['users']!.columns,
+						email: { ...afterSnapshot.tables['users']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		expect(diffSnapshots(snapshotOf(before), withCollate).statements.map((s) => s.sql))
+			.toEqual(['alter table "users" add column "email" text collate nocase']);
 	});
 
 	it('recreates rather than ALTERing for a non-constant default, which ADD COLUMN rejects', () => {
@@ -1725,6 +1903,20 @@ describe('reading table options back out of a CREATE TABLE', () => {
 		expect(parseTableOptions('create table "t" ("strict" text, "without rowid" text)'))
 			.toEqual({ strict: false, withoutRowid: false });
 		expect(parseTableOptions(`create table "t" ("a" text default 'strict')`))
+			.toEqual({ strict: false, withoutRowid: false });
+	});
+
+	it('does not read an option out of a comment', () => {
+		// SQLite keeps a comment that sits *before* a table option, verbatim. Its own
+		// `)` used to bound the tail by accident; now that comments are blanked, the
+		// tail must be taken from the blanked text or the word inside the comment
+		// becomes an option the table never had — and the rebuilt table gets a
+		// constraint that rejects rows the original accepted.
+		expect(parseTableOptions('create table "t" ("id" text primary key, "n" integer) /* strict ) */ without rowid'))
+			.toEqual({ strict: false, withoutRowid: true });
+		expect(parseTableOptions('create table "t" ("id" integer primary key autoincrement) /* without rowid ) */ strict'))
+			.toEqual({ strict: true, withoutRowid: false });
+		expect(parseTableOptions('create table "t" ("a" text) -- strict )\n'))
 			.toEqual({ strict: false, withoutRowid: false });
 	});
 

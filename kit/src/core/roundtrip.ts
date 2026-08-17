@@ -36,7 +36,7 @@
  * constraint to leave off, and that is a decision, not a default.
  */
 import type { Snapshot, TableSnapshot } from './snapshot.js';
-import { diffSnapshots } from './diff.js';
+import { carryForwardCollations, diffSnapshots } from './diff.js';
 import type { Statement } from './diff.js';
 import { impactOf } from './impact.js';
 
@@ -185,7 +185,7 @@ export function roundtripPlan(before: Snapshot, after: Snapshot, table: string):
 		const restored = new Set(names);
 		// Put back only the edges *out of* this level, leaving deeper levels
 		// detached so these tables can still be rebuilt.
-		const next: Snapshot = {
+		const merged: Snapshot = {
 			...current,
 			tables: Object.fromEntries(
 				Object.entries(current.tables).map(([name, t]) => [
@@ -194,6 +194,29 @@ export function roundtripPlan(before: Snapshot, after: Snapshot, table: string):
 				]),
 			),
 		};
+		// `after.tables[name]` is schema-derived and structurally cannot state a
+		// `collate` ([F-107]), so a table restored straight from it renders its
+		// columns BINARY here even when the live column (`before`) carries a
+		// collation — legs 1 and 2 do not have this problem because they diff
+		// against `detachedBefore`/`detachedAfter`, which still carry it. Folding
+		// `before`'s collations onto the merged snapshot before diffing closes
+		// the gap the same way `generate` closes it for the persisted baseline.
+		//
+		// Scoped to `restored` — only those tables were just replaced with the
+		// schema-derived `after` in `merged` above. Every other table in `merged`
+		// still came from `current`/`detachedAfter`, which already carries
+		// whatever collation it had; folding `before`'s collation onto those too
+		// invents a difference (`undefined` vs `'nocase'`) that
+		// `columnDifference`'s same-value exemption does not catch, forcing an
+		// unrelated table — one with no path to the table being restored — into
+		// the plan as a spurious (and sometimes destructive) recreate.
+		const scopedBefore: Snapshot = {
+			...before,
+			tables: Object.fromEntries(
+				Object.entries(before.tables).filter(([name]) => restored.has(name)),
+			),
+		};
+		const next = carryForwardCollations(scopedBefore, merged, {});
 		const leg = diffSnapshots(current, next, {});
 		legs.push({
 			title: `${index + 3}. Restore the foreign keys of ${names.map((n) => `"${n}"`).join(', ')}`,

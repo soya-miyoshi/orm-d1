@@ -95,13 +95,55 @@ const unquote = (name: string): string =>
  * which is stable for a given CREATE TABLE and is what the rebuild re-emits.
  */
 /**
- * Blank the *contents* of single-quoted literals, keeping the quotes and the
- * length so offsets into the result still index the original SQL. `''` is
- * SQL's escape for a quote inside a literal, which a plain scan handles: the
- * closing quote of the pair immediately reopens.
+ * Blank the *contents* of single-quoted literals and both comment forms
+ * (`-- …` to end of line, `/* … *\/`), keeping delimiters where literals have
+ * them and the exact length everywhere, so offsets into the result still
+ * index the original SQL. `''` is SQL's escape for a quote inside a literal,
+ * which a plain scan handles: the closing quote of the pair immediately
+ * reopens.
+ *
+ * Comments have to be blanked here, not just literals: D1 stores a
+ * `CREATE TABLE` verbatim, comment text included, and every scan in this file
+ * that walks the DDL looking for `collate`/`check`/`generated always`/a
+ * balanced paren treats comment text as structure otherwise. A `-- TODO:
+ * collate nocase` in a comment used to be read as the column's own collation
+ * (misattributing a constraint the live column does not have — the rebuild
+ * then emits `COLLATE NOCASE` over a BINARY column, and applying it against a
+ * unique index fails with `SQLITE_CONSTRAINT`, unappliable). An unbalanced
+ * `(` or a stray `"` inside a comment used to desynchronise the paren/quote
+ * depth counters that come after this blanking, silently dropping a genuine
+ * collation that appears later in the same column span.
+ *
+ * Quoted identifiers — `"…"`, `` `…` ``, `[…]` — are matched as self-mapping
+ * alternatives for the same reason the `'…'` string-literal alternative is:
+ * in the alternation, whichever branch matches at a given start position wins
+ * and its span is consumed whole, never rescanned by the comment branches
+ * that come after it. A dash-dash or slash-star cannot occur anywhere in
+ * valid SQLite outside a literal, so a column named `"a--b"` or `` `a` `` with
+ * a slash-star in it had its own quoted name read as the start of a comment,
+ * blanking everything from there to end-of-line (or to the next unrelated
+ * comment close) — constraints and even later column definitions vanished
+ * from the scan a line or more away from the identifier that triggered it.
+ *
+ * Unlike `'…'`, an identifier's own text is passed through unblanked: callers
+ * such as `columnDefinitionStart` search the *blanked* text for the literal
+ * `"columnName"` span to anchor on, so erasing an identifier's contents here
+ * would make every quoted column unfindable. An identifier cannot smuggle a
+ * dash-dash, slash-star, or `'` that changes how the *rest* of the scan is
+ * read — its doubled-quote escape is the only special sequence it carries,
+ * and the regex already accounts for it — so passing it through verbatim is
+ * safe.
  */
 const blankLiterals = (text: string): string =>
-	text.replaceAll(/'(?:[^']|'')*'/g, (literal) => `'${' '.repeat(literal.length - 2)}'`);
+	text.replaceAll(
+		/'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|--[^\n]*|\/\*[\s\S]*?\*\//g,
+		(span) => {
+			const open = span[0];
+			if (open === "'") return `'${' '.repeat(span.length - 2)}'`;
+			if (open === '"' || open === '`' || open === '[') return span;
+			return ' '.repeat(span.length);
+		},
+	);
 
 export const parseChecks = (
 	sql: string,
@@ -124,8 +166,19 @@ export const parseChecks = (
 		let depth = 1;
 		let i = start;
 		while (i < scan.length && depth > 0) {
-			if (scan[i] === '(') depth++;
-			else if (scan[i] === ')') depth--;
+			const ch = scan[i];
+			// Quote-aware, like every other balanced-paren scan in this file: a
+			// column named `"a("` inside the check's expression (e.g. `check
+			// ("a(" <> '')`) must not desynchronise depth, or the scan runs past
+			// the constraint's real close paren and swallows the rest of the
+			// table body — including later columns — into `value` ([F-108]'s
+			// class, unfixed here even after `skipQuotedIdentifier` was written).
+			if (ch === '"' || ch === '`' || ch === '[') {
+				i = skipQuotedIdentifier(scan, i);
+				continue;
+			}
+			if (ch === '(') depth++;
+			else if (ch === ')') depth--;
 			i++;
 		}
 		checks[name] = { name, value: sql.slice(start, i - 1).trim() };
@@ -165,6 +218,43 @@ export const hasAutoincrement = (sql: string, columnName: string): boolean =>
  * function's, so a schema-side spelling and a live one still round-trip
  * byte-for-byte through `createTableFromSnapshot`.
  */
+/**
+ * If `scan[i]` opens a quoted identifier — `"…"`, `` `…` ``, or `[…]`, the
+ * three spellings SQLite accepts and `parseIndexColumns`'s anchor already
+ * treats as first-class — advance past its matching close (verbatim, `""`/
+ * ` `` ` escape included for the quote forms) and return the new index.
+ * Otherwise return `i` unchanged.
+ *
+ * Shared by every balanced-paren scan below so an identifier's embedded `(`,
+ * `)`, or `"` can never desynchronise paren depth: `"a("` used to push depth
+ * to 2 and swallow the rest of the table body ([F-108]), and the same was
+ * true, unfixed, of the backtick/bracket spellings and of `parseGenerated`'s
+ * own copy of this scan.
+ */
+const skipQuotedIdentifier = (scan: string, i: number): number => {
+	const ch = scan[i];
+	if (ch === '"' || ch === '`') {
+		let j = i + 1;
+		while (j < scan.length) {
+			if (scan[j] === ch) {
+				if (ch === '"' && scan[j + 1] === '"') {
+					j += 2;
+					continue;
+				}
+				j++;
+				break;
+			}
+			j++;
+		}
+		return j;
+	}
+	if (ch === '[') {
+		const close = scan.indexOf(']', i + 1);
+		return close === -1 ? scan.length : close + 1;
+	}
+	return i;
+};
+
 export const parseColumnCollation = (sql: string, columnName: string): string | undefined => {
 	const scan = blankLiterals(sql);
 	const anchor = new RegExp(columnDefinitionStart(columnName), 'i').exec(scan);
@@ -174,51 +264,114 @@ export const parseColumnCollation = (sql: string, columnName: string): string | 
 	// top-level comma (the next column, or a table-level constraint) or the
 	// closing paren of the column list — crossing nested parens rather than
 	// stopping at their first `)`, the same balanced scan `parseGenerated` uses
-	// for its expression. `[^,]*?` here used to stop at the *first* `collate`
-	// found anywhere later in the text, which is also legal inside a
-	// `unique (…)`/`primary key (…)`/`check (…)` clause's indexed-column
-	// grammar (`unique ("email" collate nocase)` is the standard idiom for
-	// case-insensitive uniqueness) — misattributing that constraint's
-	// collation to the column itself. It also stopped scanning at the first
-	// comma even *inside* a call, e.g. `check (substr("email", 1, 1) <> '@')
-	// collate nocase`, missing a collation that genuinely belongs to the
-	// column because a comma inside `substr(...)` looked like the column
-	// definition's end.
+	// for its expression.
+	//
+	// A `COLLATE` is only ever the column's own when it sits at the *top
+	// level* of this span (paren depth 0): a `constraint … check (…)` or
+	// `generated always as (…)` opens a paren immediately after the keyword,
+	// so anything inside it — including a `collate` the sub-expression itself
+	// uses, e.g. `check ("status" collate nocase in (...))` — sits at depth
+	// >= 1 and is skipped ([F-106]; a version of this function that matched
+	// `collate` anywhere in the whole span misattributed that one to the
+	// column, and a rebuild that believed it invented `COLLATE NOCASE` over a
+	// live BINARY column, which then fails to apply against a unique index).
+	// `unique ("email" collate nocase)` at the *table* level is unreachable
+	// here regardless, since it comes after the span's closing top-level
+	// comma/paren.
+	//
+	// Depth is only counted outside a quoted identifier: `"a("`, `` `a(` ``, and
+	// `[a(]` are all legal column names whose embedded `(` must not
+	// desynchronise the counter, or the span never returns to depth 0 and
+	// swallows everything after it, including a table-level `unique(...)`
+	// clause ([F-108]).
 	let depth = 0;
 	let i = anchor.index + anchor[0].length;
+	let collate: string | undefined;
 	while (i < scan.length) {
 		const ch = scan[i];
-		if (ch === '(') depth++;
-		else if (ch === ')') {
+		if (ch === '"' || ch === '`' || ch === '[') {
+			i = skipQuotedIdentifier(scan, i);
+			continue;
+		}
+		if (ch === '(') {
+			depth++;
+			i++;
+			continue;
+		}
+		if (ch === ')') {
 			if (depth === 0) break;
 			depth--;
-		} else if (ch === ',' && depth === 0) break;
+			i++;
+			continue;
+		}
+		if (ch === ',' && depth === 0) break;
+		if (
+			depth === 0 && collate === undefined
+			// `collate` must start a new word here, not appear mid-identifier: a
+			// constraint named `b_collate` — `constraint b_collate check (...)` —
+			// otherwise matched at its own `collate` suffix and the *next* token
+			// (`check`) was read as the collation name, later rendered as
+			// `COLLATE check`, which D1 refuses (`near "check": syntax error`).
+			&& (i === 0 || !/\w/.test(scan[i - 1]!))
+		) {
+			// A bare name or a quoted one — `collate "NOCASE"`, `` collate `NOCASE` ``,
+			// and `collate [NOCASE]` are all legal SQLite and all verified forms D1
+			// stores verbatim; only matching the `"…"` spelling left the other two
+			// invisible, so a rebuild silently dropped the collation (and the
+			// meaning of any unique index built over the column).
+			const rest = scan.slice(i);
+			const match = /^collate\s+("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|\w+)/i.exec(rest);
+			if (match) {
+				const name = match[1]!;
+				collate = name.startsWith('"')
+					? name.slice(1, -1).replaceAll('""', '"')
+					: name.startsWith('`')
+					? name.slice(1, -1)
+					: name.startsWith('[')
+					? name.slice(1, -1)
+					: name;
+				i += match[0].length;
+				continue;
+			}
+		}
 		i++;
 	}
 
-	const match = /\bcollate\s+(\w+)/i.exec(scan.slice(anchor.index + anchor[0].length, i));
-	return match?.[1];
+	return collate;
 };
 
 export const parseGenerated = (
 	sql: string,
 	columnName: string,
 ): { as: string; mode: 'stored' | 'virtual' } | undefined => {
+	const scan = blankLiterals(sql);
 	const match = new RegExp(
 		`${columnDefinitionStart(columnName)}[^,]*?generated\\s+always\\s+as\\s*\\(`,
 		'i',
-	).exec(sql);
+	).exec(scan);
 	if (!match) return undefined;
 
 	// Balanced scan, not `[^)]*`: an expression is far more likely to contain
 	// parentheses than not — `upper("name")` used to come back as `upper("name`
 	// with the trailing `stored` unmatched, silently downgrading the mode.
+	//
+	// Quote-aware over `scan`, the same as `parseColumnCollation`'s span scan:
+	// a column named `"a("` (legal SQLite) used to push depth to 2 and swallow
+	// the rest of the table body into `as`, producing a migration D1 refuses
+	// with `unknown table option: virtual` ([F-108], the sub-issue this
+	// function shared with `parseColumnCollation` before both used
+	// `skipQuotedIdentifier`).
 	const start = match.index + match[0].length;
 	let depth = 1;
 	let i = start;
-	while (i < sql.length && depth > 0) {
-		if (sql[i] === '(') depth++;
-		else if (sql[i] === ')') depth--;
+	while (i < scan.length && depth > 0) {
+		const ch = scan[i];
+		if (ch === '"' || ch === '`' || ch === '[') {
+			i = skipQuotedIdentifier(scan, i);
+			continue;
+		}
+		if (ch === '(') depth++;
+		else if (ch === ')') depth--;
 		i++;
 	}
 	if (depth > 0) return undefined;
@@ -257,11 +410,21 @@ const parseIndexColumns = (sql: string | null): string[] | undefined => {
 	if (!openAfterOn) return undefined;
 	const start = openAfterOn.index + openAfterOn[0].length;
 
+	// Both scans below are quote-aware for the same reason `parseChecks` and
+	// `parseColumnCollation` are: a member such as `"a("` (legal SQLite) has an
+	// embedded `(` that must not desynchronise depth, or the scan runs past the
+	// index's real close paren, and a two-member unique index re-renders as a
+	// stricter one-member one on rebuild ([F-108]'s class).
 	let depth = 1;
 	let i = start;
 	while (i < scan.length && depth > 0) {
-		if (scan[i] === '(') depth++;
-		else if (scan[i] === ')') depth--;
+		const ch = scan[i];
+		if (ch === '"' || ch === '`' || ch === '[') {
+			i = skipQuotedIdentifier(scan, i);
+			continue;
+		}
+		if (ch === '(') depth++;
+		else if (ch === ')') depth--;
 		i++;
 	}
 	if (depth > 0) return undefined;
@@ -270,14 +433,19 @@ const parseIndexColumns = (sql: string | null): string[] | undefined => {
 	const members: string[] = [];
 	let memberStart = start;
 	let nesting = 0;
-	for (let j = start; j < bodyEnd; j++) {
+	for (let j = start; j < bodyEnd;) {
 		const ch = scan[j];
+		if (ch === '"' || ch === '`' || ch === '[') {
+			j = skipQuotedIdentifier(scan, j);
+			continue;
+		}
 		if (ch === '(') nesting++;
 		else if (ch === ')') nesting--;
 		if (ch === ',' && nesting === 0) {
 			members.push(sql.slice(memberStart, j).trim());
 			memberStart = j + 1;
 		}
+		j++;
 	}
 	const last = sql.slice(memberStart, bodyEnd).trim();
 	if (last.length > 0) members.push(last);
@@ -330,9 +498,14 @@ const parseIndexCollations = (sql: string | null): (string | undefined)[] | unde
  * the text is exactly what was written, in the order it was written.
  */
 export const parseTableOptions = (sql: string): { strict: boolean; withoutRowid: boolean } => {
-	const close = blankLiterals(sql).lastIndexOf(')');
+	// Slice the tail out of the *blanked* text, not the raw SQL: blanking removes
+	// comments, so a `)` inside one no longer bounds the column list, and a comment
+	// mentioning `strict` / `without rowid` after that point would otherwise be read
+	// as the option itself — inventing a constraint the table never had.
+	const blanked = blankLiterals(sql);
+	const close = blanked.lastIndexOf(')');
 	if (close < 0) return { strict: false, withoutRowid: false };
-	const tail = sql.slice(close + 1).toLowerCase();
+	const tail = blanked.slice(close + 1).toLowerCase();
 	return {
 		strict: /\bstrict\b/.test(tail),
 		withoutRowid: /\bwithout\s+rowid\b/.test(tail),

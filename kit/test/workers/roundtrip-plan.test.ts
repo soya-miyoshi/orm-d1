@@ -210,6 +210,84 @@ describe('roundtripPlan', () => {
 	});
 });
 
+describe('roundtripPlan leg 3 collation carry-forward', () => {
+	// Regression: `carryForwardCollations(before, merged, {})` used to walk
+	// *every* table in `before`, not just the ones just restored from the
+	// schema-derived `after` in this level. A table with no connection to the
+	// closure being restored — here "products", live-collated, sitting beside
+	// an unrelated "orgs" <- "users" <- "posts" hierarchy — got `before`'s
+	// collation folded onto its `after`-derived (uncollated) copy in `merged`,
+	// which reads as "changes its collation" and forces a spurious (sometimes
+	// destructive) recreate of a table the roundtrip never touches.
+	const adapter = {
+		async all<T>(sql: string): Promise<T[]> {
+			return (await DB.prepare(sql).all()).results as T[];
+		},
+		async batch(statements: readonly string[]): Promise<void> {
+			if (statements.length > 0) await DB.batch(statements.map((s) => DB.prepare(s)));
+		},
+	};
+
+	beforeEach(async () => {
+		for (const name of ['orders', 'products', 'posts', 'users', 'orgs']) {
+			await DB.prepare(`drop table if exists "${name}"`).run();
+		}
+		await DB.prepare('create table "orgs" ("id" text primary key, "name" text not null)').run();
+		await DB.prepare(
+			'create table "users" ("id" text primary key, '
+				+ '"org_id" text not null references "orgs"("id"))',
+		).run();
+		await DB.prepare(
+			'create table "posts" ("id" text primary key, '
+				+ '"user_id" text not null references "users"("id"))',
+		).run();
+		await DB.prepare(
+			'create table "products" ("id" text primary key, "sku" text collate nocase not null)',
+		).run();
+		await DB.prepare(
+			'create table "orders" ("id" text primary key, '
+				+ '"product_id" text not null references "products"("id"))',
+		).run();
+	});
+
+	it('does not touch a table outside the closure being restored', async () => {
+		const live = await introspect(adapter);
+
+		// `after` stands in for the schema-derived snapshot `generate` diffs
+		// against: identical shape, but structurally unable to state a
+		// `collate` the schema DSL never expressed (the same gap [F-107]
+		// closes for the persisted baseline).
+		const cloned = structuredClone(live) as typeof live;
+		const { collate: _dropped, ...skuRest } = cloned.tables['products']!.columns['sku']!;
+		const schemaDerived: typeof live = {
+			...cloned,
+			// `snapshotFromSchema` always stamps `origin: 'schema'` — it is what
+			// tells `columnDifference` an absent `collate` here means "the schema
+			// DSL cannot express one", not "the live column lost it", the same
+			// exemption that lets ordinary `generate` calls carry a collation
+			// forward across the persisted snapshot without reporting drift.
+			origin: 'schema',
+			tables: {
+				...cloned.tables,
+				products: {
+					...cloned.tables['products']!,
+					columns: { ...cloned.tables['products']!.columns, sku: skuRest },
+				},
+			},
+		};
+
+		const plan = roundtripPlan(live, schemaDerived, 'orgs');
+		expect(plan.incomplete).toBe(false);
+		for (const leg of plan.legs) {
+			expect(leg.errors).toEqual([]);
+			for (const statement of leg.statements) {
+				expect(statement.sql).not.toContain('products');
+				expect(statement.sql).not.toContain('orders');
+			}
+		}
+	});
+});
+
 describe('renderRoundtrip', () => {
 	it('leads with a refusal to be treated as a migration', () => {
 		const text = renderRoundtrip(roundtripPlan(before, after, 'rt_parent'));
