@@ -50,7 +50,59 @@ failing cannot starve the other two.
   `[F-018]` are regressions this batch introduced and should be the next thing fixed,
   whichever lens picks them up.
 
-The `## Audit areas` checklist below predates the rotation and is correctness-shaped, so it
+The `## Findings — iteration 8 (efficiency + bugs)
+
+Lens: **efficiency + bugs**, branch `sweep/efficiency-bugs-20260817-125622`.
+
+### [F-098] A table rename leaves every referencing FK pointing at the old name — status: todo — severity: **high** — area: kit/diff — lens: efficiency + bugs
+- **Where**: `kit/src/core/diff.ts:407`
+- **Defect**: `effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: false }` renames only the table's own entry; every other table's `ForeignKeySnapshot.tableTo` / `ColumnSnapshot.references.tableTo` (and the renamed table's own self-references) still names the old table, while SQLite's `ALTER TABLE … RENAME TO` rewrites every `REFERENCES` clause since 3.25.
+- **Failure scenario**: (A) `users` → `people` with `posts.author_id references users.id`: `requiresRecreate` reports `a foreign key changes`, so `generate` emits a full `__new_posts` copy + `drop table "posts"` (destructive, needs `--accept-data-loss`) for a schema that is already correct; with a third level (`comments`) `dependentTables` refuses and `generate` throws — the rename cannot be expressed at all. (B) self-referencing `nodes(parent_id → nodes.id)` renamed to `trees` errors with a remedy ("drop the foreign key, or migrate the child table in the same migration") that is impossible for a self-reference.
+- **Fix**: in step 1 of `diffSnapshots`, after building `effectiveBefore`, repoint every `tableTo` matching a renamed source across **all** tables, including the renamed table itself — mirroring what the `ALTER` actually does.
+- **Prove it**: `kit/test/unit/diff.test.ts`, next to `applies explicit renames instead of dropping and recreating`: assert the `users`→`people` diff collapses to exactly `['alter table "users" rename to "people"']` with no errors, plus a self-FK case asserting `errors` is empty.
+
+### [F-099] `nullableTables` misses tables joined before a `right`/`full` join, so they materialise as an object of nulls — status: todo — severity: **high** — area: sql/compile — lens: efficiency + bugs
+- **Where**: `src/plan/compile.ts:146` (and `explicitNullableGroups` at `:202`, which shares the same set)
+- **Defect**: `right`/`full` add only `plan.from` to `nullableTables`; Drizzle marks **every** table already in the map nullable (`drizzle-orm/sqlite-core/query-builders/select.js:111-121`).
+- **Failure scenario**: `db.select().from(users).innerJoin(profiles, …).rightJoin(events, …)`. For an `events` row with no matching user the driver returns all-null for `users.*` and `profiles.*`; orm-d1 maps `users: null` but `profiles: { id: null, userId: null, bio: null }` where Drizzle returns `profiles: null`. The declared type is non-null, so `if (row.profiles) use(row.profiles.id)` compiles, the guard passes, and `id` is silently `null`. Same for `.innerJoin(profiles).fullJoin(events)`.
+- **Fix**: track nullability as an ordered map as Drizzle does — start `{ [from]: notNull }` and fold each join in declaration order: `left` → that table nullable; `inner`/`cross` → not-null; `right` → all existing nullable + this one not-null; `full` → all existing nullable + this one nullable. `AddJoin` needs the same treatment so `rightJoin`/`fullJoin` widen previously joined entries, not just `baseRow`.
+- **Prove it**: `test/unit/compile-select.test.ts` — build the plan above, feed `compiled.map([[null,null,null,null,null,7,null]])`, assert `rows[0].profiles === null`.
+
+### [F-100] `pull` drops `STRICT`, `WITHOUT ROWID` and the append-only guard — status: todo (warning half) / needs-human (sidecar) — severity: **high** — area: kit/node — lens: efficiency + bugs
+- **Where**: `kit/src/node/commands.ts:371` (`renderSchemaModule`), `pull` at `:349`
+- **Defect**: `snapshotFromIntrospection` records `strict` / `withoutRowid` / `appendOnly` correctly and `pull` journals that snapshot, but the rendered schema module has no spelling for any of them and no companion `tableOptions([...])` module is written, so the next `snapshotOfSchema` reads all three as `false`.
+- **Failure scenario**: a live `STRICT, WITHOUT ROWID` table with an append-only trigger is pulled as a plain `sqliteTable`; the very next `generate`, with no schema edit at all, emits a `__new_reads` rebuild + `drop table "reads"` and `drop trigger if exists "reads_no_update"`. `WITHOUT ROWID` is lost with no line naming it (the first `requiresRecreate` reason wins), and the single `--accept-data-loss` the operator supplies for the `drop table` takes the append-only guard with it. The onboarding command turns a protected, strictly-typed ledger into an ordinary writable table.
+- **Fix (this iteration)**: make `pull` refuse or loudly warn when the introspected snapshot carries any `strict` / `withoutRowid` / `appendOnly` the rendered module cannot express, naming the tables and the options.
+- **Question for the human**: should `pull` also render a `tableOptions([...])` sidecar next to `--schema-out` and populate `config.tableOptions`? That is new CLI output surface and a design decision, so only the warning half is batched.
+- **Prove it**: `kit/test/unit` — feed introspection of the `STRICT, WITHOUT ROWID` + trigger table through `snapshotFromIntrospection` → `renderSchemaModule` and assert the warning names the table and each unexpressible option.
+
+### [F-101] Column-level `COLLATE` is never captured, so `check` is blind to it and any rebuild drops it — status: todo — severity: **high** — area: kit/introspect — lens: efficiency + bugs
+- **Where**: `kit/src/core/introspect.ts:470-496`, `kit/src/core/snapshot.ts:44-67`
+- **Defect**: `ColumnSnapshot` has no `collate` field; `snapshotFromIntrospection` reads index-member collations but never a column's own, and `columnDefinition` / `createTableFromSnapshot` never emit one. Index members were fixed for this exact reason (`[F-061]`); columns were not.
+- **Failure scenario**: a foreign schema with `email text collate nocase not null` and a unique index on it. `orm-d1-kit check` prints "Up to date, no drift" even after the column is rebuilt as `BINARY` by hand — the command whose job is to notice a silently-dropped constraint cannot see this one. Any diff that rebuilds `users` emits `"email" text not null` with no collation, so the unique index is recreated over a `BINARY` column and `alice@x.com` / `Alice@x.com` both insert.
+- **Fix**: add `collate?: string` to `ColumnSnapshot`; parse it in `snapshotFromIntrospection` from the column's own definition in `createSql` (the same `columnDefinitionStart` anchoring `hasAutoincrement` / `parseGenerated`, on `blankLiterals(createSql)`); emit it in `createTableFromSnapshot` and `columnDefinition`; fold case in `canonicalTable` so `NOCASE` / `NoCase` compare equal. The schema DSL cannot declare it (`docs/04` — Drizzle has no `.collate()`), so schema-side `undefined` means "not stated", and a live non-`BINARY` collation against an unstated one is **reported**, not dropped.
+- **Prove it**: `kit/test/workers/foreign-schema.test.ts` — create the table against the real D1 binding, `introspect()`, assert `columns.email.collate === 'nocase'`, then assert `createTableFromSnapshot` still contains `collate nocase`.
+
+### [F-102] `Column.name` re-runs `toSnakeCase` on every read — status: todo — severity: med — area: efficiency — lens: efficiency + bugs
+- **Where**: `src/schema/columns.ts:257` (getter), `applyCasing` at `:137`
+- **Defect**: the getter runs a regex `.match()` + `.map()` + `.join()` on every access, and is read twice per column per compile (62 reads for a 31-column `compileSelect`), for a value that provably cannot change — `configureCasing` (`:97-114`) throws if the mode is set after `casingObserved` latches.
+- **Failure scenario**: measured on this checkout, `compileSelect` over 31 columns costs 9.3 µs/op at `casing: 'preserve'` and 18.8 µs/op at `casing: 'snake_case'` — ~9 µs of pure re-derivation per query on a runtime billed for request CPU.
+- **Fix**: memoize on the instance — `#resolvedName: string | undefined; get name() { return this.#resolvedName ??= this.config.explicitName ?? applyCasing(this.config.fieldName); }`. `withTable` builds a fresh `Column` from the same config, so an alias re-resolves once and no stale value leaks. `resetCasing` is `@internal` test-only and must clear the cached names (or the affected tests rebuild their tables, which `test/unit/casing.test.ts` already does).
+- **Prove it**: `test/unit/casing.test.ts` — instrument the getter with a counting wrapper and assert one `compileSelect` over an N-column table performs at most N `applyCasing` calls, keeping the existing byte-identical-to-`drizzle-orm/casing` assertions.
+
+### [F-103] `assertRoundTrip`'s invariant is weaker than it reads — constraint order differs between the two renderers — status: todo — severity: low — area: kit/render — OFF-LENS from efficiency + bugs
+- **Where**: `kit/src/core/diff.ts:53` (`columnDefinition`), `kit/src/core/snapshot.ts:410` (`createTableFromSnapshot`) vs `orm-d1/ddl`'s `createTable`
+- The snapshot path groups all uniques → all FKs → all checks; `createTable` walks `extras` in declaration order. Semantically irrelevant to SQLite, but `assertRoundTrip` only passes for schemas that happen to declare extras in the grouped order.
+
+### [F-104] Per-row closure allocation on the positional read path — status: todo — severity: low (**unmeasured**) — area: efficiency — OFF-LENS from efficiency + bugs
+- **Where**: `src/plan/mapper.ts:175`
+- One `(index) => row[index]` closure per row on the non-flat path, and `readRow` calls `read(index)` twice per column of a nullable group (inside `columnIndexes.every`, then in the recursive build). Hoisting a mutable `current` row would make the reader monomorphic and allocation-free per row.
+
+### [F-105] `dropKeys` uses `delete row[key]` per row — status: todo — severity: low (**unmeasured**) — area: efficiency — OFF-LENS from efficiency + bugs
+- **Where**: `src/relations/query.ts:761`
+- `delete` at every relational level transitions each freshly built result object into V8 dictionary mode immediately before it is returned and JSON-serialised.
+
+## Audit areas` checklist below predates the rotation and is correctness-shaped, so it
 feeds **lens 2 (efficiency + bugs)**. It is a hint, not a schedule: each lens reviews the
 whole codebase, and ticking an area off there does not retire it from future passes.
 
