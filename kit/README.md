@@ -183,8 +183,13 @@ it is the only spelling TypeScript accepts under `moduleResolution: 'node16'`/`'
 (a relative import of a `.ts` file is `TS2835`), and the kit's own loader maps it back to
 the `.ts` source, so the sidecar both typechecks and loads.
 
-No sidecar is written when nothing in the introspected snapshot needs one — and in that
-case an existing `table-options.ts` is neither read nor touched. `pull` also prints, for
+No sidecar is written when nothing in the introspected snapshot needs one. An existing
+`table-options.ts` is still *read* whenever `config.tableOptions` names it — a file that
+exists but fails to load aborts the pull before anything is written — and, with `--force`,
+it is still *rewritten*: a file whose declarations this pull is dropping is emptied to
+`tableOptions([])` rather than left on disk, because leaving it would keep those dropped
+declarations authoritative for the next `generate`. (Emptied, not deleted:
+`config.tableOptions` still names the path.) `pull` also prints, for
 every option it found, what the rendered schema module cannot express, and reminds you to
 point `orm-d1.config.ts`'s `tableOptions` at the file it wrote: writing it is only half the
 job. From then on, `generate`/`push`/`check` read it as the schema's stated intent instead
@@ -207,7 +212,20 @@ collation, but it has no way to state "stop carrying one forward" — `BINARY` (
 solely to say that un-introspectable thing, so it is the one declared value that survives
 even when the live database still shows a real collation for that column — the retirement
 just hasn't been applied there yet — again with a warning rather than silently. A declared
-*non-null* `collate` follows the boolean rule: live wins, a stale value is dropped.
+*non-null* `collate` follows the boolean rule: live wins, a stale value is dropped. So
+does a `collate: { column: null }` retirement naming a column the live table no longer has:
+carrying it would write a sidecar `validateTableOptions` then rejects, so it is dropped with
+a warning too.
+
+Every disagreement between the two sides is reported, in both directions — not only a
+declaration the live database does not back. `pull` warns when config declares
+`strict`/`withoutRowid`/`appendOnly` and live does not, when config declares one of them
+*off* and live has it on, when both sides state an `appendOnly` guard but over different
+columns (a narrowed list against a wider or whole-table live guard), when config declares a
+`collate` live does not have, when both state a collation and they differ, when a `null`
+retirement is still contradicted by a live collation, and when a declaration names a table
+or column the live database does not have. In every case except the retirement, live wins
+and the declaration is dropped from the rendered file.
 
 A declared table the live database no longer has at all is named in the output rather than
 dropped in silence — see above. Keep a copy of a hand-written sidecar anyway before

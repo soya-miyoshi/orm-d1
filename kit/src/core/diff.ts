@@ -60,6 +60,25 @@ export interface DiffOptions {
 
 const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
+/**
+ * The name `column` has on the live table right now, given the renames this
+ * diff is about to perform on `table`. `renamedColumns` is keyed
+ * `"<after table name>.<pre-rename column name>"`, so this is its inverse
+ * lookup; `column` itself when nothing renames onto it.
+ */
+const preRenameColumnName = (
+	renamedColumns: Record<string, string>,
+	table: string,
+	column: string,
+): string => {
+	for (const [key, to] of Object.entries(renamedColumns)) {
+		if (to !== column) continue;
+		const separator = key.indexOf('.');
+		if (separator > 0 && key.slice(0, separator) === table) return key.slice(separator + 1);
+	}
+	return column;
+};
+
 const columnDefinition = (column: ColumnSnapshot): string => {
 	let ddl = `${quote(column.name)} ${column.declaredType ?? column.type}`;
 	if (column.collate) ddl += ` collate ${column.collate}`;
@@ -734,13 +753,6 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 	const beforeNames = Object.keys(before.tables);
 	const afterNames = Object.keys(after.tables);
 
-	// [F-117 cont'd]: a column rename that lands on an append-only table's
-	// guarded column, tracked here so step 4 below does not re-emit the
-	// `alter table … rename column` this step already folded into the atomic
-	// rename+trigger run. Keyed the same way `renamedColumns` is: `"<after
-	// table name>.<pre-rename column name>"`.
-	const consumedColumnRenames = new Set<string>();
-
 	// 1. Renamed tables first, so later steps see matching names.
 	const effectiveBefore: Record<string, TableSnapshot> = {};
 	for (const name of beforeNames) {
@@ -772,39 +784,24 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 				// batch 2 then failed. Keeping the three statements adjacent lets
 				// `statementGroups` (extended below) treat them as one unit, the
 				// same way it already does for a rebuild's rename-then-restore.
+				//
+				// A rename of a *guarded column* is deliberately NOT folded into
+				// this run. It was, briefly, on the theory that the guard created
+				// here names `after`'s column list and would be inert until the
+				// later rename caught up — but SQLite (and D1) auto-repoint a
+				// trigger's `UPDATE OF` list across `RENAME COLUMN` (verified:
+				// after `alter table q rename column "a" to "b"`, `sqlite_master`
+				// holds `before update of "b"`), so a guard created here under the
+				// old column name is repointed by the rename itself and is never
+				// inert. Folding it forward, on the other hand, broke the case
+				// where step 4 *also* rebuilds this table: `recreateTable`'s
+				// `insert … select` reads the pre-rename column name, which D1's
+				// double-quoted-string fallback silently degrades to the constant
+				// string — every value in the column replaced by the column's old
+				// name, migration reporting success. Emitting it in step 4 (or
+				// letting the rebuild carry it) keeps that correct; the batch
+				// window is closed by grouping instead, in `statementGroups`.
 				const staysAppendOnly = Boolean(after.tables[renamed]?.appendOnly);
-
-				// [F-117 cont'd]: when the guard survives, the trigger recreated a
-				// few lines below is built from `after`'s (i.e. the *final*) column
-				// list — `UPDATE OF "occurred_at"`, say. SQLite does not validate a
-				// trigger's `UPDATE OF <column>` against the table's actual columns
-				// at CREATE time, so if the rename of that very column were left to
-				// the later per-table pass (a *different* statement group
-				// `statementGroups` can split a batch between), the trigger would
-				// sit there — created, no error — naming a column that does not
-				// exist yet, and an UPDATE of the column under its *old* name would
-				// not fire it at all: the append-only guard would be silently inert
-				// for the entire window between this group and the rename. Folding
-				// the rename in here, before the drop/create pair, closes that
-				// window the same way the original three-statement grouping closed
-				// the drop→re-create one. `statementGroups` is extended below to
-				// keep them adjacent.
-				if (staysAppendOnly) {
-					const staysAppendOnlyColumnRenames: Record<string, string> = {};
-					for (const [key, value] of Object.entries(renamedColumns)) {
-						const [tbl, col] = key.split('.');
-						if (tbl === renamed && col) staysAppendOnlyColumnRenames[col] = value;
-					}
-					for (const [from, to] of Object.entries(staysAppendOnlyColumnRenames)) {
-						if (!t.columns[from] || !after.tables[renamed]!.columns[to]) continue;
-						statements.push({
-							sql: `alter table ${quote(renamed)} rename column ${quote(from)} to ${quote(to)}`,
-							destructive: false,
-						});
-						consumedColumnRenames.add(`${renamed}.${from}`);
-					}
-				}
-
 				statements.push({
 					sql: dropAppendOnlyTrigger(name),
 					destructive: !staysAppendOnly,
@@ -848,8 +845,38 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 						// rename, the old-name drop and the new-name re-create with
 						// nothing between them" pins. De-duplicating to the rebuild's
 						// copy alone would re-open it, so the duplicate stays.
+						// Guarded columns are named here under the names they have
+						// *right now* — pre-rename — not `after`'s final names, even
+						// though `after`'s list is what decides which columns are
+						// guarded at all. The rename of a guarded column lands later
+						// (step 4, or carried by a rebuild), and a trigger whose
+						// `UPDATE OF` names a column that does not exist yet is not
+						// an error at CREATE time: SQLite simply never fires it, so
+						// the guard would be silently inert for the whole window
+						// between here and the rename. Naming the live column keeps
+						// it in force immediately, and SQLite (and D1) auto-repoint
+						// a trigger's `UPDATE OF` list across `RENAME COLUMN`
+						// (verified: after `alter table q rename column "a" to "b"`,
+						// `sqlite_master` holds `before update of "b"`), so the
+						// later rename moves the guard onto the final name by
+						// itself — which is why the rename does *not* need to be
+						// dragged forward into this run (doing that corrupted the
+						// data of any table this diff also rebuilds; see above).
+						//
+						// A whole-table guard (`undefined` column list) needs none of
+						// this, and neither does an empty result: `appendOnlyTrigger`
+						// reads an empty list as "guard every column", so falling back
+						// to `after`'s names is strictly less wrong than handing it
+						// `[]` and blocking writes the schema permits.
+						const finalGuarded = appendOnlyColumns(after.tables[renamed]!.appendOnly);
+						const liveGuarded = finalGuarded
+							?.map((column) => preRenameColumnName(renamedColumns, renamed, column))
+							.filter((column) => t.columns[column] !== undefined);
 						statements.push({
-							sql: appendOnlyTrigger(renamed, appendOnlyColumns(after.tables[renamed]!.appendOnly)),
+							sql: appendOnlyTrigger(
+								renamed,
+								liveGuarded && liveGuarded.length > 0 ? liveGuarded : finalGuarded,
+							),
 							destructive: false,
 						});
 					}
@@ -1130,12 +1157,6 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		// are expressed against the new names.
 		for (const [from, to] of Object.entries(columnRenames)) {
 			if (!previous.columns[from] || !next.columns[to]) continue;
-			// Already emitted, adjacent to the table rename and trigger
-			// re-create in step 1 — see `consumedColumnRenames` there. Emitting
-			// it again here would fail on apply ("no such column", the source
-			// name is already gone) and, worse, would put the whole point of
-			// folding it forward back out of reach of a batch split.
-			if (consumedColumnRenames.has(`${name}.${from}`)) continue;
 			statements.push({
 				sql: `alter table ${quote(name)} rename column ${quote(from)} to ${quote(to)}`,
 				destructive: false,

@@ -11,6 +11,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { integer, sqliteTable, text } from 'orm-d1';
+import { tableOptions, validateTableOptions } from 'orm-d1/ddl';
+import type { TableOptions } from 'orm-d1/ddl';
+import { sidecarDisagreementWarnings } from '../../src/node/commands.js';
+import { snapshotFromSchema } from '../../src/core/snapshot.js';
+import type { Snapshot } from '../../src/core/snapshot.js';
 import { run } from '../../src/cli.js';
 
 const project = (ddl: string, config: Record<string, unknown> = {}): string => {
@@ -157,11 +163,17 @@ describe('pull', () => {
 	// config but no longer true of the live database are stale, not a second
 	// unintrospectable spelling like `collate: null` — they do not survive
 	// into a rendered sidecar, and the operator is warned rather than left to
-	// notice only by diffing the file. Nothing in the live snapshot needs a
-	// sidecar at all here (the only options were the stale, dropped ones), so
-	// — consistent with "no sidecar written when nothing needs one" — the
-	// hand-written file is left exactly as it was; `pull` does not go on to
-	// delete or rewrite a file it decided has nothing new to say.
+	// notice only by diffing the file.
+	//
+	// [Round 4, finding 4] Nothing in the live snapshot needs a sidecar at all
+	// here (the only options were the stale, dropped ones), and `pull` used to
+	// leave the hand-written file exactly as it was — while printing "the
+	// rendered sidecar drops them". Both cannot be true: the file it left alone
+	// is what `config.tableOptions` names, so the "dropped" declarations stayed
+	// authoritative and the very next `generate` proposed rebuilding the table
+	// to put them back. The file is emptied instead (not deleted —
+	// `config.tableOptions` still names the path), which is what makes the
+	// message true.
 	it('--force drops a declared strict/appendOnly the live database no longer backs, and warns', async () => {
 		const dir = project(
 			'create table people (id integer primary key, email text);',
@@ -173,8 +185,73 @@ describe('pull', () => {
 
 		const { code, log } = await inProject(dir, ['pull', '--local', '--force']);
 		expect(code).toBe(0);
-		expect(readFileSync(join(dir, 'table-options.ts'), 'utf8')).toBe(stale);
 		expect(log).toMatch(/declares strict, appendOnly for "people", but the live database does not have/);
+
+		const written = readFileSync(join(dir, 'table-options.ts'), 'utf8');
+		expect(written).not.toBe(stale);
+		expect(written).toContain('tableOptions([])');
+		expect(log).toMatch(/Emptied table-options\.ts/);
+
+		// The point of emptying it: what `config.tableOptions` names now declares
+		// nothing, so the next `generate` has nothing to reconcile — no rebuild
+		// of "people" to put `strict`/`appendOnly` back. Asserted on the file
+		// rather than by running `generate` here: Node caches an ES module by
+		// URL, and this suite runs every CLI invocation in one process, so a
+		// `generate` in the same test would re-read the *stale* module object
+		// `pull` already imported from that path rather than what is now on disk
+		// (each real CLI run is a fresh process — see `store.ts`'s note).
+		expect(readFileSync(join(dir, 'table-options.ts'), 'utf8')).not.toMatch(/strict|appendOnly/);
+	});
+
+	// [Round 4, finding 4, other half] The file is only emptied when it is the
+	// one the declarations were read from. A `--table-options-out` pointing
+	// somewhere else must not clear an unrelated file.
+	it('leaves a file --table-options-out points at alone when it is not the declared sidecar', async () => {
+		const dir = project(
+			'create table people (id integer primary key, email text);',
+			{ tableOptions: './table-options.ts' },
+		);
+		const stale = `const brand = Symbol.for('ormD1:TableOptions');\n`
+			+ 'export default { [brand]: true, byTable: { people: { strict: true } } };\n';
+		writeFileSync(join(dir, 'table-options.ts'), stale);
+		writeFileSync(join(dir, 'other.ts'), '// unrelated\n');
+
+		const { code } = await inProject(dir, ['pull', '--local', '--force', '--table-options-out', './other.ts']);
+		expect(code).toBe(0);
+		expect(readFileSync(join(dir, 'other.ts'), 'utf8')).toBe('// unrelated\n');
+	});
+
+	// [Round 4, finding 2] A `collate: null` retirement naming a column the live
+	// table no longer has used to be carried into the rendered sidecar
+	// unconditionally — the table-level analogue is existence-checked, this was
+	// not. The file `pull` wrote was then rejected by `validateTableOptions`
+	// ("collate names ... which is not a column"), so every later command failed
+	// on the file `pull` itself had just produced.
+	it('--force drops a collate: null retirement for a column the live table no longer has', async () => {
+		const dir = project(
+			'create table users (id integer primary key, email text collate nocase);',
+			{ tableOptions: './table-options.ts' },
+		);
+		const stale = `const brand = Symbol.for('ormD1:TableOptions');\n`
+			+ 'export default { [brand]: true, byTable: { users: { collate: { legacy_id: null } } } };\n';
+		writeFileSync(join(dir, 'table-options.ts'), stale);
+
+		const { code, log } = await inProject(dir, ['pull', '--local', '--force']);
+		expect(code).toBe(0);
+		const sidecar = readFileSync(join(dir, 'table-options.ts'), 'utf8');
+		expect(sidecar).not.toContain('legacy_id');
+		expect(sidecar).toContain(`"email": "nocase"`);
+		expect(log).toMatch(/declares collate for "users"\."legacy_id", which the live table does not have/);
+
+		// And the file it wrote is one `validateTableOptions` accepts — that check
+		// is over the *columns a collate map names*, and the rendered map now
+		// names only live columns. Asserted directly rather than by running
+		// `generate` in this process, for the module-caching reason above.
+		const users = sqliteTable('users', { id: integer('id').primaryKey(), email: text('email') });
+		// The shape `pull` used to write is exactly the one that check rejects…
+		expect(validateTableOptions(users, { collate: { legacy_id: null, email: 'nocase' } })).toMatch(/legacy_id/);
+		// …and the shape it writes now passes.
+		expect(validateTableOptions(users, { collate: { email: 'nocase' } })).toBeUndefined();
 	});
 
 	// [F-097 cont'd] A stale `table-options.ts` that imports a binding the
@@ -234,5 +311,68 @@ describe('pull', () => {
 		const { code, log } = await inProject(dir, ['pull', '--local', '--force']);
 		expect(code).toBe(0);
 		expect(log).toMatch(/declares "gone", which the live database does not have/);
+	});
+});
+
+/**
+ * [Round 4, finding 3] `sidecarDisagreementWarnings` used to cover only the
+ * null-vs-non-null edges — "declared and live has none" for the booleans and
+ * for `collate`, plus a kept `null` retirement live contradicts. Every other
+ * way the two sides can disagree (both stating a value, and not the same one)
+ * was resolved in favour of live and reported to nobody, which is the shape
+ * most likely to be a mistake rather than staleness: the operator wrote
+ * something down and silently got something else back.
+ */
+describe('sidecarDisagreementWarnings covers both directions', () => {
+	const live = (options: Parameters<typeof tableOptionsMap>[0]): Snapshot =>
+		snapshotFromSchema([liveTable], '', tableOptionsMap(options));
+	const liveTable = sqliteTable('t', { id: integer('id').primaryKey(), email: text('email') });
+	const tableOptionsMap = (options: TableOptions) => tableOptions([[liveTable, options]]);
+
+	it('warns when both sides state a collation and they differ', () => {
+		const warnings = sidecarDisagreementWarnings(live({ collate: { email: 'nocase' } }), {
+			t: { collate: { email: 'rtrim' } },
+		});
+		expect(warnings.join('\n')).toMatch(/declares collate rtrim for "t"\."email".*has collate nocase/);
+	});
+
+	it('says nothing when both sides state the same collation', () => {
+		expect(sidecarDisagreementWarnings(live({ collate: { email: 'nocase' } }), {
+			t: { collate: { email: 'NOCASE' } },
+		})).toEqual([]);
+	});
+
+	it('warns when the config declares strict/withoutRowid/appendOnly off and the live database has them on', () => {
+		const warnings = sidecarDisagreementWarnings(
+			live({ strict: true, withoutRowid: true, appendOnly: true }),
+			{ t: { strict: false, withoutRowid: false, appendOnly: false } },
+		);
+		expect(warnings.join('\n')).toMatch(/declares strict, withoutRowid, appendOnly off for "t"/);
+	});
+
+	it('says nothing when the config simply omits an option the live database has', () => {
+		// Omission states nothing, so it is not a disagreement — only an
+		// explicit `false` is.
+		expect(sidecarDisagreementWarnings(live({ strict: true }), { t: {} })).toEqual([]);
+	});
+
+	it('warns when a declared appendOnly column list is narrower than the live guard', () => {
+		const warnings = sidecarDisagreementWarnings(live({ appendOnly: true }), {
+			t: { appendOnly: ['email'] },
+		});
+		expect(warnings.join('\n')).toMatch(/appendOnly for "t" over "email".*live guard covers the whole table/);
+	});
+
+	it('warns when both sides state a column list and they differ', () => {
+		const warnings = sidecarDisagreementWarnings(live({ appendOnly: ['id', 'email'] }), {
+			t: { appendOnly: ['email'] },
+		});
+		expect(warnings.join('\n')).toMatch(/appendOnly for "t" over "email".*live guard covers "email", "id"/);
+	});
+
+	it('says nothing when both sides state the same column list, in any order', () => {
+		expect(sidecarDisagreementWarnings(live({ appendOnly: ['id', 'email'] }), {
+			t: { appendOnly: ['email', 'id'] },
+		})).toEqual([]);
 	});
 });

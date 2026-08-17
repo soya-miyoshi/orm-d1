@@ -198,7 +198,12 @@ const RENAME_TO_PATTERN = new RegExp(
 	'i',
 );
 const RENAME_COLUMN_PATTERN = new RegExp(
-	`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+column\\s+${IDENTIFIER_SOURCE}\\s+to\\s+${IDENTIFIER_SOURCE}\\s*$`,
+	// `(?:…)` around every inserted `IDENTIFIER_SOURCE`, not bare: the source is
+	// a top-level alternation of the four spellings, so interpolating it
+	// unwrapped makes the *whole* pattern an alternation — one alternative of
+	// which is a lone bare identifier followed by `\s*$`, matching almost any
+	// statement that ends in a word, with capture group 1 undefined.
+	`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+column\\s+(?:${IDENTIFIER_SOURCE})\\s+to\\s+(?:${IDENTIFIER_SOURCE})\\s*$`,
 	'i',
 );
 // A generic capture-then-compare pattern here would be wrong: `.exec()`
@@ -263,6 +268,20 @@ function buildCreateTriggerPattern(triggerName: string): RegExp {
 	);
 }
 
+// The generic (name-capturing) spellings of the guard swap, for the case where
+// no table rename precedes it and there is therefore no `fromName`/`toName` to
+// build a name-specific pattern from. `\\s` rather than `\\b` after the
+// captured identifier, for the reason spelled out on
+// `buildCreateTriggerPattern`.
+const DROP_TRIGGER_IF_EXISTS_PATTERN = new RegExp(
+	`^\\s*drop\\s+trigger\\s+if\\s+exists\\s+(${IDENTIFIER_SOURCE})\\s*$`,
+	'i',
+);
+const CREATE_TRIGGER_NAMED_PATTERN = new RegExp(
+	`^\\s*create\\s+trigger\\s+(${IDENTIFIER_SOURCE})\\s`,
+	'i',
+);
+
 export function statementGroups(statements: readonly string[]): number[] {
 	const groups: number[] = new Array(statements.length);
 	let nextGroup = 0;
@@ -322,6 +341,51 @@ export function statementGroups(statements: readonly string[]): number[] {
 				for (let k = i; k <= end; k++) groups[k] = group;
 				i = end + 1;
 				continue;
+			}
+		}
+
+		// The same guard window, without a table rename in front of it. A rename
+		// of a *guarded* column on a table that keeps its name makes
+		// `diffSnapshots` re-state the guard (its `UPDATE OF` list is keyed on
+		// column names, so narrowing/renaming changes the key): it emits
+		// `alter table X rename column …`, then `drop trigger if exists
+		// "X_no_update"`, then `create trigger "X_no_update"`. The branch above
+		// only starts at a table rename, so these stayed three singleton groups —
+		// and a batch boundary between the drop and the re-create left the table
+		// genuinely unprotected (UPDATE permitted) for as long as the next batch
+		// took, and for good if that batch failed. Exactly the hole the
+		// table-rename case already had closed; close it here too.
+		//
+		// Two entry points, because the guard pair is what actually has to be
+		// atomic: a run of column renames on one table that leads straight into
+		// the pair (grouped from the first rename, so the trigger is never
+		// re-created against a column name that has not landed yet), and the
+		// bare pair on its own (a guard merely being narrowed, with no rename).
+		{
+			let end = i;
+			const columnRenameStart = RENAME_COLUMN_PATTERN.exec(statements[i]!);
+			if (columnRenameStart) {
+				const owner = foldAsciiCase(normalizeIdentifierToken(columnRenameStart[1]!));
+				for (;;) {
+					const next = end + 1 < statements.length ? RENAME_COLUMN_PATTERN.exec(statements[end + 1]!) : null;
+					if (!next || foldAsciiCase(normalizeIdentifierToken(next[1]!)) !== owner) break;
+					end += 1;
+				}
+			}
+			const dropIndex = columnRenameStart ? end + 1 : i;
+			const dropMatch = dropIndex < statements.length
+				? DROP_TRIGGER_IF_EXISTS_PATTERN.exec(statements[dropIndex]!)
+				: null;
+			const droppedTrigger = dropMatch ? normalizeIdentifierToken(dropMatch[1]!) : undefined;
+			if (droppedTrigger !== undefined && dropIndex + 1 < statements.length) {
+				const createMatch = CREATE_TRIGGER_NAMED_PATTERN.exec(statements[dropIndex + 1]!);
+				const createdTrigger = createMatch ? normalizeIdentifierToken(createMatch[1]!) : undefined;
+				if (createdTrigger !== undefined && foldAsciiCase(createdTrigger) === foldAsciiCase(droppedTrigger)) {
+					const group = nextGroup++;
+					for (let k = i; k <= dropIndex + 1; k++) groups[k] = group;
+					i = dropIndex + 2;
+					continue;
+				}
 			}
 		}
 

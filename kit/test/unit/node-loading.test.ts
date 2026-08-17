@@ -282,6 +282,34 @@ describe('importModule', () => {
 		expect(runImportUnderPlainNode(dir, join(dir, 'options.ts'))).toBe('from-js');
 	});
 
+	// [Round 4, finding 5] The two branches that hand `nextResolve` the
+	// specifier as written — an explicit TypeScript extension, and the
+	// fallthrough for a specifier no candidate suffix matched — ignored
+	// `parentDir`, so Node resolved them against the *scratch* directory the
+	// shim lives in. Both worked before the shim moved out of the source
+	// directory and broke silently when it did: nothing relative to the real
+	// module is there.
+	it('resolves a relative specifier with an explicit .mts extension from the importing file\'s directory', () => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		writeFileSync(join(dir, 'helpers.mts'), "export const users = 'from-mts';\n");
+		writeFileSync(join(dir, 'schema.ts'), "export { users } from './helpers.mts';\n");
+
+		expect(runImportUnderPlainNode(dir, join(dir, 'schema.ts'))).toBe('from-mts');
+	});
+
+	it('resolves a relative .json import from the importing file\'s directory', () => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		writeFileSync(join(dir, 'fixtures.json'), '{"users":"from-json"}\n');
+		writeFileSync(
+			join(dir, 'schema.ts'),
+			"import data from './fixtures.json' with { type: 'json' };\nexport const users = data.users;\n",
+		);
+
+		expect(runImportUnderPlainNode(dir, join(dir, 'schema.ts'))).toBe('from-json');
+	});
+
 	it('leaves bare specifiers to Node, so a real package is not shadowed', async () => {
 		const dir = scratch();
 		// A sibling file named like the package: if the hook rewrote bare

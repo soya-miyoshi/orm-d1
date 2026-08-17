@@ -96,9 +96,23 @@ const registerResolveHook = (): void => {
 			if (!parentUrl?.startsWith('file:')) return nextResolve(specifier, context);
 			const parentDir = origin ? dirname(origin) : dirname(fileURLToPath(parentUrl));
 
+			// Every remaining branch resolves against `parentDir` — the directory
+			// of the *original* importing file, not of the shim Node thinks is
+			// the parent. Handing `nextResolve` the specifier as written makes
+			// Node resolve it against the scratch directory the shim lives in,
+			// where nothing relative to the real module exists. Only when the
+			// target is actually there: otherwise fall through unchanged, so
+			// Node produces its own (better) error for a genuinely missing file.
+			const againstParent = (spec: string): string | undefined => {
+				const candidate = join(parentDir, spec);
+				return existsSync(candidate) ? pathToFileURL(candidate).href : undefined;
+			};
+
 			// A relative specifier that already names a *TypeScript* extension is
-			// resolvable as written.
-			if (/\.[cm]?tsx?$/.test(specifier)) return nextResolve(specifier, context);
+			// resolvable as written — but still only from the right directory.
+			if (/\.[cm]?tsx?$/.test(specifier)) {
+				return nextResolve(againstParent(specifier) ?? specifier, context);
+			}
 
 			const jsExtension = Object.keys(JS_TO_TS_SUFFIXES).find((ext) => specifier.endsWith(ext));
 			if (jsExtension) {
@@ -111,7 +125,7 @@ const registerResolveHook = (): void => {
 				for (const suffix of JS_TO_TS_SUFFIXES[jsExtension]!) {
 					if (existsSync(stem + suffix)) return nextResolve(pathToFileURL(stem + suffix).href, context);
 				}
-				return nextResolve(specifier, context);
+				return nextResolve(againstParent(specifier) ?? specifier, context);
 			}
 
 			const base = join(parentDir, specifier);
@@ -120,7 +134,11 @@ const registerResolveHook = (): void => {
 					return nextResolve(pathToFileURL(base + suffix).href, context);
 				}
 			}
-			return nextResolve(specifier, context);
+			// No TypeScript source under any candidate suffix — but the specifier
+			// may name a file that needs no suffix at all (a `.json` imported with
+			// an import attribute, say), which still has to be found next to the
+			// original importer rather than next to the shim.
+			return nextResolve(againstParent(specifier) ?? specifier, context);
 		},
 	});
 };

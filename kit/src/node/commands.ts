@@ -6,7 +6,7 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { configureCasing, getTableName, isTable } from 'orm-d1';
-import { validateTableOptions } from 'orm-d1/ddl';
+import { appendOnlyKey, validateTableOptions } from 'orm-d1/ddl';
 import type { TableOptions } from 'orm-d1/ddl';
 import {
 	appliedMigrations,
@@ -373,6 +373,18 @@ export interface PullResult {
 	 * does not get a pointless sidecar file.
 	 */
 	readonly tableOptions: string | undefined;
+	/**
+	 * What an existing `config.tableOptions` sidecar declares that this pull is
+	 * *not* carrying into `tableOptions` above — every declaration for a table
+	 * the live database still has, minus the `collate: null` retirements that do
+	 * survive. Non-empty means the file on disk is now stale, which is what the
+	 * CLI's "the rendered sidecar drops them" lines claim: the caller has to
+	 * rewrite the file for that claim to be true, and when nothing live needs a
+	 * sidecar at all (`tableOptions === undefined`) rewriting it is the *only*
+	 * way — leaving it alone would leave the dropped declarations authoritative
+	 * for the next generate.
+	 */
+	readonly droppedDeclarations: readonly string[];
 }
 
 /**
@@ -449,7 +461,23 @@ export async function pullSnapshot(
 		);
 	}
 
-	return { snapshot, schema, tableOptions };
+	// Which declared tables the rendered sidecar does not (or would not) carry:
+	// everything declared for a live table whose only surviving spelling — a
+	// `collate: null` retirement on a column that still exists — is absent.
+	// Tables the live database no longer has are excluded: they are reported
+	// separately just above, and there is nothing this pull could write for
+	// them either way.
+	const droppedDeclarations = Object.entries(declared ?? {})
+		.filter(([name, carried]) => {
+			const table = snapshot.tables[name];
+			if (!table) return false;
+			const retained = Object.entries(carried.collate ?? {})
+				.some(([column, value]) => value === null && table.columns[column]);
+			return !retained && Object.keys(carried).length > 0;
+		})
+		.map(([name]) => name);
+
+	return { snapshot, schema, tableOptions, droppedDeclarations };
 }
 
 /**
@@ -605,6 +633,46 @@ export function sidecarDisagreementWarnings(
 		if (carried.strict && !table.strict) stale.push('strict');
 		if (carried.withoutRowid && !table.withoutRowid) stale.push('withoutRowid');
 		if (carried.appendOnly && !table.appendOnly) stale.push('appendOnly');
+
+		// The other direction of the same disagreement: config says the option
+		// is *off* (an explicit `false`, not an omission — omitting a key states
+		// nothing and is not a disagreement) while the live database has it on.
+		// The rendered sidecar states the live value, so the declaration is
+		// dropped just as surely as a stale `true` is, and used to be dropped
+		// silently — the operator's "we turned this off" never took effect and
+		// nothing said so.
+		const overridden: string[] = [];
+		if (carried.strict === false && table.strict) overridden.push('strict');
+		if (carried.withoutRowid === false && table.withoutRowid) overridden.push('withoutRowid');
+		if (carried.appendOnly === false && table.appendOnly) overridden.push('appendOnly');
+		if (overridden.length > 0) {
+			warnings.push(
+				`config.tableOptions declares ${overridden.join(', ')} off for "${name}", but the live database has `
+					+ `${overridden.length > 1 ? 'them' : 'it'} — the rendered sidecar states the live setting, so the `
+					+ `declaration is dropped. Migrate the database if you meant to turn ${
+						overridden.length > 1 ? 'them' : 'it'
+					} off.`,
+			);
+		}
+
+		// And the case where both sides state an `appendOnly` guard but not the
+		// same one: a declared column list against a live whole-table guard, or
+		// against a different (usually wider) live list. Neither half is a "stale
+		// true" or a "declared false", so both checks above miss it, and the
+		// rendered sidecar quietly widens the guard back to whatever is live.
+		if (
+			carried.appendOnly && table.appendOnly
+			&& appendOnlyKey(carried.appendOnly) !== appendOnlyKey(table.appendOnly)
+		) {
+			const describe = (value: boolean | readonly string[]): string =>
+				typeof value === 'boolean' ? 'the whole table' : [...value].map((c) => `"${c}"`).join(', ');
+			warnings.push(
+				`config.tableOptions declares appendOnly for "${name}" over ${describe(carried.appendOnly)}, but the `
+					+ `live guard covers ${describe(table.appendOnly)} — the rendered sidecar states the live guard, `
+					+ 'so the declaration is dropped. Migrate the database if you meant to change what is guarded.',
+			);
+		}
+
 		if (stale.length > 0) {
 			warnings.push(
 				`config.tableOptions declares ${stale.join(', ')} for "${name}", but the live database does not have `
@@ -615,6 +683,20 @@ export function sidecarDisagreementWarnings(
 		}
 
 		for (const [column, value] of Object.entries(carried.collate ?? {})) {
+			// A declaration for a column the live table no longer has — dropped
+			// (including a `null` retirement, the one spelling that otherwise
+			// survives a live disagreement), because `validateTableOptions`
+			// rejects a `collate` map naming a column that does not exist, so
+			// carrying it would make `pull` write a file no later command can
+			// load.
+			if (!table.columns[column]) {
+				warnings.push(
+					`config.tableOptions declares collate for "${name}"."${column}", which the live table does not `
+						+ 'have — the rendered sidecar drops it (a collate entry for a column that does not exist is '
+						+ 'rejected outright). Restore the entry by hand if the column is coming back under that name.',
+				);
+				continue;
+			}
 			const live = table.columns[column]?.collate;
 			const liveNonBinary = live && live.toLowerCase() !== 'binary' ? live : undefined;
 			if (value === null) {
@@ -630,6 +712,18 @@ export function sidecarDisagreementWarnings(
 					`config.tableOptions declares collate ${value} for "${name}"."${column}", but the live database `
 						+ 'does not have it — the rendered sidecar drops it rather than resurrecting a collation '
 						+ 'nothing live backs.',
+				);
+			} else if (liveNonBinary.toLowerCase() !== value.toLowerCase()) {
+				// Both sides state a collation and they are not the same one. Live
+				// wins (the rule this whole function annotates), so the declared
+				// value is dropped — and used to be dropped in silence, which is
+				// the one shape of this disagreement most likely to be a real
+				// mistake rather than staleness: the operator wrote a collation
+				// down and got a different one back.
+				warnings.push(
+					`config.tableOptions declares collate ${value} for "${name}"."${column}", but the live database `
+						+ `has collate ${liveNonBinary} — the rendered sidecar states the live collation, so the `
+						+ 'declaration is dropped. Migrate the column if you meant to change it.',
 				);
 			}
 		}
@@ -868,6 +962,22 @@ export function renderSchemaModule(snapshot: Snapshot): string {
  * Returns `undefined` when no table in the snapshot needs any of the four —
  * so `pull` does not write an empty, pointless module.
  */
+/**
+ * The sidecar with nothing in it: what `pull --force` writes over an existing
+ * `config.tableOptions` file whose declarations it is dropping and that the
+ * live database gives it nothing to put back. Emptied rather than deleted —
+ * `config.tableOptions` still names the path and `loadTableOptions` throws on
+ * a missing file — and it still has to parse and export a `tableOptions()`
+ * map, so the rest of the kit reads "nothing declared" instead of failing.
+ */
+export const EMPTY_TABLE_OPTIONS_MODULE = `import { tableOptions } from 'orm-d1/ddl';
+
+// Written by \`orm-d1-kit pull --force\`: nothing in the live database needs a
+// table-options declaration. Add entries here as you add options the schema
+// DSL cannot state.
+export default tableOptions([]);
+`;
+
 export function renderTableOptionsModule(
 	snapshot: Snapshot,
 	schemaModuleSpecifier: string,
@@ -905,7 +1015,14 @@ export function renderTableOptionsModule(
 			if (c.collate && c.collate.toLowerCase() !== 'binary') collate.set(c.name, c.collate);
 		}
 		for (const [column, value] of Object.entries(declared?.[table.name]?.collate ?? {})) {
-			if (value === null) collate.set(column, null);
+			// Only for a column the live table actually still has. A retirement
+			// naming a column that has since been dropped or renamed is as stale
+			// as any other declaration — and carrying it forward writes a sidecar
+			// `validateTableOptions` (`src/ddl.ts`) then rejects for naming an
+			// unknown column, i.e. `pull` producing a file that breaks every
+			// later command. Named out loud by the caller, the same way a
+			// declaration for a whole table the live database lacks is.
+			if (value === null && table.columns[column]) collate.set(column, null);
 		}
 		if (collate.size > 0) {
 			const rendered = [...collate].map(([name, value]) => `${JSON.stringify(name)}: ${JSON.stringify(value)}`);

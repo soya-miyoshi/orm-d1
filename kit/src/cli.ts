@@ -14,6 +14,7 @@ import type { CommandContext, TargetFlags } from './node/commands.js';
 import {
 	backfillCommand,
 	check,
+	EMPTY_TABLE_OPTIONS_MODULE,
 	generate,
 	impact,
 	journalPulledBaseline,
@@ -70,9 +71,13 @@ Options
                           non-BINARY column collation to state
   --force               let \`pull\` overwrite an existing schema or tableOptions
                           file. Lossy for a hand-maintained tableOptions file:
-                          comments and options for tables the live database no
-                          longer has do not survive. Options config.tableOptions
-                          declares for tables that do exist live are carried over.
+                          the live database wins on every option it can state, so
+                          comments, options for tables it no longer has, and any
+                          declaration it disagrees with are all dropped. The one
+                          thing carried over is a \`collate: { column: null }\`
+                          retirement — and only for a column that still exists —
+                          because introspection cannot state it; everything else
+                          is re-derived from live.
 
 Renames — repeatable, and the alternative to dropping the data
   --rename-table old_table=new_table
@@ -338,21 +343,49 @@ export async function run(argv: readonly string[]): Promise<number> {
 			// perfectly ordinary `pull` (skipping `schema.ts` with it) over a file
 			// nothing was going to touch. Still before any write: `pullSnapshot`
 			// above is read-only, so a refusal here leaves nothing on disk either.
-			if (result.tableOptions && existsSync(tableOptionsPath) && flags['force'] !== true) {
+			// Nothing live needs a sidecar, but the file on disk declares options
+			// this pull is dropping — and `pullSnapshot` has already printed "the
+			// rendered sidecar drops them". Leaving the file alone would make that
+			// line false in the way that matters: its declarations stay
+			// authoritative for the next `generate`, which keeps proposing the
+			// rebuild the operator was just told had been dropped. So the stale
+			// file is rewritten as an empty `tableOptions([])` — emptied rather
+			// than deleted, because `config.tableOptions` still names it and
+			// `loadTableOptions` throws on a missing file.
+			//
+			// Only for the file the declarations were actually *read* from: if
+			// `--table-options-out` points somewhere else, whatever sits at that
+			// path is not the stale sidecar and emptying it would destroy an
+			// unrelated file.
+			const staleTableOptionsFile = !result.tableOptions
+				&& result.droppedDeclarations.length > 0
+				&& ctx.config.tableOptions !== undefined
+				&& resolve(cwd, ctx.config.tableOptions) === tableOptionsPath
+				&& existsSync(tableOptionsPath);
+
+			if ((result.tableOptions || staleTableOptionsFile) && existsSync(tableOptionsPath) && flags['force'] !== true) {
 				ctx.log(
 					`${tableOptionsOut} already exists. Re-run with --force to overwrite it, or pass `
-						+ '--table-options-out <file> to write somewhere else. Options this pull could not derive '
-						+ 'from the live database are carried over from config.tableOptions when it points at that '
-						+ 'file; anything else in it (comments, a table the live database no longer has) is lost.',
+						+ '--table-options-out <file> to write somewhere else. The live database wins on every option '
+						+ 'it can state: only a `collate: { column: null }` retirement (for a column that still '
+						+ 'exists) is carried over from config.tableOptions when it points at that file; comments, '
+						+ 'options for tables the live database no longer has, and any declaration it disagrees with '
+						+ 'are lost.',
 				);
 				return 1;
 			}
 
 			await writeFile(path, result.schema);
 			ctx.log(`Wrote ${out}.`);
-			if (result.tableOptions) {
-				await writeFile(tableOptionsPath, result.tableOptions);
-				ctx.log(`Wrote ${tableOptionsOut}.`);
+			if (result.tableOptions || staleTableOptionsFile) {
+				await writeFile(tableOptionsPath, result.tableOptions ?? EMPTY_TABLE_OPTIONS_MODULE);
+				ctx.log(
+					result.tableOptions
+						? `Wrote ${tableOptionsOut}.`
+						: `Emptied ${tableOptionsOut} — nothing in the live database needs a sidecar, and its `
+							+ `declarations for ${result.droppedDeclarations.map((t) => `"${t}"`).join(', ')} are `
+							+ 'dropped.',
+				);
 				// Wire it up, so the rest of *this* process (and any command run
 				// through `run()` after it) reads the file that was just written
 				// instead of guessing from the last introspection — and say so,
