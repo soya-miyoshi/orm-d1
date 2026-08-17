@@ -800,6 +800,90 @@ containing `'); drop table …` renders as one properly-doubled literal.
 - **Where**: `test/unit/ddl.test.ts:99`
 - The exact assertion `expect(ddl).toContain('check ("role" in (\'admin\', , \'member\'))')` carries the weight and is correct. The two `not.toContain` guards beside it are redundant, and `not.toContain('null, ')` is not load-bearing: the DDL *does* contain `"role" text not null` immediately before the constraint, and the assertion passes only because `createTable` joins members with `,\n\t` rather than `, `. It would fail spuriously if the DDL formatter ever emitted single-line output.
 
+## Findings — downstream integration (outside the rotation)
+
+Provenance: building one feature end-to-end (schema → migration → GraphQL → two clients) in
+the downstream app that supplies `ORM_D1_FIXTURE_SCHEMA`, then reading orm-d1's source for
+each place that cost time. These are **adoption frictions**, not sweep findings: none was
+produced by a lens, and the rotation pointer above was deliberately **not** advanced.
+
+Per *Notes for the human*, no schema was copied here. Shapes are described generically and
+the evidence is counts of call sites, not table or column names.
+
+Ranked by what they cost the app, most first. All of them rank **below** the open
+regressions — `[F-055]`, `[F-068]`, `[F-069]`, `[F-070]`, `[F-071]` — which are defects
+rather than frictions. Suggested order once those are closed: `[F-094]`, `[F-096]`,
+`[F-097]`, `[F-095]` (small, no design decisions) → `[F-092]`/`[F-082]` (one decision,
+deletes user code) → `[F-091]`, `[F-093]` (new surface).
+
+### [F-091] `latestPerGroup` returns rows, so "filter by the newest row's value" has no spelling — status: needs-human — severity: med — area: sql/builders — NEW-SURFACE
+- **Where**: `src/builders/window.ts:76`, documented at `docs/02-beyond-drizzle.md` (`## latestPerGroup`)
+- **Defect**: `latestPerGroup` materialises one row per group and returns them. It cannot be composed into another query's `where`, into `count(*)`, or into a relational filter, so the adjacent shape — *"rows whose newest child row has (or does not have) a given value"* — falls back to hand-written SQL.
+- **Failure scenario**: an event-sourced table where the newest child row is the parent's current state (the shape `latestPerGroup`'s own doc example uses). "Count the parents whose current state is not `cancelled`" cannot be expressed: `latestPerGroup` fetches every group's newest row to the Worker in order to count them, so the caller writes a correlated `order by … limit 1` subquery instead. In the downstream app that predicate is hand-written in **4 places** (one shared constant consumed by 4 call sites, plus 3 independent copies), while `latestPerGroup` is used in 2 — the composable shape is the more common one, and it is the one that is missing.
+- **Fix**: add an expression-returning sibling that renders the same correlated subquery and is usable anywhere a `Condition` operand is. Proposed shape, keeping `tiebreak` required for the reason the existing doc gives:
+  ```ts
+  latestValue(child.state, {
+    partitionBy: [child.parentId],
+    orderBy: [desc(child.recordedAt)],
+    tiebreak: desc(child.id),
+    correlate: eq(child.parentId, parent.id),
+    fallback: 'initial',            // renders coalesce(…) — "no child rows yet"
+  })
+  ```
+- **Question for the human**: add this as public surface, or keep composition out of scope and document the correlated-subquery recipe in `docs/02` next to `latestPerGroup` so callers at least stop reinventing the tiebreak? The `fallback` argument is the part worth deciding on: without it every caller writes `coalesce` by hand, and omitting it silently turns "no rows yet" into `null`, which compares false against everything.
+- **Prove it**: `test/workers/latest-per-group.test.ts` gains a case asserting the emitted SQL and the rows for a `count(*)` filtered by the newest child value, against a real D1 binding; `npm run test:workers` red → green.
+
+### [F-092] `toQuery()` ignores the database's render budget and returns parameter *slots*, so the documented raw path is wrong by default — status: needs-human — severity: med — area: api
+- **Where**: `src/sql/sql.ts:106` (`toQuery(ctx?: RenderContext)`), `src/plan/params.ts:17` (`bindParams`), `src/runtime/database.ts:153` (`execute`), `:96`–`:103` (`$maxParams` / `$jsonEachThreshold`)
+- **Defect**: same root cause as `[F-082]`, recorded separately because it is new evidence about that item's severity rather than a second defect. `[F-082]` describes the `TypeError` a caller hits when reaching for `db.all(sql\`…\`)`. What it does not capture is that the **working** path — render the chunk, hand the pieces to `execute()` — has two independent ways to be silently wrong, and a caller who works around `[F-082]` correctly still has to know both.
+- **Failure scenario**: (1) `chunk.toQuery()` with no argument renders against `defaultRenderContext`, not against the database's `$maxParams` / `$jsonEachThreshold`. `inArray` switches to a single `json_each` parameter at the threshold, so a chunk rendered under the default budget can emit a different number of placeholders than the database will bind — the mismatch appears only for list lengths that straddle the two thresholds, i.e. not in the first test anyone writes. (2) `toQuery()` returns slots, not values: `const` slots carry a captured value but `fn` slots (`$defaultFn` / `$onUpdate`) must be evaluated per execution, so passing the result straight to `execute()` binds objects and SQLite reports a parameter-count mismatch. The downstream app carries a 38-line bridge whose entire body is these two corrections, and both are documented there as things that were hit, not anticipated.
+- **Fix**: resolve `[F-082]` by **widening** `db.run` / `all` / `get` to `CompiledQuery<TRow> | SQLChunk | string` rather than by throwing a better error. Widening moves both corrections inside the library, where the database's budget and the slot evaluation are already in scope; the better-error option leaves every caller to rediscover them.
+- **Question for the human**: this is `[F-082]`'s parked question, with a recommendation attached. Deciding it closes both items.
+- **Prove it**: the downstream app deletes its bridge and calls `db.all(sql\`…\`)` directly, with its own suite as the acceptance test. In this repo: `test/workers/` gains a case binding an `inArray` list whose length sits between `defaultRenderContext.jsonEachThreshold` and a database configured with a different `jsonEachThreshold`, plus one binding a `$defaultFn` column through the raw path; `npm run test:workers` red → green.
+
+### [F-093] No `insert … select … where`, so D1's only atomic compare-and-set is unreachable from the builder — status: needs-human — severity: med — area: sql/builders — NEW-SURFACE
+- **Where**: `src/builders/insert.ts:127` (`values` is the only entry point)
+- **Defect**: `insert()` accepts rows and nothing else. D1 has no interactive transactions — `docs/01` says so and refuses to pretend otherwise — which leaves a single statement as the only unit of atomicity, and therefore `insert … select … where (<predicate>)` as the only way to write "claim a slot if one is free" without a read-then-write race.
+- **Failure scenario**: any bounded resource with concurrent claimants — the canonical one is a capacity-limited row where the count of live children must stay below a limit. Count-then-insert cannot hold the count across the `await`, so two simultaneous claims for the last slot both win. The correct statement is expressible in SQLite and in D1; it is not expressible in this builder, so the downstream app drops to raw SQL for exactly the operation where being wrong is a paid-for overbooking.
+- **Fix**: add `insert(t).select(selectBuilder)`, matching `drizzle-orm`'s spelling so the `docs/04` reverse-alias invariant holds. The hard half is the guard predicate: Drizzle expresses it as a `where` on the inner select, which requires the inner select to be a source-less `select <literals> where <cond>` — confirm SQLite accepts that shape before designing around it.
+- **Question for the human**: add the surface, or document the raw-SQL recipe in `docs/02` under a heading about atomicity on D1, next to the `batch()` discussion that already explains why transactions are absent? The second is cheap and would at least make the pattern findable; the first is what makes it checked.
+- **Prove it**: `test/workers/` gains a concurrency case issuing N simultaneous conditional inserts against a limit of 1 and asserting exactly one row lands; `npm run test:workers` red → green.
+
+### [F-094] `$inferSelect` / `$inferInsert` are missing from the table type — status: todo — severity: med — area: schema — COMPAT-DEFECT
+- **Where**: `src/schema/table.ts` (the built-table type), helpers already present at `src/schema/infer.ts:58-59`
+- **Defect**: `drizzle-orm` exposes row types both as free helpers (`InferSelectModel<T>`) and as properties on the table (`typeof users.$inferSelect`, `typeof users.$inferInsert`). orm-d1 has only the first, so a schema ported by changing one import specifier keeps compiling while every `typeof X.$inferInsert` in the surrounding code becomes `TS2339`.
+- **Failure scenario**: the property spelling is what test fixtures and seed helpers use, because it needs no import. In the downstream app it appears **25 times across 9 files** and every one is an error — undetected until now only because that app's test tsconfig is not wired into any script, so the annotations have been silently inert rather than loudly wrong. An adopter whose tests *are* typechecked sees 25 errors on day one, in files that have nothing to do with the database driver.
+- **Fix**: declare `$inferSelect: InferSelect<this>` and `$inferInsert: InferInsert<this>` on the built-table type. Type-only, so no runtime bytes and no bundle cost; `InferSelect` / `InferInsert` already exist and are what `InferSelectModel` / `InferInsertModel` alias.
+- **Prove it**: `test/unit/` type-level assertions that `typeof users.$inferSelect` and `typeof users.$inferInsert` equal `InferSelectModel<typeof users>` / `InferInsertModel<typeof users>`, including a table with `$defaultFn` and a nullable column so the insert side's optionality is pinned; `npm run test:unit` red → green.
+
+### [F-095] Two resolved `drizzle-orm` copies break `instanceof Many` silently, and nothing detects it — status: todo — severity: med — area: drizzle-compat
+- **Where**: `src/drizzle.ts:120` (`asDrizzleRelations`), `:219` (`asPothosRelations`); named as a known failure mode under *Audit areas* → *Relational loading*
+- **Defect**: `asDrizzleRelations` re-prototypes onto the `Many` that **orm-d1** resolved. If the adapter (Pothos' drizzle plugin) resolves a different copy, `instanceof Many` is false for every relation and the plugin treats all of them as single objects. It is bug class #3 (wrong rows), it produces no error, and the only current defence is documentation.
+- **Failure scenario**: a lockfile that hoists two `drizzle-orm` versions — a range bump in any dependency does it. Every list field in the GraphQL schema starts returning one object instead of an array. Types do not catch it: the two copies' relation types are mutually unassignable, but adapters already require casts at exactly the seams where the assignability would have been checked. The downstream app defends against it by pinning `drizzle-orm` to an exact version and writing a warning in two places, which is a discipline, not a check.
+- **Fix**: no new runtime surface required. Add to `docs/05-adapters.md`, in the `asDrizzleRelations` bullet that already explains the `instanceof` requirement, a one-line assertion for adopters to put in their own suite:
+  ```ts
+  import { Many } from 'drizzle-orm';
+  import { asDrizzleRelations } from 'orm-d1/drizzle';
+  const r = asDrizzleRelations(relations);
+  expect(Object.values(Object.values(r)[0].relations)[0]).toBeInstanceOf(Many);
+  ```
+  It fails exactly when the two copies diverge, because the `Many` on the left is the one the *app* resolves. An `assertSameDrizzle({ Many })` export would be friendlier but is public surface, so record it as an upgrade rather than doing it here.
+- **Prove it**: this repo cannot host the negative control without installing two `drizzle-orm` copies. Assert the positive direction in `test/unit/` (the recipe passes under a single copy) and note the limitation next to it; `npm run test:unit` stays green and the recipe is what ships. `npm run check` unaffected.
+
+### [F-096] `pothosFindConfig` is exported and used everywhere, and documented nowhere — status: todo — severity: low — area: docs
+- **Where**: `src/drizzle.ts:259`; `docs/05-adapters.md` § Pothos lists three substitutions and not this one. `grep -rn pothosFindConfig docs/ README.md` returns nothing.
+- **Defect**: `docs/05` documents the *builder-construction* seam (`getTableConfig`, `asPothosRelations`, `asDrizzleTable`) and stops there. `pothosFindConfig` is the *resolver-side* seam, needed in every drizzle-backed resolver that passes a `where`, and it is reachable only by reading the source.
+- **Failure scenario**: an adopter follows `docs/05`, wires the builder correctly, writes their first resolver, and finds the plugin's `query()` result rejected by `findMany` because of the phantom `$pothosQueryFor` key. Nothing in the docs names the cause or the helper; the visible workarounds are `as never` on the whole config — which is what the helper's own docstring says the previous code did — and that silently gives up the schema-level checking of `where` / `columns` / `with` / `orderBy`. In the downstream app the helper is imported in **20 GraphQL type modules**, so it is not an edge case of the integration, it is the integration.
+- **Fix**: add it as the fourth bullet in `docs/05-adapters.md` § Pothos. The docstring at `src/drizzle.ts:259` is already the right text — why the phantom key exists, that it is never constructed, and that the return type keeps the config checked — plus the one-line usage example it carries.
+- **Prove it**: documentation only; `test/workers/pothos.test.ts` already exercises the helper. Acceptance is that `docs/05` alone is sufficient to write a resolver with a `where`, with no source reading.
+
+### [F-097] The published bundle numbers are a one-off measurement with no regression gate — status: todo — severity: low — area: efficiency
+- **Where**: `docs/01-differences.md:261` (§ Bundle size), `package.json` (`check`), `test/unit/module-resolution.test.ts`
+- **Defect**: `docs/01` publishes 44.1 kB minified / 15.3 kB gzipped and states plainly that nothing in CI re-measures them. The internal target in `CLAUDE.md` is ≤ 20 KB for the core entry. Measured now — `esbuild dist/core.js --bundle --minify --format=esm` — the core entry alone is **42,385 bytes**, so the target is out by more than 2×, and the only number that moves when someone adds an export is the one hand-written into this file's header.
+- **Failure scenario**: Workers bill startup CPU and parse time tracks uncompressed bytes, so this is a per-cold-isolate cost paid by every adopter. `[F-072]` in this file is the shape of the problem already biting: a batch's bundle cost was reported against the previous commit rather than `main`, because measuring is a manual step someone has to remember and get right.
+- **Fix**: extend `test/unit/module-resolution.test.ts` — which already measures — to assert a byte ceiling per entry, seeded at today's measurement rather than at the aspirational target, and run it from `npm run check`. Ratcheting down to 20 KB is a separate question; this item only stops the number from moving without anyone noticing.
+- **Prove it**: add an export to `src/core.ts` that pushes the entry over the ceiling and confirm `npm run check` fails naming the entry, the ceiling and the measured size; revert and it passes.
+
 ## Audit areas
 
 Unchecked areas, roughly in descending order of what a bug there would cost. One
@@ -843,6 +927,10 @@ _(nothing yet)_
 
 ## Notes for the human
 
+- **`[F-091]`–`[F-097]` did not come from a lens.** They were recorded while building a
+  feature end-to-end in the downstream app, so they are adoption frictions rather than
+  sweep findings, and the rotation pointer was left where it was. A lens is free to pick
+  them up; none of them is that lens's own finding.
 - **Fixture privacy.** acme's schema is used as a *local* fixture through
   `ORM_D1_FIXTURE_SCHEMA` and is never copied into this repo — orm-d1 is published to
   npm, and a private product's table and column names should not ship in the tarball or
