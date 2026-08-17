@@ -420,7 +420,11 @@ export class ColumnBuilder<M extends ColumnMeta = ColumnMeta> {
 			// `'integer'` for those too, but the DDL says `int` or `bigint`, not
 			// the literal `INTEGER PRIMARY KEY` spelling SQLite requires for the
 			// rowid alias, so they are not actually optional on insert.
-			hasDefault: (this.config.declaredType ?? this.config.type) === 'integer',
+			// SQLite matches the rowid-alias type name case-insensitively (and
+			// tolerant of surrounding whitespace) — `customType({ dataType: () =>
+			// 'INTEGER' })` is still the rowid alias in real SQLite even though
+			// the declared string is not the literal lowercase spelling.
+			hasDefault: (this.config.declaredType ?? this.config.type).trim().toLowerCase() === 'integer',
 		});
 	}
 

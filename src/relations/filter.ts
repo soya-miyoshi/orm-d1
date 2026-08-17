@@ -19,6 +19,7 @@
  * contributing nothing.
  */
 import { CompileError } from '../errors.js';
+import { isDev } from '../dev.js';
 import type { Column } from '../schema/columns.js';
 import type { Table } from '../schema/table.js';
 import { alias, getTableColumns, getTableOriginalName } from '../schema/table.js';
@@ -433,10 +434,17 @@ export function compileFilter(
 			continue;
 		}
 
+		// The documented Pothos use case passes a user-controlled `where`
+		// straight into this DSL, and GraphQL servers commonly surface
+		// `error.message` to the client — so the full column/relation list is
+		// useful during development but a schema-disclosure leak in
+		// production. Same `__DEV__` gate `dev.ts`'s other diagnostics use.
 		throw new Error(
-			`Unknown filter field "${key}". It is neither a column nor a relation of this table. `
-				+ `Columns: ${Object.keys(columns).join(', ')}. `
-				+ `Relations: ${Object.keys(relations).join(', ') || '(none)'}.`,
+			isDev()
+				? `Unknown filter field "${key}". It is neither a column nor a relation of this table. `
+					+ `Columns: ${Object.keys(columns).join(', ')}. `
+					+ `Relations: ${Object.keys(relations).join(', ') || '(none)'}.`
+				: `Unknown filter field "${key}". It is neither a column nor a relation of this table.`,
 		);
 	}
 

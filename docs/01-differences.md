@@ -273,8 +273,8 @@ Bundling a Worker that imports the driver and the schema DSL and runs one
 | | minified | gzipped |
 | --- | --- | --- |
 | `drizzle-orm/d1` + `drizzle-orm/sqlite-core` | 77.8 kB | 22.2 kB |
-| `orm-d1` | 44.1 kB | 15.3 kB |
-| | −43% | −31% |
+| `orm-d1` | 51.7 kB | 17.7 kB |
+| | −34% | −20% |
 
 Drizzle ships 25 MB across 718 export paths with `sideEffects: false`, and tree-shaking
 removes about 97% of it before it reaches a bundle. The remaining difference is code that
@@ -287,11 +287,14 @@ On Workers the minified column is the relevant one, because startup CPU is bille
 parse time tracks uncompressed bytes; the 3 MB / 10 MB compressed limits are not a
 constraint for a library of this size.
 
-These two numbers come from a one-off measurement. Nothing in CI re-measures them, so they
-can drift from the published packages as either library changes. The size claim that *is*
-tested is which library ends up in the bundle, in
-`test/unit/module-resolution.test.ts`; see
-[04-migrating-from-drizzle](./04-migrating-from-drizzle.md).
+The `orm-d1` number is re-measured by `test/unit/module-resolution.test.ts`'s
+"bundle-size ceiling" gate, which fails `npm run check` if it grows past a ceiling
+seeded from this measurement — so this table can no longer drift silently, only in a
+commit that also raises the ceiling and is expected to update this line. The
+`drizzle-orm` number is not gated (nothing in this repo can regress a package it
+doesn't own) and can still drift as that package changes. The size claim that is
+*separately* tested is which library ends up in the bundle at all, in the same file;
+see [04-migrating-from-drizzle](./04-migrating-from-drizzle.md).
 
 ## D1 limits, and where each is enforced
 

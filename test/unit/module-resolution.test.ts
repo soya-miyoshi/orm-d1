@@ -17,7 +17,8 @@
  * claim rather than a plausible one.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { gzipSync } from 'node:zlib';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -144,4 +145,56 @@ describe.skipIf(!ready)('the zero-diff migration recipe', () => {
 it.skipIf(ready)('SKIPPED: module resolution needs `npm run build` and esbuild', () => {
 	// Deliberately visible. See the note at the top of this file.
 	expect(built || existsSync(esbuild)).toBeDefined();
+});
+
+/**
+ * [F-097]: no regression gate on the bundle-size numbers `docs/01` and
+ * `README.md` publish. Neither had ever been re-measured, so `[F-072]`
+ * (the batch reporting bundle cost against the previous commit instead of
+ * `main`) went unnoticed — nothing would have failed either way. This
+ * re-measures the exact scenario those docs describe — a Worker importing
+ * the driver and schema DSL and running one `select().from(users).where(eq(...))`,
+ * bundled and minified with esbuild — and fails if it grows past a ceiling.
+ *
+ * The ceiling is seeded at today's actual measurement plus headroom for
+ * ordinary incremental growth; it is not the tight number itself, so a
+ * one- or two-finding batch does not flap this test. When it does fire,
+ * `docs/01-differences.md`'s "Bundle size" table and `README.md`'s bundle
+ * line are the two places to re-measure and update alongside raising the
+ * ceiling deliberately, in the same commit — never silently.
+ */
+describe.skipIf(!ready)('bundle-size ceiling', () => {
+	const minifiedBundle = (workspace: string): { bytes: number; gzipBytes: number } => {
+		writeFileSync(join(workspace, 'tsconfig.bundle.json'), tsconfig('js', true));
+		const outFile = join(workspace, 'out.min.js');
+		execFileSync(esbuild, [
+			join(workspace, 'worker.js'),
+			'--bundle',
+			'--format=esm',
+			'--minify',
+			`--tsconfig=${join(workspace, 'tsconfig.bundle.json')}`,
+			`--outfile=${outFile}`,
+			'--log-level=error',
+		], { encoding: 'utf8' });
+		const out = new Uint8Array(readFileSync(outFile));
+		return { bytes: out.length, gzipBytes: gzipSync(out).length };
+	};
+
+	// Measured directly on 2026-08-18: 51,710 bytes minified, 17,733
+	// gzipped, for the `orm-d1`-redirected, minified build of the same
+	// fixture `WORKER` above — the exact scenario `docs/01-differences.md`'s
+	// "Bundle size" table and `README.md`'s bundle line describe. Both were
+	// corrected to this figure in the same commit as this gate. The
+	// ceilings carry ~15% headroom over that measurement so an ordinary
+	// one- or two-finding batch does not flap this test; when one *does*
+	// fire, re-measure both docs and raise the ceiling deliberately, in the
+	// same commit — never silently, which is the failure `[F-072]` recorded.
+	const MINIFIED_CEILING = 60_000;
+	const GZIP_CEILING = 20_500;
+
+	it('does not grow past the sized ceiling for the documented driver+schema import', () => {
+		const { bytes, gzipBytes } = minifiedBundle(workspace);
+		expect(bytes).toBeLessThanOrEqual(MINIFIED_CEILING);
+		expect(gzipBytes).toBeLessThanOrEqual(GZIP_CEILING);
+	});
 });

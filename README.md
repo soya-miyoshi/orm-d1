@@ -194,7 +194,7 @@ No plan awareness. 50 statements per Worker invocation and 500 MB on the free pl
 
 </td><td>
 
-44.1 kB / 15.3 kB for the same Worker, built the same way. None of those layers exist to be tree-shaken.
+51.7 kB / 17.7 kB for the same Worker, built the same way. None of those layers exist to be tree-shaken.
 
 </td></tr>
 </table>
