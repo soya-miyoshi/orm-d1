@@ -512,6 +512,143 @@ describe('diffing snapshots', () => {
 		expect(createTemp?.sql).toContain('unique ("email" collate nocase)');
 	});
 
+	it('[F-115] persists a live unique-member collation into the snapshot `generate` writes as its new baseline', () => {
+		// The unique-constraint analogue of the `[F-107]` test above:
+		// `carryForwardCollations` carried a plain column's `collate` into the
+		// persisted baseline but never a unique constraint member's — so the
+		// baseline `generate` writes to `meta/` already lost it, even though
+		// the *migration SQL* that same `generate` run emits is correct (it
+		// reads straight from `before`, via `carryForwardUniqueCollation`
+		// inside `recreateTable`, not from this persisted copy). The next
+		// `generate` then reads that broken baseline and re-renders the
+		// constraint with no collation at all — zero drift reported, because
+		// as far as the diff is concerned nothing changed.
+		const t = sqliteTable('members', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [unique('u1').on(c.email)]);
+
+		const schemaAfter = snapshotOf(t);
+		const liveBefore: Snapshot = {
+			...schemaAfter,
+			origin: 'introspection',
+			tables: {
+				members: {
+					...schemaAfter.tables['members']!,
+					uniqueConstraints: {
+						...schemaAfter.tables['members']!.uniqueConstraints,
+						u1: {
+							...schemaAfter.tables['members']!.uniqueConstraints['u1']!,
+							columns: [{ name: 'email', collate: 'nocase' }],
+						},
+					},
+				},
+			},
+		};
+
+		const persisted = carryForwardCollations(liveBefore, schemaAfter);
+		const persistedMember = persisted.tables['members']!.uniqueConstraints['u1']!.columns[0];
+		expect(persistedMember).toEqual({ name: 'email', collate: 'nocase' });
+
+		// A second round trip off that persisted baseline must still see it.
+		const roundTwo = carryForwardCollations(persisted, snapshotOf(t));
+		const roundTwoMember = roundTwo.tables['members']!.uniqueConstraints['u1']!.columns[0];
+		expect(roundTwoMember).toEqual({ name: 'email', collate: 'nocase' });
+	});
+
+	it('does not merge two distinct unique constraints that share the same column list (F-115 sibling fix)', () => {
+		// Two different `before` unique constraints on the same ordered column
+		// list, each with its *own* per-member collation. Before the fix,
+		// `carryForwardUniqueCollation`'s inner loop matched — and kept
+		// re-matching — the first `after` entry with that column list for
+		// every `before` constraint, so the second `before`'s collation was
+		// deposited onto the *same* already-claimed `after` entry: a
+		// fabricated, merged constraint that neither live table actually had.
+		const before = sqliteTable('u_pair', {
+			a: text('a').notNull(),
+			b: text('b').notNull(),
+			n: text('n'),
+		}, (c) => [unique('u1').on(c.a, c.b), unique('u2').on(c.a, c.b)]);
+		const after = sqliteTable('u_pair', {
+			a: text('a').notNull(),
+			b: text('b').notNull(),
+			n: integer('n'), // unrelated change, forces a rebuild
+		}, (c) => [unique('u1').on(c.a, c.b), unique('u2').on(c.a, c.b)]);
+
+		const schemaBefore = snapshotOf(before);
+		const schemaAfter = snapshotOf(after);
+		const liveBefore: Snapshot = {
+			...schemaBefore,
+			origin: 'introspection',
+			tables: {
+				u_pair: {
+					...schemaBefore.tables['u_pair']!,
+					uniqueConstraints: {
+						u1: {
+							...schemaBefore.tables['u_pair']!.uniqueConstraints['u1']!,
+							columns: ['a', { name: 'b', collate: 'nocase' }],
+						},
+						u2: {
+							...schemaBefore.tables['u_pair']!.uniqueConstraints['u2']!,
+							columns: [{ name: 'a', collate: 'rtrim' }, 'b'],
+						},
+					},
+				},
+			},
+		};
+
+		const { statements, errors } = diffSnapshots(liveBefore, schemaAfter);
+		expect(errors).toEqual([]);
+
+		const createTemp = statements.find((s) => s.sql.includes('create table "__new_u_pair"'));
+		expect(createTemp?.sql).toContain('constraint "u1" unique ("a", "b" collate nocase)');
+		expect(createTemp?.sql).toContain('constraint "u2" unique ("a" collate rtrim, "b")');
+	});
+
+	it('does not silently collapse two single-member unique constraints on the same column into one (F-115 sibling fix)', () => {
+		// The one-member variant of the sibling test above: `unique(a) collate
+		// nocase` and `unique(a) collate rtrim` sharing the single-column list
+		// `["a"]` used to merge into a single fabricated rule (or silently drop
+		// the second one) rather than staying two distinct constraints.
+		const before = sqliteTable('u_pair2', {
+			a: text('a').notNull(),
+			n: text('n'),
+		}, (c) => [unique('u1').on(c.a), unique('u2').on(c.a)]);
+		const after = sqliteTable('u_pair2', {
+			a: text('a').notNull(),
+			n: integer('n'),
+		}, (c) => [unique('u1').on(c.a), unique('u2').on(c.a)]);
+
+		const schemaBefore = snapshotOf(before);
+		const schemaAfter = snapshotOf(after);
+		const liveBefore: Snapshot = {
+			...schemaBefore,
+			origin: 'introspection',
+			tables: {
+				u_pair2: {
+					...schemaBefore.tables['u_pair2']!,
+					uniqueConstraints: {
+						u1: {
+							...schemaBefore.tables['u_pair2']!.uniqueConstraints['u1']!,
+							columns: [{ name: 'a', collate: 'nocase' }],
+						},
+						u2: {
+							...schemaBefore.tables['u_pair2']!.uniqueConstraints['u2']!,
+							columns: [{ name: 'a', collate: 'rtrim' }],
+						},
+					},
+				},
+			},
+		};
+
+		const { statements, errors } = diffSnapshots(liveBefore, schemaAfter);
+		expect(errors).toEqual([]);
+
+		const createTemp = statements.find((s) => s.sql.includes('create table "__new_u_pair2"'));
+		expect(createTemp?.sql).toContain('constraint "u1" unique ("a" collate nocase)');
+		expect(createTemp?.sql).toContain('constraint "u2" unique ("a" collate rtrim)');
+	});
+
 	it('detects introspection-to-introspection collation drift instead of exempting it (F-101 follow-up)', () => {
 		// Right after `pull`, both sides of `check` are `origin: 'introspection'`
 		// — `undefined` there genuinely means BINARY, not "the schema DSL cannot

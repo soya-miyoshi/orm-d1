@@ -558,7 +558,13 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 
 		for (const pk of Object.values(table.compositePrimaryKeys)) {
 			imports.add('primaryKey');
-			extras.push(`primaryKey({ columns: [${pk.columns.map((c) => `t.${columnId(c)}`).join(', ')}] })`);
+			// Same loss as a unique constraint member's `collate` just below
+			// (`[F-111]`'s note): `primaryKey({ columns: [...] })` has no
+			// per-member `COLLATE` spelling in Drizzle either (`docs/04`), so a
+			// member's own collation (`[F-115]`) is left off the rendered schema
+			// module — the snapshot's `columns` is what round-trips it.
+			const names = pk.columns.map(normalizeUniqueColumn).map((c) => c.name);
+			extras.push(`primaryKey({ columns: [${names.map((n) => `t.${columnId(n)}`).join(', ')}] })`);
 		}
 
 		for (const u of Object.values(table.uniqueConstraints)) {

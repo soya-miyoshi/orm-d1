@@ -73,7 +73,7 @@ describe('snapshotting a schema with a failing check constraint', () => {
 		expect(() => snapshotFromSchema({ users })).toThrow(/empty array/);
 	});
 
-	it('refuses one in a partial index predicate', () => {
+	it('refuses one in a partial index predicate, naming the table and index', () => {
 		const roles: string[] = [];
 		const users = sqliteTable('users', {
 			id: integer('id').primaryKey(),
@@ -82,7 +82,14 @@ describe('snapshotting a schema with a failing check constraint', () => {
 			index('users_role_idx').on(c.role).where(notInArray(c.role as never, roles) as never),
 		]);
 
+		// The bare `/empty array/` assertion alone does not catch a regression
+		// that drops the `(table "…", constraint "…")` context suffix — a
+		// refactor removed the `withDDLContext` wrapper around this exact
+		// `renderInline` call while leaving the message's own "empty array"
+		// text untouched, so only asserting on the context suffix as well
+		// actually exercises the fix.
 		expect(() => snapshotFromSchema({ users })).toThrow(/empty array/);
+		expect(() => snapshotFromSchema({ users })).toThrow(/\(table "users", constraint "users_role_idx"\)/);
 	});
 
 	it('still snapshots a legitimate check and a legitimate partial index', () => {

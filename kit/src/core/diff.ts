@@ -289,6 +289,18 @@ const carryForwardCollation = (
  * member name (post-rename), the same way `carryForwardCollation` matches
  * columns — a unique constraint's *name* is not comparable (introspection
  * invents one), so its member list is the only stable identity.
+ *
+ * `used` tracks which `after` entries have already absorbed a `before`'s
+ * collations, the same discipline `matchUniqueClause` (`introspect.ts`)
+ * applies when it matches a parsed clause to an automatic index — without it,
+ * two distinct `before` constraints that happen to share the same ordered
+ * column list (e.g. two single-member `unique(a)` clauses, or `unique(a,b)`
+ * declared twice with different per-member collations) both matched the
+ * *first* `after` entry with that column list: the second `before`'s
+ * collations were deposited on top of the first's, fabricating a merged
+ * constraint neither live table actually had, and the `after` entry that
+ * should have received the second `before`'s own collation was left
+ * untouched instead.
  */
 const carryForwardUniqueCollation = (
 	beforeConstraints: TableSnapshot['uniqueConstraints'],
@@ -296,16 +308,19 @@ const carryForwardUniqueCollation = (
 	columnRenames: Record<string, string>,
 ): TableSnapshot['uniqueConstraints'] => {
 	let result = afterConstraints;
+	const used = new Set<string>();
 	for (const before of Object.values(beforeConstraints)) {
 		const beforeMembers = before.columns.map(normalizeUniqueColumn);
 		if (!beforeMembers.some((m) => m.collate)) continue;
 		const renamedNames = beforeMembers.map((m) => columnRenames[m.name] ?? m.name);
 
 		for (const [key, after] of Object.entries(result)) {
+			if (used.has(key)) continue;
 			const afterMembers = after.columns.map(normalizeUniqueColumn);
 			if (afterMembers.length !== renamedNames.length) continue;
 			if (!afterMembers.every((m, i) => m.name === renamedNames[i])) continue;
 
+			used.add(key);
 			const merged = afterMembers.map((m, i) => {
 				const carried = beforeMembers[i]?.collate;
 				return carried && !m.collate ? { name: m.name, collate: carried } : m;
@@ -330,6 +345,16 @@ const carryForwardUniqueCollation = (
  * live collation with zero drift reported. Apply the same carry-forward to
  * the whole snapshot the caller is about to persist, not just to tables a
  * recreate happens to rebuild.
+ *
+ * [F-115]: the same loss applies to a unique constraint member's own
+ * `collate` (`[F-111]`) — `carryForwardUniqueCollation` above only ran
+ * inside `recreateTable`'s rendered rebuild, never against the snapshot
+ * `generate` persists as its new baseline. The first `generate` after a pull
+ * still has the live member collation available in `before` (the persisted
+ * baseline predates this fix), so it happened to round-trip once by luck;
+ * the *second* `generate` reads a baseline that never recorded it and
+ * silently re-renders the constraint without it — zero statements, zero
+ * errors, a real downgrade of the constraint's semantics.
  */
 export const carryForwardCollations = (before: Snapshot, after: Snapshot, options: DiffOptions = {}): Snapshot => {
 	const renamedTables = options.renamedTables ?? {};
@@ -347,10 +372,23 @@ export const carryForwardCollations = (before: Snapshot, after: Snapshot, option
 			if (table === targetName && column) columnRenames[column] = value;
 		}
 
-		const columns = carryForwardCollation(beforeTable.columns, afterTable.columns, columnRenames);
-		if (columns !== afterTable.columns) {
+		let nextAfterTable = afterTable;
+
+		const columns = carryForwardCollation(beforeTable.columns, nextAfterTable.columns, columnRenames);
+		if (columns !== nextAfterTable.columns) nextAfterTable = { ...nextAfterTable, columns };
+
+		const uniqueConstraints = carryForwardUniqueCollation(
+			beforeTable.uniqueConstraints,
+			nextAfterTable.uniqueConstraints,
+			columnRenames,
+		);
+		if (uniqueConstraints !== nextAfterTable.uniqueConstraints) {
+			nextAfterTable = { ...nextAfterTable, uniqueConstraints };
+		}
+
+		if (nextAfterTable !== afterTable) {
 			if (tables === after.tables) tables = { ...after.tables };
-			tables[targetName] = { ...afterTable, columns };
+			tables[targetName] = nextAfterTable;
 		}
 	}
 

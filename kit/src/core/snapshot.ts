@@ -191,7 +191,15 @@ export interface TableSnapshot {
 	readonly columns: Record<string, ColumnSnapshot>;
 	readonly indexes: Record<string, IndexSnapshot>;
 	readonly foreignKeys: Record<string, ForeignKeySnapshot>;
-	readonly compositePrimaryKeys: Record<string, { name: string; columns: readonly string[] }>;
+	/**
+	 * `columns` holds either a bare member name or an `{ name, collate }` pair,
+	 * same shape and same reason as `uniqueConstraints.columns` just below
+	 * (`[F-115]`: a composite primary key member can carry its own `COLLATE`
+	 * exactly like a unique constraint member can — `docs/04` gives the schema
+	 * DSL no spelling for it either, so a schema-derived snapshot only ever
+	 * has bare names here).
+	 */
+	readonly compositePrimaryKeys: Record<string, { name: string; columns: readonly (string | UniqueColumnSnapshot)[] }>;
 	/**
 	 * `columns` holds either a bare member name or an `{ name, collate }` pair —
 	 * see {@link UniqueColumnSnapshot} and {@link normalizeUniqueColumn}.
@@ -373,7 +381,23 @@ export function snapshotFromSchema(
 								: decorateIndexColumn(renderInline(c as never))
 						),
 						isUnique: extra.meta.unique,
-						where: extra.meta.where ? renderInline(extra.meta.where, true) : undefined,
+						// Wrapped through `withDDLContext`, the same as the `check` branch
+						// below does for its own `renderInline` call: a refusal this can
+						// throw (the empty-array DDL refusal, `src/ddl.ts`'s
+						// `onEmptyArrayPredicate`/`onForeignFragment`) comes back
+						// anonymous otherwise — no table or constraint name — because
+						// this runs before `checkDDL` would normally attach that context.
+						// A refactor once called `createIndex(extra.meta, name)` here
+						// purely to get its `withDDLContext(name, indexName(...))`
+						// wrapper "for free"; removing that call for `[F-028]` (this
+						// index's own name is now derived directly via `indexName` above)
+						// also removed the wrapper, leaving this `renderInline` bare and
+						// the refusal's error message without the
+						// `(table "…", constraint "…")` suffix `check`/`generate` users
+						// rely on to find the offending index.
+						where: extra.meta.where
+							? withDDLContext(name, derivedName, () => renderInline(extra.meta.where!, true))
+							: undefined,
 					};
 					break;
 				}
@@ -510,7 +534,16 @@ export function createTableFromSnapshot(t: TableSnapshot): string {
 	}
 
 	for (const pk of Object.values(t.compositePrimaryKeys)) {
-		parts.push(`constraint ${quote(pk.name)} primary key (${pk.columns.map(quote).join(', ')})`);
+		// A member's own `collate` (`[F-115]`), same rendering as a unique
+		// constraint member's just below — re-emitting it is the only way a
+		// rebuild does not silently loosen a case-insensitive (or otherwise
+		// non-binary) primary key back down to plain BINARY comparison.
+		const members = pk.columns.map(normalizeUniqueColumn);
+		parts.push(
+			`constraint ${quote(pk.name)} primary key (${
+				members.map((c) => `${quote(c.name)}${c.collate ? ` collate ${c.collate}` : ''}`).join(', ')
+			})`,
+		);
 	}
 
 	// Unique / foreign-key / check constraints are interleaved in `declarationOrder`
@@ -842,7 +875,12 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 	// side saying nullable, so the table rebuilt on every run.
 	const lonePrimaryKey = new Set<string>();
 	const composite = Object.values(table.compositePrimaryKeys);
-	const compositeColumns = composite.flatMap((pk) => [...pk.columns]);
+	// Normalised to plain names here (`[F-115]` added an optional member
+	// `collate`, same shape as a unique constraint member): this identity
+	// check only cares which column is the lone primary key, not how it
+	// compares — a member's own `collate` is compared, if at all, where
+	// `sameUniques` already knows which side is schema-derived.
+	const compositeColumns = composite.flatMap((pk) => pk.columns.map(normalizeUniqueColumn)).map((c) => c.name);
 	if (compositeColumns.length === 1) lonePrimaryKey.add(compositeColumns[0]!);
 	for (const column of Object.values(table.columns)) {
 		if (column.primaryKey) lonePrimaryKey.add(column.name);
@@ -878,7 +916,9 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 		if (column.references) foreignKeys.push(canonicalFk(column.references));
 	}
 
-	for (const pk of Object.values(table.compositePrimaryKeys)) primaryKeyColumns.push(...pk.columns);
+	for (const pk of Object.values(table.compositePrimaryKeys)) {
+		primaryKeyColumns.push(...pk.columns.map(normalizeUniqueColumn).map((c) => c.name));
+	}
 	for (const u of Object.values(table.uniqueConstraints)) {
 		// A member's own `collate` is part of the constraint's identity: two
 		// otherwise-identical `unique (email)` clauses that differ only in

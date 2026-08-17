@@ -94,8 +94,19 @@ export interface IntrospectionInput {
 export const isInternalTable = (name: string): boolean =>
 	name.startsWith('sqlite_') || name.startsWith('_cf_') || name === 'd1_migrations';
 
+// Widened to all four identifier spellings for the same reason
+// `columnDefinitionStart` was (`[F-112]`): a name captured by a caller whose
+// own pattern now matches backtick/bracket forms (e.g. the constraint-name
+// regex in `parseTableUniqueConstraints`, `[F-115]`'s class) must still be
+// unquoted correctly, not merely left verbatim because only `"…"` was known.
 const unquote = (name: string): string =>
-	name.startsWith('"') && name.endsWith('"') ? name.slice(1, -1).replaceAll('""', '"') : name;
+	name.startsWith('"') && name.endsWith('"')
+		? name.slice(1, -1).replaceAll('""', '"')
+		: name.startsWith('`') && name.endsWith('`')
+		? name.slice(1, -1)
+		: name.startsWith('[') && name.endsWith(']')
+		? name.slice(1, -1)
+		: name;
 
 /**
  * `check ( … )` clauses, which no pragma exposes.
@@ -720,6 +731,87 @@ export const isAppendOnlyTrigger = (sql: string, tableName: string): boolean =>
 	appendOnlyTriggerGuard(sql, tableName) !== false;
 
 /**
+ * The table-level `[constraint <name>] primary key (…)` clause's members, in
+ * declaration order, with each member's own `COLLATE` if it states one —
+ * the primary-key analogue of `parseTableUniqueConstraints` below (`[F-115]`,
+ * the next number after `[F-114]`; grep `\[F-1` for the running tally).
+ *
+ * `pragma table_info`/`table_xinfo` report which columns make up a composite
+ * primary key and their order (its `pk` sequence), but never a member's
+ * `collate` — the same gap `[F-111]` closed for a table-level `unique (…)`
+ * member, and for the same reason: the automatic index SQLite builds for a
+ * composite primary key has no `sqlite_master.sql` row of its own, only the
+ * owning table's does. Unlike a unique constraint a table has at most one
+ * primary key, so there is no `matchUniqueClause`-style "used" bookkeeping
+ * to do here — the sole clause's members are matched to `pragma table_info`'s
+ * `pk`-ordered columns purely by position.
+ */
+const parseTablePrimaryKeyClause = (sql: string): readonly RawUniqueMember[] | undefined => {
+	const scan = blankLiterals(sql);
+	const depths = computeDepths(scan);
+	// Same anchor and quoting-form coverage as `parseTableUniqueConstraints`'s
+	// `pattern` (`[F-112]`'s class): all four constraint-name spellings, only
+	// at depth 1 (a top-level table clause, not nested inside a column's own
+	// `references (…)`/`check (…)`).
+	const pattern = /[(,]\s*(?:constraint\s+("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)\s+)?primary\s+key\s*\(/gi;
+
+	for (const match of scan.matchAll(pattern)) {
+		if (depths[match.index + 1] !== 1) continue;
+		const start = match.index + match[0].length;
+		let depth = 1;
+		let i = start;
+		while (i < scan.length && depth > 0) {
+			const ch = scan[i];
+			if (ch === '"' || ch === '`' || ch === '[') {
+				i = skipQuotedIdentifier(scan, i);
+				continue;
+			}
+			if (ch === '(') depth++;
+			else if (ch === ')') depth--;
+			i++;
+		}
+		if (depth > 0) continue;
+		const bodyEnd = i - 1;
+
+		const rawMembers: string[] = [];
+		let memberStart = start;
+		let nesting = 0;
+		for (let j = start; j < bodyEnd;) {
+			const ch = scan[j];
+			if (ch === '"' || ch === '`' || ch === '[') {
+				j = skipQuotedIdentifier(scan, j);
+				continue;
+			}
+			if (ch === '(') nesting++;
+			else if (ch === ')') nesting--;
+			if (ch === ',' && nesting === 0) {
+				rawMembers.push(blankComments(sql.slice(memberStart, j)).trim());
+				memberStart = j + 1;
+			}
+			j++;
+		}
+		const last = blankComments(sql.slice(memberStart, bodyEnd)).trim();
+		if (last.length > 0) rawMembers.push(last);
+
+		return rawMembers.map((raw) => {
+			// Same span/blank-literal technique `parseTableUniqueConstraints` uses
+			// for a unique member, for the same false-positive reasons ([F-069]'s
+			// class for a string literal, the quoted-identifier note for a name
+			// that literally contains the word "collate").
+			const blanked = blankLiterals(raw);
+			const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)/.exec(blanked);
+			const rawName = nameMatch ? nameMatch[1]! : blanked.trim();
+			const collateMatch = /\bcollate(?:\s+(\w+)|\s*("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]))/i.exec(
+				blanked.slice(nameMatch ? nameMatch[0].length : 0),
+			);
+			const collateToken = collateMatch ? (collateMatch[1] ?? collateMatch[2]) : undefined;
+			return { name: unquote(rawName), ...(collateToken ? { collate: unquote(collateToken) } : {}) };
+		});
+	}
+	return undefined;
+};
+
+/**
  * Every table-level `[constraint <name>] unique (…)` clause in a
  * `CREATE TABLE`'s text, in declaration order, with each member's own
  * `COLLATE` if it states one.
@@ -740,7 +832,15 @@ const parseTableUniqueConstraints = (sql: string): RawUniqueClause[] => {
 	// Anchored the same way `columnDefinitionStart` anchors a column: only after
 	// a top-level `(` or `,`, so a check constraint's text merely mentioning the
 	// word `unique` cannot be mistaken for the clause.
-	const pattern = /[(,]\s*(?:constraint\s+("(?:[^"]|"")+"|\w+)\s+)?unique\s*\(/gi;
+	//
+	// All four identifier spellings SQLite accepts for a constraint name —
+	// `"…"`, `` `…` ``, `[…]`, and bare — are matched here, the same way
+	// `columnDefinitionStart` widened to all four for a column name (`[F-112]`):
+	// a pull from a MySQL-origin database can produce `` constraint `u1` unique
+	// (…) `` or `constraint [u1] unique (…)`, and matching only the first two
+	// forms used to make this whole clause invisible, silently downgrading its
+	// members' collations the same way a missed clause always does.
+	const pattern = /[(,]\s*(?:constraint\s+("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)\s+)?unique\s*\(/gi;
 	const depths = computeDepths(scan);
 
 	for (const match of scan.matchAll(pattern)) {
@@ -1037,10 +1137,23 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			};
 		}
 
-		const compositePrimaryKeys: Record<string, { name: string; columns: readonly string[] }> = {};
+		const compositePrimaryKeys: Record<string, { name: string; columns: readonly (string | UniqueColumnSnapshot)[] }> =
+			{};
 		if (compositePk) {
 			const name = `${row.name}_pk`;
-			compositePrimaryKeys[name] = { name, columns: pkColumns.map((c) => c.name) };
+			// `[F-115]`: a composite primary key member can carry its own
+			// `collate`, exactly like a unique constraint member (`[F-111]`) — see
+			// `parseTablePrimaryKeyClause`. Matched to `pkColumns` by position: a
+			// table has at most one primary-key clause, so there is nothing to
+			// disambiguate by column-list matching the way `matchUniqueClause` does.
+			const pkClause = parseTablePrimaryKeyClause(createSql);
+			compositePrimaryKeys[name] = {
+				name,
+				columns: pkColumns.map((c, i) => {
+					const collate = pkClause?.[i]?.collate;
+					return collate ? { name: c.name, collate } : c.name;
+				}),
+			};
 		}
 
 		tables[row.name] = {

@@ -270,6 +270,64 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 				expect(member.collate).toBeUndefined();
 			},
 		},
+		{
+			label: '[F-115] a composite PRIMARY KEY member\'s own COLLATE must survive a rebuild',
+			ddl: [
+				'create table "t19" ("a" text, "b" text, primary key ("a" collate nocase, "b"))',
+			],
+			table: 't19',
+			assert: (s) => {
+				const pk = Object.values(s.tables['t19']!.compositePrimaryKeys)[0]!;
+				const members = pk.columns.map(normalizeUniqueColumn);
+				expect(members[0]).toEqual({ name: 'a', collate: 'nocase' });
+				expect(members[1]).toEqual({ name: 'b' });
+			},
+		},
+		{
+			label: '[F-115 sibling] backtick-quoted constraint name must not make a unique clause invisible',
+			ddl: [
+				'create table "t20" ("a" text, "b" text, constraint `t20_u1` unique ("a" collate nocase))',
+			],
+			table: 't20',
+			assert: (s) => {
+				const uq = Object.values(s.tables['t20']!.uniqueConstraints)[0]!;
+				const member = normalizeUniqueColumn(uq.columns[0]!);
+				expect(member.name).toBe('a');
+				expect(member.collate).toBe('nocase');
+			},
+		},
+		{
+			label: '[F-115 sibling] bracket-quoted constraint name must not make a unique clause invisible',
+			ddl: [
+				'create table "t21" ("a" text, "b" text, constraint [t21_u1] unique ("b" collate rtrim))',
+			],
+			table: 't21',
+			assert: (s) => {
+				const uq = Object.values(s.tables['t21']!.uniqueConstraints)[0]!;
+				const member = normalizeUniqueColumn(uq.columns[0]!);
+				expect(member.name).toBe('b');
+				expect(member.collate).toBe('rtrim');
+			},
+		},
+		{
+			label: '[F-115 sibling] backtick- and bracket-quoted constraint names together, exercising column-list '
+				+ 'attribution once both are recognised',
+			ddl: [
+				'create table "t22" ("a" text, "b" text, '
+					+ 'constraint `t22_u1` unique ("a" collate nocase), '
+					+ 'constraint [t22_u2] unique ("b" collate rtrim))',
+			],
+			table: 't22',
+			assert: (s) => {
+				const uqs = Object.values(s.tables['t22']!.uniqueConstraints);
+				expect(uqs).toHaveLength(2);
+				const byMember = new Map(
+					uqs.map((uq) => [normalizeUniqueColumn(uq.columns[0]!).name, normalizeUniqueColumn(uq.columns[0]!)]),
+				);
+				expect(byMember.get('a')).toEqual({ name: 'a', collate: 'nocase' });
+				expect(byMember.get('b')).toEqual({ name: 'b', collate: 'rtrim' });
+			},
+		},
 	];
 
 	for (const c of cases) {
@@ -303,6 +361,30 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 		const s = await introspect(runner);
 		const check = s.tables['t15']!.checkConstraints['t15_chk']!;
 		expect(check.value.replaceAll(/\s+/g, ' ').trim()).toBe('"a" > 0');
+	});
+
+	it('[F-115] a rebuilt composite PRIMARY KEY member COLLATE actually enforces case-insensitive uniqueness', async () => {
+		await DB.prepare(
+			'create table "t23" ("a" text, "b" text, primary key ("a" collate nocase, "b"))',
+		).run();
+		await DB.prepare('insert into "t23" ("a", "b") values (\'x\', \'y\')').run();
+
+		const snapshot = await introspect(runner);
+		const table = snapshot.tables['t23']!;
+		const pk = Object.values(table.compositePrimaryKeys)[0]!;
+		expect(normalizeUniqueColumn(pk.columns[0]!)).toEqual({ name: 'a', collate: 'nocase' });
+
+		// Rebuild under a fresh name and prove the collation still enforces the
+		// PK: two rows whose "a" differ only by case (and share the same "b")
+		// must still collide, or the rebuild silently loosened the constraint
+		// to a plain BINARY comparison.
+		const rebuiltName = 't23__rebuilt';
+		await DB.prepare(`drop table if exists "${rebuiltName}"`).run();
+		await DB.prepare(createTableFromSnapshot({ ...table, name: rebuiltName })).run();
+		await DB.prepare(`insert into "${rebuiltName}" ("a", "b") values ('x', 'y')`).run();
+		await expect(
+			DB.prepare(`insert into "${rebuiltName}" ("a", "b") values ('X', 'y')`).run(),
+		).rejects.toThrow();
 	});
 
 	it('a keyword-like table and column name round-trips', async () => {
