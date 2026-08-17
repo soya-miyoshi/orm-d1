@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { carryForwardCollations, diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { applicableStatements, splitStatements } from '../../src/core/sql.js';
 import { appendOnlyTriggerGuard, hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseColumnCollation, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
-import { assertRoundTrip, emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
+import { assertRoundTrip, canonicalTable, emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
 import type { Snapshot } from '../../src/core/snapshot.js';
 import { roundtripPlan } from '../../src/core/roundtrip.js';
 
@@ -469,6 +469,194 @@ describe('diffing snapshots', () => {
 
 		const { statements } = diffSnapshots(withMember('nocase'), withMember('rtrim'));
 		expect(statements.some((s) => s.reason?.includes('unique constraint'))).toBe(true);
+	});
+
+	// Finding 3: `canonicalTable`'s primary-key fingerprint used to be
+	// `JSON.stringify(primaryKeyColumns)` built from bare column *names* only
+	// — a composite PK member's own `collate` (`[F-115]`) never made it in,
+	// unlike `sameUniques`, which already compares member collations. Two
+	// origin:'introspection' snapshots differing only in a composite PK
+	// member's collation used to diff to zero statements. Mirrors "still
+	// reports a genuine unique-member collation mismatch" just above.
+	it('still reports a genuine composite-PK-member collation mismatch between two stated values (Finding 3)', () => {
+		const t = sqliteTable('memberships3', {
+			clubId: text('club_id'),
+			userId: text('user_id'),
+		}, (c) => [primaryKey({ columns: [c.clubId, c.userId] })]);
+		const base = snapshotOf(t);
+		const pkName = Object.keys(base.tables['memberships3']!.compositePrimaryKeys)[0]!;
+		const withMemberCollate = (collate: string | undefined): Snapshot => ({
+			...base,
+			origin: 'introspection',
+			tables: {
+				memberships3: {
+					...base.tables['memberships3']!,
+					compositePrimaryKeys: {
+						...base.tables['memberships3']!.compositePrimaryKeys,
+						[pkName]: {
+							...base.tables['memberships3']!.compositePrimaryKeys[pkName]!,
+							columns: [
+								collate ? { name: 'club_id', collate } : 'club_id',
+								'user_id',
+							],
+						},
+					},
+				},
+			},
+		});
+
+		// Same shape, no collate on either side: no diff.
+		expect(diffSnapshots(withMemberCollate(undefined), withMemberCollate(undefined)).statements).toEqual([]);
+
+		// Differ ONLY in the PK member's collation: must be a non-empty rebuild,
+		// not zero statements / zero errors.
+		const { statements } = diffSnapshots(withMemberCollate('nocase'), withMemberCollate('rtrim'));
+		expect(statements.length).toBeGreaterThan(0);
+		expect(statements.some((s) => s.reason?.includes('primary key'))).toBe(true);
+	});
+
+	// `carryForwardCollations`'s `carryForwardPrimaryKeyCollation` (`diff.ts`)
+	// persists a live composite-PK member's `collate` into the snapshot
+	// `generate` writes as its new baseline — the same role
+	// `carryForwardUniqueCollation` plays for a unique constraint member
+	// (tested just above and at "[F-115] persists a live unique-member
+	// collation..." below). These cover the shapes that function's own doc
+	// comment calls out: a table+column rename, a donor with no matching
+	// target, a target with no matching donor, and a PK sharing its column
+	// list with a unique constraint (proving the two are not confused).
+	describe('carryForwardPrimaryKeyCollation (via carryForwardCollations)', () => {
+		const withPkCollate = (
+			tableName: string,
+			columns: readonly string[],
+			collateFirst: string | undefined,
+		): Snapshot => {
+			const t = sqliteTable(
+				tableName,
+				Object.fromEntries(columns.map((c) => [c, text(c)])),
+				(cols) => [primaryKey({ columns: Object.values(cols) })],
+			);
+			const snap = snapshotOf(t);
+			const table = snap.tables[tableName]!;
+			const pkName = Object.keys(table.compositePrimaryKeys)[0]!;
+			const pk = table.compositePrimaryKeys[pkName]!;
+			return {
+				...snap,
+				origin: 'introspection',
+				tables: {
+					...snap.tables,
+					[tableName]: {
+						...table,
+						compositePrimaryKeys: {
+							...table.compositePrimaryKeys,
+							[pkName]: {
+								...pk,
+								columns: pk.columns.map((c, i) => (
+									i === 0 && collateFirst
+										? { name: typeof c === 'string' ? c : c.name, collate: collateFirst }
+										: c
+								)),
+							},
+						},
+					},
+				},
+			};
+		};
+
+		it('carries the member collation across both a table rename and a column rename', () => {
+			const live = withPkCollate('members_live', ['club_id', 'user_id'], 'nocase');
+			const schemaAfter = snapshotOf(
+				sqliteTable('memberships', {
+					clubId: text('club_id'),
+					userId: text('user_id'),
+				}, (c) => [primaryKey({ columns: [c.clubId, c.userId] })]),
+			);
+
+			const persisted = carryForwardCollations(live, schemaAfter, {
+				renamedTables: { members_live: 'memberships' },
+				renamedColumns: { 'memberships.club_id': 'club_id' },
+			});
+			const pk = Object.values(persisted.tables['memberships']!.compositePrimaryKeys)[0]!;
+			expect(pk.columns[0]).toEqual({ name: 'club_id', collate: 'nocase' });
+		});
+
+		it('is a no-op when the donor table has no matching entry in `after` (table dropped)', () => {
+			const live = withPkCollate('gone', ['a', 'b'], 'nocase');
+			const after: Snapshot = { ...live, origin: 'schema', tables: {} };
+			expect(() => carryForwardCollations(live, after)).not.toThrow();
+			expect(carryForwardCollations(live, after)).toEqual(after);
+		});
+
+		it('is a no-op when `after` has a matching table but no compositePrimaryKeys entry (donor member list does not match)', () => {
+			const live = withPkCollate('reshaped', ['a', 'b'], 'nocase');
+			// `after` is schema-derived with a *single*-column PK on `a` only — no
+			// arity-2 `compositePrimaryKeys` entry for `carryForwardPrimaryKeyCollation`
+			// to match against, so it must leave `after` untouched rather than throw
+			// or fabricate an entry.
+			const after = snapshotOf(sqliteTable('reshaped', { a: text('a').primaryKey(), b: text('b') }));
+			const persisted = carryForwardCollations(live, after);
+			expect(Object.keys(persisted.tables['reshaped']!.compositePrimaryKeys)).toHaveLength(0);
+		});
+
+		it('does not confuse a primary key with a unique constraint sharing the same column list', () => {
+			// Live: `(club_id, user_id)` is both the PK (collated) and, separately,
+			// carries a plain unique constraint over the same two columns. Only the
+			// PK member's collation must carry forward onto `after`'s PK — the
+			// unique constraint is untouched by this path.
+			const live = withPkCollate('dual', ['club_id', 'user_id'], 'nocase');
+			const liveTable = live.tables['dual']!;
+			const liveWithUnique: Snapshot = {
+				...live,
+				tables: {
+					...live.tables,
+					dual: {
+						...liveTable,
+						uniqueConstraints: {
+							dual_u1: { name: 'dual_u1', columns: ['club_id', 'user_id'] },
+						},
+					},
+				},
+			};
+			const schemaAfter = snapshotOf(
+				sqliteTable('dual', {
+					clubId: text('club_id'),
+					userId: text('user_id'),
+				}, (c) => [primaryKey({ columns: [c.clubId, c.userId] }), unique('dual_u1').on(c.clubId, c.userId)]),
+			);
+
+			const persisted = carryForwardCollations(liveWithUnique, schemaAfter);
+			const pk = Object.values(persisted.tables['dual']!.compositePrimaryKeys)[0]!;
+			expect(pk.columns[0]).toEqual({ name: 'club_id', collate: 'nocase' });
+			const uq = Object.values(persisted.tables['dual']!.uniqueConstraints)[0]!;
+			expect(uq.columns).toEqual(['club_id', 'user_id']);
+		});
+	});
+
+	// Finding 4: `pragma index_list` reports SQLite's automatic unique indexes
+	// in reverse creation order, so a schema-derived canonical table and an
+	// introspected one — or the same live table introspected twice around an
+	// unrelated rebuild — can disagree on `CanonicalTable.uniques`' array
+	// order despite being semantically identical. `sameUniques`'s own
+	// multiset match never cared, but `canonicalTable`'s output is deep-
+	// compared order-sensitively elsewhere (`kit/test/workers/fuzz.test.ts`'s
+	// `comparable()`), so the array itself needs a deterministic order.
+	it('orders `uniques` deterministically regardless of declaration/introspection order (Finding 4)', () => {
+		const t = sqliteTable('multi_unique', {
+			id: integer('id').primaryKey(),
+			a: text('a').notNull(),
+			b: text('b').notNull(),
+		}, (c) => [unique('u_a').on(c.a), unique('u_b').on(c.b)]);
+		const forward = snapshotOf(t).tables['multi_unique']!;
+
+		// Same table, same constraints, only the `Record`'s insertion order
+		// reversed — exactly what a live table introspected before vs. after an
+		// unrelated rebuild can produce.
+		const entries = Object.entries(forward.uniqueConstraints);
+		const reversed = {
+			...forward,
+			uniqueConstraints: Object.fromEntries(entries.slice().reverse()),
+		};
+
+		expect(canonicalTable(reversed).uniques).toEqual(canonicalTable(forward).uniques);
 	});
 
 	it('carries a live unique-member collation into a rebuild forced for an unrelated reason (F-111 follow-up)', () => {
@@ -1517,6 +1705,33 @@ describe('column-definition anchoring', () => {
 	it('still finds the real definition', () => {
 		const sql = 'create table "t" ("id" integer primary key autoincrement, "b" text)';
 		expect(hasAutoincrement(sql, 'id')).toBe(true);
+	});
+
+	// Reviewer finding: the unanchored `/autoincrement/i.test(span)` this
+	// replaced matched the *word* appearing anywhere in the column's span —
+	// including verbatim inside a quoted identifier (a column literally named
+	// `autoincrement_hint`, or a `references` clause naming a table/column
+	// that contains "autoincrement") — fabricating AUTOINCREMENT on a
+	// non-integer, non-PK column, which D1 rejects.
+	it('does not fabricate autoincrement from a references clause naming a table containing the word', () => {
+		const sql = 'create table "autoincrement_counters" ("id" text primary key); '
+			+ 'create table "t" ("code" text primary key references "autoincrement_counters"("id"), "v" text)';
+		expect(hasAutoincrement(sql, 'code')).toBe(false);
+	});
+
+	it('does not fabricate autoincrement from a quoted column name near a real integer PK', () => {
+		const sql = 'create table "t" ("autoincrement_hint" text, "id" integer primary key)';
+		expect(hasAutoincrement(sql, 'autoincrement_hint')).toBe(false);
+		expect(hasAutoincrement(sql, 'id')).toBe(false);
+	});
+
+	// The corpus case: a column literally NAMED `autoincrement`, whose own
+	// name is echoed back inside its own `check` and table-level `unique`
+	// clauses — must not be confused by its own name.
+	it('is not confused by a column named "autoincrement" mentioning itself in a check clause', () => {
+		const sql = 'create table "t_779" ("autoincrement" ANY primary key unique '
+			+ 'check ("autoincrement" is not null), unique ("autoincrement"))';
+		expect(hasAutoincrement(sql, 'autoincrement')).toBe(false);
 	});
 });
 

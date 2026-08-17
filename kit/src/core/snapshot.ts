@@ -667,7 +667,15 @@ export interface CanonicalUniqueMember {
 
 export interface CanonicalTable {
 	readonly columns: Record<string, CanonicalColumn>;
-	readonly primaryKey: string;
+	/**
+	 * The primary key's columns, in declared order, each with its own
+	 * `collate` when it states one — a lone column-level PK never does (SQLite
+	 * has no syntax for that), only a table-level `primary key (…)` clause's
+	 * member can (`[F-115]`). Compared with `samePrimaryKeyMembers`, which
+	 * (like `sameUniqueMembers`) exempts an unstated member collation on a
+	 * schema-derived side, since the schema DSL has no way to author one.
+	 */
+	readonly primaryKey: readonly CanonicalUniqueMember[];
 	/**
 	 * One entry per table-level unique constraint, each a member list rather
 	 * than a pre-serialised string — `sameUniques` needs the structure to apply
@@ -732,8 +740,15 @@ export const columnDifference = (
 	return undefined;
 };
 
-/** Whether two unique-constraint member lists are the same, member for member. */
-const sameUniqueMembers = (
+/**
+ * Whether two ordered member lists are the same, member for member —
+ * shared by a table-level unique constraint's members (`sameUniques`, which
+ * still needs the multiset match around this for constraint-to-constraint
+ * matching) and a primary key's own members (`requiresRecreate` in
+ * `diff.ts`, positionally: a table has at most one primary key, so there is
+ * no set of candidates to match against, only the one list to compare).
+ */
+export const sameUniqueMembers = (
 	a: readonly CanonicalUniqueMember[],
 	b: readonly CanonicalUniqueMember[],
 	/** Same reading as `columnDifference`'s parameter of the same name. */
@@ -867,7 +882,16 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 	const columns: Record<string, CanonicalColumn> = {};
 	const uniques: (readonly CanonicalUniqueMember[])[] = [];
 	const foreignKeys: string[] = [];
-	const primaryKeyColumns: string[] = [];
+	// Same member shape `uniques` uses ({ name, collate? }), in declared
+	// (positional) order — a table has at most one primary key, so unlike
+	// `uniques` this never needs multiset matching, only a member-for-member
+	// compare. Keeping a member's `collate` here (rather than the bare name
+	// `compositeColumns` below uses for the NOT-NULL identity check) is what
+	// lets `requiresRecreate`'s `samePrimaryKeyMembers` notice two
+	// otherwise-identical composite PKs that differ only in a member's
+	// collation — before this, that difference diffed to zero statements, the
+	// same gap `[F-111]` closed for `uniques`.
+	const primaryKeyColumns: CanonicalUniqueMember[] = [];
 
 	// A single-column primary key is NOT NULL whether or not anyone wrote it:
 	// SQLite reports it that way, and introspection records it. Spelling the
@@ -903,7 +927,14 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 				? column.collate.toLowerCase()
 				: undefined,
 		};
-		if (column.primaryKey) primaryKeyColumns.push(column.name);
+		// A single-column table-level PK clause with an explicit member
+		// `collate` is recorded in `table.compositePrimaryKeys` even at arity 1
+		// (`[F-115]`'s introspection side — see `introspect.ts`), so it is
+		// already in `compositeColumns` and pushed with its collation by the
+		// loop below; pushing the bare name here too would duplicate it.
+		if (column.primaryKey && !compositeColumns.includes(column.name)) {
+			primaryKeyColumns.push({ name: column.name });
+		}
 		// Same shape the table-level branch below now uses ({ name, collate? }) —
 		// `JSON.stringify` drops an `undefined` `collate`, so this still reads
 		// identically to a plain `[{"name":"email"}]` when there is none. A
@@ -917,7 +948,13 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 	}
 
 	for (const pk of Object.values(table.compositePrimaryKeys)) {
-		primaryKeyColumns.push(...pk.columns.map(normalizeUniqueColumn).map((c) => c.name));
+		primaryKeyColumns.push(
+			...pk.columns.map(normalizeUniqueColumn).map((c) => (
+				c.collate && c.collate.toLowerCase() !== 'binary'
+					? { name: c.name, collate: c.collate.toLowerCase() }
+					: { name: c.name }
+			)),
+		);
 	}
 	for (const u of Object.values(table.uniqueConstraints)) {
 		// A member's own `collate` is part of the constraint's identity: two
@@ -942,8 +979,19 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 
 	return {
 		columns,
-		primaryKey: JSON.stringify(primaryKeyColumns),
-		uniques,
+		primaryKey: primaryKeyColumns,
+		// `pragma index_list` reports SQLite's *automatic* unique indexes (one
+		// per column-level `.unique()`/table-level `unique(...)`) in reverse
+		// creation order, so two semantically-identical tables — one built from
+		// the schema, one introspected live, or the same live table introspected
+		// twice after an unrelated rebuild — can disagree on this array's order
+		// with no difference in what they actually enforce. `sameUniques` already
+		// does a multiset match so it never cared, but any order-sensitive deep
+		// comparison of the *whole* canonical table (`kit/test/workers/fuzz.test.ts`'s
+		// `comparable()`) did. Sorting on each member list's own serialised form
+		// gives a deterministic order independent of either side's constraint
+		// declaration/introspection order.
+		uniques: uniques.slice().sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
 		foreignKeys: foreignKeys.sort(),
 		// SQLite keeps the check's text but not reliably its whitespace.
 		checks: Object.values(table.checkConstraints)

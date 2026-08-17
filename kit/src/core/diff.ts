@@ -24,6 +24,7 @@ import {
 	createTableFromSnapshot,
 	normalizeIndexColumn,
 	normalizeUniqueColumn,
+	sameUniqueMembers,
 	sameUniques,
 } from './snapshot.js';
 import { foldAsciiCase, lookupCaseInsensitive } from './sql.js';
@@ -185,7 +186,13 @@ const requiresRecreate = (
 		const difference = columnDifference(column, target, afterIsSchemaDerived);
 		if (difference) return `column "${name}" ${difference}`;
 	}
-	if (a.primaryKey !== b.primaryKey) return 'the primary key changes';
+	// Positional, not a multiset match (`sameUniques`'s reason for one does not
+	// apply — a table has at most one primary key, nothing to disambiguate
+	// against), and exempts an unstated member `collate` on a schema-derived
+	// `b` the same way `sameUniqueMembers` already does for a unique
+	// constraint's own members: the schema DSL cannot author one (`docs/04`),
+	// so its absence there is not "changed to binary".
+	if (!sameUniqueMembers(a.primaryKey, b.primaryKey, afterIsSchemaDerived)) return 'the primary key changes';
 	if (!sameJson(a.foreignKeys, b.foreignKeys)) return 'a foreign key changes';
 	if (!sameUniques(a.uniques, b.uniques, afterIsSchemaDerived)) return 'a unique constraint changes';
 	if (!sameJson(a.checks, b.checks)) return 'a check constraint changes';

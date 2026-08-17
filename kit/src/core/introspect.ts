@@ -176,6 +176,24 @@ const blankLiterals = (text: string): string =>
 	);
 
 /**
+ * Blank a quoted identifier's *contents* to spaces, keeping its delimiters —
+ * `"…"`, `` `…` ``, `[…]` — for a scan (`hasAutoincrement`'s) that must not
+ * mistake a keyword merely spelled inside a quoted name for the keyword
+ * itself. `blankLiterals` deliberately leaves an identifier's own text
+ * verbatim (other callers anchor on it), so this is a separate pass applied
+ * only where that verbatim text would otherwise create a false positive: a
+ * column named `[autoincrement_hint]`, a `references "autoincrement_counters"
+ * (...)` clause, or a `check (...)` clause mentioning a same-named column, all
+ * of which contain the literal word `autoincrement` without it ever being the
+ * `AUTOINCREMENT` keyword.
+ */
+const blankIdentifierContents = (text: string): string =>
+	text.replaceAll(
+		/"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]/g,
+		(span) => `${span[0]}${' '.repeat(span.length - 2)}${span[span.length - 1]}`,
+	);
+
+/**
  * Blank *only* comments from a value already sliced out of the DDL for
  * storage in a snapshot (a `check` expression, a generated column's `as`, an
  * index member) — string literals and quoted identifiers pass through
@@ -340,10 +358,28 @@ export const hasAutoincrement = (
 	const depths = precomputed?.depths ?? computeDepths(scan);
 	const anchor = findColumnDefinitionAnchor(scan, columnName, depths);
 	if (anchor) {
-		const rest = scan.slice(anchor.index + anchor[0].length);
+		const spanStart = anchor.index + anchor[0].length;
+		const rest = scan.slice(spanStart);
 		const commaIdx = rest.indexOf(',');
 		const span = commaIdx === -1 ? rest : rest.slice(0, commaIdx);
-		if (/autoincrement/i.test(span)) return true;
+		// The bare `/autoincrement/i.test(span)` this replaced matched the word
+		// appearing *anywhere* in the span — including inside a quoted
+		// identifier verbatim (a column literally named `autoincrement`, a
+		// `references "autoincrement_counters"(...)` clause, a `check (...)`
+		// mentioning a column called `autoincrement`) or nested inside that
+		// same `check`/`references` clause's own parens. Any of those made this
+		// fabricate `AUTOINCREMENT` on a column that never declared it —
+		// silently wrong PK semantics on an INTEGER PK, or an outright D1
+		// rejection (`AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY`)
+		// on anything else. `blankIdentifierContents` erases what is inside a
+		// quoted name so the word can no longer hide there, and requiring the
+		// remaining match's paren depth (from the whole-scan `depths`, at the
+		// anchor's own depth of 1) to still be top-level excludes one buried
+		// inside a nested `references (...)`/`check (...)` even when spelled
+		// unquoted.
+		for (const match of blankIdentifierContents(span).matchAll(/\bautoincrement\b/gi)) {
+			if (depths[spanStart + match.index] === 1) return true;
+		}
 	}
 	// SQLite also accepts AUTOINCREMENT stated inside a *table-level*
 	// `primary key (col autoincrement)` clause rather than on the column's own
@@ -1188,17 +1224,6 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 				}
 				: undefined;
 
-			// A single-column table-level `primary key (col collate x)` states
-			// its collation on the PK clause's own member, not on the column's
-			// definition — `parseColumnCollation` cannot see it, so it is
-			// consulted separately here and only used when the column's own
-			// definition stated none (the two are not expected to differ, but if
-			// they did, the column's own explicit `COLLATE` is the more direct
-			// statement of intent).
-			const pkMemberCollate = single
-				? pkClause?.find((m) => foldAsciiCase(m.name) === foldAsciiCase(column.name))?.collate
-				: undefined;
-
 			columns[column.name] = {
 				name: column.name,
 				type: column.type.toLowerCase(),
@@ -1226,13 +1251,28 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 				default: column.dflt_value === null ? undefined : defaultExpression(column.dflt_value),
 				generated,
 				references: undefined,
-				collate: parseColumnCollation(createSql, column.name, tableScanContext) ?? pkMemberCollate,
+				collate: parseColumnCollation(createSql, column.name, tableScanContext),
 			};
 		}
 
 		const compositePrimaryKeys: Record<string, { name: string; columns: readonly (string | UniqueColumnSnapshot)[] }> =
 			{};
-		if (compositePk) {
+		// A table-level `primary key (…)` clause whose members carry an explicit
+		// `collate` needs the arity-1 (single-column) case too, not only the
+		// `compositePk` (arity>=2) one below: SQLite scopes a member's own
+		// `COLLATE` to the primary key's own automatic index, never to the
+		// column's declared collation (unlike a column-level `col type primary
+		// key collate x`, which *does* declare it on the column). Folding it
+		// into `column.collate` used to make `createTableFromSnapshot` emit
+		// `"a" TEXT collate nocase primary key` — a column-level COLLATE, which
+		// governs every comparison and index over the column, not the
+		// table-level `constraint … primary key ("a" collate nocase)` the live
+		// table actually has, and the two can return different query results.
+		// Recording it here instead, the same way the arity>=2 branch already
+		// does, makes `createTableFromSnapshot` render it on the PK clause
+		// (`hasCompositePk` there turns off the column's own inline `primary
+		// key`, so this table-level clause is the only place it is emitted).
+		if (compositePk || pkClause) {
 			const name = `${row.name}_pk`;
 			// `[F-115]`: a composite primary key member can carry its own
 			// `collate`, exactly like a unique constraint member (`[F-111]`) — see
@@ -1240,13 +1280,20 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			// above). Matched to `pkColumns` by position: a table has at most one
 			// primary-key clause, so there is nothing to disambiguate by
 			// column-list matching the way `matchUniqueClause` does.
-			compositePrimaryKeys[name] = {
-				name,
-				columns: pkColumns.map((c, i) => {
-					const collate = pkClause?.[i]?.collate;
-					return collate ? { name: c.name, collate } : c.name;
-				}),
-			};
+			const members = pkColumns.map((c, i) => {
+				const collate = pkClause?.[i]?.collate;
+				return collate ? { name: c.name, collate } : c.name;
+			});
+			// For the single-column case, `pkClause` is only defined when the DDL
+			// actually used the table-level `primary key (…)` clause shape
+			// (`parseTablePrimaryKeyClause` never matches a column-level inline
+			// `primary key`) — so only add this entry when that member states a
+			// `collate`; otherwise leave the column-level rendering (`single &&
+			// column.primaryKey`, `createTableFromSnapshot`) as the faithful,
+			// simpler round-trip it already was.
+			if (compositePk || members.some((m) => typeof m !== 'string')) {
+				compositePrimaryKeys[name] = { name, columns: members };
+			}
 		}
 
 		tables[row.name] = {

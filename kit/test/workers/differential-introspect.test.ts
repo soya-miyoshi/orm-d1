@@ -341,7 +341,17 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 			},
 		},
 		{
-			label: '[Finding 3] single-column table-level `primary key (col collate x)` must capture the collation',
+			// A table-level `primary key (col collate x)` scopes COLLATE to the
+			// PK's own automatic index, not to the column's declared collation —
+			// unlike a column-level `col type primary key collate x`, which does
+			// declare it on the column. Recording it on `column.collate` (as an
+			// earlier round of this fix did) made `createTableFromSnapshot` emit
+			// column-level `collate nocase`, which governs *every* comparison
+			// over the column, not only the PK's own index — a different table
+			// that can return different query results than the live one. It must
+			// land on `compositePrimaryKeys` instead, the same place an arity>=2
+			// member's own collation already does.
+			label: '[Finding 2] single-column table-level `primary key (col collate x)` collation belongs to the PK clause, not the column',
 			ddl: [
 				'create table "t26" ("a" text, constraint "t26_pk" primary key ("a" collate nocase))',
 			],
@@ -349,7 +359,11 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 			assert: (s) => {
 				const a = s.tables['t26']!.columns['a']!;
 				expect(a.primaryKey).toBe(true);
-				expect(a.collate).toBe('nocase');
+				expect(a.collate).toBeUndefined();
+				const pk = Object.values(s.tables['t26']!.compositePrimaryKeys)[0]!;
+				const member = normalizeUniqueColumn(pk.columns[0]!);
+				expect(member.name).toBe('a');
+				expect(member.collate).toBe('nocase');
 			},
 		},
 		{
@@ -451,5 +465,64 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 		const rendered = createIndexFromSnapshot(idx, 't17').replace('index "t17_idx"', 'index "t17_idx__rebuilt"');
 		const combined = `${rendered};\nselect 1`;
 		expect(combined.split(';').map((s2) => s2.trim()).filter(Boolean)).toHaveLength(2);
+	});
+});
+
+/**
+ * [Finding 2] A single-column table-level `primary key (col collate x)`
+ * scopes the collation to the primary key's own automatic index, not to the
+ * column's declared collation — a real SQLite/D1 distinction that a rendered
+ * DDL *string* comparison cannot catch (both a column-level and a table-level
+ * `collate nocase` render similarly), so this asserts actual *query* behavior
+ * against real D1: comparisons, ordering, and a duplicate-insert rejection,
+ * before and after a round-trip through introspection + rebuild.
+ */
+describe('[Finding 2] single-column table-level PK collation, query behavior against real D1', () => {
+	it('keeps NOCASE query behavior identical before and after a round-trip rebuild', async () => {
+		await dropEverything();
+		await DB.prepare(
+			'create table "t" ("a" text, constraint "t_pk" primary key ("a" collate nocase))',
+		).run();
+		await DB.batch([
+			DB.prepare(`insert into "t" ("a") values ('abc')`),
+			DB.prepare(`insert into "t" ("a") values ('m')`),
+			DB.prepare(`insert into "t" ("a") values ('Z')`),
+		]);
+
+		const assertBaselineBehavior = async (table: string): Promise<void> => {
+			const equalsUpper = await runner.all<{ a: string }>(
+				`select "a" from "${table}" where "a" = 'ABC'`,
+			);
+			expect(equalsUpper).toHaveLength(0);
+
+			const ordered = await runner.all<{ a: string }>(`select "a" from "${table}" order by "a"`);
+			expect(ordered.map((r) => r.a)).toEqual(['Z', 'abc', 'm']);
+
+			await expect(DB.prepare(`insert into "${table}" ("a") values ('ABC')`).run()).rejects.toThrow();
+		};
+
+		// Baseline, before any introspection or rebuild is involved.
+		await assertBaselineBehavior('t');
+
+		// Round-trip: introspect, render the rebuild DDL under a fresh name, and
+		// apply it — the same (b)+(c) proof `run()` above does for the rendered
+		// shape, but here re-asserting on *real query results*, not the
+		// snapshot or the SQL string.
+		const snapshot = await introspect(runner);
+		const table = snapshot.tables['t']!;
+		expect(table.columns['a']!.collate).toBeUndefined();
+		const pk = Object.values(table.compositePrimaryKeys)[0]!;
+		expect(normalizeUniqueColumn(pk.columns[0]!).collate).toBe('nocase');
+
+		const rebuiltName = 't__rebuilt';
+		await DB.prepare(`drop table if exists "${rebuiltName}"`).run();
+		await DB.prepare(createTableFromSnapshot({ ...table, name: rebuiltName })).run();
+		await DB.batch([
+			DB.prepare(`insert into "${rebuiltName}" ("a") values ('abc')`),
+			DB.prepare(`insert into "${rebuiltName}" ("a") values ('m')`),
+			DB.prepare(`insert into "${rebuiltName}" ("a") values ('Z')`),
+		]);
+
+		await assertBaselineBehavior(rebuiltName);
 	});
 });
