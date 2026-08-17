@@ -566,7 +566,7 @@ and rejected on three further points. Two review rounds is the cap, the gate was
 **`[F-055]` is a regression against `main` reachable at the default budget** — a query that
 compiled and ran fine now throws `CompileError`. Fix it first.
 
-### [F-055] The new bound-parameter guard counts *columns*, not parameters, and rejects inserts that worked — status: todo — severity: **high** — area: sql/compile — REGRESSION
+### [F-055] The new bound-parameter guard counts *columns*, not parameters, and rejects inserts that worked — status: done (TBD, actual-param counting via scratch-render — see `countRowParams`/`countReturningParams` in `src/plan/compile.ts`) — severity: **high** — area: sql/compile — REGRESSION
 - **Where**: `src/plan/compile.ts:539`
 - **Defect**: `cols.length + conflictParams > ctx.maxParams` treats every column in the row as one bound parameter, but a value supplied as a zero-parameter `sql` fragment occupies a column without binding anything. The `CompileError` therefore fires on queries whose emitted statement is nowhere near the budget — **at the default `maxParams: 100`**, not only under a lowered one.
 - **Failure scenario** (verified against both revisions, default budget): an 80-column table where 40 values are SQL literals binding nothing, upserted with `set: { c0: sql\`excluded."c0"\` }` (0 params) and `where: inArray(wide.c1, [25 ids])` (25 params). `main` compiles to **one statement with 65 bound parameters**, which D1 accepts. HEAD throws `CompileError: A row of 80 columns plus 25 bound parameter(s) from "on conflict" exceed the bound-parameter limit of 100; no chunking can satisfy it.` A realistic instance: a 98-column table (legal), three values written as `sql\`unixepoch()\``, an upsert binding 3 → `98 + 3 = 101` throws, while the real statement binds `95 + 3 = 98`.
@@ -574,19 +574,19 @@ compiled and ran fine now throws `CompileError`. Fix it first.
 - **Second, narrower window**: `maxParams` is documented as a chunking *lever* (`docs/02-d1-platform.md:183`, `src/plan/compile.ts:378`), not only as D1's ceiling. A 10-column table with `maxParams: 10` and an upsert on a table carrying `$onUpdate` compiled to a valid 11-parameter statement on `main` and now throws.
 - **Fix**: count the row's actual bound parameters — render or count them the way `countOnConflictParams` already does for the conflict clause — rather than equating columns with parameters. The same conflation makes `rowsPerChunk` (line 546) inexact in both directions, but that part is pre-existing; only the *throw* is new.
 
-### [F-056] A group mixing a depth-2 leaf with a deeper leaf does not do what Drizzle does — status: todo — severity: med — area: sql/compile
+### [F-056] A group mixing a depth-2 leaf with a deeper leaf does not do what Drizzle does — status: done (TBD, deeper leaves skipped per-leaf, not group veto — see `src/plan/compile.ts` explicitNullableGroups) — severity: med — area: sql/compile
 - **Where**: `src/plan/compile.ts:213` — `if (leaves.some((leaf) => leaf.path.length !== 2)) continue;`
 - **Defect**: this applies Drizzle's `path.length === 2` rule as a group-wide veto. Drizzle applies it *per leaf*: a deeper leaf is simply skipped (`drizzle-orm/utils.js:136`) and the group's own depth-2 Column leaves still decide. The comment above the line ("Only a group's *own* depth matters") describes Drizzle's rule; the code implements a stricter one.
 - **Failure scenario**, both implementations on driver row `[7, null, null]`: `select({ postId: posts.id, author: { id: users.id, contact: { email: users.email } } }).from(posts).leftJoin(users, …)` gives Drizzle `[{ postId: 7, author: null }]` and orm-d1 `[{ postId: 7, author: { id: null, contact: { email: null } } }]`. This is the exact "null row materialized as an object of nulls" shape the batch exists to fix.
 - **Not a regression against `main`** (equally wrong there), but note that `fd11e75` happened to get this shape right and `4b70c35` traded it for the depth-3 fix.
 - **Fix**: skip deeper leaves rather than vetoing the group. **Matching Drizzle also requires `GroupSpec.columnIndexes` to hold only the group's *direct* depth-2 column leaves** — today `buildShape` pushes each column index into every ancestor (`src/plan/mapper.ts:99`), so a naive relaxation of line 213 would test the wrong indexes.
 
-### [F-057] `GroupSpec.indexes` is now write-only — dead allocations and 75 bundle bytes — status: todo — severity: low — area: efficiency
+### [F-057] `GroupSpec.indexes` is now write-only — dead allocations and 75 bundle bytes — status: done (TBD, `indexes` field, its allocations and pushes deleted from `src/plan/mapper.ts`) — severity: low — area: efficiency
 - **Where**: `src/plan/mapper.ts:38`
 - **Defect**: `readRow` was the only reader and now reads `columnIndexes` (line 145). `indexes` is still declared, initialized in four places, pushed to once per (field × ancestor depth) in `buildShape` (line 98), and copied into every `GroupSpec` (line 120). Deleting it gives 41,223 bytes vs 41,298 — **75 of this batch's 1,083 bytes are dead weight** parsed on every cold isolate, plus one dead array allocation per group and one dead push per column per level on every compile.
 - **Careful**: `[F-056]`'s fix needs `columnIndexes` to change meaning, so do these two together.
 
-### [F-058] The same `too many SQL variables` remains reachable through `returning()` and multi-parameter `values()` — status: todo — severity: med — area: sql/compile
+### [F-058] The same `too many SQL variables` remains reachable through `returning()` and multi-parameter `values()` — status: done (TBD, `rowsPerChunk` replaced with greedy packing against actual per-row/returning param counts — see `src/plan/compile.ts`) — severity: med — area: sql/compile
 - **Where**: `src/plan/compile.ts` (the `rowsPerChunk` computation)
 - **Defect**: the chunker still assumes exactly one bound parameter per column in `VALUES` and zero from `returning`. Both reproduced against real D1 in workerd: `db.insert(t).values(40 rows × 4 cols).returning({ id: t.id, tag: sql\`${'tag'}\` })` → parts `[101, 61]` → `D1_ERROR: too many SQL variables at offset 411`; and a `values()` entry written as `sql\`${'x'} || ${'y'}\`` (2 params in one column) → parts `[125, 75]` → same error.
 - **Pre-existing, not introduced by this batch** — but `countOnConflictParams` is the right shape for both, and a general "params outside/inside VALUES, rendered not guessed" reservation would close them together with `[F-055]`.
@@ -626,7 +626,7 @@ compiled and ran fine now throws `CompileError`. Fix it first.
 - **Fix**: at `:146`, also match when `command` starts with `-`.
 - **Prove it**: `await expect(run(['--help'])).resolves.toBe(0)`.
 
-### [F-064] Error mapping loses the failing statement on a chunked write — status: todo — severity: low — area: runtime — OFF-LENS from efficiency + bugs
+### [F-064] Error mapping loses the failing statement on a chunked write — status: done (TBD, `#runParts`/`batch()` now report every part's SQL and bound params, not just the first — see `src/runtime/session.ts`) — severity: low — area: runtime — OFF-LENS from efficiency + bugs
 - **Where**: `src/runtime/session.ts:150` throws `wrapQueryError(cause, query.sql)` where `query.sql` is `parts[0].sql`, so a 40-chunk insert failing on chunk 37 reports chunk 1's SQL and no parameters — contradicting the documented "errors carry the SQL that caused them". `src/runtime/session.ts:194` joins only each item's *first* part for the same reason.
 
 ### [F-065] `verify` replays in array order, `migrate` in `idx` order — status: todo — severity: low — area: kit/journal — OFF-LENS from efficiency + bugs
@@ -635,7 +635,7 @@ compiled and ran fine now throws `CompileError`. Fix it first.
 ### [F-066] `pull` writes a snapshot with no `prevId` — status: todo — severity: low — area: kit/node — OFF-LENS from efficiency + bugs
 - **Where**: `kit/src/node/commands.ts:278` omits it where `generate` (`:145`) sets `prevId: previous.id`, so a pulled baseline breaks the snapshot chain.
 
-### [F-067] A Drizzle fragment inside DDL ignores `bareColumns` — status: todo — severity: med — area: sql — OFF-LENS from efficiency + bugs
+### [F-067] A Drizzle fragment inside DDL ignores `bareColumns` — status: done (TBD, `stripQualifiers` in `src/sql/drizzle-sql.ts`) — severity: med — area: sql — OFF-LENS from efficiency + bugs
 - **Where**: `src/sql/drizzle-sql.ts:109` honours `ctx.paramToken` but not `ctx.bareColumns`, so `check('c', drizzleSql\`${col} > 0\`)` renders `"t"."col" > 0` inside a `CHECK`, which SQLite rejects. Concrete and in-lens; recorded rather than batched only to keep this iteration's batch small.
 
 ## Unresolved objections merged anyway (`efe70a4`)
@@ -798,12 +798,12 @@ Only items not already on the recorded list:
 4. **`db.batch([db.query.users.findMany()])`** — Drizzle's D1 driver accepts a relational query in a batch (`SQLiteAsyncRelationalQuery` implements `_prepare`); orm-d1 throws `TypeError: item.compile is not a function`. Only expressible for queries that compile to one statement — the `joined` strategy, or any `find*` with no `with` — so a real design decision, not a small patch.
 5. **`sql.fromList`, `sql.param`, `sql.comment`, `SQL.prototype.append`** — on Drizzle's `sql` namespace, absent from `SQLTag` (`src/sql/sql.ts:212-219`).
 
-### [F-085] `alias(subquery, 'x')` silently produces wrong SQL — status: todo — severity: med — area: schema — OFF-LENS from feature
+### [F-085] `alias(subquery, 'x')` silently produces wrong SQL — status: done (TBD, `alias()` propagates `TableSource`/`TableNullableGroups` — see `src/schema/table.ts`) — severity: med — area: schema — OFF-LENS from feature
 - **Where**: `src/schema/table.ts:352`
 - **Defect**: `alias()` runs `buildTable(...)`, which does not copy the `TableSource` symbol, so the inner statement is lost. `query.select({id: a.id}).from(alias(sq,'x'))` compiles to `select "x"."id" from "sq" "x"` and fails at runtime with `no such table: sq`, instead of inlining `(select …) "x"`.
 - Off-lens because Drizzle's `alias()` is documented for tables and views, not subqueries — but it is wrong SQL produced silently at compile time.
 
-### [F-086] `logger` is accepted and ignored — status: todo — severity: low — area: runtime — OFF-LENS from feature
+### [F-086] `logger` is accepted and ignored — status: done (TBD, `Logger` interface + `DefaultLogger`, wired through `Executor#prepare` — see `src/runtime/database.ts`, `src/runtime/session.ts`) — severity: low — area: runtime — OFF-LENS from feature
 - **Where**: `src/runtime/database.ts:59`
 - **Defect**: `logger: true` is the single most common Drizzle debugging switch; silently discarding it means a user who sets it concludes no queries are running. `docs/08`'s Tier 2 says such options should carry a `__DEV__` warning; this one does not.
 
@@ -824,7 +824,7 @@ rejected loudly by SQLite (`near ",": syntax error`, `near ")": syntax error`), 
 is closed rather than moved. No injection on the newly-reachable inline path: a value
 containing `'); drop table …` renders as one properly-doubled literal.
 
-### [F-087] An *empty* interpolated array in a DDL predicate renders `()`, which SQLite accepts — status: todo — severity: med — area: sql/ddl
+### [F-087] An *empty* interpolated array in a DDL predicate renders `()`, which SQLite accepts — status: done (TBD, `__DEV__`-only warning on empty-array interpolation in a `bareColumns` context — see `src/sql/sql.ts`) — severity: med — area: sql/ddl
 - **Where**: `src/sql/sql.ts:198-204` (the array branch) + `src/ddl.ts:187` (`renderInline`)
 - **Defect**: the one place in the batch where a loud failure became a silent one, and it lands in bug class #1. Verified on SQLite 3.53.1 through both trees: `main` emitted `check ("role" not in '')` → **rejected**, `subqueries prohibited in CHECK constraints`; HEAD emits `check ("role" not in ())` → **accepted**, and admitted a row. Same for a partial index: `where "role" in ''` was rejected, `where "role" in ()` is accepted and the "unique" index then admits a duplicate.
 - **Failure scenario**: `check('role_ok', sql\`${c.role} not in ${ROLES}\`)` where `ROLES` is a config array that happens to be empty. `x NOT IN ()` is unconditionally true and `x IN ()` unconditionally false, so the CHECK is permanently inert and the partial unique index covers zero rows — and both are self-consistent, so introspection reads them back verbatim and `check`/`push` converge forever.
@@ -834,7 +834,7 @@ containing `'); drop table …` renders as one properly-doubled literal.
 ### [F-088] `sql.join`'s changed default needs a release note — status: needs-human — severity: low — area: release
 - `SQLTag.join`'s declared type is untouched (`separator?:` was already optional); only the runtime default changed, from `', '` to none. An existing orm-d1-native caller writing `sql.join(parts)` now gets `select a b from t` where it used to get `select a, b from t` — SQL that parses and returns one aliased column, with no type error and no deprecation. Correct under `docs/08` and `sql.join` is undocumented in `README.md`/`docs/`, so it is a release-note item rather than a defect. It is now reachable by user code through `callableOperators` (`src/relations/query.ts:75`), which is exactly where Drizzle parity matters.
 
-### [F-089] A hand-written `sql\`${col} in ${ids}\`` has no `json_each` fallback — status: todo — severity: low — area: sql
+### [F-089] A hand-written `sql\`${col} in ${ids}\`` has no `json_each` fallback — status: needs-human (not closed — the only fix shape available is textually detecting an `in`/`not in`-shaped fragment inside an arbitrary hand-written `sql` template, which is exactly the fragile heuristic to avoid; low severity per the finding itself, since `main` never worked here either) — severity: low — area: sql
 - With 200 ids it now compiles cleanly to 200 `?` and fails at D1 with `too many SQL variables`. The budget guard lives in `InArray` (`src/sql/expressions.ts:155`), which a hand-written fragment does not go through. On `main` that expression never worked at all, and Drizzle behaves the same, so `[F-081]` did not open it so much as make it reachable.
 
 ### [F-090] Two redundant `not.toContain` guards in the new DDL test — status: todo — severity: low — area: test-integrity

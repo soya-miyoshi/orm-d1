@@ -21,6 +21,8 @@ export interface D1Target {
 export interface ResolvedOptions {
 	readonly compileOptions: CompileOptions;
 	readonly onQuery: ((event: QueryEvent) => void) | undefined;
+	/** See `Logger` in `runtime/database.ts` — `undefined` means no logging. */
+	readonly logger: { logQuery(query: string, params: unknown[]): void } | undefined;
 	/**
 	 * Present only when `plan` was supplied. Shared by every database derived
 	 * from the one that was opened — `withSession()` reuses these options — so
@@ -94,6 +96,10 @@ export class Executor implements QueryExecutor {
 	}
 
 	#prepare(sql: string, params: readonly D1Param[]): D1PreparedStatement {
+		// Every statement actually sent to D1 passes through here — each chunk
+		// of a chunked write, each member of a `batch()` — which is what makes
+		// this the one place to log rather than the call sites above it.
+		this.options.logger?.logQuery(sql, [...params]);
 		const stmt = this.target.prepare(sql);
 		return params.length > 0 ? stmt.bind(...params) : stmt;
 	}
@@ -158,7 +164,12 @@ export class Executor implements QueryExecutor {
 			}
 			return results as D1Result[];
 		} catch (cause) {
-			throw wrapQueryError(cause, query.sql);
+			// `query.sql` is always `parts[0].sql` — reporting only it named the
+			// wrong statement for anything but a failure in the first chunk. D1's
+			// `batch()` gives no indication of which member failed, so every
+			// part's SQL and bound parameters are reported rather than guessing
+			// which one to blame. See [F-064].
+			throw wrapQueryError(cause, query.parts.map((part) => part.sql).join('; '), bound.flat());
 		}
 	}
 
@@ -185,6 +196,8 @@ export class Executor implements QueryExecutor {
 
 		/** Parallel to `statements`, so `onQuery` can report what was bound. */
 		const bound: (readonly D1Param[])[] = [];
+		/** Parallel to `statements` too — every part's SQL, not just each item's first. */
+		const sqls: string[] = [];
 
 		for (const { query, input } of compiled) {
 			const span: number[] = [];
@@ -192,6 +205,7 @@ export class Executor implements QueryExecutor {
 				span.push(statements.length);
 				const params = bindParams(part.params, input);
 				bound.push(params);
+				sqls.push(part.sql);
 				statements.push(this.#prepare(part.sql, params));
 			}
 			spans.push(span);
@@ -202,7 +216,12 @@ export class Executor implements QueryExecutor {
 		try {
 			results = await this.target.batch<Record<string, unknown>>(statements);
 		} catch (cause) {
-			throw wrapQueryError(cause, compiled.map((c) => c.query.sql).join('; '));
+			// `compiled.map((c) => c.query.sql)` joined only each item's *first*
+			// part — an item that itself compiled to several chunked statements
+			// (a wide insert inside `batch()`) lost every part but the first.
+			// D1 gives no indication of which statement in the batch failed, so
+			// every part actually sent is reported. See [F-064].
+			throw wrapQueryError(cause, sqls.join('; '), bound.flat());
 		}
 
 		return compiled.map(({ query }, i) => {

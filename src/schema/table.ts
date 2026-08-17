@@ -498,13 +498,28 @@ export function alias<T extends Table, TName extends string>(
 		}
 		return out;
 	};
-	return buildTable(
+	const aliased = buildTable(
 		aliasName,
 		getTableOriginalName(t),
 		rebind(getTableColumns(t)),
 		getTableExtras(t),
 		true,
-	) as any;
+	);
+	// `alias()` on a subquery (from `.as()`/`createSubquery`) must keep the
+	// inner statement — otherwise the aliased table looks exactly like an
+	// ordinary table named after the subquery's own alias, and `from` renders
+	// `"sq" "x"` (a table that does not exist) instead of inlining
+	// `(select …) "x"`. Drizzle's own `alias()` is documented for tables and
+	// views, not subqueries, but producing wrong SQL silently is worse than
+	// this small extension of it. See [F-085].
+	const source = getTableSource(t);
+	if (source !== undefined) {
+		Object.assign(aliased, {
+			[TableSource]: source,
+			[TableNullableGroups]: (t as unknown as Partial<Subquery>)[TableNullableGroups] ?? EMPTY_GROUPS,
+		});
+	}
+	return aliased as any;
 }
 
 export const isAliased = (t: Table): boolean => t[TableName] !== t[TableOriginalName];

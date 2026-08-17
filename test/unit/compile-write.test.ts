@@ -187,6 +187,50 @@ describe('insert compilation', () => {
 			expect(compiled.parts).toHaveLength(1);
 			expect(compiled.parts[0]!.params.length).toBeLessThanOrEqual(100);
 		});
+
+		// [F-055]: the guard used to count `cols.length` (every column) as one
+		// bound parameter, so a row whose values include zero-parameter `sql`
+		// fragments could be rejected even though the emitted statement binds
+		// well under the budget.
+		it('does not reject a wide row whose sql-fragment values bind zero parameters', () => {
+			const cols: Record<string, ReturnType<typeof integer>> = {};
+			for (let i = 0; i < 80; i++) cols[`c${i}`] = integer(`c${i}`);
+			const wide = sqliteTable('wide_zero', cols);
+
+			// 40 of the 80 values are zero-parameter `sql` literals; the other 40
+			// bind one parameter each — 40 actual bound params in VALUES.
+			const row: Record<string, unknown> = {};
+			for (let i = 0; i < 80; i++) row[`c${i}`] = i < 40 ? sql`unixepoch()` : i;
+
+			const compiled = query.insert(wide).values(row as never)
+				// 0 params of its own.
+				.onConflictDoUpdate({ target: wide.c0 as never, set: { c0: sql`excluded."c0"` } as never })
+				.compile();
+
+			expect(compiled.parts).toHaveLength(1);
+			// 40 real bound params from VALUES, well under the default 100 budget.
+			expect(compiled.parts[0]!.params.length).toBe(40);
+		});
+
+		// [F-058]: the chunker used to assume exactly one bound parameter per
+		// `VALUES` column and zero from `returning()`. A `sql` expression in
+		// `returning()` adds parameters to *every* chunk and must be reserved,
+		// just like the conflict clause.
+		it('reserves parameters bound by a sql expression in returning()', () => {
+			const cols: Record<string, ReturnType<typeof integer>> = { id: integer('id').primaryKey() };
+			for (let i = 0; i < 3; i++) cols[`c${i}`] = integer(`c${i}`);
+			const small = sqliteTable('small_returning', cols);
+
+			const rows = Array.from({ length: 40 }, (_, i) => ({ id: i, c0: 1, c1: 2, c2: 3 }));
+			const compiled = query.insert(small).values(rows)
+				.returning({ id: small.id as never, tag: sql<string>`${'tag'}` })
+				.compile();
+
+			expect(compiled.parts.length).toBeGreaterThan(1);
+			for (const part of compiled.parts) {
+				expect(part.params.length).toBeLessThanOrEqual(100);
+			}
+		});
 	});
 });
 

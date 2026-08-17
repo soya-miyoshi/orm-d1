@@ -97,6 +97,19 @@ const toSlot = (param: unknown): ParamSlot => {
 const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
 /**
+ * Strip a `"table".` qualifier from in front of every quoted identifier.
+ *
+ * Drizzle's own `SQL.toQuery` always renders a `Column` chunk as
+ * `escapeName(table) + "." + escapeName(column)` (`drizzle-orm/sql/sql.js`) —
+ * there is no config knob to ask it for the bare column, unlike our own
+ * `Column.toQuery`, which honours `ctx.bareColumns` directly. Every identifier
+ * `escapeName` produces here is double-quoted (see `quote` above), so
+ * `"x"."y"` unambiguously means "y qualified by x" and is safe to collapse to
+ * `"y"` wherever it appears in the rendered text.
+ */
+const stripQualifiers = (sql: string): string => sql.replace(/"(?:[^"]|"")*"\.(?="(?:[^"]|"")*")/g, '');
+
+/**
  * Render a Drizzle fragment into our `{ sql, params }`.
  *
  * `casing` is not read by every Drizzle version but is cheap to supply, and
@@ -120,7 +133,9 @@ export const fromDrizzleSQL = (value: unknown, ctx?: RenderContext): Query => {
 		inlineParams: false,
 	});
 
-	return { sql, params: params.map(toSlot) };
+	// `check('c', drizzleSql\`${col} > 0\`)` must not render "t"."c" > 0 — SQLite
+	// rejects a table-qualified column inside a CHECK constraint. See [F-067].
+	return { sql: ctx?.bareColumns ? stripQualifiers(sql) : sql, params: params.map(toSlot) };
 };
 
 /**

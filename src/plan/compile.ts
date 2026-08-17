@@ -223,11 +223,14 @@ const explicitNullableGroups = (plan: SelectPlan): Set<string> => {
 	if (nullable.size === 0) return groups;
 	for (const [key, entry] of Object.entries(plan.selection)) {
 		if (!isSelectionObject(entry)) continue;
-		const leaves = flattenSelection(entry, [key]);
-		if (leaves.length === 0) continue;
+		const allLeaves = flattenSelection(entry, [key]);
+		if (allLeaves.length === 0) continue;
 		// Only this group's own depth is eligible — a leaf that sits deeper
-		// belongs to a nested group of its own, not to this one.
-		if (leaves.some((leaf) => leaf.path.length !== 2)) continue;
+		// belongs to a nested group of its own, not to this one. Drizzle applies
+		// `path.length === 2` per leaf (`drizzle-orm/utils.js:136`): a deeper
+		// leaf is simply skipped, it does not veto the whole group.
+		const leaves = allLeaves.filter((leaf) => leaf.path.length === 2);
+		if (leaves.length === 0) continue;
 		const tableNames = new Set<string>();
 		for (const leaf of leaves) {
 			if (!leaf.column) continue;
@@ -544,26 +547,41 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 	};
 
 	const conflictParams = plan.onConflict ? countOnConflictParams(plan.onConflict, columns, ctx) : 0;
+	const returningParams = countReturningParams(plan.table, plan.returning, ctx);
+	const reservedParams = conflictParams + returningParams;
 
 	for (const group of groups) {
 		const cols = group.fields.map((field) => columns[field]!);
-		if (cols.length > ctx.maxParams) {
+		// Actual bound parameters per row, not `cols.length`: a value supplied
+		// as a zero-parameter `sql` fragment occupies a column without binding
+		// anything, and a fragment like `sql`${a} || ${b}`` can bind more than
+		// one. Rendered rather than guessed, the same way `countOnConflictParams`
+		// counts the conflict clause — see [F-055], [F-058].
+		const rowParams = group.rows.map((row) => countRowParams(row, group.fields, cols, ctx));
+		const maxRowParams = Math.max(...rowParams);
+		if (maxRowParams + reservedParams > ctx.maxParams) {
 			throw new CompileError(
-				`A row of ${cols.length} columns exceeds the bound-parameter limit of ${ctx.maxParams}; `
-					+ 'no chunking can satisfy it. Insert fewer columns per statement.',
+				`A row binds ${maxRowParams} parameter(s) plus ${reservedParams} bound parameter(s) from `
+					+ '"on conflict"/"returning" exceed the bound-parameter limit of '
+					+ `${ctx.maxParams}; no chunking can satisfy it. Insert fewer columns, bind fewer `
+					+ 'parameters per row, or bind fewer parameters in the conflict/returning clauses.',
 			);
 		}
-		if (cols.length + conflictParams > ctx.maxParams) {
-			throw new CompileError(
-				`A row of ${cols.length} columns plus ${conflictParams} bound parameter(s) from `
-					+ `"on conflict" exceed the bound-parameter limit of ${ctx.maxParams}; no chunking can `
-					+ 'satisfy it. Insert fewer columns, or bind fewer parameters in the conflict clause.',
-			);
-		}
-		const rowsPerChunk = Math.max(1, Math.floor((ctx.maxParams - conflictParams) / cols.length));
+		const budget = ctx.maxParams - reservedParams;
 
-		for (let start = 0; start < group.rows.length; start += rowsPerChunk) {
-			const chunkRows = group.rows.slice(start, start + rowsPerChunk);
+		let start = 0;
+		while (start < group.rows.length) {
+			let sum = 0;
+			let end = start;
+			while (end < group.rows.length && sum + rowParams[end]! <= budget) {
+				sum += rowParams[end]!;
+				end++;
+			}
+			// `maxRowParams + reservedParams <= ctx.maxParams` above guarantees
+			// every individual row fits the budget alone, so `end` always
+			// advances past `start` here.
+			const chunkRows = group.rows.slice(start, end);
+			start = end;
 			const writer = new Writer(ctx);
 			writer
 				.text(`insert into ${quoteIdentifier(getTableName(plan.table))} (`)
@@ -653,6 +671,43 @@ const withOnUpdate = (
  * one, or many parameters — counting must match what `writeOnConflict` will
  * actually emit, not guess "one param per assignment".
  */
+/**
+ * How many bound parameters one row of `VALUES` will actually add: rendered
+ * against a scratch writer, not assumed to be one per column — a value
+ * supplied as a `sql` fragment can bind zero, one, or many parameters. See
+ * `countOnConflictParams` below, which the same reasoning is lifted from.
+ */
+const countRowParams = (
+	row: Record<string, unknown>,
+	fields: readonly string[],
+	cols: readonly Column<any>[],
+	ctx: RenderContext,
+): number => {
+	const scratch = new Writer(ctx);
+	for (const [c, column] of cols.entries()) {
+		const field = fields[c]!;
+		const value = row[field];
+		scratch.chunk(value === undefined ? defaultChunk(column) : valueChunk(column, value));
+	}
+	return scratch.toQuery().params.length;
+};
+
+/**
+ * How many bound parameters `writeReturning` will add to *every* statement in
+ * the insert, outside the `VALUES` list — zero unless `returning()` was given
+ * a `Selection` containing a `sql` expression that itself binds parameters.
+ */
+const countReturningParams = (
+	t: Table,
+	returning: Selection | true | undefined,
+	ctx: RenderContext,
+): number => {
+	if (!returning) return 0;
+	const scratch = new Writer(ctx);
+	writeReturning(scratch, t, returning, ctx);
+	return scratch.toQuery().params.length;
+};
+
 const countOnConflictParams = (
 	conflict: NonNullable<InsertPlan['onConflict']>,
 	columns: Record<string, Column<any>>,

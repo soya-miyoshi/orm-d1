@@ -483,6 +483,36 @@ describe('observability and errors', () => {
 			.rejects.toMatchObject({ name: 'OrmD1QueryError', sql: expect.stringContaining('insert into "users"') });
 	});
 
+	// [F-064]: error mapping used `parts[0].sql` unconditionally, so a chunked
+	// write failing on a later chunk reported the *first* chunk's SQL and no
+	// parameters — contradicting the documented "errors carry the SQL that
+	// caused them".
+	it('attaches the failing chunk\'s SQL and params, not just the first chunk\'s, on a chunked write', async () => {
+		setDev(true);
+		try {
+			const db = ormD1(DB, { maxParams: 8 });
+			// 4 params/row (id, email, name, active) at maxParams: 8 chunks 2 rows
+			// per statement. Row 3 (third row, second chunk) collides with the
+			// seeded user's email — chunk 1 succeeds, chunk 2 fails.
+			const rows = [
+				{ id: 100, email: 'x100@b.c', name: 'x', active: true },
+				{ id: 101, email: 'x101@b.c', name: 'x', active: true },
+				{ id: 102, email: 'a@b.c', name: 'x', active: true }, // duplicates seed's user 1
+				{ id: 103, email: 'x103@b.c', name: 'x', active: true },
+			];
+
+			await expect(db.insert(users).values(rows).run()).rejects.toMatchObject({
+				name: 'OrmD1QueryError',
+				// The bug: `query.sql` is always the *first* chunk, which binds
+				// none of these values, so the error's params never contained
+				// the row that actually caused the failure.
+				params: expect.arrayContaining(['a@b.c', 102]) as unknown as unknown[],
+			});
+		} finally {
+			setDev(false);
+		}
+	});
+
 	it('refuses transaction() with a pointer to batch()', () => {
 		expect(() => ormD1(DB).transaction()).toThrow(NoTransactionsError);
 		expect(() => ormD1(DB).transaction()).toThrow(/batch/);

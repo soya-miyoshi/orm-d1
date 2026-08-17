@@ -6,6 +6,7 @@
  * string and a flat parameter list. Everything in orm-d1 compiles down to this.
  */
 
+import { warn } from '../dev.js';
 import { CompileError } from '../errors.js';
 import { isForeignSQL, render } from './drizzle-sql.js';
 
@@ -196,6 +197,22 @@ class SQL<T = unknown> implements SQLChunk<T> {
 				text += nested.sql;
 				params.push(...nested.params);
 			} else if (Array.isArray(value)) {
+				// An empty array renders `()`, matching `drizzle-orm` exactly (see
+				// `docs/08`'s reverse-alias invariant — diverging here would break
+				// it). In a DDL predicate that is not safe the way it is at
+				// runtime: `x not in ()` is unconditionally true and `x in ()` is
+				// unconditionally false, so a CHECK or partial-index `where` built
+				// from an empty array goes permanently inert instead of failing
+				// loudly. `__DEV__`-only: production pays nothing, and the array
+				// being empty is ordinarily a config mistake worth surfacing once.
+				if (value.length === 0 && ctx.bareColumns) {
+					warn(
+						'An empty array was interpolated into a DDL predicate (a check() or a '
+							+ 'partial index\'s where()). This renders "in ()" / "not in ()", which '
+							+ 'SQLite accepts but is unconditionally false/true — the constraint or '
+							+ 'partial index becomes permanently inert instead of failing loudly.',
+					);
+				}
 				text += '(';
 				for (const [j, item] of value.entries()) {
 					if (j > 0) text += ', ';

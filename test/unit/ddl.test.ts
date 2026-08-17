@@ -1,6 +1,10 @@
+import { gt as dGt } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
+import { setDev, setWarn } from '../../src/dev.js';
+import { asDrizzleTable } from '../../src/drizzle.js';
 import { createIndexes, createSchema, createTable, dropTable, literal } from '../../src/ddl.js';
 import { blob, check, customType, integer, numeric, real, sql, sqliteTable, text, uniqueIndex } from '../../src/index.js';
+import type { SQLChunk } from '../../src/sql/sql.js';
 import { allTables, postTags, posts, users } from '../schema.js';
 
 describe('ddl generation', () => {
@@ -120,6 +124,52 @@ describe('ddl generation', () => {
 		expect(ddl).toContain('check ("role" in (\'admin\', , \'member\'))');
 		expect(ddl).not.toContain("'admin', null");
 		expect(ddl).not.toContain('null, ');
+	});
+
+	// [F-087]: an empty interpolated array in a DDL predicate renders `()`,
+	// which SQLite accepts — `not in ()` is unconditionally true, `in ()` is
+	// unconditionally false, so the constraint goes permanently inert with no
+	// error. Matching `drizzle-orm`'s own `()` rendering is correct (the
+	// `docs/08` reverse-alias invariant), so the fix is a `__DEV__` warning,
+	// not a rendering divergence.
+	it('warns in dev when an empty array is interpolated into a check', () => {
+		setDev(true);
+		const warnings: string[] = [];
+		setWarn((message) => warnings.push(message));
+		try {
+			const ROLES: string[] = [];
+			const t = sqliteTable('t', {
+				role: text('role'),
+			}, (c) => [
+				check('t_role_check', sql`${c.role} not in ${ROLES}`),
+			]);
+
+			const ddl = createTable(t);
+			expect(ddl).toContain('check ("role" not in ())');
+			expect(warnings.some((m) => m.includes('empty array'))).toBe(true);
+		} finally {
+			setDev(false);
+			setWarn(() => {});
+		}
+	});
+
+	it('does not warn for a non-empty interpolated array in a check', () => {
+		setDev(true);
+		const warnings: string[] = [];
+		setWarn((message) => warnings.push(message));
+		try {
+			const t = sqliteTable('t', {
+				role: text('role'),
+			}, (c) => [
+				check('t_role_check', sql`${c.role} in ${['admin', 'member']}`),
+			]);
+
+			createTable(t);
+			expect(warnings).toEqual([]);
+		} finally {
+			setDev(false);
+			setWarn(() => {});
+		}
 	});
 
 	it('renders sql defaults inline and value defaults as literals', () => {
@@ -304,5 +354,22 @@ describe('blob defaults', () => {
 		}, (table) => [check('payload_check', sql`${table.payload} <> ${new Uint8Array([0x00, 0xff])}`)]);
 
 		expect(createTable(t)).toContain(`check ("payload" <> x'00ff')`);
+	});
+
+	// [F-067]: a Drizzle fragment inside DDL ignored `ctx.bareColumns`, so
+	// `check('c', drizzleSql\`${col} > 0\`)` rendered a table-qualified column,
+	// which SQLite rejects inside a CHECK constraint.
+	it('renders a Drizzle fragment in a check constraint with a bare column, not table-qualified', () => {
+		const t = sqliteTable('t', {
+			score: integer('score'),
+		});
+		const dt = asDrizzleTable(t);
+		const withCheck = sqliteTable('t', {
+			score: integer('score'),
+		}, () => [check('t_score_check', dGt(dt.score, 0) as unknown as SQLChunk)]);
+
+		const ddl = createTable(withCheck);
+		expect(ddl).toContain('check ("score" > 0)');
+		expect(ddl).not.toContain('"t"."score"');
 	});
 });

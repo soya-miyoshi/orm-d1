@@ -24,6 +24,36 @@ import { Executor } from './session.js';
  */
 export type RelationalStrategy = 'split' | 'joined';
 
+/**
+ * Subset of `drizzle-orm`'s `Logger` interface (`interface Logger {
+ * logQuery(query: string, params: unknown[]): void }`) — kept identical so a
+ * caller's existing Drizzle logger (custom or `DefaultLogger`) can be handed
+ * to `logger:` unchanged.
+ */
+export interface Logger {
+	logQuery(query: string, params: unknown[]): void;
+}
+
+/** Matches `drizzle-orm`'s `DefaultLogger`: one line per query, to `console.log`. */
+class DefaultLogger implements Logger {
+	logQuery(query: string, params: unknown[]): void {
+		const stringifiedParams = params.map((p) => {
+			try {
+				return JSON.stringify(p);
+			} catch {
+				return String(p);
+			}
+		});
+		const paramsStr = stringifiedParams.length ? ` -- params: [${stringifiedParams.join(', ')}]` : '';
+		console.log(`Query: ${query}${paramsStr}`);
+	}
+}
+
+const resolveLogger = (logger: boolean | Logger | undefined): Logger | undefined => {
+	if (!logger) return undefined;
+	return logger === true ? new DefaultLogger() : logger;
+};
+
 export interface OrmD1Options {
 	/** Applied to column names that don't specify one explicitly. */
 	casing?: 'preserve' | 'snake_case';
@@ -56,8 +86,17 @@ export interface OrmD1Options {
 	 * of `defineRelations` as `relations`, which the root `drizzle()` reads.
 	 */
 	schema?: unknown;
-	/** Accepted and ignored — see `onQuery` instead. */
-	logger?: unknown;
+	/**
+	 * Drizzle-shaped query logging: `true` for a default `console.log` logger,
+	 * an object implementing `Logger` to receive `logQuery(sql, params)` for
+	 * every statement actually run (each chunk of a chunked write, each member
+	 * of a batch), or omitted/`false` for none. Distinct from `onQuery` — which
+	 * this project added and which also carries timing and D1's own row-count
+	 * metadata — kept because `logger: true` is the single most common Drizzle
+	 * debugging switch, and silently discarding it (as this used to) reads as
+	 * "no queries are running".
+	 */
+	logger?: boolean | Logger;
 	/**
 	 * Which Workers plan this database is on.
 	 *
@@ -234,6 +273,7 @@ export function ormD1(binding: D1Database, options: OrmD1Options = {}): OrmD1Dat
 			...(options.jsonEachThreshold !== undefined ? { jsonEachThreshold: options.jsonEachThreshold } : {}),
 		},
 		onQuery: options.onQuery,
+		logger: resolveLogger(options.logger),
 		// Created here rather than per Executor so that the databases
 		// `withSession()` derives share the count — they are the same invocation.
 		budget: options.plan ? new InvocationBudget(options.plan, PLAN_LIMITS[options.plan]) : undefined,
