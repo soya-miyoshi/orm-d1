@@ -113,14 +113,36 @@ const unquote = (name: string): string =>
  * `(` or a stray `"` inside a comment used to desynchronise the paren/quote
  * depth counters that come after this blanking, silently dropping a genuine
  * collation that appears later in the same column span.
+ *
+ * Quoted identifiers — `"…"`, `` `…` ``, `[…]` — are matched as self-mapping
+ * alternatives for the same reason the `'…'` string-literal alternative is:
+ * in the alternation, whichever branch matches at a given start position wins
+ * and its span is consumed whole, never rescanned by the comment branches
+ * that come after it. A dash-dash or slash-star cannot occur anywhere in
+ * valid SQLite outside a literal, so a column named `"a--b"` or `` `a` `` with
+ * a slash-star in it had its own quoted name read as the start of a comment,
+ * blanking everything from there to end-of-line (or to the next unrelated
+ * comment close) — constraints and even later column definitions vanished
+ * from the scan a line or more away from the identifier that triggered it.
+ *
+ * Unlike `'…'`, an identifier's own text is passed through unblanked: callers
+ * such as `columnDefinitionStart` search the *blanked* text for the literal
+ * `"columnName"` span to anchor on, so erasing an identifier's contents here
+ * would make every quoted column unfindable. An identifier cannot smuggle a
+ * dash-dash, slash-star, or `'` that changes how the *rest* of the scan is
+ * read — its doubled-quote escape is the only special sequence it carries,
+ * and the regex already accounts for it — so passing it through verbatim is
+ * safe.
  */
 const blankLiterals = (text: string): string =>
 	text.replaceAll(
-		/'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\//g,
-		(span) =>
-			span[0] === "'"
-				? `'${' '.repeat(span.length - 2)}'`
-				: ' '.repeat(span.length),
+		/'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|--[^\n]*|\/\*[\s\S]*?\*\//g,
+		(span) => {
+			const open = span[0];
+			if (open === "'") return `'${' '.repeat(span.length - 2)}'`;
+			if (open === '"' || open === '`' || open === '[') return span;
+			return ' '.repeat(span.length);
+		},
 	);
 
 export const parseChecks = (
@@ -144,8 +166,19 @@ export const parseChecks = (
 		let depth = 1;
 		let i = start;
 		while (i < scan.length && depth > 0) {
-			if (scan[i] === '(') depth++;
-			else if (scan[i] === ')') depth--;
+			const ch = scan[i];
+			// Quote-aware, like every other balanced-paren scan in this file: a
+			// column named `"a("` inside the check's expression (e.g. `check
+			// ("a(" <> '')`) must not desynchronise depth, or the scan runs past
+			// the constraint's real close paren and swallows the rest of the
+			// table body — including later columns — into `value` ([F-108]'s
+			// class, unfixed here even after `skipQuotedIdentifier` was written).
+			if (ch === '"' || ch === '`' || ch === '[') {
+				i = skipQuotedIdentifier(scan, i);
+				continue;
+			}
+			if (ch === '(') depth++;
+			else if (ch === ')') depth--;
 			i++;
 		}
 		checks[name] = { name, value: sql.slice(start, i - 1).trim() };
@@ -272,13 +305,31 @@ export const parseColumnCollation = (sql: string, columnName: string): string | 
 			continue;
 		}
 		if (ch === ',' && depth === 0) break;
-		if (depth === 0 && collate === undefined) {
-			// A bare name or a quoted one (`collate "NOCASE"` is legal SQLite).
+		if (
+			depth === 0 && collate === undefined
+			// `collate` must start a new word here, not appear mid-identifier: a
+			// constraint named `b_collate` — `constraint b_collate check (...)` —
+			// otherwise matched at its own `collate` suffix and the *next* token
+			// (`check`) was read as the collation name, later rendered as
+			// `COLLATE check`, which D1 refuses (`near "check": syntax error`).
+			&& (i === 0 || !/\w/.test(scan[i - 1]!))
+		) {
+			// A bare name or a quoted one — `collate "NOCASE"`, `` collate `NOCASE` ``,
+			// and `collate [NOCASE]` are all legal SQLite and all verified forms D1
+			// stores verbatim; only matching the `"…"` spelling left the other two
+			// invisible, so a rebuild silently dropped the collation (and the
+			// meaning of any unique index built over the column).
 			const rest = scan.slice(i);
-			const match = /^collate\s+("(?:[^"]|"")*"|\w+)/i.exec(rest);
+			const match = /^collate\s+("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|\w+)/i.exec(rest);
 			if (match) {
 				const name = match[1]!;
-				collate = name.startsWith('"') ? name.slice(1, -1).replaceAll('""', '"') : name;
+				collate = name.startsWith('"')
+					? name.slice(1, -1).replaceAll('""', '"')
+					: name.startsWith('`')
+					? name.slice(1, -1)
+					: name.startsWith('[')
+					? name.slice(1, -1)
+					: name;
 				i += match[0].length;
 				continue;
 			}
@@ -359,11 +410,21 @@ const parseIndexColumns = (sql: string | null): string[] | undefined => {
 	if (!openAfterOn) return undefined;
 	const start = openAfterOn.index + openAfterOn[0].length;
 
+	// Both scans below are quote-aware for the same reason `parseChecks` and
+	// `parseColumnCollation` are: a member such as `"a("` (legal SQLite) has an
+	// embedded `(` that must not desynchronise depth, or the scan runs past the
+	// index's real close paren, and a two-member unique index re-renders as a
+	// stricter one-member one on rebuild ([F-108]'s class).
 	let depth = 1;
 	let i = start;
 	while (i < scan.length && depth > 0) {
-		if (scan[i] === '(') depth++;
-		else if (scan[i] === ')') depth--;
+		const ch = scan[i];
+		if (ch === '"' || ch === '`' || ch === '[') {
+			i = skipQuotedIdentifier(scan, i);
+			continue;
+		}
+		if (ch === '(') depth++;
+		else if (ch === ')') depth--;
 		i++;
 	}
 	if (depth > 0) return undefined;
@@ -372,14 +433,19 @@ const parseIndexColumns = (sql: string | null): string[] | undefined => {
 	const members: string[] = [];
 	let memberStart = start;
 	let nesting = 0;
-	for (let j = start; j < bodyEnd; j++) {
+	for (let j = start; j < bodyEnd;) {
 		const ch = scan[j];
+		if (ch === '"' || ch === '`' || ch === '[') {
+			j = skipQuotedIdentifier(scan, j);
+			continue;
+		}
 		if (ch === '(') nesting++;
 		else if (ch === ')') nesting--;
 		if (ch === ',' && nesting === 0) {
 			members.push(sql.slice(memberStart, j).trim());
 			memberStart = j + 1;
 		}
+		j++;
 	}
 	const last = sql.slice(memberStart, bodyEnd).trim();
 	if (last.length > 0) members.push(last);

@@ -201,7 +201,22 @@ export function roundtripPlan(before: Snapshot, after: Snapshot, table: string):
 		// against `detachedBefore`/`detachedAfter`, which still carry it. Folding
 		// `before`'s collations onto the merged snapshot before diffing closes
 		// the gap the same way `generate` closes it for the persisted baseline.
-		const next = carryForwardCollations(before, merged, {});
+		//
+		// Scoped to `restored` — only those tables were just replaced with the
+		// schema-derived `after` in `merged` above. Every other table in `merged`
+		// still came from `current`/`detachedAfter`, which already carries
+		// whatever collation it had; folding `before`'s collation onto those too
+		// invents a difference (`undefined` vs `'nocase'`) that
+		// `columnDifference`'s same-value exemption does not catch, forcing an
+		// unrelated table — one with no path to the table being restored — into
+		// the plan as a spurious (and sometimes destructive) recreate.
+		const scopedBefore: Snapshot = {
+			...before,
+			tables: Object.fromEntries(
+				Object.entries(before.tables).filter(([name]) => restored.has(name)),
+			),
+		};
+		const next = carryForwardCollations(scopedBefore, merged, {});
 		const leg = diffSnapshots(current, next, {});
 		legs.push({
 			title: `${index + 3}. Restore the foreign keys of ${names.map((n) => `"${n}"`).join(', ')}`,

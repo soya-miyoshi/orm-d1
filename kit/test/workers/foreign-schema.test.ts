@@ -19,6 +19,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { applyMigrations, checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
+import { appendOnlyTriggerGuard } from '../../src/core/introspect.js';
 import { createTableFromSnapshot, typeAffinity } from '../../src/core/snapshot.js';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -208,5 +209,128 @@ describe('introspecting a database orm-d1 did not write', () => {
 			sql: `create table "__new_accounts" ("id" integer primary key); `
 				+ `drop table "accounts"; alter table "__new_accounts" rename to "accounts"`,
 		}])).rejects.toThrow(/accounts_balance_immutable/);
+	});
+
+	describe('a quoted identifier containing -- or /*', () => {
+		// Regression: `blankLiterals` was comment-aware but not
+		// identifier-aware, so `--` or `/*` inside a *quoted identifier* still
+		// started a "comment" that blanked everything to end of line (or to the
+		// next unrelated `*/`) — the exact founding failure mode `kit/README.md`
+		// exists to prevent, reintroduced inside the fix meant to prevent it.
+
+		it('(a) still captures a COLLATE after an identifier containing --, and the rebuild refuses a case-insensitive duplicate', async () => {
+			await DB.prepare('drop table if exists "dd"').run();
+			await DB.prepare(
+				'create table "dd" ("id" integer primary key, "a--b" text, '
+					+ '"email" text collate nocase not null)',
+			).run();
+			await DB.prepare('create unique index "dd_email" on "dd" ("email")').run();
+
+			const live = await introspect(runner);
+			expect(live.tables['dd']!.columns['email']!.collate).toBe('nocase');
+
+			await DB.prepare('insert into "dd" ("id", "a--b", "email") values (1, \'x\', \'alice@x.com\')').run();
+			await expect(
+				DB.prepare('insert into "dd" ("id", "a--b", "email") values (2, \'y\', \'ALICE@x.com\')').run(),
+			).rejects.toThrow();
+		});
+
+		it('(b) a GENERATED column anchored past an identifier containing -- still parses its expression', async () => {
+			await DB.prepare('drop table if exists "gg"').run();
+			await DB.prepare(
+				'create table "gg" ("id" integer primary key, "a--b" text, '
+					+ '"up" text generated always as (upper("a--b")) virtual)',
+			).run();
+
+			const live = await introspect(runner);
+			const generated = live.tables['gg']!.columns['up']!.generated;
+			expect(generated).toBeDefined();
+			expect(generated!.as).toContain('upper');
+			expect(generated!.mode).toBe('virtual');
+
+			const rendered = createTableFromSnapshot(live.tables['gg']!);
+			await DB.prepare('drop table if exists "gg_rebuilt"').run();
+			await DB.prepare(rendered.replace('"gg"', '"gg_rebuilt"')).run();
+		});
+
+		it('(c) a CHECK anchored past an identifier containing -- is still captured', async () => {
+			await DB.prepare('drop table if exists "t"').run();
+			await DB.prepare(
+				'create table "t" ("a--b" integer, "z" text not null, constraint "c1" check ("a--b" > 0))',
+			).run();
+
+			const live = await introspect(runner);
+			expect(Object.keys(live.tables['t']!.checkConstraints)).toContain('c1');
+			expect(Object.keys(live.tables['t']!.columns)).toContain('z');
+		});
+
+		it('(d) the append-only trigger guard is still recognised when the table name contains --', async () => {
+			await DB.prepare('drop table if exists "t--x"').run();
+			await DB.prepare('create table "t--x" ("id" integer primary key)').run();
+			await DB.prepare(
+				'create trigger "t--x_no_update" before update on "t--x" '
+					+ "begin select raise(abort, 'append-only'); end",
+			).run();
+
+			expect(appendOnlyTriggerGuard(
+				await DB.prepare('select sql from sqlite_master where type = \'trigger\' and name = \'t--x_no_update\'')
+					.first<{ sql: string }>()
+					.then((row) => row!.sql),
+				't--x',
+			)).toBe(true);
+		});
+	});
+
+	it('[F-108] a check constraint whose expression references a column named with an embedded ( is captured, and later columns survive', async () => {
+		await DB.prepare('drop table if exists "ck"').run();
+		await DB.prepare(
+			'create table "ck" ("id" integer primary key, "a(" text, "b" text not null, '
+				+ 'constraint "ck_1" check ("a(" <> \'\'))',
+		).run();
+
+		const live = await introspect(runner);
+		expect(live.tables['ck']!.checkConstraints['ck_1']?.value.trim()).toBe('"a(" <> \'\'');
+		expect(Object.keys(live.tables['ck']!.columns)).toContain('b');
+	});
+
+	it('[F-108] a unique index with two members, one containing an embedded (, keeps both members', async () => {
+		await DB.prepare('drop table if exists "ux"').run();
+		await DB.prepare('create table "ux" ("id" integer primary key, "email" text, "a(" text)').run();
+		await DB.prepare('create unique index "ux_u" on "ux" (lower("email"), "a(")').run();
+
+		const live = await introspect(runner);
+		const index = live.tables['ux']!.indexes['ux_u'];
+		expect(index).toBeDefined();
+		expect(index!.columns).toHaveLength(2);
+	});
+
+	it('a constraint named *_collate does not have its own name mistaken for a COLLATE clause', async () => {
+		await DB.prepare('drop table if exists "mc"').run();
+		await DB.prepare(
+			'create table "mc" ("id" integer primary key, '
+				+ '"b" text constraint b_collate check ("b" <> \'\'), "c" text)',
+		).run();
+
+		const live = await introspect(runner);
+		expect(live.tables['mc']!.columns['b']!.collate).toBeUndefined();
+
+		const rendered = createTableFromSnapshot(live.tables['mc']!);
+		await DB.prepare('drop table if exists "mc_rebuilt"').run();
+		await DB.prepare(rendered.replace('"mc"', '"mc_rebuilt"')).run();
+	});
+
+	it('captures COLLATE spelled with [brackets] and `backticks`, not just "double quotes"', async () => {
+		await DB.prepare('drop table if exists "bt"').run();
+		await DB.prepare(
+			'create table "bt" ("id" integer primary key, '
+				+ '"a" text collate [NOCASE], "b" text collate `NOCASE`)',
+		).run();
+
+		const live = await introspect(runner);
+		expect(live.tables['bt']!.columns['a']!.collate).toBe('NOCASE');
+		expect(live.tables['bt']!.columns['b']!.collate).toBe('NOCASE');
+
+		const rendered = createTableFromSnapshot(live.tables['bt']!);
+		expect(rendered.toLowerCase()).toContain('collate');
 	});
 });
