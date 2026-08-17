@@ -952,32 +952,82 @@ claims about code on `main`, recorded verbatim in substance. **`[F-106]` is the 
 open item in this file**: it is a regression this batch introduced, and its symptom is a
 migration that cannot be applied at all.
 
-### [F-106] A `COLLATE` inside a *column-level* `CHECK` or generated expression is attributed to the column, so the next rebuild invents `COLLATE NOCASE` and the migration fails on apply — status: **done** (fix/collation-regression-20260817) — severity: **high** — area: kit/introspect — REGRESSION vs `main`
+### [F-106] A `COLLATE` inside a *column-level* `CHECK` or generated expression is attributed to the column, so the next rebuild invents `COLLATE NOCASE` and the migration fails on apply — status: **done** (`52a25af`) — severity: **high** — area: kit/introspect — REGRESSION vs `main`
 - **Where**: `kit/src/core/introspect.ts:168-200` (`parseColumnCollation`)
 - **Defect**: the balanced scan closed the table-level `unique (…)` case, but the span is still the whole column definition, so a `COLLATE` belonging to a sub-expression *inside* that definition is captured as the column's own.
 - **Failure scenario**: live `create table "q" ("id" integer primary key, "status" text not null constraint "q_check_1" check ("status" collate nocase in ('active','closed')))` with `create unique index "q_status" on "q" ("status")` and rows `(1,'active'), (2,'ACTIVE')` — both legal, the column is BINARY. `introspect()` returns `status.collate === 'nocase'`; `pull` prints a false warning; any ordinary edit that forces a rebuild emits `"status" text collate nocase not null`, and applying it against real D1 gives **`D1_ERROR: UNIQUE constraint failed: q.status: SQLITE_CONSTRAINT`** — the whole `batch()` rolls back and the migration can never apply. On `main` the identical scenario applies cleanly. Without a unique index the failure is quieter and worse: `where status = 'ACTIVE'` silently starts matching `'active'`. Same mis-attribution for `"b" integer generated always as ("a" collate nocase = 'x') virtual`.
 - **Fix**: attribute a `COLLATE` only when it sits at the top level of the column definition — outside any parenthesised sub-expression and outside a `constraint …`/`check (…)`/`generated always as (…)` clause.
 - **Prove it**: `kit/test/workers/foreign-schema.test.ts` — create the `q` table above against the real binding, assert `columns.status.collate === undefined`, and assert the generated rebuild applies without error.
 
-### [F-107] The carried-over collation survives exactly one migration; the second rebuild drops it silently and `check` reports zero drift — status: **done** (fix/collation-regression-20260817) — severity: **high** — area: kit/node
+### [F-107] The carried-over collation survives exactly one migration; the second rebuild drops it silently and `check` reports zero drift — status: **done** (`52a25af`) — severity: **high** — area: kit/node
 - **Where**: `kit/src/node/commands.ts:229` (`writeSnapshot({ ...next })`), `kit/src/core/diff.ts:328`
 - **Defect**: `recreateTable`'s carry-over reads `before.collate`, but `generate` writes the schema-derived `next` as the new baseline, which structurally has no `collate`, so the live collation leaves the `meta/` chain after the first `generate` while the database still has it.
 - **Failure scenario**: proven end-to-end on real D1 with `"email" text collate nocase not null` + a unique index. `generate` #1 correctly emits `collate nocase`; `generate` #2 emits `"email" text not null`, after which `Alice@x.com` inserts next to `alice@x.com` with no error and `diffSnapshots(live, expected)` returns **0 drift statements** — `check` says "Up to date, no drift" over a unique constraint that changed meaning. This is `kit/README.md`'s founding failure mode reproduced inside the fix meant to prevent it.
 - **Fix**: apply the same copy-on-write `recreateTable` already does to the snapshot `generate` writes.
 - **Related**: the `origin`-keyed exemption does catch introspection-to-introspection collation drift, but **only** in the window between `pull` and the first `generate`; after that both sides fold to `undefined` and no command can ever see a column collation again.
 
-### [F-108] `parseColumnCollation`'s depth counter is desynchronised by a quoted identifier containing a paren — status: **done** (fix/collation-regression-20260817; the anchor-takes-first-match sub-issue shared with `hasAutoincrement`/`parseGenerated` is left, as instructed) — severity: med — area: kit/introspect
+### [F-108] `parseColumnCollation`'s depth counter is desynchronised by a quoted identifier containing a paren — status: **done** (`52a25af`) — severity: med — area: kit/introspect
 - **Where**: `kit/src/core/introspect.ts:187-197`
 - **Failure scenario**: `create table "t" ("a(" text, "b" text generated always as ("a(" || 'x') virtual, "email" text not null, unique ("email" collate nocase))` → `parseColumnCollation(sql, 'b')` returns `'nocase'`: the `(` inside `"a("` increments depth, which never returns to 0, so the span runs to end-of-string and swallows the table-level `unique(...)` — the exact class `[F-101]`'s round-1 gap 3 was supposed to close. `hasAutoincrement` already has a test for a column named `a(`, so this is in scope.
 - **Also**: `collate "NOCASE"` (quoted collation name, legal SQLite) returns `undefined`, so the collation is invisible and a rebuild drops it. And the anchor takes the *first* match, so `create table "posts" ("author_id" integer references "users"("id"), "id" text collate nocase primary key)` anchors on the FK's `("id")` and returns `undefined` — shared with `hasAutoincrement`/`parseGenerated`, so pre-existing rather than new.
 
-### [F-109] `columnDefinition` (the `ALTER TABLE … ADD COLUMN` renderer) still drops `collate` — status: **done** (fix/collation-regression-20260817) — severity: low — area: kit/diff
+### [F-109] `columnDefinition` (the `ALTER TABLE … ADD COLUMN` renderer) still drops `collate` — status: **done** (`52a25af`) — severity: low — area: kit/diff
 - **Where**: `kit/src/core/diff.ts:53`
 - `[F-101]`'s stated fix was "emit it in `createTableFromSnapshot` **and `columnDefinition`**"; only the former landed. Unreachable today — in `generate`/`push`/`verify` the `after` side is schema-derived and added columns never carry a collation, and `roundtripPlan`'s legs add no columns — so it affects only `check`'s printed drift. Recorded so it is not mistaken for done.
 
 ### [F-110] The `pull` warning does not name `config.tableOptions` — status: todo — severity: low — area: kit/node
 - **Where**: `kit/src/node/commands.ts`, warning text
 - The warning names what is lost but not `config.tableOptions` (`kit/README.md:17`), the one mechanism the kit already has to express `strict` / `withoutRowid` / `appendOnly`. Related to `[F-100]`'s parked sidecar question.
+
+
+## Findings — the collation repair branch (merged `52a25af`)
+
+Three review rounds on `fix/collation-regression-20260817`. `[F-106]`–`[F-109]` are closed and
+were differentially fuzzed against `main` (≈40 adversarial DDLs plus 2365 generated ones for
+appliability and 665 with SQLite itself as the oracle; `headOnlyBroken = 0`). Each round's fix
+opened a new hole in `kit/src/core/introspect.ts`, all of which were closed in turn: comments
+were not blanked (so `/* collate nocase */` was read as structure), the depth counter was
+quote-aware for `"` only, the `collate` keyword lost its left word boundary, and blanking
+comments moved the table-option boundary so a comment could invent `STRICT`. The items below
+are what the final differential review left standing.
+
+### [F-111] A table-level `UNIQUE (col COLLATE …)` member collation is captured nowhere, so a rebuild converts case-insensitive uniqueness into case-sensitive — status: todo — severity: **high** — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:659-661`, `kit/src/core/snapshot.ts:442-443` (`UniqueConstraintSnapshot` has only `columns: string[]`)
+- **Failure scenario**: live `create table "t" ("id" integer primary key, "email" text not null, constraint "u1" unique ("email" collate nocase))`. The original refuses `('A@X.com')` after `('a@x.com')`; every rebuild emits `constraint "u1" unique ("email")` and the rebuilt table **accepts** the duplicate. `sqlite_autoindex_*` has no `sql` row, so the collation can only come from the `CREATE TABLE` text, which nothing reads. Column-level collation is now preserved, so `email text collate nocase … unique` survives — it is specifically the table-level idiom that is lost.
+- **Fix**: give `UniqueConstraintSnapshot` per-member `{ name, collate? }` (as `IndexColumnSnapshot` already has), parse it from the constraint text, and render it back.
+
+### [F-112] `columnDefinitionStart` only knows `"…"` and bare names, so a backtick- or bracket-quoted column loses its collation, and the anchor takes the first match — status: todo — severity: med — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:202-203`
+- **Failure scenario**: `` `email` text collate nocase `` and `[email] text collate nocase` introspect as no collation and the rebuild emits `"email" TEXT not null`; so does `collate"NOCASE"` with no space (`parseColumnCollation`'s `\s+`). And the anchor takes the *first* match: `create table "t" ("author_id" text references "u"("id"), "id" text collate nocase not null)` → `id.collate === undefined`. Shared with `hasAutoincrement` / `parseGenerated`.
+- **Fix**: accept all four quoting forms (`parseIndexColumns` at `:300` already does), make the `collate` token separator optional before a quote, and anchor on a top-level match rather than the first one.
+
+### [F-113] A trailing `--` comment inside a captured expression re-renders as invalid SQL — status: todo — severity: med — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:184`, and the equivalent slices in `parseGenerated` / `parseIndexColumns`
+- **Failure scenario**: `check ("a" > 0 -- positive\n)` is captured with the comment, and `.trim()` removes the newline that made it harmless, so the rebuild renders `check ("a" > 0 -- positive)` → `D1_ERROR: incomplete input`. Present on `main` too. (Block comments and `--` followed by more expression are now handled *better* than `main`.)
+- **Fix**: strip comments from a captured expression value, or normalise the newline back in.
+
+### [F-114] A nullable non-INTEGER primary key is rendered `not null`, and the rebuild fails — status: todo — severity: med — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:701` (`notNull: column.notnull === 1 || single`)
+- **Failure scenario**: a nullable `TEXT PRIMARY KEY` holding NULL is legal in SQLite (only `INTEGER PRIMARY KEY` implies `NOT NULL`). Both branches render `"id" TEXT primary key not null` and the rebuild fails with `NOT NULL constraint failed: __new_t.id`. Pre-existing.
+- **Fix**: derive `notNull` from `column.notnull` alone unless the column is an `INTEGER PRIMARY KEY` rowid alias.
+
+### [F-115] `generate`'s collation carry-forward is self-perpetuating, so a deliberately removed collation can never leave `meta/` and `check` goes permanently red — status: todo — severity: **high** — area: kit/node
+- **Where**: `kit/src/node/commands.ts:233`
+- **Defect**: `generate` is offline — `previous` is the last persisted snapshot, not the live DB — so `carryForwardCollations` is unconditional and re-persists a collation forever.
+- **Failure scenario**: `pull` (baseline has `nocase`) → `generate` (persists `nocase`) → the team deliberately rebuilds the column as `BINARY`. `check` then reports `column "email" changes its collation` (drift no `generate` can express: `generate` emits `[]` because the exemption suppresses it, and re-persists `nocase`); `push` sees no diff either. The only exits are another `pull` or hand-editing `meta/`, which the project forbids.
+- **Fix**: give the operator a way to state the intent — the `config.tableOptions` sidecar of `[F-100]` / `[F-110]` is the natural home, since a stated collation would end the carry-forward's guesswork.
+
+## Standing authorization from the human — 2026-08-18
+
+> audit.md に書いてある、improvement も含めて全てやっておいてください。
+
+Every open item in this file is authorized, **including the `needs-human` ones and the
+`NEW-SURFACE` proposals**. That overrides the sweep skill's "park API-surface changes as
+`needs-human`" rule for this run. Still binding: no release, no version bump, no
+`RELEASING.md` / `Makefile` edits; no dependency added; nothing in `src/` gains a `node:`
+import or a runtime dependency; no schema-facing spelling that `drizzle-orm/sqlite-core`
+lacks (`docs/04`); no test weakened to go green. `docs/` may now be edited, since several
+items are documentation fixes.
 
 
 ## Audit areas
