@@ -36,6 +36,7 @@ export {
 	createTableFromSnapshot,
 	emptySnapshot,
 	normalizeIndexColumn,
+	normalizeUniqueColumn,
 	snapshotFromSchema,
 	SNAPSHOT_VERSION,
 } from './snapshot.js';
@@ -46,6 +47,7 @@ export type {
 	IndexSnapshot,
 	Snapshot,
 	TableSnapshot,
+	UniqueColumnSnapshot,
 } from './snapshot.js';
 
 export { renderRoundtrip, roundtripPlan } from './roundtrip.js';

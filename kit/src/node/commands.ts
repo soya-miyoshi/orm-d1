@@ -415,6 +415,20 @@ export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
 					+ `DSL has no way to express a column collation — the rendered schema module will not state it.`,
 			);
 		}
+		// Same gap as a column's own collation (F-101), one level down: a
+		// table-level `unique (col collate x)` member's collation (`[F-111]`) is
+		// introspected correctly but has no `.collate()` spelling either, so the
+		// rendered `unique()` call states the member names without it.
+		for (const uq of Object.values(table.uniqueConstraints)) {
+			for (const member of uq.columns.map(normalizeUniqueColumn)) {
+				if (!member.collate || member.collate.toLowerCase() === 'binary') continue;
+				warnings.push(
+					`"${table.name}"."${uq.name}" has a member "${member.name}" collate ${member.collate} in the live `
+						+ `database, but the schema DSL has no way to express a unique constraint member's collation — `
+						+ `the rendered schema module will not state it.`,
+				);
+			}
+		}
 	}
 	return warnings;
 }

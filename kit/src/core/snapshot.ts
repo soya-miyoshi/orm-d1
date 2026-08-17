@@ -626,10 +626,22 @@ const legacyAffinity = (declared: string): string => {
 	return ['integer', 'text', 'real', 'blob', 'numeric'].find((candidate) => lower.includes(candidate)) ?? 'text';
 };
 
+/** One member of a canonicalised unique constraint — see `CanonicalTable.uniques`. */
+export interface CanonicalUniqueMember {
+	readonly name: string;
+	readonly collate?: string;
+}
+
 export interface CanonicalTable {
 	readonly columns: Record<string, CanonicalColumn>;
 	readonly primaryKey: string;
-	readonly uniques: readonly string[];
+	/**
+	 * One entry per table-level unique constraint, each a member list rather
+	 * than a pre-serialised string — `sameUniques` needs the structure to apply
+	 * the same "unexpressible in the schema DSL" exemption to a member's
+	 * `collate` that `columnDifference` already applies to a column's.
+	 */
+	readonly uniques: readonly (readonly CanonicalUniqueMember[])[];
 	readonly foreignKeys: readonly string[];
 	readonly checks: readonly string[];
 	/** Part of the `CREATE TABLE`, so a change here means a rebuild. */
@@ -685,6 +697,50 @@ export const columnDifference = (
 		return 'changes its collation';
 	}
 	return undefined;
+};
+
+/** Whether two unique-constraint member lists are the same, member for member. */
+const sameUniqueMembers = (
+	a: readonly CanonicalUniqueMember[],
+	b: readonly CanonicalUniqueMember[],
+	/** Same reading as `columnDifference`'s parameter of the same name. */
+	bIsSchemaDerived: boolean,
+): boolean => {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i]!.name !== b[i]!.name) return false;
+		// The same "unexpressible in the schema DSL" exemption `columnDifference`
+		// applies to a column's own `collate`: the schema DSL has no `.collate()`
+		// spelling at all (`docs/04`), so a unique member's collation is exactly
+		// as unstateable there as a column's — a schema-derived `b` can never
+		// carry one, so its absence is not "changed to binary".
+		if (bIsSchemaDerived && a[i]!.collate !== undefined && b[i]!.collate === undefined) continue;
+		if (a[i]!.collate !== b[i]!.collate) return false;
+	}
+	return true;
+};
+
+/**
+ * Whether two tables' unique constraints are the same set, ignoring the
+ * unexpressible-collation gap `sameUniqueMembers` already carves out.
+ *
+ * Constraint names are not comparable (see `canonicalFk`'s note), so this
+ * matches by content — a multiset of member lists — rather than by position:
+ * `a`'s constraint order has no relationship to `b`'s.
+ */
+export const sameUniques = (
+	a: readonly (readonly CanonicalUniqueMember[])[],
+	b: readonly (readonly CanonicalUniqueMember[])[],
+	bIsSchemaDerived: boolean,
+): boolean => {
+	if (a.length !== b.length) return false;
+	const remaining = b.map((members) => members);
+	for (const members of a) {
+		const index = remaining.findIndex((candidate) => sameUniqueMembers(members, candidate, bIsSchemaDerived));
+		if (index === -1) return false;
+		remaining.splice(index, 1);
+	}
+	return true;
 };
 
 /**
@@ -776,7 +832,7 @@ export const typeAffinity = (declared: string): 'integer' | 'text' | 'blob' | 'r
 
 export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 	const columns: Record<string, CanonicalColumn> = {};
-	const uniques: string[] = [];
+	const uniques: (readonly CanonicalUniqueMember[])[] = [];
 	const foreignKeys: string[] = [];
 	const primaryKeyColumns: string[] = [];
 
@@ -818,7 +874,7 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 		// that field) — mismatched shapes here used to make an in-sync, unique
 		// single column compare unequal against itself the moment the table-level
 		// branch below started reporting `collate` (`[F-111]`'s own regression risk).
-		if (column.unique) uniques.push(JSON.stringify([{ name: column.name }]));
+		if (column.unique) uniques.push([{ name: column.name }]);
 		if (column.references) foreignKeys.push(canonicalFk(column.references));
 	}
 
@@ -830,19 +886,24 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 		// must diff (`[F-111]`) — the same `undefined`/`binary` fold `canonicalTable`
 		// already applies to a column's own collation, so the schema side (which
 		// never states one) and a `BINARY`-declared live one still compare equal.
-		uniques.push(JSON.stringify(
+		// Whether an *unstated* member collation is exempted from the comparison
+		// entirely (schema DSL cannot author one, same as a column's own
+		// `collate`) is `sameUniques`'s call, not this function's — it needs to
+		// know which *side* is schema-derived, which a single table's snapshot
+		// does not know about itself.
+		uniques.push(
 			u.columns.map(normalizeUniqueColumn).map((c) => ({
 				name: c.name,
-				collate: c.collate && c.collate.toLowerCase() !== 'binary' ? c.collate.toLowerCase() : undefined,
+				...(c.collate && c.collate.toLowerCase() !== 'binary' ? { collate: c.collate.toLowerCase() } : {}),
 			})),
-		));
+		);
 	}
 	for (const fk of Object.values(table.foreignKeys)) foreignKeys.push(canonicalFk(fk));
 
 	return {
 		columns,
 		primaryKey: JSON.stringify(primaryKeyColumns),
-		uniques: uniques.sort(),
+		uniques,
 		foreignKeys: foreignKeys.sort(),
 		// SQLite keeps the check's text but not reliably its whitespace.
 		checks: Object.values(table.checkConstraints)

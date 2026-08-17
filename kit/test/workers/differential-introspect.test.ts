@@ -241,6 +241,35 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 				expect(gen.as).toContain('upper');
 			},
 		},
+		{
+			label: '[F-111 follow-up] an unquoted, differently-cased unique member must still match its column '
+				+ 'and keep its COLLATE',
+			ddl: [
+				'create table "t18" ("id" integer primary key, "email" text not null, '
+					+ 'constraint "t18_u1" unique (EMAIL collate nocase))',
+			],
+			table: 't18',
+			assert: (s) => {
+				const uq = Object.values(s.tables['t18']!.uniqueConstraints)[0]!;
+				const member = normalizeUniqueColumn(uq.columns[0]!);
+				expect(member.name).toBe('email');
+				expect(member.collate).toBe('nocase');
+			},
+		},
+		{
+			label: '[F-069 class] a quoted identifier that literally contains the word "collate" must not be read '
+				+ 'as a unique member\'s own COLLATE',
+			ddl: [
+				'create table "t16" ("collate nocase" text, constraint "t16_u1" unique ("collate nocase"))',
+			],
+			table: 't16',
+			assert: (s) => {
+				const uq = Object.values(s.tables['t16']!.uniqueConstraints)[0]!;
+				const member = normalizeUniqueColumn(uq.columns[0]!);
+				expect(member.name).toBe('collate nocase');
+				expect(member.collate).toBeUndefined();
+			},
+		},
 	];
 
 	for (const c of cases) {
@@ -280,5 +309,27 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 		await DB.prepare('create table "select" ("check" integer primary key, "unique" text collate nocase)').run();
 		const s = await introspect(runner);
 		expect(s.tables['select']!.columns['unique']!.collate).toBe('nocase');
+	});
+
+	it('a trailing line comment inside a partial index WHERE clause must not corrupt statement splitting on rebuild', async () => {
+		// `parseChecks`/`parseGenerated`/`parseIndexColumns`/`parseTableUniqueConstraints`
+		// all route their captured text through `blankComments` before storing it;
+		// `parseIndexWhere` did not, so a `-- comment` inside a `where` predicate
+		// was stored (and re-rendered) verbatim. A `--` that survives into the
+		// middle of a rendered multi-statement migration comments out everything
+		// after it on the same line, corrupting whatever statement splitting sees
+		// next.
+		await DB.prepare('create table "t17" ("a" integer, "b" integer)').run();
+		await DB.prepare('create index "t17_idx" on "t17" ("a") where "b" > 0 -- keep').run();
+		const s = await introspect(runner);
+		const idx = s.tables['t17']!.indexes['t17_idx']!;
+		expect(idx.where).not.toContain('--');
+		expect(idx.where).toBe('"b" > 0');
+
+		// Prove it end to end: render the index DDL, append another statement
+		// after it (as a migration file would), and confirm splitting sees both.
+		const rendered = createIndexFromSnapshot(idx, 't17').replace('index "t17_idx"', 'index "t17_idx__rebuilt"');
+		const combined = `${rendered};\nselect 1`;
+		expect(combined.split(';').map((s2) => s2.trim()).filter(Boolean)).toHaveLength(2);
 	});
 });

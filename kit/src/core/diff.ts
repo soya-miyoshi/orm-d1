@@ -17,7 +17,15 @@ import {
 	dropAppendOnlyTrigger,
 } from 'orm-d1/ddl';
 import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
-import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
+import {
+	canonicalTable,
+	columnDifference,
+	createIndexFromSnapshot,
+	createTableFromSnapshot,
+	normalizeIndexColumn,
+	normalizeUniqueColumn,
+	sameUniques,
+} from './snapshot.js';
 import { foldAsciiCase, lookupCaseInsensitive } from './sql.js';
 
 export interface Statement {
@@ -179,7 +187,7 @@ const requiresRecreate = (
 	}
 	if (a.primaryKey !== b.primaryKey) return 'the primary key changes';
 	if (!sameJson(a.foreignKeys, b.foreignKeys)) return 'a foreign key changes';
-	if (!sameJson(a.uniques, b.uniques)) return 'a unique constraint changes';
+	if (!sameUniques(a.uniques, b.uniques, afterIsSchemaDerived)) return 'a unique constraint changes';
 	if (!sameJson(a.checks, b.checks)) return 'a check constraint changes';
 	// `STRICT` and `WITHOUT ROWID` are part of the `CREATE TABLE` statement, not
 	// constraints, and SQLite has no ALTER for either — so changing one is a
@@ -265,6 +273,48 @@ const carryForwardCollation = (
 		if (afterColumn && !afterColumn.collate) {
 			if (result === afterColumns) result = { ...afterColumns };
 			result[target] = { ...afterColumn, collate: beforeColumn.collate };
+		}
+	}
+	return result;
+};
+
+/**
+ * Carry a `before` unique constraint member's stated `collate` onto the
+ * matching `after` member wherever `after` does not state one — the same
+ * exemption `sameUniques` applies when *comparing* the two (a schema-derived
+ * `after` cannot author a member `collate` at all, see `docs/04`), but doing
+ * that comparison alone is not enough: a rebuild forced for an unrelated
+ * reason (say, an added column) still renders `after`'s constraint as-is,
+ * which has no `collate` on it, silently dropping the live one. Matched by
+ * member name (post-rename), the same way `carryForwardCollation` matches
+ * columns — a unique constraint's *name* is not comparable (introspection
+ * invents one), so its member list is the only stable identity.
+ */
+const carryForwardUniqueCollation = (
+	beforeConstraints: TableSnapshot['uniqueConstraints'],
+	afterConstraints: TableSnapshot['uniqueConstraints'],
+	columnRenames: Record<string, string>,
+): TableSnapshot['uniqueConstraints'] => {
+	let result = afterConstraints;
+	for (const before of Object.values(beforeConstraints)) {
+		const beforeMembers = before.columns.map(normalizeUniqueColumn);
+		if (!beforeMembers.some((m) => m.collate)) continue;
+		const renamedNames = beforeMembers.map((m) => columnRenames[m.name] ?? m.name);
+
+		for (const [key, after] of Object.entries(result)) {
+			const afterMembers = after.columns.map(normalizeUniqueColumn);
+			if (afterMembers.length !== renamedNames.length) continue;
+			if (!afterMembers.every((m, i) => m.name === renamedNames[i])) continue;
+
+			const merged = afterMembers.map((m, i) => {
+				const carried = beforeMembers[i]?.collate;
+				return carried && !m.collate ? { name: m.name, collate: carried } : m;
+			});
+			if (merged.some((m, i) => m !== afterMembers[i])) {
+				if (result === afterConstraints) result = { ...afterConstraints };
+				result[key] = { ...after, columns: merged };
+			}
+			break;
 		}
 	}
 	return result;
@@ -470,7 +520,18 @@ const recreateTable = (
 		? carryForwardCollation(before.columns, after.columns, columnRenames)
 		: after.columns;
 
-	const body = createTableFromSnapshot({ ...after, name: temporary, columns: rebuiltColumns });
+	// Same carry-forward, for a unique constraint member's own `collate`
+	// (`[F-111]`) — see `carryForwardUniqueCollation`.
+	const rebuiltUniqueConstraints = afterIsSchemaDerived
+		? carryForwardUniqueCollation(before.uniqueConstraints, after.uniqueConstraints, columnRenames)
+		: after.uniqueConstraints;
+
+	const body = createTableFromSnapshot({
+		...after,
+		name: temporary,
+		columns: rebuiltColumns,
+		uniqueConstraints: rebuiltUniqueConstraints,
+	});
 	const statements: Statement[] = [
 		// Not `foreign_keys = OFF`: D1 runs every query in an implicit
 		// transaction and refuses to change that pragma inside one, so the old

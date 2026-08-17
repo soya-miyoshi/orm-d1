@@ -491,7 +491,11 @@ export const parseGenerated = (
 
 const parseIndexWhere = (sql: string | null): string | undefined => {
 	const match = sql?.match(/\)\s*where\s+(.+)$/is);
-	return match ? match[1]!.trim() : undefined;
+	// Routed through `blankComments`, the same as `parseChecks`/`parseGenerated`/
+	// `parseIndexColumns`/`parseTableUniqueConstraints`: a trailing `-- comment`
+	// inside the predicate would otherwise be stored verbatim and, on re-render,
+	// corrupt statement splitting for whatever follows it in the same batch.
+	return match ? blankComments(match[1]!).trim() : undefined;
 };
 
 /**
@@ -798,7 +802,15 @@ const parseTableUniqueConstraints = (sql: string): RawUniqueClause[] => {
 				: rawName.startsWith('[')
 				? rawName.slice(1, -1)
 				: rawName;
-			const collateMatch = /\bcollate(?:\s+(\w+)|\s*("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]))/i.exec(blanked);
+			// Scanned from *after* the matched name, not the whole member: a quoted
+			// identifier that literally contains the word "collate" (e.g. a column
+			// named `"collate nocase"`) is still present, verbatim, in `blanked`
+			// (`blankLiterals` only blanks string literals, not identifiers), and
+			// scanning the whole member misread it as the member's own `COLLATE`
+			// clause — the same false-positive class as `[F-069]`.
+			const collateMatch = /\bcollate(?:\s+(\w+)|\s*("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]))/i.exec(
+				blanked.slice(nameMatch ? nameMatch[0].length : 0),
+			);
 			const collateToken = collateMatch ? (collateMatch[1] ?? collateMatch[2]) : undefined;
 			const collate = collateToken === undefined ? undefined : collateToken.startsWith('"')
 				? collateToken.slice(1, -1).replaceAll('""', '"')
@@ -836,7 +848,12 @@ const matchUniqueClause = (
 		const clause = clauses[i]!;
 		if (
 			clause.members.length === columnNames.length
-			&& clause.members.every((m, mi) => m.name === columnNames[mi])
+			// `foldAsciiCase`, not `===`: SQLite resolves an unquoted identifier
+			// against the column list case-insensitively (ASCII only), so
+			// `unique ("EMAIL" collate nocase)` still refers to a column declared
+			// `"email"`. Comparing the raw text left a case-differing member
+			// unmatched, silently dropping its `COLLATE`.
+			&& clause.members.every((m, mi) => foldAsciiCase(m.name) === foldAsciiCase(columnNames[mi] ?? ''))
 		) {
 			used.add(i);
 			return clause;

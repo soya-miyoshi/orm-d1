@@ -410,6 +410,108 @@ describe('diffing snapshots', () => {
 		expect(roundTwo.tables['users']!.columns['email']!.collate).toBe('nocase');
 	});
 
+	it('does not force a destructive recreate for a live unique-member collation the schema DSL cannot express (F-111 follow-up)', () => {
+		// `unique ("email" collate nocase)` is introspected with `collate: 'nocase'`
+		// on the constraint's `email` member. The schema DSL has no `.collate()`,
+		// so `unique('u1').on(t.email)` can never state one — the same
+		// "unexpressible" exemption `columnDifference` already applies to a
+		// column's own `collate` must apply here too, or `pull` followed
+		// immediately by `generate` forces a needless destructive rebuild.
+		const t = sqliteTable('u_members', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [unique('u1').on(c.email)]);
+		const schemaSide = snapshotOf(t);
+		const liveSide: Snapshot = {
+			...schemaSide,
+			origin: 'introspection',
+			tables: {
+				u_members: {
+					...schemaSide.tables['u_members']!,
+					uniqueConstraints: {
+						...schemaSide.tables['u_members']!.uniqueConstraints,
+						u1: {
+							...schemaSide.tables['u_members']!.uniqueConstraints['u1']!,
+							columns: [{ name: 'email', collate: 'nocase' }],
+						},
+					},
+				},
+			},
+		};
+
+		expect(diffSnapshots(liveSide, schemaSide).statements).toEqual([]);
+	});
+
+	it('still reports a genuine unique-member collation mismatch between two stated values', () => {
+		// One-directional, same as the column-level exemption: a real value on
+		// both sides that genuinely differs must still be caught.
+		const t = sqliteTable('u_members2', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [unique('u1').on(c.email)]);
+		const base = snapshotOf(t);
+		const withMember = (collate: string): Snapshot => ({
+			...base,
+			origin: 'introspection',
+			tables: {
+				u_members2: {
+					...base.tables['u_members2']!,
+					uniqueConstraints: {
+						...base.tables['u_members2']!.uniqueConstraints,
+						u1: {
+							...base.tables['u_members2']!.uniqueConstraints['u1']!,
+							columns: [{ name: 'email', collate }],
+						},
+					},
+				},
+			},
+		});
+
+		const { statements } = diffSnapshots(withMember('nocase'), withMember('rtrim'));
+		expect(statements.some((s) => s.reason?.includes('unique constraint'))).toBe(true);
+	});
+
+	it('carries a live unique-member collation into a rebuild forced for an unrelated reason (F-111 follow-up)', () => {
+		// A rebuild forced by, say, an `id` type change must not render the
+		// after-side unique constraint as-is: `after` structurally never states
+		// a member `collate`, so doing that would silently turn a
+		// case-insensitive unique constraint into a BINARY one the moment
+		// anything else about the table forces a recreate.
+		const before = sqliteTable('u_rebuild', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [unique('u1').on(c.email)]);
+		const after = sqliteTable('u_rebuild', {
+			id: text('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [unique('u1').on(c.email)]);
+
+		const schemaAfter = snapshotOf(after);
+		const schemaBefore = snapshotOf(before);
+		const liveBefore: Snapshot = {
+			...schemaBefore,
+			origin: 'introspection',
+			tables: {
+				u_rebuild: {
+					...schemaBefore.tables['u_rebuild']!,
+					uniqueConstraints: {
+						...schemaBefore.tables['u_rebuild']!.uniqueConstraints,
+						u1: {
+							...schemaBefore.tables['u_rebuild']!.uniqueConstraints['u1']!,
+							columns: [{ name: 'email', collate: 'nocase' }],
+						},
+					},
+				},
+			},
+		};
+
+		const { statements, errors } = diffSnapshots(liveBefore, schemaAfter);
+		expect(errors).toEqual([]);
+
+		const createTemp = statements.find((s) => s.sql.includes('create table "__new_u_rebuild"'));
+		expect(createTemp?.sql).toContain('unique ("email" collate nocase)');
+	});
+
 	it('detects introspection-to-introspection collation drift instead of exempting it (F-101 follow-up)', () => {
 		// Right after `pull`, both sides of `check` are `origin: 'introspection'`
 		// — `undefined` there genuinely means BINARY, not "the schema DSL cannot
