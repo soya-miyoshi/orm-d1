@@ -244,7 +244,7 @@ export function statementGroups(statements: readonly string[]): number[] {
 			: null;
 		const createdName = createMatch ? normalizeIdentifierToken(createMatch[1]!) : undefined;
 
-		if (!createdName || !createdName.startsWith('__new_')) {
+		if (!createdName || !foldAsciiCase(createdName).startsWith('__new_')) {
 			groups[i] = nextGroup++;
 			i++;
 			continue;
@@ -256,7 +256,10 @@ export function statementGroups(statements: readonly string[]): number[] {
 		let finalName: string | undefined;
 		for (let j = createIndex + 1; j < statements.length; j++) {
 			const renameMatch = RENAME_TO_PATTERN.exec(statements[j]!);
-			if (renameMatch && normalizeIdentifierToken(renameMatch[1]!) === tempName) {
+			if (
+				renameMatch
+				&& foldAsciiCase(normalizeIdentifierToken(renameMatch[1]!)) === foldAsciiCase(tempName)
+			) {
 				end = j;
 				finalName = normalizeIdentifierToken(renameMatch[2]!);
 				break;
@@ -310,7 +313,7 @@ export function tablesRebuiltIn(statements: readonly string[]): string[] {
 		const match = createTableNamePattern.exec(statement);
 		if (!match) continue;
 		const name = normalizeIdentifierToken(match[1]!);
-		if (name.startsWith('__new_')) names.push(name.slice('__new_'.length));
+		if (foldAsciiCase(name).startsWith('__new_')) names.push(name.slice('__new_'.length));
 	}
 	return names;
 }
@@ -464,11 +467,15 @@ export const foldAsciiCase = (value: string): string => value.replace(/[A-Za-z]/
  */
 export function lookupCaseInsensitive<T>(map: Record<string, T> | undefined, key: string): T | undefined {
 	if (!map) return undefined;
-	if (Object.hasOwn(map, key)) return map[key];
 	const lower = foldAsciiCase(key);
 	let result: T | undefined;
 	let found = false;
+	if (Object.hasOwn(map, key)) {
+		result = map[key];
+		found = true;
+	}
 	for (const k of Object.keys(map)) {
+		if (k === key) continue;
 		if (foldAsciiCase(k) !== lower) continue;
 		const value = map[k]!;
 		if (!found) {

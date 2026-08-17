@@ -297,7 +297,7 @@ export async function migrate(ctx: CommandContext, flags: TargetFlags = {}): Pro
 
 export async function push(ctx: CommandContext, flags: TargetFlags = {}): Promise<string[]> {
 	const runner = await resolveRunner(ctx, flags);
-	const foreignTriggers: Record<string, string[]> = {};
+	const foreignTriggers: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
 	const live = await introspect(runner, foreignTriggers);
 	const next = await snapshotOfSchema(ctx);
 	const diff = diffSnapshots(live, next, { ...(flags.renames ?? {}), foreignTriggers });
@@ -712,7 +712,7 @@ export async function check(ctx: CommandContext, flags: TargetFlags = {}): Promi
 	const applied = await appliedMigrations(runner, ctx.config.migrationsTable, false);
 	const pending = pendingMigrations(journal, applied).map((entry) => entry.tag);
 
-	const foreignTriggers: Record<string, string[]> = {};
+	const foreignTriggers: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
 	const live = await introspect(runner, foreignTriggers);
 	const expected = await readLatestSnapshot(ctx.config.out);
 	const { drift, blocked, warnings } = driftBetween(live, expected, foreignTriggers);
@@ -804,7 +804,7 @@ export async function verify(ctx: CommandContext): Promise<VerifyResult> {
 		corruption.push(`integrity_check: ${integrity.map((r) => r.integrity_check).join(', ')}`);
 	}
 
-	const foreignTriggers: Record<string, string[]> = {};
+	const foreignTriggers: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
 	const replayed = await introspect(runner, foreignTriggers);
 	const expected = await snapshotOfSchema(ctx);
 	const diff = diffSnapshots(replayed, expected, { foreignTriggers });

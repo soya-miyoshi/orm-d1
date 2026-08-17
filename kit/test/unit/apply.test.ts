@@ -402,3 +402,115 @@ describe('finding 9: the cross-file rename fold is case-insensitive', () => {
 			.rejects.toThrow(/"orders_audit"/);
 	});
 });
+
+/**
+ * A rebuild whose `create table "__new_X"` and closing
+ * `alter table … rename to "X"` disagree in case on the `__new_`/`__NEW_`
+ * marker — SQLite identifiers are case-insensitive, so `"__new_orders"` and
+ * `"__NEW_ORDERS"` name the same table, but the marker matching in `sql.ts`/
+ * `apply.ts` used to compare with plain `===`/`.startsWith()`, missing this.
+ */
+const mixedCaseRebuildGroup = (table: string): string[] => [
+	'PRAGMA defer_foreign_keys = ON',
+	`create table "__new_${table}" ("id" integer)`,
+	`insert into "__new_${table}" ("id") select "id" from "${table}"`,
+	`drop table "${table}"`,
+	`alter table "__NEW_${table.toUpperCase()}" rename to "${table}"`,
+];
+
+describe('round 3, finding 1: __new_ matching is case-insensitive, like SQLite identifiers', () => {
+	it('statementGroups treats a mixed-case __new_/__NEW_ rebuild as one atomic group, not five singletons', () => {
+		// [BLOCKING]: with a case-sensitive comparison, the closing rename is
+		// never recognized as closing the group. `statementGroups` then treats
+		// the `drop table "orders"` and the rename as two unrelated singleton
+		// statements, which `packIntoBatches` can freely split across two
+		// batches — committing the drop in one batch and losing the rename (and
+		// the table) if the next batch fails.
+		const statements = mixedCaseRebuildGroup('orders');
+		const groups = statementGroups(statements);
+		expect(new Set(groups).size).toBe(1);
+	});
+
+	it('packIntoBatches never splits a mixed-case rebuild across two batches', () => {
+		const statements = [
+			...Array.from({ length: MAX_STATEMENTS_PER_BATCH - 2 }, (_, i) => `create table "t${i}" ("id" integer)`),
+			...mixedCaseRebuildGroup('orders'),
+		];
+		const batches = packIntoBatches(statements, MAX_STATEMENTS_PER_BATCH);
+		for (const batch of batches) {
+			const hasDrop = batch.some((s) => s === 'drop table "orders"');
+			const hasRename = batch.some((s) => s === 'alter table "__NEW_ORDERS" rename to "orders"');
+			expect(hasDrop).toBe(hasRename);
+		}
+	});
+
+	it('tablesRebuiltIn recognizes a create table spelled "__NEW_" (uppercase marker)', () => {
+		const statements = [
+			'PRAGMA defer_foreign_keys = ON',
+			'create table "__NEW_orders" ("id" integer)',
+			'insert into "__NEW_orders" ("id") select "id" from "orders"',
+			'drop table "orders"',
+			'alter table "__NEW_orders" rename to "orders"',
+		];
+		expect(tablesRebuiltIn(statements)).toEqual(['orders']);
+	});
+
+	// Guard-bypass half: a mis-recognized close used to file itself as a
+	// genuine live-table rename in `renamesInMigration`, which corrupted the
+	// resolution chain `checkForeignTriggerConflicts` uses and could hide a
+	// real foreign trigger on the rebuilt table from the refusal below.
+	it('still refuses a mixed-case rebuild of a table carrying a foreign trigger', async () => {
+		const runner = triggerRunner([
+			{ name: 'orders_audit', tbl_name: 'orders', sql: 'create trigger "orders_audit" after insert on "orders" begin select 1; end' },
+		]);
+		const sql = `${mixedCaseRebuildGroup('orders').join(';\n')};`;
+
+		await expect(checkForeignTriggerConflicts(runner, [{ tag: 'm1', sql }]))
+			.rejects.toThrow(/"orders_audit"/);
+	});
+});
+
+describe('round 3, finding 2: lookupCaseInsensitive unions the exact key with case-insensitive matches', () => {
+	it('includes the exact-key value in the union rather than short-circuiting on it', () => {
+		// The exact-case key ("orders") is present *and* a differently-cased key
+		// ("Orders") also matches case-insensitively. The old fast path returned
+		// `map['orders']` alone the moment `Object.hasOwn` was true, skipping the
+		// union loop below it entirely — exactly the case the union exists for.
+		const map: Record<string, string[]> = { orders: ['a'], Orders: ['b'] };
+		const result = lookupCaseInsensitive(map, 'orders');
+		expect(new Set(result)).toEqual(new Set(['a', 'b']));
+	});
+});
+
+describe('round 3, [F-078]: trigger/rename maps are prototype-safe', () => {
+	it('records a foreign trigger on a live table literally named "constructor"', async () => {
+		// A plain `{}` object literal has `Object.prototype.constructor` as an
+		// inherited (non-own) property — a function, not `undefined` — so
+		// `(foreignTriggers['constructor'] ??= []).push(...)` throws
+		// `TypeError: … .push is not a function` instead of recording the
+		// trigger. checkForeignTriggerConflicts must not throw that, and must
+		// still catch the trigger.
+		const runner = triggerRunner([
+			{
+				name: 'constructor_audit',
+				tbl_name: 'constructor',
+				sql: 'create trigger "constructor_audit" after insert on "constructor" begin select 1; end',
+			},
+		]);
+		const sql = `${rebuildGroup('constructor').join(';\n')};`;
+
+		await expect(checkForeignTriggerConflicts(runner, [{ tag: 'm1', sql }]))
+			.rejects.toThrow(/"constructor_audit"/);
+	});
+
+	it('follows a rename chain through a table literally named "__proto__"', async () => {
+		const runner = triggerRunner([
+			{ name: 'orders_audit', tbl_name: 'orders', sql: 'create trigger "orders_audit" after insert on "orders" begin select 1; end' },
+		]);
+		const m1 = { tag: 'm1', sql: 'alter table orders rename to __proto__;' };
+		const m2 = { tag: 'm2', sql: `${rebuildGroup('__proto__').join(';\n')};` };
+
+		await expect(checkForeignTriggerConflicts(runner, [m1, m2]))
+			.rejects.toThrow(/"orders_audit"/);
+	});
+});

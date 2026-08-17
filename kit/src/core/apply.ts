@@ -119,6 +119,11 @@ export async function introspect(runner: SqlRunner, foreignTriggers?: Record<str
 	);
 
 	if (foreignTriggers) {
+		// `foreignTriggers` is caller-supplied (an out-param); callers are
+		// expected to pass a null-prototype object for the same `[F-078]`
+		// reason documented on `checkForeignTriggerConflicts`'s own
+		// `foreignTriggers` below — a live table named `constructor` must not
+		// resolve to `Object.prototype`'s member instead of `undefined`.
 		for (const row of master) {
 			if (row.type !== 'trigger' || !row.sql) continue;
 			if (isAppendOnlyTrigger(row.sql, row.tbl_name)) continue;
@@ -286,7 +291,11 @@ export async function applyMigration(
  * rebuilt table invisible to the refusal below.
  */
 function renamesInMigration(statements: readonly string[]): Record<string, string> {
-	const renames: Record<string, string> = {};
+	// Null-prototype for the same `[F-078]` reason as `foreignTriggers`/
+	// `accumulated` below: `to`/`from` are parsed table names, not internal
+	// literals, so `renames['constructor']` must not resolve to
+	// `Object.prototype.constructor`.
+	const renames: Record<string, string> = Object.create(null) as Record<string, string>;
 	// Kit's own `recreateTable` always emits `create table "__new_X"` with the
 	// double-quoted spelling, but `renames` below already has to recognise a
 	// hand-written rename in any of the four spellings — and a hand-written
@@ -335,8 +344,9 @@ function renamesInMigration(statements: readonly string[]): Record<string, strin
 		// backtick-/bracket-quoted `create table __new_x` produced a name that
 		// never matched `from`'s normalized form, for the same reason.
 		const name = normalizeIdentifierToken(created[1]!);
-		if (!name.startsWith('__new_')) return;
-		if (!createdAt.has(name)) createdAt.set(name, index);
+		if (!foldAsciiCase(name).startsWith('__new_')) return;
+		const key = foldAsciiCase(name);
+		if (!createdAt.has(key)) createdAt.set(key, index);
 	});
 
 	statements.forEach((statement, index) => {
@@ -344,9 +354,9 @@ function renamesInMigration(statements: readonly string[]): Record<string, strin
 		if (!match) return;
 		const from = normalizeIdentifierToken(match[1]!);
 		const to = normalizeIdentifierToken(match[2]!);
-		const strippedTarget = from.startsWith('__new_') ? from.slice('__new_'.length) : undefined;
-		const createdIndex = createdAt.get(from);
-		const isRebuildsOwnClose = strippedTarget !== undefined && to === strippedTarget
+		const strippedTarget = foldAsciiCase(from).startsWith('__new_') ? from.slice('__new_'.length) : undefined;
+		const createdIndex = createdAt.get(foldAsciiCase(from));
+		const isRebuildsOwnClose = strippedTarget !== undefined && foldAsciiCase(to) === foldAsciiCase(strippedTarget)
 			&& createdIndex !== undefined && createdIndex < index;
 		if (isRebuildsOwnClose) return;
 		renames[to] = from;
@@ -389,7 +399,13 @@ export async function checkForeignTriggerConflicts(
 	const master = await runner.all<MasterRow>(
 		"select type, name, tbl_name, sql from sqlite_master where type = 'trigger'",
 	);
-	const foreignTriggers: Record<string, string[]> = {};
+	// Null-prototype: `row.tbl_name` is a live table name straight from
+	// `sqlite_master`, so a table named `constructor`/`__proto__`/`toString`
+	// (the `[F-078]` class) must not resolve to `Object.prototype`'s own
+	// members — a plain `{}` literal made `(foreignTriggers['constructor'] ??=
+	// []).push(...)` throw `TypeError: … .push is not a function` instead of
+	// recording the trigger.
+	const foreignTriggers: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
 	for (const row of master) {
 		if (!row.sql) continue;
 		if (isAppendOnlyTrigger(row.sql, row.tbl_name)) continue;
@@ -407,7 +423,11 @@ export async function checkForeignTriggerConflicts(
 	// being checked to the table's true live name in the database (before
 	// this `migrate` run touched anything), and is folded forward after each
 	// migration is considered so the next one inherits it.
-	const accumulated: Record<string, string> = {};
+	// Null-prototype for the same `[F-078]` reason as `foreignTriggers` above:
+	// a live table literally named `constructor` would otherwise resolve
+	// `accumulated['constructor']` to `Object.prototype.constructor` instead
+	// of `undefined`, corrupting the rename chain rather than starting it.
+	const accumulated: Record<string, string> = Object.create(null) as Record<string, string>;
 
 	for (const migration of parsed) {
 		for (const table of migration.tables) {

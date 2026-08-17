@@ -1997,6 +1997,32 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			expect(diff.errors[0]).toMatch(/"events_no_update"/);
 			expect(diff.statements).toEqual([]);
 		});
+
+		// [Round 3, Finding 3]: `tableGuardCollides` used to fold case with
+		// `.toLowerCase()`, not the ASCII-only `foldAsciiCase` this file already
+		// uses elsewhere for identifier comparison. `.toLowerCase()` maps U+212A
+		// KELVIN SIGN to ordinary ASCII "k" — SQLite's own identifier comparison
+		// is ASCII-only and treats them as different characters — so a table
+		// named with a Kelvin sign turning append-only used to be refused
+		// against a live trigger that, to SQLite, has an entirely different
+		// name. `create trigger` would actually succeed.
+		it('does not refuse when the guard name only collides after non-ASCII case folding (Kelvin sign vs "k")', () => {
+			const kelvinSign = String.fromCharCode(0x212a);
+			const eventK = sqliteTable(`event${kelvinSign}`, { id: text('id').primaryKey() });
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, eventK);
+			const after = snapshotFromSchema([audit, eventK], '', tableOptions([[eventK, { appendOnly: true }]]));
+
+			// A live foreign trigger spelled with an ordinary ASCII "k" — distinct
+			// from `event<KELVIN SIGN>_no_update` to SQLite, but `.toLowerCase()`
+			// would fold both to the same string.
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['eventk_no_update'] },
+			});
+
+			expect(diff.errors).toEqual([]);
+			expect(diff.statements.some((s) => s.sql.includes(`"event${kelvinSign}_no_update"`))).toBe(true);
+		});
 	});
 
 	// Finding 2 (smaller half): a rebuild triggered for some other reason

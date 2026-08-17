@@ -18,7 +18,7 @@ import {
 } from 'orm-d1/ddl';
 import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
-import { lookupCaseInsensitive } from './sql.js';
+import { foldAsciiCase, lookupCaseInsensitive } from './sql.js';
 
 export interface Statement {
 	readonly sql: string;
@@ -334,13 +334,13 @@ const tableGuardCollides = (
 	statementsSoFar: readonly Statement[],
 ): boolean => {
 	if (!foreignTriggers) return false;
-	const lowerGuard = guardName.toLowerCase();
+	const lowerGuard = foldAsciiCase(guardName);
 
 	const droppedTriggerNames = new Set(
 		statementsSoFar
 			.map((s) => /^drop\s+trigger\s+(?:if\s+exists\s+)?"((?:[^"]|"")+)"/i.exec(s.sql)?.[1])
 			.filter((n): n is string => n !== undefined)
-			.map((n) => n.replaceAll('""', '"').toLowerCase()),
+			.map((n) => foldAsciiCase(n.replaceAll('""', '"'))),
 	);
 	if (droppedTriggerNames.has(lowerGuard)) return false;
 
@@ -359,18 +359,18 @@ const tableGuardCollides = (
 	// table it is rebuilding before creating its own guard) never depended on
 	// `droppedTables` at all — that table is excluded via `foreignTriggers`
 	// instead, checked separately in `recreateTable`. [Finding 2]
-	const droppedTablesLower = new Set(droppedTables.map((t) => t.toLowerCase()));
+	const droppedTablesLower = new Set(droppedTables.map((t) => foldAsciiCase(t)));
 	const alreadyDroppedLower = new Set(
 		statementsSoFar
 			.map((s) => /^drop\s+table\s+"((?:[^"]|"")+)"/i.exec(s.sql)?.[1])
 			.filter((n): n is string => n !== undefined)
-			.map((n) => n.replaceAll('""', '"').toLowerCase())
+			.map((n) => foldAsciiCase(n.replaceAll('""', '"')))
 			.filter((n) => droppedTablesLower.has(n)),
 	);
 
 	return Object.entries(foreignTriggers).some(([table, triggers]) => {
-		if (alreadyDroppedLower.has(table.toLowerCase())) return false;
-		return triggers.some((t) => t.toLowerCase() === lowerGuard);
+		if (alreadyDroppedLower.has(foldAsciiCase(table))) return false;
+		return triggers.some((t) => foldAsciiCase(t) === lowerGuard);
 	});
 };
 
