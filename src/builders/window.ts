@@ -28,11 +28,11 @@ import type { Condition } from '../sql/expressions.js';
 import { and, eq } from '../sql/expressions.js';
 import type { SQLChunk } from '../sql/sql.js';
 import { sql } from '../sql/sql.js';
-import type { D1zzleDatabase } from '../runtime/database.js';
+import type { OrmD1Database } from '../runtime/database.js';
 import type { InferSelectModel } from '../schema/infer.js';
 
 /** Projected alongside the row's own columns; never survives into a result. */
-const ROW_NUMBER = '__d1zzle_latest_rn';
+const ROW_NUMBER = '__ormd1_latest_rn';
 
 export interface LatestPerGroupConfig<T extends Table> {
 	/** Columns the rows are grouped by — one row comes back per distinct value. */
@@ -74,7 +74,7 @@ export interface LatestPerGroupConfig<T extends Table> {
  * column can collide with and is dropped from the rows handed back.
  */
 export async function latestPerGroup<T extends Table>(
-	db: D1zzleDatabase,
+	db: OrmD1Database,
 	table: T,
 	config: LatestPerGroupConfig<T>,
 ): Promise<InferSelectModel<T>[]> {
@@ -102,7 +102,7 @@ export async function latestPerGroup<T extends Table>(
 		})
 		.from(table as never)
 		.where(config.where as never)
-		.as('d1zzle_latest');
+		.as('ormd1_latest');
 
 	const inner = getTableColumns(numbered as unknown as Table) as unknown as Record<string, SQLChunk>;
 	const projection: Record<string, SQLChunk> = {};

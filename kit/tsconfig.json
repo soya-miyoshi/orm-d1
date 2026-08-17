@@ -3,14 +3,14 @@
 	"compilerOptions": {
 		// The kit runs in Node, not in workerd: it may use Node builtins and
 		// contributes zero bytes to the Worker bundle. The Workers types come
-		// along because it imports d1zzle, which is typed against them.
+		// along because it imports orm-d1, which is typed against them.
 		"types": ["node"],
 		// Against the built declarations, exactly as a published install
 		// resolves them — which also keeps workerd globals out of this program.
 		"paths": {
-			"d1zzle": ["../dist/index.d.ts"],
-			"d1zzle/ddl": ["../dist/ddl.d.ts"],
-			"d1zzle/relations": ["../dist/relations/index.d.ts"]
+			"orm-d1": ["../dist/index.d.ts"],
+			"orm-d1/ddl": ["../dist/ddl.d.ts"],
+			"orm-d1/relations": ["../dist/relations/index.d.ts"]
 		}
 	},
 	"include": ["src"]

@@ -7,8 +7,8 @@
  * seeded before a migration survives it.
  */
 import { env } from 'cloudflare:test';
-import { createSchema, tableOptions } from 'd1zzle/ddl';
-import { integer, real, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
+import { createSchema, tableOptions } from 'orm-d1/ddl';
+import { integer, real, sql, sqliteTable, text, uniqueIndex } from 'orm-d1';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { applyMigrations, appliedMigrations, checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
@@ -295,7 +295,7 @@ describe('batching a large migration cannot cut a table rebuild in half (finding
 });
 
 describe('a rebuild refuses to silently drop a foreign trigger (finding 2)', () => {
-	it('refuses a rebuild-forcing push when the live table carries a trigger d1zzle did not author, naming it', async () => {
+	it('refuses a rebuild-forcing push when the live table carries a trigger orm-d1 did not author, naming it', async () => {
 		const before = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: integer('balance') });
 		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
 
@@ -371,7 +371,7 @@ describe('a rename in the same migration cannot bypass the foreign-trigger refus
 		const before = sqliteTable('orders', { id: integer('id').primaryKey(), amount: integer('amount') });
 		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
 
-		// A hand-written trigger d1zzle did not author, on the live (pre-rename)
+		// A hand-written trigger orm-d1 did not author, on the live (pre-rename)
 		// name.
 		await DB.prepare(
 			'create trigger "orders_audit" after insert on "orders" '

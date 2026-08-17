@@ -1,10 +1,10 @@
 /**
- * `d1zzle/better-auth` — a Better Auth database adapter backed by d1zzle.
+ * `orm-d1/better-auth` — a Better Auth database adapter backed by orm-d1.
  *
  * Better Auth ships an official Drizzle adapter, but it cannot be pointed at a
- * d1zzle schema: it drives the database through drizzle-orm's *runtime* — it
+ * orm-d1 schema: it drives the database through drizzle-orm's *runtime* — it
  * calls drizzle column methods (`col.shouldDisableInsert()`), builds predicates
- * with drizzle's own `eq`/`and`, and reads `db.query` / `db._`. `d1zzle/drizzle`
+ * with drizzle's own `eq`/`and`, and reads `db.query` / `db._`. `orm-d1/drizzle`
  * closes the *type* gap for adapters that only read a schema's shape; it cannot
  * close a runtime gap, because our query builder is a different implementation
  * rather than a re-typing of theirs.
@@ -13,23 +13,23 @@
  * `createAdapterFactory` takes a `CustomAdapter` — ten methods over
  * `{ model, where, data }` — and handles field mapping, id generation, input and
  * output transforms, and the plugin schema on top. That is the whole contract,
- * and it is expressible in d1zzle directly:
+ * and it is expressible in orm-d1 directly:
  *
  * ```ts
  * import { betterAuth } from 'better-auth';
- * import { drizzle } from 'd1zzle';
- * import { d1zzleAdapter } from 'd1zzle/better-auth';
+ * import { drizzle } from 'orm-d1';
+ * import { ormD1Adapter } from 'orm-d1/better-auth';
  * import { user, session, account, verification } from './schema';
  *
  * const auth = betterAuth({
- *   database: d1zzleAdapter(drizzle(env.DB), {
+ *   database: ormD1Adapter(drizzle(env.DB), {
  *     schema: { user, session, account, verification },
  *   }),
  * });
  * ```
  *
- * `better-auth` is an **optional peer**. Nothing else in d1zzle imports this
- * module, so a project that never calls `d1zzleAdapter` never loads it.
+ * `better-auth` is an **optional peer**. Nothing else in orm-d1 imports this
+ * module, so a project that never calls `ormD1Adapter` never loads it.
  *
  * ## What differs from the Drizzle adapter, and why
  *
@@ -45,11 +45,11 @@
  * **`select` is honoured with a projection**, not a full row read, because on D1
  * the bytes you do not select are still `rows_read` you paid for.
  *
- * **No `createSchema`.** `npx @better-auth/cli generate` cannot emit a d1zzle
- * schema, because in a d1zzle project the schema file is the source of truth
- * that `d1zzle-migrate` diffs against — generating it from Better Auth's model
- * list would invert that. Write the tables in `d1zzle/sqlite-core` (the Better
- * Auth docs' Drizzle schema ports over unchanged) and run `d1zzle-migrate
+ * **No `createSchema`.** `npx @better-auth/cli generate` cannot emit an orm-d1
+ * schema, because in an orm-d1 project the schema file is the source of truth
+ * that `orm-d1-kit` diffs against — generating it from Better Auth's model
+ * list would invert that. Write the tables in `orm-d1/sqlite-core` (the Better
+ * Auth docs' Drizzle schema ports over unchanged) and run `orm-d1-kit
  * generate`.
  */
 import { createAdapterFactory } from 'better-auth/adapters';
@@ -78,20 +78,20 @@ import { exceedsBytes, MAX_PATTERN_BYTES } from './limits.js';
 import { count } from './sql/functions.js';
 import type { SQLChunk } from './sql/sql.js';
 import { sql } from './sql/sql.js';
-import type { D1zzleDatabase } from './runtime/database.js';
+import type { OrmD1Database } from './runtime/database.js';
 
 /** Raised for a misconfiguration this adapter can detect — a missing model, an
  *  unknown field, an operator used with the wrong value shape. Named so the
  *  message is attributable when it surfaces inside Better Auth's own stack. */
-export class D1zzleAdapterError extends Error {
-	override readonly name = 'D1zzleAdapterError';
+export class OrmD1AdapterError extends Error {
+	override readonly name = 'OrmD1AdapterError';
 }
 
-export interface D1zzleAdapterConfig {
+export interface OrmD1AdapterConfig {
 	/**
-	 * Better Auth model name → the d1zzle table backing it.
+	 * Better Auth model name → the orm-d1 table backing it.
 	 *
-	 * Unlike the Drizzle adapter this is required, not optional: d1zzle's
+	 * Unlike the Drizzle adapter this is required, not optional: orm-d1's
 	 * `drizzle()` takes `relations`, not a flat `schema` bag, so there is no
 	 * `db._.fullSchema` to fall back on and no way to guess which table is the
 	 * `user`. Keys are Better Auth's model names (`user`, `session`, `account`,
@@ -107,7 +107,7 @@ export interface D1zzleAdapterConfig {
 	 * Whether `Date` values may be handed to the driver as-is.
 	 *
 	 * True is right when your timestamp columns are `integer({ mode: 'timestamp' })`
-	 * or `timestamp_ms` — d1zzle's encoder turns the `Date` into the epoch number
+	 * or `timestamp_ms` — orm-d1's encoder turns the `Date` into the epoch number
 	 * the column stores. Set it to `false` if you declared them as plain `text`
 	 * or `integer`, and Better Auth will hand over ISO strings instead.
 	 *
@@ -133,14 +133,14 @@ export interface D1zzleAdapterConfig {
 	supportsNumericIds?: boolean | undefined;
 }
 
-/** The subset of a d1zzle database this adapter uses. `drizzle(env.DB)` and
+/** The subset of an orm-d1 database this adapter uses. `drizzle(env.DB)` and
  *  `drizzle(env.DB, { relations })` both satisfy it. */
-export type D1zzleAdapterDatabase = Pick<D1zzleDatabase, 'select' | 'insert' | 'update' | 'delete'>;
+export type OrmD1AdapterDatabase = Pick<OrmD1Database, 'select' | 'insert' | 'update' | 'delete'>;
 
 /** A `where` value that has to be an array for the operator to make sense. */
 const arrayValue = (w: CleanedWhere, model: string): readonly unknown[] => {
 	if (!Array.isArray(w.value)) {
-		throw new D1zzleAdapterError(
+		throw new OrmD1AdapterError(
 			`The value for "${w.field}" on model "${model}" must be an array to use the "${w.operator}" operator.`,
 		);
 	}
@@ -205,7 +205,7 @@ const patternCondition = (
 ): Condition => {
 	const pattern = wrap(escapeLikeValue(w.value));
 	if (exceedsBytes(pattern, MAX_PATTERN_BYTES)) {
-		throw new D1zzleAdapterError(
+		throw new OrmD1AdapterError(
 			`"${w.operator}" on "${model}"."${column.name}" builds a ${pattern.length}-character LIKE pattern, `
 				+ `past D1's ${MAX_PATTERN_BYTES}-byte limit. Shorten the search term — note that a \`%\` or `
 				+ '`_` in it is escaped, which costs one character each — or match on a narrower field.',
@@ -233,7 +233,7 @@ const isInsensitive = (w: CleanedWhere): boolean =>
 	&& (typeof w.value === 'string' || (Array.isArray(w.value) && w.value.every((v) => typeof v === 'string')));
 
 /**
- * One `Where` entry as a d1zzle condition.
+ * One `Where` entry as an orm-d1 condition.
  *
  * `null` is special-cased ahead of the operators because SQL's `=` and `<>` are
  * never true against `null`; Better Auth means `is null` / `is not null` and
@@ -281,15 +281,15 @@ const toCondition = (column: Column<any>, w: CleanedWhere, model: string): Condi
  * pinned to whatever the installed Better Auth says it is, and this module
  * needs no import from `better-auth`'s type entry.
  */
-export type D1zzleAdapterFactory = ReturnType<typeof createAdapterFactory>;
+export type OrmD1AdapterFactory = ReturnType<typeof createAdapterFactory>;
 
-export const d1zzleAdapter = (
-	db: D1zzleAdapterDatabase,
-	config: D1zzleAdapterConfig,
-): D1zzleAdapterFactory => {
+export const ormD1Adapter = (
+	db: OrmD1AdapterDatabase,
+	config: OrmD1AdapterConfig,
+): OrmD1AdapterFactory => {
 	const createCustomAdapter: Parameters<typeof createAdapterFactory>[0]['adapter'] =
 		({ getFieldName }) => {
-			/** The d1zzle table for a Better Auth model name. */
+			/** The orm-d1 table for a Better Auth model name. */
 			const tableFor = (model: string): Table => {
 				const key = config.usePlural ? `${model}s` : model;
 				// `hasOwn`, not a bare index: `schema` is a plain object the user
@@ -302,8 +302,8 @@ export const d1zzleAdapter = (
 					Object.hasOwn(config.schema, name) ? config.schema[name] : undefined;
 				const t = own(key) ?? own(model);
 				if (!t) {
-					throw new D1zzleAdapterError(
-						`The model "${model}" is not in the d1zzle adapter's \`schema\` option. `
+					throw new OrmD1AdapterError(
+						`The model "${model}" is not in the orm-d1 adapter's \`schema\` option. `
 							+ `Add it, e.g. \`schema: { ${key}: ${key} }\`. `
 							+ `Known models: ${Object.keys(config.schema).join(', ') || '(none)'}.`,
 					);
@@ -317,7 +317,7 @@ export const d1zzleAdapter = (
 			 * `getFieldName` maps a model's field to the name it is stored under —
 			 * which, for both this adapter and Drizzle's, is the *property* key in
 			 * the schema object, not the SQL column name. The property is what a
-			 * `fields: { image: 'avatarUrl' }` override names, and d1zzle turns the
+			 * `fields: { image: 'avatarUrl' }` override names, and orm-d1 turns the
 			 * property back into `"avatar_url"` when it renders. Calling it here is
 			 * belt and braces: the factory has already mapped `where` and `data`
 			 * keys, and the mapping is idempotent because an already-mapped name is
@@ -338,10 +338,10 @@ export const d1zzleAdapter = (
 				const columns = getTableColumns(table) as Record<string, Column<any> | undefined>;
 				const column = Object.hasOwn(columns, key) ? columns[key] : undefined;
 				if (!column) {
-					throw new D1zzleAdapterError(
-						`The field "${field}" does not exist on the d1zzle table "${getTableName(table)}" `
+					throw new OrmD1AdapterError(
+						`The field "${field}" does not exist on the orm-d1 table "${getTableName(table)}" `
 							+ `backing the model "${model}". Add the column to your schema (and generate a `
-							+ `migration with \`d1zzle-migrate generate\`), or map it with \`fields\`.`,
+							+ `migration with \`orm-d1-kit generate\`), or map it with \`fields\`.`,
 					);
 				}
 				return column;
@@ -368,7 +368,7 @@ export const d1zzleAdapter = (
 				return and(and(...ands), or(...ors));
 			};
 
-			/** `select: ['id', 'email']` as a d1zzle projection, or `undefined` for
+			/** `select: ['id', 'email']` as an orm-d1 projection, or `undefined` for
 			 *  the whole row. Worth doing rather than ignoring: on D1 an unselected
 			 *  column is still billed as `rows_read`. */
 			const projectionFor = (
@@ -407,8 +407,8 @@ export const d1zzleAdapter = (
 
 			const rejectJoins = (join: JoinConfig | undefined, method: string): void => {
 				if (!join || Object.keys(join).length === 0) return;
-				throw new D1zzleAdapterError(
-					`\`experimental.joins\` is not supported by the d1zzle adapter (${method} asked to join `
+				throw new OrmD1AdapterError(
+					`\`experimental.joins\` is not supported by the orm-d1 adapter (${method} asked to join `
 						+ `${Object.keys(join).join(', ')}). Turn the option off; Better Auth will fetch the `
 						+ `related rows with follow-up queries instead.`,
 				);
@@ -584,8 +584,8 @@ export const d1zzleAdapter = (
 
 	return createAdapterFactory({
 		config: {
-			adapterId: 'd1zzle',
-			adapterName: 'd1zzle Adapter',
+			adapterId: 'orm-d1',
+			adapterName: 'orm-d1 Adapter',
 			usePlural: config.usePlural ?? false,
 			debugLogs: config.debugLogs ?? false,
 			supportsNumericIds: config.supportsNumericIds ?? true,

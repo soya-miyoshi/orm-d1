@@ -69,7 +69,7 @@ export interface ColumnConfig {
 /**
  * Identifier casing applied to columns that did not specify a database name.
  *
- * Set once by `d1zzle()` (or by the kit) and read lazily, so a schema module
+ * Set once by `orm-d1()` (or by the kit) and read lazily, so a schema module
  * can be imported before the option is known.
  */
 let casingMode: 'preserve' | 'snake_case' = 'preserve';
@@ -82,14 +82,14 @@ let casingObserved = false;
  * Reconfiguring is refused rather than honoured, and so is configuring late.
  *
  * `Column.name` reads this lazily, and a Workers isolate outlives the request,
- * so a second `d1zzle(…, { casing })` with a different value would silently
+ * so a second `orm-d1(…, { casing })` with a different value would silently
  * rewrite the SQL of every table already built — including for the first
  * database.
  *
  * Setting it *after* a name has been read is the more dangerous case, because
  * it is what the documented module-scope compilation does by construction: a
  * query compiled at import time bakes `"firstName"` into its SQL, and the
- * `d1zzle(env.DB, { casing: 'snake_case' })` that runs on the first request
+ * `orm-d1(env.DB, { casing: 'snake_case' })` that runs on the first request
  * then makes every *later* reader say `first_name`. The compiled query keeps
  * the old text and D1 answers "no such column" — at runtime, in production,
  * for the one query that was optimised. Both cases throw here instead.
@@ -106,7 +106,7 @@ export const configureCasing = (mode: 'preserve' | 'snake_case'): void => {
 			`Casing was set to "${mode}" after column names had already been read. Names resolve lazily, `
 				+ 'so anything compiled before this call — a query built at module scope, a createSchema() '
 				+ 'call — kept the old spelling and would now query columns that do not exist. Pass `casing` '
-				+ 'on the first d1zzle() call in the module graph, before any query is compiled.',
+				+ 'on the first ormD1() call in the module graph, before any query is compiled.',
 		);
 	}
 	casingMode = mode;

@@ -1,6 +1,6 @@
 # Differences from drizzle-orm on D1
 
-Each item below states the case, what `drizzle-orm@1.0.0-rc.4` does on D1, and what d1zzle
+Each item below states the case, what `drizzle-orm@1.0.0-rc.4` does on D1, and what orm-d1
 does. The Drizzle behaviour is read from that version's `d1/session.js`,
 `sqlite-core/async/*.js` and `sql/expressions/conditions.js`.
 
@@ -36,7 +36,7 @@ await db.insert(users).values(rows);   // rows.length === 500, 4 columns each
 `D1_ERROR: too many SQL variables`. There is no chunking in the SQLite insert builder, so
 the caller has to split the array and give up all-or-nothing behaviour across the pieces.
 
-**d1zzle** computes `floor(100 / 4) = 25` rows per statement at compile time, produces 20
+**orm-d1** computes `floor(100 / 4) = 25` rows per statement at compile time, produces 20
 statements, and submits them as one `batch()`. That is one round trip, and the batch is
 atomic, so a conflict in the last chunk inserts nothing. `.returning()` rows come back
 concatenated in input order.
@@ -58,7 +58,7 @@ await db.select().from(users).where(inArray(users.id, ids));   // ids.length ===
 **Drizzle** binds one parameter per value — `in (?, ?, ?, …)` — so any list longer than
 100 fails at D1.
 
-**d1zzle** switches strategy once the list reaches `jsonEachThreshold` (30 by default) and
+**orm-d1** switches strategy once the list reaches `jsonEachThreshold` (30 by default) and
 the values are representable as JSON. The list travels as a single bound parameter:
 
 ```sql
@@ -81,13 +81,13 @@ can apply to a connection none of the writes use, and each write commits by itse
 the third of five writes fails, the first two stay applied and the `rollback` has nothing
 to undo.
 
-**d1zzle** has no `transaction()`. There is no transaction object, no savepoint, and no
+**orm-d1** has no `transaction()`. There is no transaction object, no savepoint, and no
 code in the bundle that emits `BEGIN`. What remains under the name is a three-line method
 whose whole body throws, so that a call ported from Drizzle produces an explanation rather
 than `TypeError: db.transaction is not a function`:
 
 ```
-d1zzle does not provide transaction(). D1 has no interactive transactions: statements in
+orm-d1 does not provide transaction(). D1 has no interactive transactions: statements in
 a session are not guaranteed to land on the same connection, so an emitted BEGIN may
 apply elsewhere. Use db.batch([...]) instead — it is atomic and takes one round trip.
 ```
@@ -126,10 +126,10 @@ name, and two columns named `id` occupy one key.
 Drizzle's own source comments the function: *"It may cause issues with duplicated column
 names in join queries."* By the time the object exists, one of the two values is gone.
 
-**d1zzle** knows the projection while compiling, detects the collision then, and emits
+**orm-d1** knows the projection while compiling, detects the collision then, and emits
 generated aliases (`c0`, `c1`, …) for the colliding columns only, so the returned keys are
 unique. Outside `batch()` both libraries read positionally through `.raw()`, where the
-problem does not arise; d1zzle additionally checks the returned column names against the
+problem does not arise; orm-d1 additionally checks the returned column names against the
 compiled projection in development builds.
 
 ## Reading from a replica, and reading your own writes
@@ -137,7 +137,7 @@ compiled projection in development builds.
 **Drizzle** has no D1 session API — `withSession` does not appear anywhere in the package.
 Using replicas means calling the binding directly and leaving the query builder behind.
 
-**d1zzle** returns the same database API from `withSession()`, with `bookmark()` added:
+**orm-d1** returns the same database API from `withSession()`, with `bookmark()` added:
 
 ```ts
 const bookmark = req.headers.get('Cookie')?.match(/d1_bookmark=([^;]+)/)?.[1];
@@ -161,7 +161,7 @@ D1 returns `rows_read` and `rows_written` on every response. These are the bille
 reads through `.raw()`, which returns rows only, so the metadata is not available to the
 caller; `run()` returns D1's result object, so writes keep it.
 
-**d1zzle** takes an `onQuery` callback, called once per executed statement — including
+**orm-d1** takes an `onQuery` callback, called once per executed statement — including
 every member of a `batch()` and every chunk of a chunked insert, which is how D1 counts
 them too:
 
@@ -190,12 +190,12 @@ user data; `test/workers/integration.test.ts` asserts that a production build om
 session holds the binding. On Workers the binding arrives with the request, so the SQL is
 built inside `fetch`, on every request.
 
-**d1zzle** separates compilation from execution. `query.select()` needs no binding, so a
+**orm-d1** separates compilation from execution. `query.select()` needs no binding, so a
 query can be compiled at module scope and reused for the isolate's lifetime; values are
 supplied through named placeholders:
 
 ```ts
-import { drizzle, eq, ph, query } from 'd1zzle';
+import { drizzle, eq, ph, query } from 'orm-d1';
 
 const byEmail = query.select().from(users).where(eq(users.email, ph('email'))).compile();
 
@@ -216,7 +216,7 @@ module-scope constant compiles once even without `compile()`.
 the constraint but not the call: `too many SQL variables` does not say which `inArray`,
 and `too many arguments on function coalesce` does not say which `coalesce`.
 
-**d1zzle** checks the limits that are knowable while compiling — which happens once per
+**orm-d1** checks the limits that are knowable while compiling — which happens once per
 isolate and already walks the whole query — and names the lever:
 
 ```
@@ -266,14 +266,14 @@ Bundling a Worker that imports the driver and the schema DSL and runs one
 | | minified | gzipped |
 | --- | --- | --- |
 | `drizzle-orm/d1` + `drizzle-orm/sqlite-core` | 77.8 kB | 22.2 kB |
-| `d1zzle` | 44.1 kB | 15.3 kB |
+| `orm-d1` | 44.1 kB | 15.3 kB |
 | | −43% | −31% |
 
 Drizzle ships 25 MB across 718 export paths with `sideEffects: false`, and tree-shaking
 removes about 97% of it before it reaches a bundle. The remaining difference is code that
 is reachable from the SQLite entry point and therefore cannot be dropped by a bundler: the
 dialect indirection, the transaction and savepoint subsystem, and the prepared-statement
-abstractions that cover both synchronous and asynchronous drivers. d1zzle does not contain
+abstractions that cover both synchronous and asynchronous drivers. orm-d1 does not contain
 them.
 
 On Workers the minified column is the relevant one, because startup CPU is billed and
@@ -315,4 +315,4 @@ number; the ones above were last checked on 2026-07-27.
 The schema DSL, the query builder, the inferred types and the `db.query` interface are
 Drizzle's. The supported and unsupported lists are in
 [04-migrating-from-drizzle](./04-migrating-from-drizzle.md); how Drizzle's own adapters
-still recognise a d1zzle table is [05-adapters](./05-adapters.md).
+still recognise an orm-d1 table is [05-adapters](./05-adapters.md).

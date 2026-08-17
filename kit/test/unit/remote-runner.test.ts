@@ -388,7 +388,7 @@ describe.skipIf(!hasCredentials)('against a real D1 database', () => {
 			token: credentials.token!,
 		});
 
-	const TABLE = '_d1zzle_remote_test';
+	const TABLE = '_ormd1_remote_test';
 
 	afterEach(async () => {
 		await runner().batch([`drop table if exists "${TABLE}"`]);

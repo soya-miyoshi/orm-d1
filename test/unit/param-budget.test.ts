@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { blob, CompileError, compilePlan, d1zzle, inArray, integer, notInArray, sqliteTable } from '../../src/index.js';
+import { blob, CompileError, compilePlan, ormD1, inArray, integer, notInArray, sqliteTable } from '../../src/index.js';
 import type { SelectPlan } from '../../src/index.js';
 
-// `d1zzle()` distinguishes a binding from a config by `prepare`; nothing runs.
+// `orm-d1()` distinguishes a binding from a config by `prepare`; nothing runs.
 const binding = { prepare: () => {} } as unknown as D1Database;
 
 const keys = sqliteTable('keys', {
@@ -31,9 +31,9 @@ const planOf = (where?: SelectPlan['where']): SelectPlan => ({
 
 describe('maxParams / jsonEachThreshold', () => {
 	it('rejects a threshold above the budget at construction', () => {
-		expect(() => d1zzle(binding, { maxParams: 100, jsonEachThreshold: 200 }))
+		expect(() => ormD1(binding, { maxParams: 100, jsonEachThreshold: 200 }))
 			.toThrow(CompileError);
-		expect(() => d1zzle(binding, { maxParams: 100, jsonEachThreshold: 200 }))
+		expect(() => ormD1(binding, { maxParams: 100, jsonEachThreshold: 200 }))
 			.toThrow(/jsonEachThreshold \(200\) exceeds maxParams \(100\)/);
 	});
 
@@ -43,13 +43,13 @@ describe('maxParams / jsonEachThreshold', () => {
 	});
 
 	it('accepts a threshold at the budget', () => {
-		expect(() => d1zzle(binding, { maxParams: 100, jsonEachThreshold: 100 })).not.toThrow();
+		expect(() => ormD1(binding, { maxParams: 100, jsonEachThreshold: 100 })).not.toThrow();
 	});
 
 	it('clamps the default threshold when only maxParams is lowered', () => {
 		// Lowering maxParams alone is how you ask for smaller chunks; the
 		// default threshold of 30 is not a choice the caller made.
-		expect(() => d1zzle(binding, { maxParams: 10 })).not.toThrow();
+		expect(() => ormD1(binding, { maxParams: 10 })).not.toThrow();
 
 		const compiled = compilePlan(planOf(inArray(keys.id, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])), {
 			maxParams: 10,
@@ -59,8 +59,8 @@ describe('maxParams / jsonEachThreshold', () => {
 	});
 
 	it('rejects nonsense values', () => {
-		expect(() => d1zzle(binding, { maxParams: 0 })).toThrow(/maxParams must be a positive integer/);
-		expect(() => d1zzle(binding, { jsonEachThreshold: -1 }))
+		expect(() => ormD1(binding, { maxParams: 0 })).toThrow(/maxParams must be a positive integer/);
+		expect(() => ormD1(binding, { jsonEachThreshold: -1 }))
 			.toThrow(/jsonEachThreshold must be a positive integer/);
 	});
 });

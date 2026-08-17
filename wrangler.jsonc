@@ -1,11 +1,11 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "d1zzle",
+	"name": "orm-d1",
 	"compatibility_date": "2026-07-01",
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "d1zzle-test",
+			"database_name": "orm-d1-test",
 			"database_id": "local"
 		}
 	]

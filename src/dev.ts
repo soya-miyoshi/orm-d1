@@ -9,7 +9,7 @@ declare const __DEV__: boolean | undefined;
 
 let devEnabled = typeof __DEV__ !== 'undefined'
 	? Boolean(__DEV__)
-	: Boolean((globalThis as { __D1ZZLE_DEV__?: boolean }).__D1ZZLE_DEV__);
+	: Boolean((globalThis as { __ORM_D1_DEV__?: boolean }).__ORM_D1_DEV__);
 
 export const isDev = (): boolean => devEnabled;
 
@@ -21,7 +21,7 @@ export const setDev = (enabled: boolean): void => {
 export type Warn = (message: string) => void;
 
 let warnFn: Warn = (message) => {
-	console.warn(`[d1zzle] ${message}`);
+	console.warn(`[ormD1] ${message}`);
 };
 
 export const setWarn = (fn: Warn): void => {
@@ -44,7 +44,7 @@ export const assertHeader = (expected: readonly string[], actual: readonly strin
 			// most likely running a fork, so the message names the file to look in
 			// rather than a channel that may not answer in time to help them.
 			`Projection mismatch: compiled [${expected.join(', ')}] but D1 returned [${actual.join(', ')}]. `
-				+ 'This is a d1zzle bug — the projection is built in plan/compile.ts.',
+				+ 'This is an orm-d1 bug — the projection is built in plan/compile.ts.',
 		);
 	}
 };

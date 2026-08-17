@@ -13,14 +13,14 @@
  * differ's notion of equality at once.
  */
 import { env } from 'cloudflare:test';
-import { createSchema, tableOptions } from 'd1zzle/ddl';
+import { createSchema, tableOptions } from 'orm-d1/ddl';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots } from '../../src/core/diff.js';
 import { snapshotFromSchema } from '../../src/core/snapshot.js';
 import { allTables } from '../../../test/schema.js';
-import { check, index, integer, primaryKey, sql, sqliteTable, text, uniqueIndex } from 'd1zzle';
+import { check, index, integer, primaryKey, sql, sqliteTable, text, uniqueIndex } from 'orm-d1';
 
 /**
  * Declared here rather than in the shared fixture, which misses this by one

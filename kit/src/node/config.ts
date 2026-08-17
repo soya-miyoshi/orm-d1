@@ -41,7 +41,7 @@ export interface Config {
 	 * A separate module rather than part of the schema on purpose: none of the
 	 * three has a spelling in `drizzle-orm/sqlite-core`, and docs/04 keeps the
 	 * schema DSL a strict subset of it so a schema file stays reverse-aliasable.
-	 * See `TableOptions` in `d1zzle/ddl`.
+	 * See `TableOptions` in `orm-d1/ddl`.
 	 */
 	tableOptions?: string | undefined;
 	/** Migration output folder, in wrangler's layout. */
@@ -89,7 +89,7 @@ export type UserConfig = Partial<Config> & { schema: string | string[] };
 
 export const defineConfig = (config: UserConfig): UserConfig => config;
 
-const CONFIG_FILES = ['d1zzle.config.ts', 'd1zzle.config.js', 'd1zzle.config.mjs'];
+const CONFIG_FILES = ['orm-d1.config.ts', 'orm-d1.config.js', 'orm-d1.config.mjs'];
 const WRANGLER_FILES = ['wrangler.jsonc', 'wrangler.json', 'wrangler.toml'];
 
 /**
@@ -280,13 +280,13 @@ const READ_KEYS = new Set([
  * Which wrangler environment this run is about.
  *
  * The rule, in one sentence: **mirror wrangler where wrangler has an opinion,
- * and refuse where only d1zzle does.**
+ * and refuse where only orm-d1 does.**
  *
  * - `--env <name>` wins outright, spelled as wrangler spells it. The same flag
- *   is passed to both tools from the same script, so d1zzle disagreeing with
+ *   is passed to both tools from the same script, so orm-d1 disagreeing with
  *   wrangler about what it means would be the whole bug.
  * - `CLOUDFLARE_ENV` is read next, because wrangler reads it.
- * - `d1.env` in `d1zzle.config.ts` is the static default for a repo.
+ * - `d1.env` in `orm-d1.config.ts` is the static default for a repo.
  *
  * `CLOUDFLARE_ENV` and `d1.env` disagreeing is the one case with no wrangler
  * precedent to copy: a committed default silently beating the operator's own
@@ -304,12 +304,12 @@ export function resolveEnvironment(
 	const fromVariable = processEnv['CLOUDFLARE_ENV'];
 	if (fromVariable !== undefined && configEnv !== undefined && fromVariable !== configEnv) {
 		throw new Error(
-			`CLOUDFLARE_ENV is "${fromVariable}" but d1zzle.config.ts sets d1.env to "${configEnv}". `
+			`CLOUDFLARE_ENV is "${fromVariable}" but orm-d1.config.ts sets d1.env to "${configEnv}". `
 				+ 'Refusing to guess which database you meant — pass --env explicitly, or make them agree.',
 		);
 	}
 	if (fromVariable !== undefined) return { value: fromVariable, source: 'CLOUDFLARE_ENV' };
-	if (configEnv !== undefined) return { value: configEnv, source: 'd1zzle.config.ts (d1.env)' };
+	if (configEnv !== undefined) return { value: configEnv, source: 'orm-d1.config.ts (d1.env)' };
 	return { value: undefined, source: 'default (top-level block)' };
 }
 
@@ -319,7 +319,7 @@ export function resolveEnvironment(
  * Wrangler classifies `d1_databases` as **non-inheritable**: an environment that
  * does not declare its own gets *none*, plus a warning ("… is not inherited by
  * environments"). Falling back to the top-level block here would therefore make
- * d1zzle migrate a database wrangler would never have bound — the precise
+ * orm-d1 migrate a database wrangler would never have bound — the precise
  * failure this tool exists to prevent — so the equivalent of wrangler's "no
  * bindings" is an error, not a fallback. A warning is not enough: nobody reads
  * warnings in CI, and the consequence is an irreversible write.
@@ -357,7 +357,7 @@ function environmentBlock(
 		throw new Error(
 			`${where}, and ${file} has an "env.${name}" block, but no d1_databases in it. `
 				+ 'Wrangler does not inherit d1_databases from the top level — it would bind no database at '
-				+ `all — so neither does d1zzle. Add the binding under "env.${name}".`,
+				+ `all — so neither does orm-d1. Add the binding under "env.${name}".`,
 		);
 	}
 
@@ -377,8 +377,8 @@ export async function loadConfig(cwd: string, configPath?: string, flagEnv?: str
 
 	if (!user) {
 		throw new Error(
-			`No d1zzle config found. Create d1zzle.config.ts:\n\n`
-				+ `  import { defineConfig } from 'd1zzle-migrate';\n\n`
+			`No orm-d1 config found. Create orm-d1.config.ts:\n\n`
+				+ `  import { defineConfig } from 'orm-d1-kit';\n\n`
 				+ `  export default defineConfig({\n`
 				+ `    schema: './src/schema.ts',\n`
 				+ `    out: './migrations',\n`
@@ -405,7 +405,7 @@ export async function loadConfig(cwd: string, configPath?: string, flagEnv?: str
 	}`;
 
 	/**
-	 * One precedence rule for every value: **`d1zzle.config.ts` > environment
+	 * One precedence rule for every value: **`orm-d1.config.ts` > environment
 	 * variable > wrangler config.**
 	 *
 	 * The config file is first because a value written there is a deliberate
@@ -420,7 +420,7 @@ export async function loadConfig(cwd: string, configPath?: string, flagEnv?: str
 		fallback: string | undefined,
 	): Resolved =>
 		fromConfig !== undefined
-			? { value: fromConfig, source: 'd1zzle.config.ts' }
+			? { value: fromConfig, source: 'orm-d1.config.ts' }
 			: variable !== undefined && process.env[variable] !== undefined
 			? { value: process.env[variable], source: variable }
 			: { value: fallback, source: fallback === undefined ? 'unset' : fromWrangler };
@@ -434,7 +434,7 @@ export async function loadConfig(cwd: string, configPath?: string, flagEnv?: str
 	// Deliberately NOT `${VAR}` interpolation of the wrangler file: wrangler does
 	// not interpolate its own config (verified in wrangler 4 — `parseTOML` is a
 	// bare parse, and dotenv-expand is applied only to `.env`/`.dev.vars`), so a
-	// d1zzle that did would read a different value than wrangler from the same
+	// orm-d1 that did would read a different value than wrangler from the same
 	// line. That is a new instance of exactly the drift this change removes.
 	const databaseId = pick(user.d1?.databaseId, 'CLOUDFLARE_D1_DATABASE_ID', database?.database_id);
 	// No environment-variable route for the *name*: it only selects a local
@@ -453,7 +453,7 @@ export async function loadConfig(cwd: string, configPath?: string, flagEnv?: str
 		schema: user.schema,
 		tableOptions: user.tableOptions,
 		// Wrangler's own default layout, so `wrangler d1 migrations apply` and
-		// `d1zzle-migrate migrate` stay interchangeable. `migrations_dir` is a
+		// `orm-d1-kit migrate` stay interchangeable. `migrations_dir` is a
 		// property of the binding in wrangler; the top-level read is kept only so
 		// projects configured against older versions of this kit do not move.
 		out: user.out ?? database?.migrations_dir ?? wrangler?.migrations_dir ?? './migrations',
@@ -472,7 +472,7 @@ export async function loadConfig(cwd: string, configPath?: string, flagEnv?: str
 			environment,
 			wranglerFile: wrangler?.configFile,
 			binding: binding !== undefined
-				? { value: binding, source: 'd1zzle.config.ts' }
+				? { value: binding, source: 'orm-d1.config.ts' }
 				: { value: database?.binding, source: database ? fromWrangler : 'unset' },
 			databaseName,
 			databaseId,
@@ -507,7 +507,7 @@ export function describeResolution(config: Config, remote: boolean): string[] {
 		// deliberately keeps the id out of git does not get it printed into CI
 		// output by the tool that was supposed to protect it.
 		...(remote ? [line('database_id', r.databaseId, maskId), line('account_id', r.accountId, maskId)] : []),
-		...(r.wranglerFile ? [] : ['  (no wrangler config found; values came from d1zzle.config.ts or the environment)']),
+		...(r.wranglerFile ? [] : ['  (no wrangler config found; values came from orm-d1.config.ts or the environment)']),
 	];
 }
 

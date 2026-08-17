@@ -14,7 +14,7 @@ import { importModule } from '../../src/node/import.js';
 import { loadTableOptions, unreadableMigrations } from '../../src/node/store.js';
 import { findLocalDatabase } from '../../src/node/runners.js';
 
-const scratch = (): string => mkdtempSync(join(tmpdir(), 'd1zzle-kit-'));
+const scratch = (): string => mkdtempSync(join(tmpdir(), 'orm-d1-kit-'));
 
 describe('importModule', () => {
 	it('resolves extension-less relative imports', async () => {
@@ -61,10 +61,10 @@ describe('loadTableOptions', () => {
 	// a module loaded from a temp folder cannot resolve the in-repo package —
 	// and building it by hand pins the part that actually matters across that
 	// boundary: the brand is `Symbol.for`, so a map made by a *different* copy
-	// of `d1zzle/ddl` than the kit's own is still recognised. A registered
+	// of `orm-d1/ddl` than the kit's own is still recognised. A registered
 	// symbol is the only spelling for which that holds.
 	const source = (exported: string) =>
-		"const brand = Symbol.for('d1zzle:TableOptions');\n"
+		"const brand = Symbol.for('ormD1:TableOptions');\n"
 		+ `${exported} { [brand]: true, byTable: { events: { strict: true, appendOnly: true } } };\n`;
 
 	it('accepts the map as the default export', async () => {

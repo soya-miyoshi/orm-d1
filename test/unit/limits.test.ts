@@ -2,7 +2,7 @@
  * D1's non-parameter limits.
  *
  * The bound-parameter budget has its own file; these are the ones D1 states in
- * bytes or in counts, which d1zzle checks at compile time so the error names
+ * bytes or in counts, which orm-d1 checks at compile time so the error names
  * the call instead of arriving as a bare SQLite message.
  */
 import { describe, expect, it } from 'vitest';

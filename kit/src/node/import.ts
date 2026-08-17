@@ -76,7 +76,7 @@ export async function importModule<T = Record<string, unknown>>(path: string): P
 	} catch (error) {
 		if (!isModuleSyntaxError(error) || !/\.[cm]?ts$/.test(path)) throw error;
 
-		const shim = join(dirname(path), `.d1zzle-${process.pid}-${shimCounter++}.mts`);
+		const shim = join(dirname(path), `.orm-d1-${process.pid}-${shimCounter++}.mts`);
 		await copyFile(path, shim);
 		try {
 			return await import(pathToFileURL(shim).href) as T;

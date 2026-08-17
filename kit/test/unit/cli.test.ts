@@ -7,7 +7,7 @@ import { appendEntry, emptyJournal, migrationName, migrationTag, nextIndex, pend
 import { applicableStatements, isPragma, splitStatements } from '../../src/core/sql.js';
 import { loadConfig, parseJsonc, readWranglerConfig } from '../../src/node/config.js';
 
-const temp = () => mkdtemp(join(tmpdir(), 'd1zzle-migrate-'));
+const temp = () => mkdtemp(join(tmpdir(), 'orm-d1-kit-'));
 
 describe('splitting a migration into statements', () => {
 	it('splits on semicolons', () => {
@@ -112,7 +112,7 @@ describe('config', () => {
 			'{"d1_databases":[{"binding":"DB","database_name":"app-db","database_id":"abc-123"}]}',
 		);
 		await writeFile(
-			join(dir, 'd1zzle.config.ts'),
+			join(dir, 'orm-d1.config.ts'),
 			`export default { schema: './schema.ts' };\n`,
 		);
 
@@ -124,7 +124,7 @@ describe('config', () => {
 
 	it('explains itself when there is no config at all', async () => {
 		const dir = await temp();
-		await expect(loadConfig(dir)).rejects.toThrow(/d1zzle.config.ts/);
+		await expect(loadConfig(dir)).rejects.toThrow(/orm-d1.config.ts/);
 	});
 });
 
@@ -219,12 +219,12 @@ describe('--help in the command position', () => {
 	it('does not treat every other flag-shaped first token as --help', async () => {
 		// `command.startsWith('-')` used to match ANY leading-dash first token,
 		// so `--nope`, `-x`, and flags-before-command invocations like
-		// `d1zzle-migrate --remote migrate` all silently printed usage and
+		// `orm-d1-kit --remote migrate` all silently printed usage and
 		// exited 0 instead of failing. None of those are `-h`/`--help`/`help`,
 		// so they must fall through to the normal (non-zero) unrecognised-input
 		// path instead of resolving to 0.
 		// Past the help check, both fall through to the normal command path,
-		// which (with no d1zzle config in this test's cwd) rejects rather than
+		// which (with no orm-d1 config in this test's cwd) rejects rather than
 		// resolving — the point is only that neither resolves to 0.
 		await expect(run(['--nope'])).rejects.toThrow();
 		await expect(run(['--remote', 'migrate'])).rejects.toThrow();
@@ -412,7 +412,7 @@ describe('rendering a schema module from a snapshot', () => {
 			payload: column('payload', 'blob'),
 		}) as never);
 
-		expect(rendered.split('\n')[0]).toBe(`import { blob, integer, sqliteTable } from 'd1zzle';`);
+		expect(rendered.split('\n')[0]).toBe(`import { blob, integer, sqliteTable } from 'orm-d1';`);
 		// blob() defaults to mode 'json'; an introspected BLOB-affinity column
 		// must round-trip as raw bytes, so pull emits explicit buffer mode.
 		expect(rendered).toContain(`payload: blob("payload", { mode: 'buffer' })`);
@@ -476,7 +476,7 @@ describe('rendering a schema module from a snapshot', () => {
 		) as never);
 
 		expect(rendered.split('\n')[0])
-			.toBe(`import { sql, sqliteTable, text, uniqueIndex } from 'd1zzle';`);
+			.toBe(`import { sql, sqliteTable, text, uniqueIndex } from 'orm-d1';`);
 	});
 });
 
@@ -691,7 +691,7 @@ describe('up', () => {
 	});
 });
 
-/** The temp schema imports d1zzle from this checkout, not from node_modules. */
+/** The temp schema imports orm-d1 from this checkout, not from node_modules. */
 const schemaImport = (): string => new URL('../../../src/index.ts', import.meta.url).pathname;
 
 describe('parseJsonc edge cases', () => {

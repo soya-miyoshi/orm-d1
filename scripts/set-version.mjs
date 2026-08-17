@@ -3,13 +3,13 @@
  *
  *   node scripts/set-version.mjs 0.2.0
  *
- * Three things have to move together — `d1zzle`'s version, `d1zzle-migrate`'s
- * version, and `d1zzle-migrate`'s peer range on `d1zzle` — and the release workflow
+ * Three things have to move together — `orm-d1`'s version, `orm-d1-kit`'s
+ * version, and `orm-d1-kit`'s peer range on `orm-d1` — and the release workflow
  * refuses to publish if they disagree. Doing it by hand across two files is
  * exactly the step that gets half-done, so it is a script.
  *
  * Deliberately writes the peer range as `^<version>`: lockstep means the kit
- * published alongside a given d1zzle is the one it is tested against.
+ * published alongside a given orm-d1 is the one it is tested against.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 
@@ -47,8 +47,8 @@ const edit = (path, replacements) => {
 edit('package.json', [[/("version":\s*)"[^"]+"/, `$1"${version}"`]]);
 edit('kit/package.json', [
 	[/("version":\s*)"[^"]+"/, `$1"${version}"`],
-	[/("d1zzle":\s*)"[^"]+"/, `$1"^${version}"`],
+	[/("orm-d1":\s*)"[^"]+"/, `$1"^${version}"`],
 ]);
 
-console.log(`d1zzle and d1zzle-migrate are now ${version} (kit peer: ^${version}).`);
+console.log(`orm-d1 and orm-d1-kit are now ${version} (kit peer: ^${version}).`);
 console.log('Next: npm run check, commit, tag v' + version + ', draft the release.');

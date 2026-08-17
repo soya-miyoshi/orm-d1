@@ -1,7 +1,7 @@
 # Adapters: Pothos and Better Auth
 
 Drizzle has no public API for describing a schema, so adapters read its internals:
-`entityKind`, `Symbol.for('drizzle:Columns')`, `db._.relations`. d1zzle tables and columns
+`entityKind`, `Symbol.for('drizzle:Columns')`, `db._.relations`. orm-d1 tables and columns
 carry those, so Drizzle's own helpers work on them:
 
 ```ts
@@ -13,19 +13,19 @@ is(users.id, SQLiteInteger);  // true
 getTableColumns(users);       // { id, email, name }
 ```
 
-Drizzle `SQL` fragments built over d1zzle columns — `eq(users.id, 1)`, `inArray(...)`,
-`` sql`…` `` — render correctly inside a d1zzle query, which is how an adapter's own
+Drizzle `SQL` fragments built over orm-d1 columns — `eq(users.id, 1)`, `inArray(...)`,
+`` sql`…` `` — render correctly inside an orm-d1 query, which is how an adapter's own
 predicates reach the database.
 
 ## Pothos
 
-`test/workers/pothos.test.ts` runs a GraphQL schema over a d1zzle database inside workerd
+`test/workers/pothos.test.ts` runs a GraphQL schema over an orm-d1 database inside workerd
 with `@pothos/plugin-drizzle`. Two substitutions are required:
 
 ```ts
-import type { PothosRelations } from 'd1zzle/drizzle';
-import { asPothosRelations } from 'd1zzle/drizzle';
-import { getTableConfig } from 'd1zzle';           // ours, not drizzle-orm/sqlite-core's
+import type { PothosRelations } from 'orm-d1/drizzle';
+import { asPothosRelations } from 'orm-d1/drizzle';
+import { getTableConfig } from 'orm-d1';           // ours, not drizzle-orm/sqlite-core's
 
 const builder = new SchemaBuilder<{ DrizzleRelations: PothosRelations<typeof relations> }>({
   plugins: [DrizzlePlugin],
@@ -33,8 +33,8 @@ const builder = new SchemaBuilder<{ DrizzleRelations: PothosRelations<typeof rel
 });
 ```
 
-- `getTableConfig` must be d1zzle's. Drizzle's derives constraints by running a table's
-  `ExtraConfigBuilder`, which a d1zzle table does not have, so it reports the columns and
+- `getTableConfig` must be orm-d1's. Drizzle's derives constraints by running a table's
+  `ExtraConfigBuilder`, which an orm-d1 table does not have, so it reports the columns and
   leaves every other field empty — and the plugin then cannot find a composite primary key.
   The plugin reads `getTableConfig` from its own config, so substituting it is enough.
 - `asPothosRelations` re-prototypes the relations onto Drizzle's `One`/`Many`. The plugin
@@ -59,31 +59,31 @@ the protected-member rule applies there.
 
 ## Better Auth
 
-`d1zzle/better-auth` is a Better Auth database adapter written against
+`orm-d1/better-auth` is a Better Auth database adapter written against
 `createAdapterFactory`, not a shim over the Drizzle one:
 
 ```ts
 import { betterAuth } from 'better-auth';
-import { drizzle } from 'd1zzle';
-import { d1zzleAdapter } from 'd1zzle/better-auth';
+import { drizzle } from 'orm-d1';
+import { ormD1Adapter } from 'orm-d1/better-auth';
 import { user, session, account, verification } from './schema';
 
 const auth = betterAuth({
-  database: d1zzleAdapter(drizzle(env.DB), {
+  database: ormD1Adapter(drizzle(env.DB), {
     schema: { user, session, account, verification },
   }),
 });
 ```
 
 Write the four tables with `sqliteTable` as usual — the schema in Better Auth's Drizzle
-documentation ports over unchanged — and generate the migration with `d1zzle-migrate`.
+documentation ports over unchanged — and generate the migration with `orm-d1-kit`.
 Model names map to tables through `schema`; field names map to columns through Better
 Auth's own `fields` option.
 
 The reason for a separate adapter: everything in the section above is about being *read*.
 Better Auth's Drizzle adapter instead *executes* through drizzle-orm — `db.insert(t)
 .values(…)`, `eq()`, `and()`, its dialect and session layer. `asDrizzleSchema()` retypes a
-schema; it cannot retype a runtime, and a d1zzle table fails there on the first write.
+schema; it cannot retype a runtime, and an orm-d1 table fails there on the first write.
 `createAdapterFactory` takes ten methods over `{ model, where, data }` and supplies the
 mapping, id generation and transforms itself, so it needs no Drizzle at all.
 
@@ -95,5 +95,5 @@ only one caller may win — consuming a verification token, decrementing a guard
 
 `experimental.joins` is not supported: the adapter raises a named error rather than
 dropping the joined models. There is no `createSchema` for `@better-auth/cli generate`,
-because in a d1zzle project the schema file is what `d1zzle-migrate` diffs against, and
+because in an orm-d1 project the schema file is what `orm-d1-kit` diffs against, and
 generating it from Better Auth's model list would invert the source of truth.

@@ -1,8 +1,8 @@
 /**
- * The promise this suite protects: a d1zzle schema is indistinguishable from a
+ * The promise this suite protects: an orm-d1 schema is indistinguishable from a
  * Drizzle schema to Drizzle's *own* code. Everything imported below comes from
  * the real `drizzle-orm` package (a devDependency — never a runtime one), and
- * is handed objects built by d1zzle.
+ * is handed objects built by orm-d1.
  */
 import { getTableColumns as drizzleGetTableColumns, getTableName as drizzleGetTableName, is } from 'drizzle-orm';
 import { Column as DrizzleColumn, Table as DrizzleTable } from 'drizzle-orm';

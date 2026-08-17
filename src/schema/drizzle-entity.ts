@@ -11,7 +11,7 @@
  * while (cls) { if (cls[entityKind] === type[entityKind]) return true; … }
  * ```
  *
- * So a d1zzle table has to *be* an instance of a class whose static
+ * So an orm-d1 table has to *be* an instance of a class whose static
  * `entityKind` chain matches Drizzle's, and carry Drizzle's symbols. Both are
  * a handful of empty classes and symbol assignments; the cost is a few dozen
  * bytes and it is what makes every existing adapter work unchanged.

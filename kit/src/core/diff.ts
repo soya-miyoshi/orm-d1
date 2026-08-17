@@ -15,7 +15,7 @@ import {
 	appendOnlyTrigger,
 	appendOnlyTriggerName,
 	dropAppendOnlyTrigger,
-} from 'd1zzle/ddl';
+} from 'orm-d1/ddl';
 import type { ColumnSnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
 
@@ -40,7 +40,7 @@ export interface DiffOptions {
 	/** `{ 'table.old_column': 'new_column' }`. */
 	readonly renamedColumns?: Record<string, string>;
 	/**
-	 * Triggers found on the *live* table (keyed by table name) that d1zzle did
+	 * Triggers found on the *live* table (keyed by table name) that orm-d1 did
 	 * not author — everything except the append-only guard. Not part of
 	 * `TableSnapshot`: that shape is schema-facing and exported, so this rides
 	 * alongside it instead. See `introspect`'s `foreignTriggers` out-param.
@@ -270,10 +270,10 @@ const recreateTable = (
 	if (foreignTriggers.length > 0) {
 		errors.push(
 			`"${before.name}" has to be recreated because ${reason}, but it carries trigger(s) `
-				+ `${foreignTriggers.map((t) => `"${t}"`).join(', ')} that d1zzle did not create. Rebuilding drops `
+				+ `${foreignTriggers.map((t) => `"${t}"`).join(', ')} that orm-d1 did not create. Rebuilding drops `
 				+ 'the table, which drops those triggers with it, and there is no way to reproduce a trigger '
-				+ 'd1zzle does not know the definition of. Drop the trigger, recreate it by hand after this '
-				+ 'migration runs, or bring it into the schema so d1zzle can carry it across rebuilds.',
+				+ 'orm-d1 does not know the definition of. Drop the trigger, recreate it by hand after this '
+				+ 'migration runs, or bring it into the schema so orm-d1 can carry it across rebuilds.',
 		);
 		return { statements: [], errors };
 	}
@@ -651,7 +651,7 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			if (next.appendOnly) {
 				// The trigger this would create is named `<table>_no_update`
 				// (`appendOnlyTrigger`). If that name is already taken by a trigger
-				// the live database has but d1zzle did not author — the anchoring
+				// the live database has but orm-d1 did not author — the anchoring
 				// above is exactly what makes that distinction reliable now — `create
 				// trigger` fails on apply with "already exists", and prepending
 				// `drop trigger if exists` would silently destroy whatever that
@@ -663,8 +663,8 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 				if (!previousGuard && foreignTriggersForTable.includes(guardName)) {
 					errors.push(
 						`"${name}" is becoming append-only, but a trigger named "${guardName}" already exists and `
-							+ 'd1zzle did not create it. Creating the guard would fail on apply because the name is '
-							+ 'taken. Drop or rename that trigger, or bring it into the schema so d1zzle can carry it '
+							+ 'orm-d1 did not create it. Creating the guard would fail on apply because the name is '
+							+ 'taken. Drop or rename that trigger, or bring it into the schema so orm-d1 can carry it '
 							+ 'across rebuilds.',
 					);
 				} else {

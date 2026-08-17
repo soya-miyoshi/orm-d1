@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * `d1zzle-migrate <command>`.
+ * `orm-d1-kit <command>`.
  *
  * The command surface deliberately mirrors drizzle-kit, so existing muscle
  * memory and CI scripts transfer unchanged.
@@ -13,19 +13,19 @@ import { loadConfig } from './node/config.js';
 import type { CommandContext, TargetFlags } from './node/commands.js';
 import { backfillCommand, check, generate, impact, migrate, pull, push, up, verify } from './node/commands.js';
 
-const USAGE = `d1zzle-migrate — migrations for d1zzle on Cloudflare D1
+const USAGE = `orm-d1-kit — migrations for orm-d1 on Cloudflare D1
 
 Usage
-  d1zzle-migrate generate [--name <name>] [--accept-data-loss] [--emit-roundtrip] [renames]
-  d1zzle-migrate migrate  [--env <name>] [--local | --remote]
-  d1zzle-migrate push     [--env <name>] [--local | --remote] [--accept-data-loss] [renames]
-  d1zzle-migrate pull     [--env <name>] [--local | --remote] [--schema-out <file>] [--force]
-  d1zzle-migrate check    [--env <name>] [--local | --remote]
-  d1zzle-migrate verify
-  d1zzle-migrate up
-  d1zzle-migrate backfill --table <name> [--table <name>…] --file <path.sql>
+  orm-d1-kit generate [--name <name>] [--accept-data-loss] [--emit-roundtrip] [renames]
+  orm-d1-kit migrate  [--env <name>] [--local | --remote]
+  orm-d1-kit push     [--env <name>] [--local | --remote] [--accept-data-loss] [renames]
+  orm-d1-kit pull     [--env <name>] [--local | --remote] [--schema-out <file>] [--force]
+  orm-d1-kit check    [--env <name>] [--local | --remote]
+  orm-d1-kit verify
+  orm-d1-kit up
+  orm-d1-kit backfill --table <name> [--table <name>…] --file <path.sql>
                           [--env <name>] [--local | --remote]
-  d1zzle-migrate impact   [--table <name>] [--env <name>] [--local | --remote]
+  orm-d1-kit impact   [--table <name>] [--env <name>] [--local | --remote]
 
 Commands
   check     does the live database match the snapshot? (drift, unapplied)
@@ -38,12 +38,12 @@ Commands
               adds row counts, the other half of what a rebuild costs.
 
 Options
-  --config <path>       config file (default: d1zzle.config.ts)
+  --config <path>       config file (default: orm-d1.config.ts)
   --env <name>          wrangler environment: the [env.<name>] block whose
                           d1_databases this run resolves. Spelled as wrangler
                           spells it, and never falls back to the top-level
                           block. Also read from CLOUDFLARE_ENV, or d1.env in
-                          d1zzle.config.ts.
+                          orm-d1.config.ts.
   --local               act on the local .wrangler SQLite state (default)
   --remote              act on the remote D1 database over the HTTP API
   --accept-data-loss    allow destructive statements
@@ -202,10 +202,10 @@ export const environmentFlag = (flags: Record<string, FlagValue>): string | unde
 export async function run(argv: readonly string[]): Promise<number> {
 	const { command, flags } = parseArgs(argv);
 
-	// `--help`/`-h` in the *command* position (`d1zzle-migrate --help`) parses
+	// `--help`/`-h` in the *command* position (`orm-d1-kit --help`) parses
 	// as `command === '--help'`, not as a flag on some other command — there
 	// is no command yet for it to be a flag of. Left unmatched, it fell
-	// through to the config-loading path below and failed with "No d1zzle
+	// through to the config-loading path below and failed with "No orm-d1
 	// config found" before the usage text ever printed.
 	//
 	// Matched by exact spelling, not `command.startsWith('-')`: that shape
@@ -286,7 +286,7 @@ export async function run(argv: readonly string[]): Promise<number> {
 			if (tables.length === 0 || !file) {
 				console.error(
 					'backfill needs at least one --table and a --file.\n'
-						+ '  d1zzle-migrate backfill --table transactions --file ./drizzle/manual/fees.sql',
+						+ '  orm-d1-kit backfill --table transactions --file ./drizzle/manual/fees.sql',
 				);
 				return 1;
 			}
@@ -295,8 +295,8 @@ export async function run(argv: readonly string[]): Promise<number> {
 		}
 		case 'studio':
 			console.error(
-				'd1zzle-migrate does not ship a studio. Use the Drizzle Studio browser extension — it\n'
-					+ 'introspects the live database and works with d1zzle unchanged — or Cloudflare\'s\n'
+				'orm-d1-kit does not ship a studio. Use the Drizzle Studio browser extension — it\n'
+					+ 'introspects the live database and works with orm-d1 unchanged — or Cloudflare\'s\n'
 					+ 'D1 console in the dashboard.',
 			);
 			return 1;
@@ -307,7 +307,7 @@ export async function run(argv: readonly string[]): Promise<number> {
 }
 
 // Only run when invoked as a binary, so the module stays importable.
-if (process.argv[1]?.endsWith('cli.js') || process.argv[1]?.endsWith('d1zzle-migrate')) {
+if (process.argv[1]?.endsWith('cli.js') || process.argv[1]?.endsWith('orm-d1-kit')) {
 	run(process.argv.slice(2)).then(
 		(code) => process.exit(code),
 		(error: unknown) => {

@@ -1,16 +1,16 @@
-# d1zzle-migrate
+# orm-d1-kit
 
-Migrations, introspection and drift detection for [d1zzle](../README.md) on Cloudflare D1.
+Migrations, introspection and drift detection for [orm-d1](../README.md) on Cloudflare D1.
 
 A **devDependency**. It runs in Node, and contributes zero bytes to the Worker bundle.
 
 ```bash
-npm install -D d1zzle-migrate
+npm install -D orm-d1-kit
 ```
 
 ```ts
-// d1zzle.config.ts
-import { defineConfig } from 'd1zzle-migrate';
+// orm-d1.config.ts
+import { defineConfig } from 'orm-d1-kit';
 
 export default defineConfig({
   schema: './src/schema.ts',
@@ -24,7 +24,7 @@ export default defineConfig({
 ```
 
 `tableOptions` points at a module whose default export is `tableOptions([...])` from
-`d1zzle/ddl` — `STRICT`, `WITHOUT ROWID` and the append-only trigger, which have no
+`orm-d1/ddl` — `STRICT`, `WITHOUT ROWID` and the append-only trigger, which have no
 spelling in `drizzle-orm/sqlite-core` and therefore live outside the schema file. What
 each does, and what `generate` checks about it, is
 [02-beyond-drizzle](../docs/02-beyond-drizzle.md).
@@ -41,7 +41,7 @@ Wrangler's `[[env.<name>.d1_databases]]` (TOML) and `env: { <name>: { d1_databas
 | --- | --- |
 | 1 | `--env <name>` on the command line |
 | 2 | `CLOUDFLARE_ENV` |
-| 3 | `d1.env` in `d1zzle.config.ts` |
+| 3 | `d1.env` in `orm-d1.config.ts` |
 | — | none of them: the **top-level** block, which is what `wrangler` uses without `--env` |
 
 `CLOUDFLARE_ENV` and `d1.env` disagreeing is an error rather than a preference. Wrangler
@@ -52,13 +52,13 @@ as it does for wrangler.
 **An environment that is missing, or that declares no `d1_databases`, is an error — it never
 falls back to the top-level block.** Wrangler classifies `d1_databases` as *non-inheritable*:
 an environment without its own gets no D1 binding at all. Falling back would therefore point
-d1zzle at a database wrangler would never have bound, and applying a migration is not
+orm-d1 at a database wrangler would never have bound, and applying a migration is not
 undoable. `account_id` *is* inheritable in wrangler, so it does fall back. `migrations_dir`
 is a property of the individual binding, which is where it is read from.
 
 ### Where each value comes from
 
-One rule for every value: **`d1zzle.config.ts` > environment variable > wrangler config.**
+One rule for every value: **`orm-d1.config.ts` > environment variable > wrangler config.**
 The config file is first because a value written there is a deliberate per-repo decision —
 and it can always opt back into the environment itself (`accountId: process.env.…`).
 
@@ -73,7 +73,7 @@ commit a placeholder: point the variable at the real id and the migration step n
 rewritten `wrangler.toml`.
 
 **`${VAR}` inside the wrangler file is *not* expanded.** Wrangler does not expand its own
-config, so a d1zzle that did would read a different value than wrangler from the same line —
+config, so an orm-d1 that did would read a different value than wrangler from the same line —
 a new instance of the drift this all exists to prevent. A `database_id` that is still a
 `__PLACEHOLDER__`, or the literal `local`, is rejected on `--remote` rather than sent to the
 API as a mystery 404.
@@ -93,17 +93,17 @@ Target: remote D1 (HTTP API)
 ## Commands
 
 ```
-d1zzle-migrate generate      # diff schema against the last snapshot → a new SQL migration
-d1zzle-migrate migrate       # apply pending migrations (--local | --remote)
-d1zzle-migrate push          # diff and apply directly, no migration file (dev only)
-d1zzle-migrate pull          # introspect a live database → schema.ts + baseline snapshot
-d1zzle-migrate check         # detect drift and unapplied migrations; non-zero exit for CI
-d1zzle-migrate verify        # replay the migrations into an empty DB and compare with the
+orm-d1-kit generate      # diff schema against the last snapshot → a new SQL migration
+orm-d1-kit migrate       # apply pending migrations (--local | --remote)
+orm-d1-kit push          # diff and apply directly, no migration file (dev only)
+orm-d1-kit pull          # introspect a live database → schema.ts + baseline snapshot
+orm-d1-kit check         # detect drift and unapplied migrations; non-zero exit for CI
+orm-d1-kit verify        # replay the migrations into an empty DB and compare with the
                              #   schema; needs no database at all, so it runs in CI
-d1zzle-migrate up            # upgrade snapshot format after a kit version bump
-d1zzle-migrate backfill      # run one-off statements against append-only tables, with
+orm-d1-kit up            # upgrade snapshot format after a kit version bump
+orm-d1-kit backfill      # run one-off statements against append-only tables, with
                              #   their guards suspended and put back verbatim, in one batch
-d1zzle-migrate impact        # how many tables a rebuild of one table drags with it;
+orm-d1-kit impact        # how many tables a rebuild of one table drags with it;
                              #   --local/--remote adds row counts
 ```
 
@@ -172,13 +172,13 @@ so a renderer that drops a constraint produces two self-consistent artifacts and
 stays green. `verify` compares two sides that share no code path, and needs no database.
 
 **Migrations stay interchangeable with wrangler.** They are written in wrangler's layout
-and recorded in wrangler's own `d1_migrations` table, so `d1zzle-migrate migrate` and
+and recorded in wrangler's own `d1_migrations` table, so `orm-d1-kit migrate` and
 `wrangler d1 migrations apply` can be used against the same database.
 
 ## Studio
 
 Not implemented. The Drizzle Studio browser extension introspects the live database and
-never loads a schema file, so it works against a d1zzle project unchanged; Cloudflare's D1
+never loads a schema file, so it works against an orm-d1 project unchanged; Cloudflare's D1
 console covers ad-hoc queries.
 
 ## Programmatic use
@@ -186,12 +186,12 @@ console covers ad-hoc queries.
 Every command is a plain function, and the diff engine is pure:
 
 ```ts
-import { diffSnapshots, renderMigration, snapshotFromSchema } from 'd1zzle-migrate/core';
+import { diffSnapshots, renderMigration, snapshotFromSchema } from 'orm-d1-kit/core';
 
 const sql = renderMigration(diffSnapshots(previousSnapshot, snapshotFromSchema(schema)));
 ```
 
-`d1zzle-migrate/core` has no Node dependencies, so it also runs inside workerd — which is where
+`orm-d1-kit/core` has no Node dependencies, so it also runs inside workerd — which is where
 the migration engine is tested against a real D1 database.
 
 ## License

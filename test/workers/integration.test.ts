@@ -8,7 +8,7 @@ import {
 	and,
 	asc,
 	count,
-	d1zzle,
+	ormD1,
 	desc,
 	eq,
 	gt,
@@ -30,7 +30,7 @@ const reset = async (): Promise<void> => {
 };
 
 const seed = async (): Promise<void> => {
-	const db = d1zzle(DB);
+	const db = ormD1(DB);
 	await db.insert(users).values([
 		{ id: 1, email: 'a@b.c', name: 'Ada', active: true, score: 9.5, createdAt: new Date(1000) },
 		{ id: 2, email: 'b@b.c', name: 'Bob', active: false, createdAt: new Date(2000) },
@@ -62,7 +62,7 @@ describe('the generated DDL runs on real D1', () => {
 
 	it('enforces the check constraint it generated', async () => {
 		await expect(
-			d1zzle(DB).insert(users).values({ email: 'x@y.z', score: -1 }).run(),
+			ormD1(DB).insert(users).values({ email: 'x@y.z', score: -1 }).run(),
 		).rejects.toThrow();
 	});
 });
@@ -71,7 +71,7 @@ describe('reads and writes', () => {
 	beforeEach(seed);
 
 	it('selects and decodes every column type', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const row = await db.select().from(users).where(eq(users.id, 1)).get();
 
 		expect(row).toEqual({
@@ -92,7 +92,7 @@ describe('reads and writes', () => {
 	});
 
 	it('round-trips json and boolean columns', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		await db.update(users).set({ settings: { theme: 'dark' }, active: false })
 			.where(eq(users.id, 1))
 			.run();
@@ -103,7 +103,7 @@ describe('reads and writes', () => {
 	});
 
 	it('applies $onUpdate on every update', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		await db.update(users).set({ name: 'Ada L.' }).where(eq(users.id, 1)).run();
 		const row = await db.select({ updatedAt: users.updatedAt }).from(users).where(eq(users.id, 1)).get();
 		expect(row?.updatedAt).toEqual(new Date(0));
@@ -113,7 +113,7 @@ describe('reads and writes', () => {
 		// F-005: a column with `$onUpdate` and no `default` is populated at
 		// insert time as well, matching drizzle-orm's `buildInsertQuery` — it
 		// used to stay null until the first `update()` touched the row.
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		await db.insert(users).values({ id: 3, email: 'c@b.c' }).run();
 		const row = await db.select({ updatedAt: users.updatedAt }).from(users).where(eq(users.id, 3)).get();
 		expect(row?.updatedAt).not.toBeNull();
@@ -121,7 +121,7 @@ describe('reads and writes', () => {
 	});
 
 	it('returns inserted rows in order', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const returned = await db.insert(posts)
 			.values([{ id: 20, authorId: 2, title: 'x' }, { id: 21, authorId: 2, title: 'y' }])
 			.returning({ id: posts.id, title: posts.title });
@@ -130,7 +130,7 @@ describe('reads and writes', () => {
 	});
 
 	it('upserts', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		await db.insert(users).values({ email: 'a@b.c', name: 'Replaced' })
 			.onConflictDoUpdate({ target: users.email, set: { name: 'Replaced' } })
 			.run();
@@ -140,14 +140,14 @@ describe('reads and writes', () => {
 	});
 
 	it('deletes and reports the change count', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const result = await db.delete(posts).where(eq(posts.id, 10)).run();
 		expect(result.meta.changes).toBe(1);
 		expect(await db.select({ n: count() }).from(posts)).toEqual([{ n: 1 }]);
 	});
 
 	it('inserts 500 rows atomically and returns all of them in order', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const rows = Array.from({ length: 500 }, (_, i) => ({
 			id: 1000 + i,
 			authorId: 1,
@@ -162,7 +162,7 @@ describe('reads and writes', () => {
 	});
 
 	it('rolls the whole chunked insert back when one chunk fails', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const rows = Array.from({ length: 120 }, (_, i) => ({ id: 2000 + i, authorId: 1, title: 't' }));
 		rows[119] = { id: 10, authorId: 1, title: 'duplicate' };
 
@@ -175,7 +175,7 @@ describe('joins', () => {
 	beforeEach(seed);
 
 	it('nests one group per table and nulls missing left-joined rows', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const rows = await db.select().from(users)
 			.leftJoin(posts, eq(posts.authorId, users.id))
 			.orderBy(asc(users.id), asc(posts.id));
@@ -188,7 +188,7 @@ describe('joins', () => {
 	});
 
 	it('keeps duplicate column names distinct on the direct read path', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const rows = await db.select({ userId: users.id, postId: posts.id })
 			.from(users)
 			.innerJoin(posts, eq(posts.authorId, users.id))
@@ -198,7 +198,7 @@ describe('joins', () => {
 	});
 
 	it('keeps them distinct inside batch(), where D1 returns keyed objects', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const [rows] = await db.batch([
 			db.select({ a: { id: users.id }, b: { id: posts.id } })
 				.from(users)
@@ -213,7 +213,7 @@ describe('joins', () => {
 	});
 
 	it('self-joins through an alias', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const author = alias(users, 'author');
 		const rows = await db.select({ title: posts.title, author: author.name })
 			.from(posts)
@@ -224,7 +224,7 @@ describe('joins', () => {
 	});
 
 	it('selects from a subquery', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const popular = db.select({ id: posts.id, views: posts.views }).from(posts)
 			.where(gt(posts.views, 10))
 			.as('popular');
@@ -238,7 +238,7 @@ describe('joins', () => {
 		// rather than anything visible at compile time. A subquery whose
 		// declared surface disagreed with its own statement typechecked, read
 		// correctly, and only failed here.
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const s = db.select().from(posts).innerJoin(users, eq(users.id, posts.authorId)).as('s');
 
 		const rows = await db.select({ title: s.posts.title, author: s.users.name })
@@ -249,7 +249,7 @@ describe('joins', () => {
 	});
 
 	it('runs an implicit select over such a subquery, regrouped as it went in', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const s = db.select().from(posts).innerJoin(users, eq(users.id, posts.authorId)).as('s');
 
 		const rows = await db.select().from(s).where(gt(s.posts.views, 10));
@@ -264,7 +264,7 @@ describe('joins', () => {
 		// read directly, `posts: { id: null, … }` read back out of the
 		// subquery, because the outer plan has no joins to re-derive it from.
 		// Bob has no posts.
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const on = eq(posts.authorId, users.id);
 
 		const direct = await db.select().from(users).leftJoin(posts, on).where(eq(users.id, 2));
@@ -281,14 +281,14 @@ describe('expressions against real SQLite', () => {
 	beforeEach(seed);
 
 	it('runs a long inArray through json_each', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const ids = [1, ...Array.from({ length: 200 }, (_, i) => 500 + i)];
 		const rows = await db.select({ id: users.id }).from(users).where(inArray(users.id, ids));
 		expect(rows).toEqual([{ id: 1 }]);
 	});
 
 	it('groups, filters and orders', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const rows = await db.select({ author: posts.authorId, views: sql<number>`sum(${posts.views})` })
 			.from(posts)
 			.groupBy(posts.authorId)
@@ -298,7 +298,7 @@ describe('expressions against real SQLite', () => {
 	});
 
 	it('honours a composite primary key', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		await db.insert(postTags).values({ postId: 10, tag: 'sql' }).run();
 		await expect(db.insert(postTags).values({ postId: 10, tag: 'sql' }).run()).rejects.toThrow();
 	});
@@ -313,7 +313,7 @@ describe('compiled queries and placeholders', () => {
 			.where(and(eq(users.email, ph('email')), eq(users.active, ph('active'))))
 			.compile();
 
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		expect(await db.get(byEmail, { email: 'a@b.c', active: true })).toEqual({ id: 1, name: 'Ada' });
 		expect(await db.all(byEmail, { email: 'b@b.c', active: true })).toEqual([]);
 	});
@@ -325,7 +325,7 @@ describe('compiled queries and placeholders', () => {
 			.offset(ph('offset'))
 			.compile();
 
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		expect(await db.all(page, { limit: 1, offset: 0 })).toEqual([{ id: 10 }]);
 		expect(await db.all(page, { limit: 1, offset: 1 })).toEqual([{ id: 11 }]);
 	});
@@ -335,7 +335,7 @@ describe('batch', () => {
 	beforeEach(seed);
 
 	it('returns a tuple typed per statement, in one round trip', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const [inserted, rows, deleted] = await db.batch([
 			db.insert(posts).values({ id: 30, authorId: 2, title: 'batched' }).returning({ id: posts.id }),
 			db.select({ id: posts.id }).from(posts).orderBy(asc(posts.id)),
@@ -348,7 +348,7 @@ describe('batch', () => {
 	});
 
 	it('is all-or-nothing', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		await expect(db.batch([
 			db.insert(posts).values({ id: 40, authorId: 1, title: 'ok' }),
 			db.insert(posts).values({ id: 10, authorId: 1, title: 'duplicate' }),
@@ -362,7 +362,7 @@ describe('sessions', () => {
 	beforeEach(seed);
 
 	it('reads its own writes and hands back a bookmark', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		const session = db.withSession('first-primary');
 
 		await session.insert(posts).values({ id: 50, authorId: 1, title: 'session' }).run();
@@ -385,7 +385,7 @@ describe('observability and errors', () => {
 		setWarn((message) => messages.push(message));
 
 		try {
-			const db = d1zzle(DB, { plan: 'free' });
+			const db = ormD1(DB, { plan: 'free' });
 			// 51 statements: one past the free plan's 50. Sent as batches so the
 			// test also pins that a batch member counts individually, which is
 			// how D1 counts them.
@@ -408,7 +408,7 @@ describe('observability and errors', () => {
 		setWarn((message) => messages.push(message));
 
 		try {
-			const db = d1zzle(DB);
+			const db = ormD1(DB);
 			for (let i = 0; i < 6; i++) {
 				await db.batch(Array.from({ length: 10 }, () => db.select({ id: users.id }).from(users)));
 			}
@@ -421,7 +421,7 @@ describe('observability and errors', () => {
 	});
 
 	it('rejects a plan that is neither free nor paid', () => {
-		expect(() => d1zzle(DB, { plan: 'enterprise' as never })).toThrow(/plan must be 'free' or 'paid'/);
+		expect(() => ormD1(DB, { plan: 'enterprise' as never })).toThrow(/plan must be 'free' or 'paid'/);
 	});
 
 	it('rejects inherited keys rather than silently disabling the guard', () => {
@@ -432,7 +432,7 @@ describe('observability and errors', () => {
 		// untyped ones, which is where a value read from env or a config file
 		// arrives.
 		for (const key of ['constructor', 'toString', 'valueOf', '__proto__']) {
-			expect(() => d1zzle(DB, { plan: key as never })).toThrow(/plan must be 'free' or 'paid'/);
+			expect(() => ormD1(DB, { plan: key as never })).toThrow(/plan must be 'free' or 'paid'/);
 		}
 	});
 
@@ -440,13 +440,13 @@ describe('observability and errors', () => {
 		// `drizzle(env.DB)` with no `DB` in wrangler.jsonc is the common way to
 		// get here, and it used to be the one path with the unhelpful message:
 		// the config-vs-binding probe reads `.prepare` before the check runs.
-		expect(() => d1zzle(undefined as never)).toThrow(/was given no binding/);
-		expect(() => d1zzle({ client: undefined as never })).toThrow(/needs a `client`/);
+		expect(() => ormD1(undefined as never)).toThrow(/was given no binding/);
+		expect(() => ormD1({ client: undefined as never })).toThrow(/needs a `client`/);
 	});
 
 	it('reports D1 billing units to onQuery', async () => {
 		const events: QueryEvent[] = [];
-		const db = d1zzle(DB, { onQuery: (event) => events.push(event) });
+		const db = ormD1(DB, { onQuery: (event) => events.push(event) });
 
 		await db.select({ id: users.id }).from(users);
 		await db.insert(posts).values({ id: 60, authorId: 1, title: 'x' }).run();
@@ -460,7 +460,7 @@ describe('observability and errors', () => {
 
 	it('emits one event per statement in a batch', async () => {
 		const events: QueryEvent[] = [];
-		const db = d1zzle(DB, { onQuery: (event) => events.push(event) });
+		const db = ormD1(DB, { onQuery: (event) => events.push(event) });
 
 		await db.batch([
 			db.select({ id: users.id }).from(users),
@@ -472,20 +472,20 @@ describe('observability and errors', () => {
 
 	it('never leaks parameters outside dev', async () => {
 		const events: QueryEvent[] = [];
-		const db = d1zzle(DB, { onQuery: (event) => events.push(event) });
+		const db = ormD1(DB, { onQuery: (event) => events.push(event) });
 		await db.select({ id: users.id }).from(users).where(eq(users.email, 'secret@b.c'));
 		expect(events[0]!.params).toBeUndefined();
 	});
 
 	it('attaches the failing SQL to the error', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		await expect(db.insert(users).values({ id: 1, email: 'a@b.c' }).run())
-			.rejects.toMatchObject({ name: 'D1zzleQueryError', sql: expect.stringContaining('insert into "users"') });
+			.rejects.toMatchObject({ name: 'OrmD1QueryError', sql: expect.stringContaining('insert into "users"') });
 	});
 
 	it('refuses transaction() with a pointer to batch()', () => {
-		expect(() => d1zzle(DB).transaction()).toThrow(NoTransactionsError);
-		expect(() => d1zzle(DB).transaction()).toThrow(/batch/);
+		expect(() => ormD1(DB).transaction()).toThrow(NoTransactionsError);
+		expect(() => ormD1(DB).transaction()).toThrow(/batch/);
 	});
 });
 
@@ -493,6 +493,6 @@ describe('batch edge cases', () => {
 	it('returns nothing for an empty batch instead of erroring', async () => {
 		// D1 rejects an empty batch with "No SQL statements detected", which a
 		// batch assembled from a filtered array reaches easily.
-		await expect(d1zzle(DB).batch([])).resolves.toEqual([]);
+		await expect(ormD1(DB).batch([])).resolves.toEqual([]);
 	});
 });

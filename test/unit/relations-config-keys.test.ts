@@ -59,7 +59,7 @@ describe('prototype keys in with', () => {
 	/**
 	 * This one already threw — but with "has no resolved join columns", which
 	 * names an internal invariant of `defineRelations` rather than the caller's
-	 * mistake, and reads like a d1zzle bug worth filing. The relation genuinely
+	 * mistake, and reads like an orm-d1 bug worth filing. The relation genuinely
 	 * does not exist, so that is what it must say.
 	 */
 	it.each(PROTOTYPE_KEYS)('reports "%s" as a missing relation, not a broken one', async (key) => {

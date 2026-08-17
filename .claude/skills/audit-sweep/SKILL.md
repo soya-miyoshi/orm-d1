@@ -1,6 +1,6 @@
 ---
 name: audit-sweep
-description: Run one iteration of the d1zzle sweep — one of three rotating review lenses (feature, efficiency+bugs, security) over the whole codebase, a coder batch committed to its own branch, up to two review rounds, then a merge to main. State and the rotation pointer live in AUDIT.md. Intended to be driven on an interval by /loop.
+description: Run one iteration of the orm-d1 sweep — one of three rotating review lenses (feature, efficiency+bugs, security) over the whole codebase, a coder batch committed to its own branch, up to two review rounds, then a merge to main. State and the rotation pointer live in AUDIT.md. Intended to be driven on an interval by /loop.
 ---
 
 # One sweep iteration
@@ -140,7 +140,7 @@ in every lens, append these two paragraphs:
 >
 > Sort every finding into exactly one of these, and label it:
 >
-> - `COMPAT-DEFECT` — a symbol d1zzle already exposes under a Drizzle spelling that
+> - `COMPAT-DEFECT` — a symbol orm-d1 already exposes under a Drizzle spelling that
 >   behaves differently, incompletely, or wrongly against Drizzle's own semantics, or an
 >   internal representation an adapter reads and gets wrong. **This is a bug**, it is
 >   implementable now, and it is what this lens is most valuable for.

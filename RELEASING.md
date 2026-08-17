@@ -4,10 +4,10 @@ Two packages, published in lockstep from one GitHub Release:
 
 | package | directory | notes |
 | --- | --- | --- |
-| `d1zzle` | `.` | the library |
-| `d1zzle-migrate` | `kit/` | CLI; peer-depends on `d1zzle` |
+| `orm-d1` | `.` | the library |
+| `orm-d1-kit` | `kit/` | CLI; peer-depends on `orm-d1` |
 
-They always share a version, and `d1zzle-migrate`'s peer range is always `^<that
+They always share a version, and `orm-d1-kit`'s peer range is always `^<that
 version>`. `.github/workflows/release.yml` refuses to publish if the tag and the two
 `package.json` versions disagree — npm has no unpublish story worth relying on, so the
 check runs before anything ships.
@@ -25,7 +25,7 @@ The repository has no commits and no remote yet, so nothing can run:
 ```bash
 git add .
 git commit -m "Initial commit"
-gh repo create d1zzle --public --source=. --remote=origin --push
+gh repo create orm-d1 --public --source=. --remote=origin --push
 ```
 
 CI (`.github/workflows/ci.yml`) runs on every push and PR from that point on.
@@ -45,14 +45,14 @@ fails the publish rather than quietly skipping the attestation.
 npm login
 npm run check          # typecheck → build → test → kit typecheck → kit build
 
-npm publish                      # d1zzle
-cd kit && npm publish && cd ..   # d1zzle-migrate — publish AFTER d1zzle
+npm publish                      # orm-d1
+cd kit && npm publish && cd ..   # orm-d1-kit — publish AFTER orm-d1
 ```
 
 > `npm pack`/`publish` select the package by **working directory**. `--prefix kit` reads
-> the root `package.json` and would publish `d1zzle` twice — use `cd kit`.
+> the root `package.json` and would publish `orm-d1` twice — use `cd kit`.
 
-Order matters: `d1zzle-migrate` peer-depends on `d1zzle`, so the dependency should be resolvable
+Order matters: `orm-d1-kit` peer-depends on `orm-d1`, so the dependency should be resolvable
 before the dependent lands.
 
 ### 3. Configure the trusted publisher
@@ -60,11 +60,11 @@ before the dependent lands.
 Once both names exist on the registry, from the CLI:
 
 ```bash
-npm trust github d1zzle     --repo <owner>/d1zzle --file release.yml --allow-publish
-npm trust github d1zzle-migrate --repo <owner>/d1zzle --file release.yml --allow-publish
+npm trust github orm-d1     --repo <owner>/orm-d1 --file release.yml --allow-publish
+npm trust github orm-d1-kit --repo <owner>/orm-d1 --file release.yml --allow-publish
 
-npm trust list d1zzle       # verify
-npm trust list d1zzle-migrate
+npm trust list orm-d1       # verify
+npm trust list orm-d1-kit
 ```
 
 `--allow-publish` is **required**, not optional: trusted-publisher configurations created
@@ -121,7 +121,7 @@ publish it. That fires `release.yml`, which:
 2. checks the tag matches both versions and that the peer range admits them;
 3. runs the full gate: typecheck → build → unit + workerd tests → kit typecheck → kit build;
 4. prints both tarball manifests;
-5. publishes `d1zzle`, then `d1zzle-migrate`.
+5. publishes `orm-d1`, then `orm-d1-kit`.
 
 Publishes use `--ignore-scripts` because step 3 already ran the gate and built both
 packages. Without it, `prepublishOnly` would run the entire test suite again per package,
@@ -145,5 +145,5 @@ If a bad version is already on the registry and should not be installed, depreca
 than remove it — removal breaks anyone who already resolved it:
 
 ```bash
-npm deprecate d1zzle@0.2.0 "Broken build; use 0.2.1"
+npm deprecate orm-d1@0.2.0 "Broken build; use 0.2.1"
 ```

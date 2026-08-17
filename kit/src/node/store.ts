@@ -14,8 +14,8 @@
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { isTableOptionsMap } from 'd1zzle/ddl';
-import type { TableOptionsMap } from 'd1zzle/ddl';
+import { isTableOptionsMap } from 'orm-d1/ddl';
+import type { TableOptionsMap } from 'orm-d1/ddl';
 import { importModule } from './import.js';
 import type { Journal } from '../core/journal.js';
 import { emptyJournal } from '../core/journal.js';
@@ -139,7 +139,7 @@ export async function loadTableOptions(cwd: string, path: string): Promise<Table
 
 	throw new Error(
 		`${resolved} exports no tableOptions() map. Expected \`export default tableOptions([[table, {...}], ...])\` `
-			+ "from 'd1zzle/ddl'.",
+			+ "from 'orm-d1/ddl'.",
 	);
 }
 

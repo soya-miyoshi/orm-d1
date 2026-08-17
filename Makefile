@@ -1,4 +1,4 @@
-# Release automation for d1zzle + d1zzle-migrate (published in lockstep).
+# Release automation for orm-d1 + orm-d1-kit (published in lockstep).
 #
 #   make release          # 0.1.3 -> 0.1.4   (patch; the default)
 #   make release patch    # same as above, spelled out
@@ -68,8 +68,8 @@ release:
 		exit 1; }
 	@# npm has no unpublish story worth relying on, so refuse a version that is
 	@# already on the registry rather than discovering it in the workflow.
-	@! npm view d1zzle@$(NEXT) version >/dev/null 2>&1 \
-		|| { echo "error: d1zzle@$(NEXT) is already published"; exit 1; }
+	@! npm view orm-d1@$(NEXT) version >/dev/null 2>&1 \
+		|| { echo "error: orm-d1@$(NEXT) is already published"; exit 1; }
 	@echo "==> releasing $(CURRENT) -> $(NEXT) ($(BUMP))"
 	npm run version:set $(NEXT)
 	git commit -am "Release $(NEXT)"

@@ -1,15 +1,15 @@
 /**
- * d1zzle — a type-safe query builder built exclusively for Cloudflare D1.
+ * orm-d1 — a type-safe query builder built exclusively for Cloudflare D1.
  *
  * ```ts
- * import { drizzle } from 'd1zzle';
+ * import { drizzle } from 'orm-d1';
  * const db = drizzle(env.DB, { schema });
  * ```
  *
- * Everything the lean `d1zzle/core` entry exports is re-exported here. The one
- * difference is `d1zzle()` / `drizzle()`: passing `schema` attaches `db.query`
+ * Everything the lean `orm-d1/core` entry exports is re-exported here. The one
+ * difference is `orm-d1()` / `drizzle()`: passing `schema` attaches `db.query`
  * and the `db._` metadata that Drizzle's ecosystem reads, which means this
- * entry does reach `relations/`. `d1zzle/core` is the byte-counting path.
+ * entry does reach `relations/`. `orm-d1/core` is the byte-counting path.
  */
 export * from './core.js';
 
@@ -19,15 +19,15 @@ import type { RelationsConfig } from './relations/index.js';
 import type { QueryAPI, RelationalMeta } from './relations/index.js';
 import { withRelations } from './relations/index.js';
 import type { RelationalStrategy } from './relations/index.js';
-import type { D1zzleOptions } from './runtime/database.js';
-import { D1zzleDatabase, d1zzle as createDatabase } from './runtime/database.js';
+import type { OrmD1Options } from './runtime/database.js';
+import { OrmD1Database, ormD1 as createDatabase } from './runtime/database.js';
 
-export type D1zzleDatabaseWithRelations<TRelations> =
-	& D1zzleDatabase
+export type OrmD1DatabaseWithRelations<TRelations> =
+	& OrmD1Database
 	& { query: QueryAPI<TRelations>; _: RelationalMeta<TRelations> };
 
 /** Options plus the binding, as v1's single-argument form takes them. */
-export interface D1zzleConfig<TRelations> extends D1zzleOptions {
+export interface OrmD1Config<TRelations> extends OrmD1Options {
 	client: D1Database;
 	relations?: TRelations;
 }
@@ -48,19 +48,19 @@ export interface D1zzleConfig<TRelations> extends D1zzleOptions {
  * const db = drizzle(env.DB, { relations });
  * ```
  */
-export function d1zzle<TRelations extends RelationsConfig>(
-	config: D1zzleConfig<TRelations> & { relations: TRelations },
-): D1zzleDatabaseWithRelations<TRelations>;
-export function d1zzle(config: D1zzleConfig<never>): D1zzleDatabase;
-export function d1zzle<TRelations extends RelationsConfig>(
+export function ormD1<TRelations extends RelationsConfig>(
+	config: OrmD1Config<TRelations> & { relations: TRelations },
+): OrmD1DatabaseWithRelations<TRelations>;
+export function ormD1(config: OrmD1Config<never>): OrmD1Database;
+export function ormD1<TRelations extends RelationsConfig>(
 	binding: D1Database,
-	options: D1zzleOptions & { relations: TRelations },
-): D1zzleDatabaseWithRelations<TRelations>;
-export function d1zzle(binding: D1Database, options?: D1zzleOptions): D1zzleDatabase;
-export function d1zzle(
-	bindingOrConfig: D1Database | D1zzleConfig<RelationsConfig>,
-	options: D1zzleOptions = {},
-): D1zzleDatabase {
+	options: OrmD1Options & { relations: TRelations },
+): OrmD1DatabaseWithRelations<TRelations>;
+export function ormD1(binding: D1Database, options?: OrmD1Options): OrmD1Database;
+export function ormD1(
+	bindingOrConfig: D1Database | OrmD1Config<RelationsConfig>,
+	options: OrmD1Options = {},
+): OrmD1Database {
 	// Guarded before the probe below, which would otherwise throw a bare
 	// `Cannot read properties of undefined (reading 'prepare')`. A typo'd
 	// binding name is the most common way to arrive here, and `drizzle(env.DB)`
@@ -75,8 +75,8 @@ export function d1zzle(
 	// A binding has `prepare`; a config object does not. Nothing else
 	// distinguishes them, and `client` may legitimately be absent from neither.
 	const isConfig = typeof (bindingOrConfig as D1Database).prepare !== 'function';
-	const config = isConfig ? bindingOrConfig as D1zzleConfig<RelationsConfig> : options;
-	const binding = isConfig ? (bindingOrConfig as D1zzleConfig<RelationsConfig>).client : bindingOrConfig as D1Database;
+	const config = isConfig ? bindingOrConfig as OrmD1Config<RelationsConfig> : options;
+	const binding = isConfig ? (bindingOrConfig as OrmD1Config<RelationsConfig>).client : bindingOrConfig as D1Database;
 
 	if (!binding) {
 		throw new Error('drizzle({ … }) needs a `client`: the D1 binding to run against, e.g. `env.DB`.');
@@ -92,4 +92,4 @@ export function d1zzle(
  * Drizzle-compatible entry point. The signature matches `drizzle-orm/d1`, so
  * migrating a project is a one-line import change.
  */
-export const drizzle: typeof d1zzle = d1zzle;
+export const drizzle: typeof ormD1 = ormD1;

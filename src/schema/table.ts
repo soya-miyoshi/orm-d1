@@ -21,11 +21,11 @@ import {
 	SQLiteTableEntity,
 } from './drizzle-entity.js';
 
-export const TableName = Symbol.for('d1zzle:TableName');
-export const TableOriginalName = Symbol.for('d1zzle:TableOriginalName');
-export const TableColumns = Symbol.for('d1zzle:TableColumns');
-export const TableExtras = Symbol.for('d1zzle:TableExtras');
-export const IsTable = Symbol.for('d1zzle:IsTable');
+export const TableName = Symbol.for('ormD1:TableName');
+export const TableOriginalName = Symbol.for('ormD1:TableOriginalName');
+export const TableColumns = Symbol.for('ormD1:TableColumns');
+export const TableExtras = Symbol.for('ormD1:TableExtras');
+export const IsTable = Symbol.for('ormD1:IsTable');
 
 /**
  * A table's columns by TypeScript name.
@@ -89,9 +89,9 @@ type ExtrasResult = readonly TableExtra[] | Record<string, TableExtra> | TableEx
  * A table is an *instance* of a class whose static `entityKind` chain matches
  * Drizzle's, and it carries Drizzle's symbols alongside our own. That is what
  * makes `is(t, SQLiteTable)`, `getTableColumns(t)` and every existing Drizzle
- * adapter work on a d1zzle schema unchanged. See `drizzle-entity.ts`.
+ * adapter work on an orm-d1 schema unchanged. See `drizzle-entity.ts`.
  */
-class D1zzleTable extends SQLiteTableEntity {
+class OrmD1Table extends SQLiteTableEntity {
 	static override readonly [entityKind]: string = 'SQLiteTable';
 }
 
@@ -124,7 +124,7 @@ const buildTable = (
 		[DrizzleInlineForeignKeys]: [],
 	};
 
-	const t = Object.assign(new D1zzleTable(), columns, meta, drizzleMeta) as unknown as Table;
+	const t = Object.assign(new OrmD1Table(), columns, meta, drizzleMeta) as unknown as Table;
 	// Skips a nested group, which only a subquery over grouped rows produces.
 	// Its leaves still get a `table`, one level down.
 	const own = (map: ColumnsMap): void => {
@@ -209,7 +209,7 @@ export const getTableExtras = (t: Table): readonly TableExtra[] => t[TableExtras
  *
  * Shipping our own is what makes the interop work rather than merely typecheck.
  * Drizzle's version derives every constraint by *running* a table's
- * `ExtraConfigBuilder`, which we set to `undefined` — so on a d1zzle table it
+ * `ExtraConfigBuilder`, which we set to `undefined` — so on an orm-d1 table it
  * returns the columns correctly and every other field empty. Pothos' drizzle
  * plugin resolves a model's primary key with
  * `columns.find(c => c.primary) ?? primaryKeys.find(…)?.columns ?? [columns.find(c => c.isUnique)]`,
@@ -230,7 +230,7 @@ export interface TableConfig {
 	readonly checks: readonly TableCheck[];
 	readonly primaryKeys: readonly TablePrimaryKey[];
 	readonly uniqueConstraints: readonly TableUniqueConstraint[];
-	/** Our own constraint records, unprocessed. Read by `d1zzle/ddl`. */
+	/** Our own constraint records, unprocessed. Read by `orm-d1/ddl`. */
 	readonly extras: readonly TableExtra[];
 }
 
@@ -378,7 +378,7 @@ export const isAliased = (t: Table): boolean => t[TableName] !== t[TableOriginal
  * A subquery behaves exactly like a table everywhere except the `from` clause,
  * so it is represented as one — with the inner statement hung off a symbol.
  */
-export const TableSource = Symbol.for('d1zzle:TableSource');
+export const TableSource = Symbol.for('ormD1:TableSource');
 
 /**
  * Groups inside the subquery's rows that an outer join can leave null, as dotted
@@ -390,7 +390,7 @@ export const TableSource = Symbol.for('d1zzle:TableSource');
  * an object full of nulls instead of the `null` the same query returns when read
  * directly.
  */
-export const TableNullableGroups = Symbol.for('d1zzle:TableNullableGroups');
+export const TableNullableGroups = Symbol.for('ormD1:TableNullableGroups');
 
 export type Subquery<TColumns extends ColumnsMap = ColumnsMap, TName extends string = string> =
 	& Table<TColumns, TName>

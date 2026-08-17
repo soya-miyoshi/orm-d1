@@ -27,7 +27,7 @@ describe('configureCasing', () => {
 	it('refuses to take effect after a name has already been resolved', () => {
 		// This is the documented module-scope compilation: a query built at
 		// import time bakes `"firstName"` into its SQL, and a later
-		// `d1zzle(env.DB, { casing: 'snake_case' })` would make every *other*
+		// `orm-d1(env.DB, { casing: 'snake_case' })` would make every *other*
 		// reader say `first_name`. The compiled query keeps the old text and D1
 		// answers "no such column" — in production, for the optimised query.
 		const t = sqliteTable('t', { firstName: text(), id: integer() });

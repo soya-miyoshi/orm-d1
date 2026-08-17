@@ -1,7 +1,7 @@
 /**
  * What the kit picks up out of a schema module, and what it must not.
  *
- * `snapshotFromSchema` filters module exports on the `d1zzle:IsTable` symbol,
+ * `snapshotFromSchema` filters module exports on the `orm-d1:IsTable` symbol,
  * so a `defineRelations` export is skipped. That is worth a test rather than an
  * assumption: the result is a plain record whose every value carries a `table`
  * property, which is exactly the shape a looser "does it look like a table?"
@@ -9,8 +9,8 @@
  * silently turning into a migration is not a failure anyone would enjoy
  * diagnosing.
  */
-import { integer, sqliteTable, text } from 'd1zzle';
-import { defineRelations } from 'd1zzle/relations';
+import { integer, sqliteTable, text } from 'orm-d1';
+import { defineRelations } from 'orm-d1/relations';
 import { describe, expect, it } from 'vitest';
 import { snapshotFromSchema } from '../../src/core/snapshot.js';
 

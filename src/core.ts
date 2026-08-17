@@ -1,9 +1,9 @@
 /**
- * `d1zzle/core` — the lean entry point.
+ * `orm-d1/core` — the lean entry point.
  *
- * Identical to the root entry except that `d1zzle()` here does not accept a
+ * Identical to the root entry except that `orm-d1()` here does not accept a
  * `schema` option, so nothing reaches `relations/` and the relational query
- * layer never enters the bundle (rule R5). Import from `d1zzle` unless you are
+ * layer never enters the bundle (rule R5). Import from `orm-d1` unless you are
  * counting bytes and never use `db.query`.
  */
 
@@ -121,10 +121,10 @@ export type { LatestPerGroupConfig } from './builders/window.js';
 export { latestPerGroup } from './builders/window.js';
 
 // runtime
-export type { D1zzleOptions, D1zzleSession } from './runtime/database.js';
-export { D1zzleDatabase, d1zzle } from './runtime/database.js';
+export type { OrmD1Options, OrmD1Session } from './runtime/database.js';
+export { OrmD1Database, ormD1 } from './runtime/database.js';
 export type { QueryEvent } from './runtime/result.js';
-export { D1zzleQueryError, NoTransactionsError } from './errors.js';
+export { OrmD1QueryError, NoTransactionsError } from './errors.js';
 export type { D1Plan, PlanLimits } from './limits.js';
 export {
 	MAX_COLUMNS_PER_TABLE,

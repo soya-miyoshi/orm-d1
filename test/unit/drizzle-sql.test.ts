@@ -2,9 +2,9 @@
  * The Drizzle `SQL` bridge.
  *
  * These fragments are built with Drizzle's *own* `sql`/`eq`/`and`/`inArray`
- * over d1zzle columns — the exact thing Pothos' drizzle plugin does when it
+ * over orm-d1 columns — the exact thing Pothos' drizzle plugin does when it
  * assembles `where: { RAW: (table) => … }`. The assertion is that they render
- * the same operands and bind the same values as the equivalent d1zzle
+ * the same operands and bind the same values as the equivalent orm-d1
  * expression, Drizzle's extra parenthesisation aside.
  */
 import { and as dAnd, eq as dEq, inArray as dInArray, sql as dSql } from 'drizzle-orm';
@@ -39,7 +39,7 @@ describe('recognising a foreign fragment', () => {
 	});
 
 	it('treats a Drizzle SQLWrapper as foreign but leaves our own columns alone', () => {
-		// A d1zzle column is a `SQLWrapper` too — `getSQL()` returns itself — and
+		// An orm-d1 column is a `SQLWrapper` too — `getSQL()` returns itself — and
 		// must keep rendering through our own path.
 		expect(isForeignSQL(users.id)).toBe(false);
 		expect(isForeignSQL(dSql`1`)).toBe(true);
@@ -50,7 +50,7 @@ describe('recognising a foreign fragment', () => {
 	});
 });
 
-describe('rendering matches the equivalent d1zzle expression', () => {
+describe('rendering matches the equivalent orm-d1 expression', () => {
 	it('renders a comparison identically', () => {
 		expect(rendered(dEq(dUsers.id, 42) as never)).toEqual(rendered(eq(users.id, 42)));
 	});
@@ -76,7 +76,7 @@ describe('rendering matches the equivalent d1zzle expression', () => {
 		expect(rendered(dEq(dUsers.active, true) as never).params).toEqual([{ k: 'const', v: 1 }]);
 	});
 
-	it('renders inArray over a d1zzle column', () => {
+	it('renders inArray over an orm-d1 column', () => {
 		const theirs = rendered(dInArray(dUsers.id, [1, 2, 3]) as never);
 		expect(theirs.sql).toBe('"users"."id" in (?, ?, ?)');
 		expect(theirs.params).toEqual([1, 2, 3].map((v) => ({ k: 'const', v })));

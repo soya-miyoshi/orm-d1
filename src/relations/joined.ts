@@ -270,9 +270,9 @@ const renderInner = (
 		', ',
 	);
 
-	// `from "posts" as "d1zzle_j1"`, spelled out: rendering the aliased table
+	// `from "posts" as "ormd1_j1"`, spelled out: rendering the aliased table
 	// object directly emits only its alias, which SQLite reads as a table of
-	// that name — so the inner query looked for a table called "d1zzle_j1".
+	// that name — so the inner query looked for a table called "ormd1_j1".
 	const from = sql.raw(`${quote(getTableOriginalName(table))} as ${quote(getTableName(table))}`);
 	// Each predicate is parenthesized before joining: `compileFilter` returns
 	// an unwrapped `RAW` fragment for a lone predicate (matching Drizzle's

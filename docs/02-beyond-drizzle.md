@@ -22,11 +22,11 @@ SQLite blocks `UPDATE` with a `BEFORE UPDATE … RAISE(ABORT)` trigger. Neither
 written by hand in a migration, where the schema does not record it and `check` cannot
 report its absence.
 
-`d1zzle/ddl` declares it as a table option:
+`orm-d1/ddl` declares it as a table option:
 
 ```ts
 // src/db/table-options.ts — a sidecar module the schema file does not import
-import { tableOptions } from 'd1zzle/ddl';
+import { tableOptions } from 'orm-d1/ddl';
 import { ledgerEntries, transactions, users } from './schema';
 
 export default tableOptions([
@@ -90,7 +90,7 @@ SQLite has no `DISTINCT ON`, and `row_number()` cannot appear in `WHERE`, so one
 group is a numbered subquery with an outer filter.
 
 ```ts
-import { desc, inArray, latestPerGroup } from 'd1zzle';
+import { desc, inArray, latestPerGroup } from 'orm-d1';
 
 const latest = await latestPerGroup(db, bookingEvents, {
   partitionBy: [bookingEvents.bookingId],
@@ -103,15 +103,15 @@ const latest = await latestPerGroup(db, bookingEvents, {
 One statement, as emitted (line breaks added):
 
 ```sql
-select "d1zzle_latest"."id", "d1zzle_latest"."bookingId", "d1zzle_latest"."state",
-       "d1zzle_latest"."recordedAt"
+select "ormd1_latest"."id", "ormd1_latest"."bookingId", "ormd1_latest"."state",
+       "ormd1_latest"."recordedAt"
 from (select "booking_events"."id", "booking_events"."booking_id" as "bookingId",
              "booking_events"."state", "booking_events"."recorded_at" as "recordedAt",
              row_number() over (partition by "booking_events"."booking_id"
                                 order by "booking_events"."recorded_at" desc,
-                                         "booking_events"."id" desc) as "__d1zzle_latest_rn"
-      from "booking_events" where "booking_events"."booking_id" in (?, ?)) "d1zzle_latest"
-where "d1zzle_latest"."__d1zzle_latest_rn" = ?
+                                         "booking_events"."id" desc) as "__ormd1_latest_rn"
+      from "booking_events" where "booking_events"."booking_id" in (?, ?)) "ormd1_latest"
+where "ormd1_latest"."__ormd1_latest_rn" = ?
 ```
 
 The rank column is projected under a name no user column can collide with and is removed
@@ -134,7 +134,7 @@ since only the caller knows which column is unique within a partition.
 Both are options in the same sidecar module, and both are validated at `generate` against
 behaviour confirmed on D1. `WITHOUT ROWID` on a table with no primary key fails with
 `PRIMARY KEY missing`. `STRICT` with a `NUMERIC` column fails with `unknown datatype`;
-`numeric()` is the only d1zzle column type that renders one. The alternative to checking is
+`numeric()` is the only orm-d1 column type that renders one. The alternative to checking is
 a migration that applies to production halfway and then fails.
 
 ## `impact`
@@ -145,9 +145,9 @@ first, and dropping a foreign key rebuilds the table holding it. The cost runs b
 along the reference edges, transitively.
 
 ```bash
-npx d1zzle-migrate impact                                 # every table, most expensive first
-npx d1zzle-migrate impact --table transactions            # from the schema; no database
-npx d1zzle-migrate impact --table transactions --remote   # …and count(*) per table
+npx orm-d1-kit impact                                 # every table, most expensive first
+npx orm-d1-kit impact --table transactions            # from the schema; no database
+npx orm-d1-kit impact --table transactions --remote   # …and count(*) per table
 ```
 
 ```
@@ -171,7 +171,7 @@ duration. A trigger can be dropped and re-created without rebuilding the table, 
 operation is cheap; the two ways it fails when assembled by hand are both silent.
 
 ```bash
-npx d1zzle-migrate backfill --table transactions --file ./migrations/manual/fees.sql --remote
+npx orm-d1-kit backfill --table transactions --file ./migrations/manual/fees.sql --remote
 ```
 
 The guard is read out of `sqlite_master`, dropped, and re-created **from the captured
@@ -192,7 +192,7 @@ rebuild of the child, which is refused for the same reason whenever that child h
 children of its own.
 
 ```bash
-npx d1zzle-migrate generate --emit-roundtrip
+npx orm-d1-kit generate --emit-roundtrip
 ```
 
 One file per refused table, `<out>/roundtrip/<timestamp>_<table>.draft.sql`, holding the

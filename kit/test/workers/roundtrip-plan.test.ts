@@ -12,9 +12,9 @@
  * engine, not of the differ.
  */
 import { env } from 'cloudflare:test';
-import { createSchema } from 'd1zzle/ddl';
-import { check, integer, sqliteTable, text } from 'd1zzle';
-import { sql } from 'd1zzle';
+import { createSchema } from 'orm-d1/ddl';
+import { check, integer, sqliteTable, text } from 'orm-d1';
+import { sql } from 'orm-d1';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { introspect } from '../../src/core/apply.js';
 import { diffSnapshots } from '../../src/core/diff.js';

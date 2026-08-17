@@ -1,5 +1,5 @@
 /**
- * The acceptance test: `@pothos/plugin-drizzle` driving a d1zzle database
+ * The acceptance test: `@pothos/plugin-drizzle` driving an orm-d1 database
  * inside workerd, against a real D1 binding.
  *
  * This is the definition of done for adopting the v1 interface, and it is the
@@ -133,7 +133,7 @@ beforeAll(async () => {
 	]);
 });
 
-describe('a Pothos schema over a d1zzle database', () => {
+describe('a Pothos schema over an orm-d1 database', () => {
 	it('resolves scalar fields off a drizzleObject', async () => {
 		expect(await run(`{ users { id email } }`)).toEqual({
 			users: [{ id: 1, email: 'ada@example.com' }, { id: 2, email: 'bob@example.com' }],
@@ -205,7 +205,7 @@ describe('what the plugin depends on', () => {
 
 	it('gets a composite primary key from ours where Drizzle’s reports none', () => {
 		// Drizzle derives constraints by running a table's ExtraConfigBuilder,
-		// which a d1zzle table does not have — so its version returns the
+		// which an orm-d1 table does not have — so its version returns the
 		// columns and nothing else, and the plugin's getPrimaryKey throws on
 		// `post_tags`. This is the substitution that makes the plugin work.
 		expect(drizzleGetTableConfig(schema.postTags as never).primaryKeys).toEqual([]);

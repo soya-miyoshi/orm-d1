@@ -1,6 +1,6 @@
-import { blob, check, customType, foreignKey, index, integer, numeric, primaryKey, real, sql, sqliteTable, text, unique, uniqueIndex } from 'd1zzle';
-import { appendOnlyTrigger, tableOptions, validateTableOptions } from 'd1zzle/ddl';
-import type { Column } from 'd1zzle';
+import { blob, check, customType, foreignKey, index, integer, numeric, primaryKey, real, sql, sqliteTable, text, unique, uniqueIndex } from 'orm-d1';
+import { appendOnlyTrigger, tableOptions, validateTableOptions } from 'orm-d1/ddl';
+import type { Column } from 'orm-d1';
 import { describe, expect, it } from 'vitest';
 import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { applicableStatements, splitStatements } from '../../src/core/sql.js';
@@ -1359,7 +1359,7 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 	// authors itself; any other trigger on the live table is silently dropped
 	// with the table, with no error and no way to get it back.
 	describe('refusing a rebuild that would silently drop a foreign trigger (finding 2)', () => {
-		it('refuses when the live table carries a trigger d1zzle did not author', () => {
+		it('refuses when the live table carries a trigger orm-d1 did not author', () => {
 			const before = withOptions(users, {});
 			const after = withOptions(
 				sqliteTable('users', { id: text('id').primaryKey(), email: text('email') }),
@@ -1547,7 +1547,7 @@ describe('reading table options back out of a CREATE TABLE', () => {
 		expect(isAppendOnlyTrigger(filtered, 'events')).toBe(false);
 	});
 
-	it('still recognises d1zzle\'s own generated guard after the anchor tightening', () => {
+	it('still recognises orm-d1\'s own generated guard after the anchor tightening', () => {
 		expect(isAppendOnlyTrigger(appendOnlyTrigger('events'), 'events')).toBe(true);
 	});
 
@@ -1628,7 +1628,7 @@ describe('reading table options back out of a CREATE TABLE', () => {
 	// `BEFORE UPDATE OF` used to be lumped in with `WHEN` as "conditional, so not
 	// the guard". It is a different kind of conditional: `WHEN` decides per row,
 	// `OF` decides per column and freezes the ones it names for every row. Reading
-	// it as `false` hid d1zzle's own trigger from `apply`, which treats anything
+	// it as `false` hid orm-d1's own trigger from `apply`, which treats anything
 	// it does not recognise as a foreign trigger it must not touch.
 	describe('column-scoped guards', () => {
 		it('reports the column list instead of true', () => {

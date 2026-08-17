@@ -10,7 +10,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { QueryEvent } from '../../src/index.js';
-import { d1zzle, eq } from '../../src/index.js';
+import { ormD1, eq } from '../../src/index.js';
 import { setDev, setWarn } from '../../src/dev.js';
 import { users } from '../schema.js';
 
@@ -30,7 +30,7 @@ const stubClient = (meta: Record<string, unknown>): D1Database => {
 
 const eventFrom = async (meta: Record<string, unknown>): Promise<QueryEvent> => {
 	let event: QueryEvent | undefined;
-	const db = d1zzle(stubClient(meta), { onQuery: (e) => void (event = e) });
+	const db = ormD1(stubClient(meta), { onQuery: (e) => void (event = e) });
 	await db.select().from(users).where(eq(users.id, 1));
 	return event!;
 };
@@ -97,7 +97,7 @@ describe('emitting only when someone is listening', () => {
 		// then turned on and the threshold crossed, which is the only window the
 		// warning can be observed in: it fires at most once per database object,
 		// so a crossing that happens while dev is off is consumed silently.
-		const db = d1zzle(stub(), { plan: 'free' });
+		const db = ormD1(stub(), { plan: 'free' });
 
 		setDev(false);
 		for (let i = 0; i < 49; i++) await db.insert(users).values({ id: i, email: `u${i}@e.com` }).run();
@@ -120,7 +120,7 @@ describe('emitting only when someone is listening', () => {
 
 	it('still reports writes to onQuery', async () => {
 		const events: QueryEvent[] = [];
-		const db = d1zzle(stub(), { onQuery: (e) => events.push(e) });
+		const db = ormD1(stub(), { onQuery: (e) => events.push(e) });
 
 		await db.insert(users).values({ id: 1, email: 'a@e.com' }).run();
 		await db.update(users).set({ name: 'Ada' }).run();
@@ -138,7 +138,7 @@ describe('emitting only when someone is listening', () => {
 			batch: async (statements: unknown[]) =>
 				statements.map(() => ({ success: true, results: [], meta: { rows_read: 0, rows_written: 0 } })),
 		} as unknown as D1Database;
-		const db = d1zzle(batching, { onQuery: (e) => events.push(e) });
+		const db = ormD1(batching, { onQuery: (e) => events.push(e) });
 
 		await db.batch([
 			db.insert(users).values({ id: 1, email: 'a@e.com' }),

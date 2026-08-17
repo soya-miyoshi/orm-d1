@@ -6,7 +6,7 @@
  * database inside a workerd test. What each pragma actually returns on D1 is
  * verified by those tests rather than assumed from documentation.
  */
-import { defaultExpression } from 'd1zzle/ddl';
+import { defaultExpression } from 'orm-d1/ddl';
 import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { SNAPSHOT_VERSION } from './snapshot.js';
 
@@ -311,7 +311,7 @@ export const parseTableOptions = (sql: string): { strict: boolean; withoutRowid:
  * columns for every row, which is the same promise over a smaller surface, so
  * it is reported as the list rather than as `true`. Returning `true` for it
  * would claim protection the table does not have; returning `false` would hide
- * d1zzle's own trigger from `apply`, which reads anything unrecognised as a
+ * orm-d1's own trigger from `apply`, which reads anything unrecognised as a
  * foreign trigger it must refuse to touch.
  *
  * @returns `false` when this is not the guard, `true` for a whole-table guard,
@@ -364,7 +364,7 @@ export const appendOnlyTriggerGuard = (sql: string, tableName: string): boolean 
 /**
  * Whether the table carries *some* append-only guard, whole-table or scoped.
  *
- * `apply` uses this to tell d1zzle's own trigger apart from ones the schema
+ * `apply` uses this to tell orm-d1's own trigger apart from ones the schema
  * does not know about; for that question the column list does not matter.
  */
 export const isAppendOnlyTrigger = (sql: string, tableName: string): boolean =>

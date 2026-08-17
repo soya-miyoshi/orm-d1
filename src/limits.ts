@@ -73,7 +73,7 @@ export const exceedsBytes = (text: string, limit: number): boolean => {
  *
  * Shared across every database derived from the one you opened — notably the
  * ones `withSession()` returns — because the limit belongs to the invocation,
- * not to the session. `d1zzle()` creates one and it rides along in the
+ * not to the session. `orm-d1()` creates one and it rides along in the
  * resolved options.
  *
  * Counting per database object is exact for the ordinary

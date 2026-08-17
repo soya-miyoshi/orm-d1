@@ -16,7 +16,7 @@ import { environmentFlag, parseArgs } from '../../src/cli.js';
 import { describeResolution, loadConfig, readWranglerConfig, resolveEnvironment } from '../../src/node/config.js';
 import { resolveRunner } from '../../src/node/commands.js';
 
-const temp = () => mkdtemp(join(tmpdir(), 'd1zzle-env-'));
+const temp = () => mkdtemp(join(tmpdir(), 'orm-d1-env-'));
 
 const WRANGLER_TOML = `name = "acme-api"
 main = "src/index.ts"
@@ -64,11 +64,11 @@ const WRANGLER_JSONC = `{
 	},
 }`;
 
-/** A project on disk: a wrangler config plus a minimal d1zzle config. */
-const project = async (wrangler: string, file = 'wrangler.toml', d1zzleConfig = `{ schema: './schema.ts' }`) => {
+/** A project on disk: a wrangler config plus a minimal orm-d1 config. */
+const project = async (wrangler: string, file = 'wrangler.toml', ormD1Config = `{ schema: './schema.ts' }`) => {
 	const dir = await temp();
 	await writeFile(join(dir, file), wrangler);
-	await writeFile(join(dir, 'd1zzle.config.ts'), `export default ${d1zzleConfig};\n`);
+	await writeFile(join(dir, 'orm-d1.config.ts'), `export default ${ormD1Config};\n`);
 	return dir;
 };
 
@@ -157,7 +157,7 @@ describe('selecting an environment', () => {
 
 	it('refuses --env when there is no wrangler config to select from', async () => {
 		const dir = await temp();
-		await writeFile(join(dir, 'd1zzle.config.ts'), `export default { schema: './schema.ts' };\n`);
+		await writeFile(join(dir, 'orm-d1.config.ts'), `export default { schema: './schema.ts' };\n`);
 
 		await expect(loadConfig(dir, undefined, 'stg')).rejects.toThrow(/no wrangler config was found/);
 	});
@@ -205,7 +205,7 @@ describe('which environment', () => {
 });
 
 describe('precedence of a resolved value', () => {
-	it('takes d1zzle.config.ts over the environment variable over wrangler', async () => {
+	it('takes orm-d1.config.ts over the environment variable over wrangler', async () => {
 		vi.stubEnv('CLOUDFLARE_D1_DATABASE_ID', 'from-variable');
 
 		const fromWrangler = await project(WRANGLER_JSONC, 'wrangler.jsonc');
@@ -235,7 +235,7 @@ describe('precedence of a resolved value', () => {
 	});
 
 	it('does not interpolate ${VAR} in the wrangler file', async () => {
-		// Wrangler does not interpolate its own config, so a d1zzle that did would
+		// Wrangler does not interpolate its own config, so an orm-d1 that did would
 		// read a different value than wrangler from the same line — a new instance
 		// of the drift this change exists to remove.
 		vi.stubEnv('D1_ID', 'interpolated');

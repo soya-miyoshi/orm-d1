@@ -1,5 +1,5 @@
 /**
- * `d1zzle-migrate` — migrations, introspection and drift detection.
+ * `orm-d1-kit` — migrations, introspection and drift detection.
  *
  * A devDependency: it runs in Node, may use dependencies freely, and
  * contributes zero bytes to the Worker bundle.

@@ -5,7 +5,7 @@ Change the import specifier:
 ```diff
 - import { drizzle } from 'drizzle-orm/d1';
 - import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core';
-+ import { drizzle, sqliteTable, text, integer } from 'd1zzle';
++ import { drizzle, sqliteTable, text, integer } from 'orm-d1';
 ```
 
 For a zero-diff migration, alias the modules instead of editing files:
@@ -16,16 +16,16 @@ For a zero-diff migration, alias the modules instead of editing files:
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "drizzle-orm": ["./node_modules/d1zzle/dist/index.js"],
-      "drizzle-orm/d1": ["./node_modules/d1zzle/dist/index.js"],
-      "drizzle-orm/sqlite-core": ["./node_modules/d1zzle/dist/sqlite-core.js"]
+      "drizzle-orm": ["./node_modules/orm-d1/dist/index.js"],
+      "drizzle-orm/d1": ["./node_modules/orm-d1/dist/index.js"],
+      "drizzle-orm/sqlite-core": ["./node_modules/orm-d1/dist/sqlite-core.js"]
     }
   }
 }
 ```
 
 Point at the `.js`, not the `.d.ts`. Getting this wrong fails silently: the build
-succeeds, the types are d1zzle's, the editor is satisfied, and the Worker runs on
+succeeds, the types are orm-d1's, the editor is satisfied, and the Worker runs on
 `drizzle-orm`. esbuild — wrangler's bundler — honours `paths` for module resolution but
 cannot bundle a declaration file, so it falls through to node resolution and finds the real
 `drizzle-orm`, which is installed by definition during a migration. TypeScript picks up the
@@ -39,7 +39,7 @@ library ended up in the bundle rather than measure its size:
 | `paths` target | bundle | contains |
 | --- | --- | --- |
 | `dist/index.d.ts` | 175 kB | `drizzle-orm` — the mapping did nothing |
-| `dist/index.js` | 81 kB | d1zzle |
+| `dist/index.js` | 81 kB | orm-d1 |
 
 `test/unit/module-resolution.test.ts` bundles that fixture and asserts it.
 
@@ -64,7 +64,7 @@ you can read:
 | Views (`sqliteView`), CTEs, `union` / `intersect` / `except` | Not exported, so a schema or query using them does not compile. `db.execute(sql, params)` is the escape hatch. |
 
 Drizzle's execution plan for relational queries is not adopted either, only its interface;
-the plans d1zzle runs are in [03-relational-queries](./03-relational-queries.md).
+the plans orm-d1 runs are in [03-relational-queries](./03-relational-queries.md).
 
 The schema DSL is a strict subset of `drizzle-orm/sqlite-core`: every symbol usable in a
 schema file also exists there with the same meaning. That is what makes the aliasing work

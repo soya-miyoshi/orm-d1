@@ -1,5 +1,5 @@
 /**
- * `d1zzle/sqlite-core` — the Drizzle-named surface a schema file uses.
+ * `orm-d1/sqlite-core` — the Drizzle-named surface a schema file uses.
  *
  * This entry exists so an existing project can migrate with **zero diff**, by
  * aliasing the module specifier instead of editing imports:
@@ -8,8 +8,8 @@
  * // tsconfig.json
  * "baseUrl": ".",
  * "paths": {
- *   "drizzle-orm":             ["./node_modules/d1zzle/dist/index.js"],
- *   "drizzle-orm/sqlite-core": ["./node_modules/d1zzle/dist/sqlite-core.js"]
+ *   "drizzle-orm":             ["./node_modules/orm-d1/dist/index.js"],
+ *   "drizzle-orm/sqlite-core": ["./node_modules/orm-d1/dist/sqlite-core.js"]
  * }
  * ```
  *
@@ -18,7 +18,7 @@
  * and ignores a bare path with no `baseUrl`, so in either case it falls through
  * to node resolution and bundles the real `drizzle-orm` — which is present by
  * definition for anyone following this recipe. The result typechecks against
- * d1zzle and runs on Drizzle. `test/unit/module-resolution.test.ts` pins it.
+ * orm-d1 and runs on Drizzle. `test/unit/module-resolution.test.ts` pins it.
  *
  * Everything here is a re-export of the native API under Drizzle's names, so
  * the two entry points cannot drift.
@@ -85,7 +85,7 @@ export type {
 export type { Column as AnySQLiteColumn } from './index.js';
 
 /**
- * Drizzle exposes the D1 driver from `drizzle-orm/d1`; d1zzle's `drizzle()`
+ * Drizzle exposes the D1 driver from `drizzle-orm/d1`; orm-d1's `drizzle()`
  * lives on the root entry and is re-exported here for convenience.
  */
-export { d1zzle, drizzle } from './index.js';
+export { ormD1, drizzle } from './index.js';

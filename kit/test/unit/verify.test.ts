@@ -48,7 +48,7 @@ describe('scratchRunner', () => {
 
 describe('verify', () => {
 	const project = async (migrations: [tag: string, sql: string][]): Promise<Config> => {
-		const out = join(mkdtempSync(join(tmpdir(), 'd1zzle-verify-')), 'migrations');
+		const out = join(mkdtempSync(join(tmpdir(), 'orm-d1-verify-')), 'migrations');
 		await mkdir(join(out, 'meta'), { recursive: true });
 		await writeFile(
 			join(out, 'meta', '_journal.json'),

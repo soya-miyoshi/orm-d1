@@ -1,7 +1,7 @@
 /**
- * `d1zzle/drizzle` — the type-level bridge to Drizzle's own types.
+ * `orm-d1/drizzle` — the type-level bridge to Drizzle's own types.
  *
- * At runtime a d1zzle schema already *is* a Drizzle schema: the entity kinds,
+ * At runtime an orm-d1 schema already *is* a Drizzle schema: the entity kinds,
  * the symbols and the column surface all match, and `drizzle-orm`'s `is()`,
  * `getTableColumns()` and `getTableName()` work on it unchanged
  * (see `schema/drizzle-entity.ts`).
@@ -17,7 +17,7 @@
  * `drizzle-orm` accepts our schema and infers exactly the same row types:
  *
  * ```ts
- * import { asDrizzleSchema } from 'd1zzle/drizzle';
+ * import { asDrizzleSchema } from 'orm-d1/drizzle';
  * import { buildSchema } from 'drizzle-graphql';
  *
  * const graphql = buildSchema(db as never, { schema: asDrizzleSchema(schema) });
@@ -224,14 +224,14 @@ export const asPothosRelations = <TRelations extends Record<string, unknown>>(
 // ------------------------------------------- Pothos' resolver-side find-config
 
 /**
- * Pothos' `query()` result, retyped as the d1zzle find-config it already is.
+ * Pothos' `query()` result, retyped as the orm-d1 find-config it already is.
  *
  * `@pothos/plugin-drizzle` hands every drizzle-backed resolver a `query()` that
  * merges the caller's selection with the columns and relations the GraphQL
  * selection set needs, and the result goes straight to
  * `db.query.<table>.findMany` / `findFirst`.
  *
- * The merged config is a valid d1zzle config at runtime, but not at the type
+ * The merged config is a valid orm-d1 config at runtime, but not at the type
  * level, because the plugin declares one extra key:
  *
  * ```ts

@@ -1,7 +1,7 @@
 # Relational queries
 
 ```ts
-import { defineRelations, drizzle } from 'd1zzle';
+import { defineRelations, drizzle } from 'orm-d1';
 
 export const relations = defineRelations({ users, posts }, (r) => ({
   users: { posts: r.many.posts() },

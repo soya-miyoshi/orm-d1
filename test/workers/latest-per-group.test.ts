@@ -14,7 +14,7 @@ import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createSchema } from '../../src/ddl.js';
 import type { QueryEvent } from '../../src/index.js';
-import { d1zzle, desc, eq, latestPerGroup } from '../../src/index.js';
+import { ormD1, desc, eq, latestPerGroup } from '../../src/index.js';
 import { allTables, posts, users } from '../schema.js';
 
 const DB = (env as { DB: D1Database }).DB;
@@ -25,7 +25,7 @@ beforeEach(async () => {
 	}
 	for (const statement of createSchema(allTables)) await DB.prepare(statement).run();
 
-	const db = d1zzle(DB);
+	const db = ormD1(DB);
 	await db.insert(users).values([
 		{ id: 1, email: 'a@b.c', name: 'Ada', createdAt: new Date(0) },
 		{ id: 2, email: 'b@b.c', name: 'Bob', createdAt: new Date(0) },
@@ -45,7 +45,7 @@ beforeEach(async () => {
 });
 
 const latestPost = (where?: Parameters<typeof latestPerGroup>[2]['where']) =>
-	latestPerGroup(d1zzle(DB), posts, {
+	latestPerGroup(ormD1(DB), posts, {
 		partitionBy: [posts.authorId],
 		orderBy: [desc(posts.views)],
 		tiebreak: desc(posts.id),
@@ -63,7 +63,7 @@ describe('latestPerGroup on real D1', () => {
 	// not one per group, and not one that drags every historical row back.
 	it('issues exactly one statement, whatever the number of groups', async () => {
 		const events: QueryEvent[] = [];
-		const db = d1zzle(DB, { onQuery: (event) => events.push(event) });
+		const db = ormD1(DB, { onQuery: (event) => events.push(event) });
 		await latestPerGroup(db, posts, {
 			partitionBy: [posts.authorId],
 			orderBy: [desc(posts.views)],
@@ -98,7 +98,7 @@ describe('latestPerGroup on real D1', () => {
 	it('applies `where` before the numbering, not after', async () => {
 		// Excluding the winner has to promote the runner-up, not drop the group.
 		// Filtering after the numbering would return nothing for author 1.
-		const rows = await latestPerGroup(d1zzle(DB), posts, {
+		const rows = await latestPerGroup(ormD1(DB), posts, {
 			partitionBy: [posts.authorId],
 			orderBy: [desc(posts.views)],
 			tiebreak: desc(posts.id),
@@ -115,7 +115,7 @@ describe('latestPerGroup on real D1', () => {
 	});
 
 	it('decodes columns through the table\'s codecs, like an ordinary select', async () => {
-		const rows = await latestPerGroup(d1zzle(DB), users, {
+		const rows = await latestPerGroup(ormD1(DB), users, {
 			partitionBy: [users.id],
 			orderBy: [desc(users.id)],
 			tiebreak: desc(users.id),
@@ -127,7 +127,7 @@ describe('latestPerGroup on real D1', () => {
 	});
 
 	it('refuses a configuration whose answer would be undefined', async () => {
-		const db = d1zzle(DB);
+		const db = ormD1(DB);
 		await expect(
 			latestPerGroup(db, posts, { partitionBy: [], orderBy: [desc(posts.views)], tiebreak: desc(posts.id) }),
 		).rejects.toThrow(/partitionBy/);

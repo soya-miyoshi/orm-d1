@@ -2,11 +2,11 @@ import { defineWorkersProject } from '@cloudflare/vitest-pool-workers/config';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
-/** `d1zzle-migrate` depends on `d1zzle` as a peer; in-repo it resolves to source. */
+/** `orm-d1-kit` depends on `orm-d1` as a peer; in-repo it resolves to source. */
 const alias = {
-	'd1zzle/relations': fileURLToPath(new URL('./src/relations/index.ts', import.meta.url)),
-	'd1zzle/ddl': fileURLToPath(new URL('./src/ddl.ts', import.meta.url)),
-	'd1zzle': fileURLToPath(new URL('./src/index.ts', import.meta.url)),
+	'orm-d1/relations': fileURLToPath(new URL('./src/relations/index.ts', import.meta.url)),
+	'orm-d1/ddl': fileURLToPath(new URL('./src/ddl.ts', import.meta.url)),
+	'orm-d1': fileURLToPath(new URL('./src/index.ts', import.meta.url)),
 };
 
 // Two projects:

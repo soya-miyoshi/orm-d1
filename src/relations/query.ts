@@ -14,7 +14,7 @@
  * filter DSL instead of a callback, an object form for `orderBy`, a callback
  * form for `extras` — not the executor itself.
  */
-import type { D1zzleDatabase, RelationalStrategy } from '../runtime/database.js';
+import type { OrmD1Database, RelationalStrategy } from '../runtime/database.js';
 import type { Column } from '../schema/columns.js';
 import type { Table } from '../schema/table.js';
 import { alias, getTableColumns } from '../schema/table.js';
@@ -187,7 +187,7 @@ interface PerParentWindow {
 }
 
 /** Projected alongside the child's columns; never survives into a result. */
-const ROW_NUMBER = '__d1zzle_rn';
+const ROW_NUMBER = '__ormd1_rn';
 
 /**
  * Prefix for a junction column projected onto a `through` child.
@@ -197,10 +197,10 @@ const ROW_NUMBER = '__d1zzle_rn';
  * is projected under a name no user column can collide with, and dropped once
  * the buckets are keyed.
  */
-const JUNCTION_PREFIX = '__d1zzle_j';
+const JUNCTION_PREFIX = '__ormd1_j';
 
 /** The database's own budget, for the places that need to count parameters. */
-const renderContextOf = (db: D1zzleDatabase): RenderContext => ({
+const renderContextOf = (db: OrmD1Database): RenderContext => ({
 	maxParams: db.$maxParams,
 	jsonEachThreshold: db.$jsonEachThreshold,
 });
@@ -265,7 +265,7 @@ interface ThroughFetch {
 
 export class RelationalQueryBuilder {
 	constructor(
-		private readonly db: D1zzleDatabase,
+		private readonly db: OrmD1Database,
 		private readonly schema: RelationsConfig,
 		private readonly config: TableRelationalConfig,
 		private readonly strategy: RelationalStrategy = 'split',
@@ -288,7 +288,7 @@ export class RelationalQueryBuilder {
 
 	async #runJoined(config: FindConfig, input?: Record<string, unknown>): Promise<Record<string, unknown>[]> {
 		let counter = 0;
-		const next = (): string => `d1zzle_j${counter++}`;
+		const next = (): string => `ormd1_j${counter++}`;
 
 		const root = alias(this.config.table, next()) as unknown as Table;
 		const rootColumns = getTableColumns(root) as unknown as Record<string, Column<any>>;
@@ -353,7 +353,7 @@ export class RelationalQueryBuilder {
 			{ ...selection, [ROW_NUMBER]: sql`row_number() over (partition by ${partition}${ordering})` },
 			where,
 			child.through,
-		).as('d1zzle_window');
+		).as('ormd1_window');
 
 		const inner = getTableColumns(numbered as unknown as Table) as unknown as Record<string, SQLChunk>;
 		const outerSelection: Record<string, SQLChunk> = {};
@@ -444,7 +444,7 @@ export class RelationalQueryBuilder {
 				// a prototype member resolved to a function, sailed past this
 				// refusal, and was caught two lines down by the "no resolved join
 				// columns" message — which names an internal invariant rather than
-				// the caller's mistake, and reads as a d1zzle bug report.
+				// the caller's mistake, and reads as an orm-d1 bug report.
 				const relation = Object.hasOwn(this.config.relations, name) ? this.config.relations[name] : undefined;
 				if (!relation) {
 					throw new Error(
@@ -545,7 +545,7 @@ export class RelationalQueryBuilder {
 		 * `users.following` through a `follows` table — cannot collide with the
 		 * target it is joined to.
 		 */
-		const junction = relation.throughTable ? alias(relation.throughTable, 'd1zzle_through') : undefined;
+		const junction = relation.throughTable ? alias(relation.throughTable, 'ormd1_through') : undefined;
 		const rebind = junction ? columnRebinder(junction) : undefined;
 
 		/**

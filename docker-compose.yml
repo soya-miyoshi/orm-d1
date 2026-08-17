@@ -1,4 +1,4 @@
-# d1zzle devcontainer.
+# orm-d1 devcontainer.
 #
 #   docker compose up -d      # build + start
 #   ./dev-exec                # interactive shell
@@ -18,7 +18,7 @@ services:
         GIT_DELTA_VERSION: 0.18.2
         ZSH_IN_DOCKER_VERSION: 1.2.0
 
-    container_name: d1zzle-devcontainer
+    container_name: orm-d1-devcontainer
 
     user: node
     init: true
@@ -39,7 +39,7 @@ services:
       #
       # Cost: one `npm install` inside the container the first time, and again
       # after dependency changes. `./dev-exec npm install` does it.
-      - d1zzle-node-modules:/workspace/node_modules
+      - orm-d1-node-modules:/workspace/node_modules
 
       # A real-world schema to exercise the kit against, read-only so nothing
       # here can write to the product repo. `..` is the parent checkout; point
@@ -70,7 +70,7 @@ services:
       - PATH=/usr/local/share/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/node/.local/bin
       # Consumed by the big-schema regression harness (see AUDIT.md F-001).
       # Unset it and that harness skips instead of failing.
-      - D1ZZLE_FIXTURE_SCHEMA=/fixture/apps/api/src/db/schema/index.ts
+      - ORM_D1_FIXTURE_SCHEMA=/fixture/apps/api/src/db/schema/index.ts
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - HTTP_PROXY=${HTTP_PROXY:-}
       - NO_PROXY=${NO_PROXY:-}
@@ -79,6 +79,6 @@ services:
     command: sleep infinity
 
 volumes:
-  d1zzle-node-modules:
+  orm-d1-node-modules:
   bashhistory:
   npm-cache:

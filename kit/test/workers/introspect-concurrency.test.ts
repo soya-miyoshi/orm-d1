@@ -7,8 +7,8 @@
  * table/index count, not 1.
  */
 import { env } from 'cloudflare:test';
-import { createSchema } from 'd1zzle/ddl';
-import { index, integer, sqliteTable, text } from 'd1zzle';
+import { createSchema } from 'orm-d1/ddl';
+import { index, integer, sqliteTable, text } from 'orm-d1';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';

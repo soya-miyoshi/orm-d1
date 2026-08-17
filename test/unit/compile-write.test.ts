@@ -245,7 +245,7 @@ describe('update compilation', () => {
 		 * a `TypeError` from `valueChunk` reading `.config` off `Object`, after
 		 * the assignment had already rendered as `"Object" = ?` (`Object.name`
 		 * is the string `"Object"`). A caller cannot tell that apart from a
-		 * d1zzle crash, and `instanceof CompileError` is what an app branches on
+		 * orm-d1 crash, and `instanceof CompileError` is what an app branches on
 		 * to turn a bad request into a 400.
 		 */
 		it('refuses with a CompileError, not an internal TypeError', () => {

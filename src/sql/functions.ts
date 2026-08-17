@@ -47,7 +47,7 @@ export const max = <T>(operand: Column<any> | SQLChunk<T>): DecodedChunk<T | nul
 
 export const coalesce = <T>(...operands: (Column<any> | SQLChunk<T> | T)[]): SQLChunk<T> => {
 	// D1 caps any single SQL function at 32 arguments. `coalesce` is the only
-	// variadic one d1zzle builds, and this fires at the call site rather than
+	// variadic one orm-d1 builds, and this fires at the call site rather than
 	// as a bare "too many arguments on function coalesce" from SQLite.
 	if (operands.length > MAX_FUNCTION_ARGS) {
 		throw new CompileError(

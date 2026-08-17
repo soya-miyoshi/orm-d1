@@ -6,11 +6,11 @@
  * drizzle-kit's shape — it is a reasonable design, and matching it is what
  * makes importing an existing migration history possible.
  */
-import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName } from 'd1zzle/ddl';
-import type { TableOptionsMap } from 'd1zzle/ddl';
-import { appendOnlyKey, assertAppendOnlyColumns } from 'd1zzle/ddl';
-import type { Column, Table } from 'd1zzle';
-import { getTableColumns, getTableExtras, getTableName, isColumn } from 'd1zzle';
+import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName } from 'orm-d1/ddl';
+import type { TableOptionsMap } from 'orm-d1/ddl';
+import { appendOnlyKey, assertAppendOnlyColumns } from 'orm-d1/ddl';
+import type { Column, Table } from 'orm-d1';
+import { getTableColumns, getTableExtras, getTableName, isColumn } from 'orm-d1';
 
 /**
  * What a table's `appendOnly` option becomes in the snapshot.
@@ -46,7 +46,7 @@ export interface ColumnSnapshot {
 	readonly type: string;
 	/**
 	 * The exact string a `customType`'s `dataType(config)` declared, when this
-	 * column has one — `d1zzle/ddl`'s `typeName()` emits this verbatim instead
+	 * column has one — `orm-d1/ddl`'s `typeName()` emits this verbatim instead
 	 * of `type` (which is only ever a reduced SQLite storage-class affinity).
 	 * Absent on a snapshot written before this field existed, and absent for
 	 * every non-`customType` column; both read as "no declared type", i.e. fall
@@ -163,7 +163,7 @@ export interface TableSnapshot {
 	readonly checkConstraints: Record<string, { name: string; value: string }>;
 	/**
 	 * Physical-storage options and the append-only guard, from the sidecar
-	 * `tableOptions()` module (see `d1zzle/ddl`). Optional so a version-1
+	 * `tableOptions()` module (see `orm-d1/ddl`). Optional so a version-1
 	 * snapshot still parses; absent means `false`.
 	 *
 	 * `strict` and `withoutRowid` are properties of the `CREATE TABLE` itself, so
@@ -246,7 +246,7 @@ const columnSnapshot = (column: Column<any>): ColumnSnapshot => ({
  * `options` is the sidecar `tableOptions()` map. It is separate from the schema
  * module because `STRICT` / `WITHOUT ROWID` / triggers have no spelling in
  * `drizzle-orm/sqlite-core`, and docs/04 keeps the schema DSL a strict subset of
- * it — see the `TableOptions` docs in `d1zzle/ddl`.
+ * it — see the `TableOptions` docs in `orm-d1/ddl`.
  */
 export function snapshotFromSchema(
 	schema: Record<string, unknown> | readonly Table[],
@@ -404,7 +404,7 @@ export function snapshotFromSchema(
 
 const isTableLike = (value: unknown): value is Table =>
 	typeof value === 'object' && value !== null
-	&& Symbol.for('d1zzle:IsTable') in (value as Record<symbol, unknown>);
+	&& Symbol.for('ormD1:IsTable') in (value as Record<symbol, unknown>);
 
 /** The `CREATE TABLE` a snapshot table implies, without needing live objects. */
 export function createTableFromSnapshot(t: TableSnapshot): string {
@@ -444,7 +444,7 @@ export function createTableFromSnapshot(t: TableSnapshot): string {
 		parts.push(`constraint ${quote(check.name)} check (${check.value})`);
 	}
 
-	// Same order as `createTable` in `d1zzle/ddl`, and the same order
+	// Same order as `createTable` in `orm-d1/ddl`, and the same order
 	// `sqlite_master` reports back — which is what lets an introspected snapshot
 	// compare equal to a schema-derived one.
 	const suffix = [t.strict ? 'strict' : undefined, t.withoutRowid ? 'without rowid' : undefined]
@@ -609,12 +609,12 @@ const canonicalFk = (fk: ForeignKeySnapshot): string =>
  * SQLite's declared-type → affinity rules, verbatim from the documentation.
  *
  * A live database records whatever the `CREATE TABLE` said — `VARCHAR(255)`,
- * `BOOLEAN`, `DATETIME`, `INT` — while a d1zzle schema only ever produces the
+ * `BOOLEAN`, `DATETIME`, `INT` — while an orm-d1 schema only ever produces the
  * five canonical spellings. To SQLite those pairs are *identical*: affinity is
  * the whole of a column's type, and `VARCHAR(255)` is `TEXT`.
  *
  * Comparing the raw strings therefore reported a type change on every column of
- * every table that d1zzle did not create — which `pull` then turned into a
+ * every table that orm-d1 did not create — which `pull` then turned into a
  * destructive rebuild that rewrote the live types for no benefit. Compared by
  * affinity, a pulled schema is stable, and a genuine change (`INTEGER` to
  * `TEXT`) still differs because the affinities do.

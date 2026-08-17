@@ -1,5 +1,5 @@
 {
-	"name": "d1zzle",
+	"name": "orm-d1",
 	"version": "0.2.1",
 	"description": "A tiny, type-safe ORM built exclusively for Cloudflare D1 and Workers.",
 	"type": "module",
@@ -96,11 +96,11 @@
 	],
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/soya-miyoshi/d1zzle.git"
+		"url": "git+https://github.com/soya-miyoshi/orm-d1.git"
 	},
-	"homepage": "https://github.com/soya-miyoshi/d1zzle#readme",
+	"homepage": "https://github.com/soya-miyoshi/orm-d1#readme",
 	"bugs": {
-		"url": "https://github.com/soya-miyoshi/d1zzle/issues"
+		"url": "https://github.com/soya-miyoshi/orm-d1/issues"
 	},
 	"author": "Soya Miyoshi",
 	"publishConfig": {

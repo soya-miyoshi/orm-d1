@@ -1,5 +1,5 @@
 #!/bin/bash
-# Exec into the d1zzle devcontainer.
+# Exec into the orm-d1 devcontainer.
 #
 #   ./dev-exec                  interactive zsh
 #   ./dev-exec npm run check    run one command and exit
@@ -9,7 +9,7 @@
 
 set -uo pipefail
 
-CONTAINER_NAME="d1zzle-devcontainer"
+CONTAINER_NAME="orm-d1-devcontainer"
 
 if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo "Error: Container '${CONTAINER_NAME}' is not running."

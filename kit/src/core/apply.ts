@@ -342,10 +342,10 @@ export async function checkForeignTriggerConflicts(
 			if (!triggers || triggers.length === 0) continue;
 			throw new Error(
 				`Migration "${migration.tag}" would rebuild "${table}", but it carries trigger(s) `
-					+ `${triggers.map((t) => `"${t}"`).join(', ')} that d1zzle did not create. Rebuilding drops `
+					+ `${triggers.map((t) => `"${t}"`).join(', ')} that orm-d1 did not create. Rebuilding drops `
 					+ 'the table, which drops those triggers with it, and there is no way to reproduce a trigger '
-					+ 'd1zzle does not know the definition of. Drop the trigger, recreate it by hand after this '
-					+ 'migration runs, or bring it into the schema so d1zzle can carry it across rebuilds.',
+					+ 'orm-d1 does not know the definition of. Drop the trigger, recreate it by hand after this '
+					+ 'migration runs, or bring it into the schema so orm-d1 can carry it across rebuilds.',
 			);
 		}
 	}
@@ -372,7 +372,7 @@ export async function applyMigrations(
 
 	// Unconditional, not opt-in: this is the applier every `applyMigrations`
 	// caller goes through (the CLI's `migrate` and any Worker calling the
-	// public `d1zzle-migrate/core` entry directly), and the guard it replaces
+	// public `orm-d1-kit/core` entry directly), and the guard it replaces
 	// used to be bolted onto the CLI command only, which left a direct caller
 	// with no protection and no exported symbol to ask for it.
 	await checkForeignTriggerConflicts(runner, migrations);

@@ -10,16 +10,16 @@
 import { env } from 'cloudflare:test';
 import type { BetterAuthOptions } from 'better-auth/types';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { d1zzleAdapter } from '../../src/better-auth.js';
+import { ormD1Adapter } from '../../src/better-auth.js';
 import { createSchema } from '../../src/ddl.js';
-import { d1zzle, integer, sqliteTable, text } from '../../src/index.js';
+import { ormD1, integer, sqliteTable, text } from '../../src/index.js';
 
 const DB = (env as { DB: D1Database }).DB;
 
 // ------------------------------------------------------------------ fixture
 
 /**
- * Better Auth's four core models as a d1zzle schema.
+ * Better Auth's four core models as an orm-d1 schema.
  *
  * Deliberately awkward in the two ways a real project is: the table is named
  * `customers` rather than `user`, and `image` is stored on an `avatar_url`
@@ -84,10 +84,10 @@ const options = {
 	},
 } satisfies BetterAuthOptions;
 
-const db = d1zzle(DB);
+const db = ormD1(DB);
 
 const makeAdapter = () =>
-	d1zzleAdapter(db, { schema: { user, session, account, verification } })(options);
+	ormD1Adapter(db, { schema: { user, session, account, verification } })(options);
 
 const reset = async (): Promise<void> => {
 	for (const name of ['verification', 'account', 'session', 'customers']) {
@@ -134,14 +134,14 @@ describe('create', () => {
 	});
 
 	/**
-	 * A field the *Better Auth schema* knows about but the d1zzle table has no
+	 * A field the *Better Auth schema* knows about but the orm-d1 table has no
 	 * column for. A field neither of them knows about never reaches the adapter —
 	 * the factory drops it during input transform — so this is the only shape of
 	 * this mistake we can be asked about, and it is the one a half-finished
 	 * `additionalFields` produces.
 	 */
 	it('names an unbacked field, and the table, rather than failing at D1', async () => {
-		const adapter = d1zzleAdapter(db, { schema: { user, session, account, verification } })({
+		const adapter = ormD1Adapter(db, { schema: { user, session, account, verification } })({
 			...options,
 			user: {
 				fields: { image: 'avatarUrl' },
@@ -167,7 +167,7 @@ describe('create', () => {
 	 * change, and if they fix it our guard is what answers instead.
 	 */
 	it('cannot reach our field check for a prototype-shadowing name (upstream throws first)', async () => {
-		const adapter = d1zzleAdapter(db, { schema: { user, session, account, verification } })({
+		const adapter = ormD1Adapter(db, { schema: { user, session, account, verification } })({
 			...options,
 			user: {
 				fields: { image: 'avatarUrl' },
@@ -631,7 +631,7 @@ describe('the whole four-model shape', () => {
 	});
 
 	it('names the model when it is missing from `schema`', async () => {
-		const adapter = d1zzleAdapter(db, { schema: { user } })(options);
+		const adapter = ormD1Adapter(db, { schema: { user } })(options);
 		await expect(adapter.findOne({ model: 'session', where: [] })).rejects.toThrow(/session/);
 	});
 });

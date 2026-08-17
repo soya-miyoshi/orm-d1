@@ -4,8 +4,8 @@
  */
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { configureCasing, getTableName, isTable } from 'd1zzle';
-import { validateTableOptions } from 'd1zzle/ddl';
+import { configureCasing, getTableName, isTable } from 'orm-d1';
+import { validateTableOptions } from 'orm-d1/ddl';
 import {
 	appliedMigrations,
 	applyMigrations,
@@ -73,7 +73,7 @@ export async function resolveRunner(ctx: CommandContext, flags: TargetFlags): Pr
 		if (!accountId || !databaseId || !token) {
 			throw new Error(
 				'--remote needs accountId, databaseId and an API token. Set CLOUDFLARE_ACCOUNT_ID, '
-					+ 'CLOUDFLARE_D1_DATABASE_ID and CLOUDFLARE_API_TOKEN, or put them in d1zzle.config.ts.',
+					+ 'CLOUDFLARE_D1_DATABASE_ID and CLOUDFLARE_API_TOKEN, or put them in orm-d1.config.ts.',
 			);
 		}
 		const unusable = unusableRemoteId(databaseId);
@@ -260,7 +260,7 @@ export async function migrate(ctx: CommandContext, flags: TargetFlags = {}): Pro
 							: `${unknown.length} entries that look like migrations:\n`)
 						+ unknown.map((f) => `  - ${f}`).join('\n')
 						+ '\n\nThe kit reads wrangler\'s flat layout (`<tag>.sql` plus `meta/_journal.json`). '
-						+ 'Run `d1zzle-migrate pull` to start from a baseline snapshot of the live database, '
+						+ 'Run `orm-d1-kit pull` to start from a baseline snapshot of the live database, '
 						+ 'or convert the folder to that layout. Refusing to report "up to date" for a database '
 						+ 'that may have had nothing applied.',
 				);
@@ -358,7 +358,7 @@ export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	// against whatever came before it. The migration file is empty on purpose:
 	// the live database is already in this state, so applying it is a no-op
 	// that only records the baseline in the migrations table.
-	await writeMigration(ctx.config.out, tag, `-- Baseline introspected by d1zzle-migrate pull; nothing to apply.`);
+	await writeMigration(ctx.config.out, tag, `-- Baseline introspected by orm-d1-kit pull; nothing to apply.`);
 	await writeSnapshot(ctx.config.out, index, { ...snapshot, id: tag });
 	await writeJournal(ctx.config.out, appendEntry(journal, tag, ctx.now()));
 
@@ -400,7 +400,7 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 
 		for (const column of Object.values(table.columns)) {
 			// By affinity, so a live column declared `VARCHAR(255)`, `BOOLEAN` or
-			// `INT` — anything not written by d1zzle — maps to the factory
+			// `INT` — anything not written by orm-d1 — maps to the factory
 			// SQLite would actually give it, rather than collapsing to `text`.
 			// `numeric` used to fall through to `text` here despite being one of
 			// our own column types.
@@ -528,7 +528,7 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 		lines.push(']);', '');
 	}
 
-	lines[0] = `import { ${[...imports].sort().join(', ')} } from 'd1zzle';`;
+	lines[0] = `import { ${[...imports].sort().join(', ')} } from 'orm-d1';`;
 
 	return lines.join('\n');
 }

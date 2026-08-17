@@ -1,10 +1,10 @@
 /**
- * `d1zzle/relations` — `defineRelations` and `db.query`.
+ * `orm-d1/relations` — `defineRelations` and `db.query`.
  *
  * A separate entry point, so users who never touch relational queries never
  * parse this code (rule R5).
  */
-import type { D1zzleDatabase } from '../runtime/database.js';
+import type { OrmD1Database } from '../runtime/database.js';
 import type { Column, ColumnMeta } from '../schema/columns.js';
 import type { InferSelect, Simplify } from '../schema/infer.js';
 import type { Table, TableColumns } from '../schema/table.js';
@@ -235,10 +235,10 @@ export type { RelationalStrategy } from '../runtime/database.js';
 import type { RelationalStrategy } from '../runtime/database.js';
 
 export function withRelations<TRelations extends RelationsConfig>(
-	db: D1zzleDatabase,
+	db: OrmD1Database,
 	relations: TRelations,
 	strategy: RelationalStrategy = 'split',
-): D1zzleDatabase & { query: QueryAPI<TRelations>; _: RelationalMeta<TRelations> } {
+): OrmD1Database & { query: QueryAPI<TRelations>; _: RelationalMeta<TRelations> } {
 	const config = relations as RelationsConfig;
 	const query: Record<string, RelationalQueryBuilder> = {};
 	const fullSchema: Record<string, Table> = {};
@@ -258,15 +258,15 @@ export function withRelations<TRelations extends RelationsConfig>(
 
 	// `withSession()` builds a fresh database around the session binding, and
 	// cannot reach this module to re-attach the relational surface itself. The
-	// hook is how it gets it back — see `D1zzleDatabase.withSession`.
+	// hook is how it gets it back — see `OrmD1Database.withSession`.
 	const attached = Object.assign(db, {
 		query,
 		_: meta,
-		$reattach: (derived: D1zzleDatabase) => void withRelations(derived, relations, strategy),
+		$reattach: (derived: OrmD1Database) => void withRelations(derived, relations, strategy),
 	});
 
 	return attached as unknown as
-		& D1zzleDatabase
+		& OrmD1Database
 		& { query: QueryAPI<TRelations>; _: RelationalMeta<TRelations> };
 }
 

@@ -303,7 +303,7 @@ const compileRelationFilter = (
 ): Condition | undefined => {
 	if (value === undefined) return undefined;
 
-	const target = alias(relation.targetTable, `d1zzle_f${depth}`);
+	const target = alias(relation.targetTable, `ormd1_f${depth}`);
 	const targetColumns = getTableColumns(target) as Record<string, Column<any>>;
 	const rebind = (columns: Record<string, Column<any>>) => {
 		const byName = new Map(Object.values(columns).map((c) => [c.name, c]));
@@ -315,7 +315,7 @@ const compileRelationFilter = (
 	// A relation names the *declared* columns of its two tables. One level
 	// down, the table this filter applies to is itself an alias, so the
 	// correlating side has to be re-bound too or the subquery would compare
-	// against `"posts"."id"` when the outer row is `"d1zzle_f0"."id"`.
+	// against `"posts"."id"` when the outer row is `"ormd1_f0"."id"`.
 	const outer = rebind(sourceColumns);
 	const source = (relation.sourceColumns ?? []).map(outer);
 	const targets = relation.targetColumns ?? [];
@@ -324,7 +324,7 @@ const compileRelationFilter = (
 	let joinCondition: Condition | undefined;
 
 	if (relation.through && relation.throughTable) {
-		const junction = alias(relation.throughTable, `d1zzle_ft${depth}`);
+		const junction = alias(relation.throughTable, `ormd1_ft${depth}`);
 		const junctionColumns = getTableColumns(junction) as Record<string, Column<any>>;
 		const junctionByName = new Map(Object.values(junctionColumns).map((c) => [c.name, c]));
 		const viaSource = relation.through.source.map((c) => junctionByName.get(c.name) ?? c);

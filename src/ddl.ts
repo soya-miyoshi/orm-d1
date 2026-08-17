@@ -2,7 +2,7 @@
  * Schema → DDL. A separate entry point: the core query builder never reaches
  * this module, so it costs the Worker bundle nothing (rule R5).
  *
- * `d1zzle-migrate` generates migrations from exactly these strings, which is what
+ * `orm-d1-kit` generates migrations from exactly these strings, which is what
  * keeps "what the schema says" and "what the migration does" in one place.
  */
 import type { Column } from './schema/columns.js';
@@ -24,7 +24,7 @@ import { defaultRenderContext, quoteIdentifier, render } from './sql/sql.js';
  * from `sql.raw(…)`, so parameter slots are marked with something that cannot
  * appear in SQL text instead of being recovered by counting `?`s afterwards.
  */
-const PARAM_TOKEN = '\u0000d1zzle:param\u0000';
+const PARAM_TOKEN = '\u0000orm-d1:param\u0000';
 
 /** DDL cannot qualify column names with a table, and cannot bind parameters. */
 const ddlContext: RenderContext = { ...defaultRenderContext, bareColumns: true, paramToken: PARAM_TOKEN };
@@ -51,15 +51,15 @@ export interface DDLOptions {
  * These live here rather than in the schema DSL on purpose. `STRICT`,
  * `WITHOUT ROWID` and triggers have no spelling in `drizzle-orm/sqlite-core`,
  * and docs/04 makes "every symbol a schema file uses also exists in Drizzle" a
- * standing constraint — it is what keeps a d1zzle schema reverse-aliasable and
- * therefore what lets `d1zzle-migrate studio` delegate to `drizzle-kit studio`.
+ * standing constraint — it is what keeps an orm-d1 schema reverse-aliasable and
+ * therefore what lets `orm-d1-kit studio` delegate to `drizzle-kit studio`.
  * Putting them on `table()` would break that for every user.
  *
  * So they are declared in a **sidecar module** the schema file never imports:
  *
  * ```ts
  * // src/db/table-options.ts
- * import { tableOptions } from 'd1zzle/ddl';
+ * import { tableOptions } from 'orm-d1/ddl';
  * import { users, announcementReads } from './schema';
  *
  * export default tableOptions([
@@ -93,7 +93,7 @@ export interface TableOptions {
 }
 
 /** Marks the value a sidecar module default-exports, so the kit can find it. */
-export const TableOptionsBrand = Symbol.for('d1zzle:TableOptions');
+export const TableOptionsBrand = Symbol.for('ormD1:TableOptions');
 
 export interface TableOptionsMap {
 	readonly [TableOptionsBrand]: true;
@@ -181,7 +181,7 @@ export const dropAppendOnlyTrigger = (tableName: string): string =>
 /**
  * SQLite's `STRICT` allow-list, verified against D1 rather than taken from the
  * docs: a `NUMERIC` column in a strict table is rejected outright with
- * `unknown datatype`. `numeric()` is the only d1zzle column type that produces
+ * `unknown datatype`. `numeric()` is the only orm-d1 column type that produces
  * one, so it is the only type this can catch.
  */
 const STRICT_TYPES = new Set(['int', 'integer', 'real', 'text', 'blob', 'any']);

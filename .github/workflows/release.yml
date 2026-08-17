@@ -1,4 +1,4 @@
-# Publishes `d1zzle` and `d1zzle-migrate` to npm, in lockstep, from a GitHub Release.
+# Publishes `orm-d1` and `orm-d1-kit` to npm, in lockstep, from a GitHub Release.
 #
 # Authentication is npm **trusted publishing** (OIDC): no NPM_TOKEN, no
 # long-lived secret to rotate. The `id-token: write` permission below is what
@@ -8,7 +8,7 @@
 #
 # One-time setup on npmjs.com, per package, before the first automated run:
 #   Package → Settings → Trusted Publisher → GitHub Actions
-#     repository: <owner>/d1zzle     workflow: release.yml
+#     repository: <owner>/orm-d1     workflow: release.yml
 # npm's UI attaches a trusted publisher to a package that already exists, so the
 # very first publish of each package is normally done by hand. See RELEASING.md.
 name: Release
@@ -59,16 +59,16 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"
           root=$(node -p "require('./package.json').version")
           kit=$(node -p "require('./kit/package.json').version")
-          peer=$(node -p "require('./kit/package.json').peerDependencies.d1zzle")
+          peer=$(node -p "require('./kit/package.json').peerDependencies['orm-d1']")
 
-          echo "tag=$tag root=$root kit=$kit kit.peer(d1zzle)=$peer"
+          echo "tag=$tag root=$root kit=$kit kit.peer(orm-d1)=$peer"
 
-          [ "$tag" = "$root" ] || { echo "::error::tag $tag != d1zzle $root"; exit 1; }
-          [ "$tag" = "$kit" ]  || { echo "::error::tag $tag != d1zzle-migrate $kit"; exit 1; }
+          [ "$tag" = "$root" ] || { echo "::error::tag $tag != orm-d1 $root"; exit 1; }
+          [ "$tag" = "$kit" ]  || { echo "::error::tag $tag != orm-d1-kit $kit"; exit 1; }
 
           # Lockstep means the peer range must admit the version being published.
           npx --yes semver -r "$peer" "$root" >/dev/null \
-            || { echo "::error::d1zzle-migrate peer range '$peer' does not admit $root"; exit 1; }
+            || { echo "::error::orm-d1-kit peer range '$peer' does not admit $root"; exit 1; }
 
       # typecheck -> build -> test (unit + workerd) -> kit typecheck -> kit build.
       # This is the same gate `prepublishOnly` runs locally, and it produces both
@@ -86,7 +86,7 @@ jobs:
       # packages, so this is the cheapest guard against an empty or bloated
       # tarball reaching the registry.
       # Note: `--prefix kit` does NOT work here — npm still reads the root
-      # package.json and packs d1zzle twice. The working directory is what
+      # package.json and packs orm-d1 twice. The working directory is what
       # selects the package.
       - name: Show tarball contents
         run: npm pack --dry-run
@@ -99,13 +99,13 @@ jobs:
       # both packages. Without it, `prepublishOnly` runs the entire suite a
       # second time per package, and kit's would rebuild against a `dist/` it
       # does not own.
-      - name: Publish d1zzle
+      - name: Publish orm-d1
         if: github.event_name == 'release' || inputs.dry_run == false
         run: npm publish --ignore-scripts
 
-      # Order matters: d1zzle-migrate peer-depends on d1zzle, so the dependency is
+      # Order matters: orm-d1-kit peer-depends on orm-d1, so the dependency is
       # on the registry before anything can resolve the dependent.
-      - name: Publish d1zzle-migrate
+      - name: Publish orm-d1-kit
         if: github.event_name == 'release' || inputs.dry_run == false
         working-directory: kit
         run: npm publish --ignore-scripts

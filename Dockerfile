@@ -1,4 +1,4 @@
-# d1zzle devcontainer.
+# orm-d1 devcontainer.
 #
 # Deliberately leaner than the sibling product repo's image: this package has no
 # browser tests, no payment CLI and no native modules, so Playwright, Chromium,

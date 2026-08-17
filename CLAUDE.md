@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-d1zzle — a type-safe ORM built **exclusively** for Cloudflare D1 and Workers, plus its
+orm-d1 — a type-safe ORM built **exclusively** for Cloudflare D1 and Workers, plus its
 migration CLI. `docs/01`–`docs/07` は使う側向けのドキュメント（挙動の差、機能、
 移行、セキュリティ）で、`kit/README.md` が CLI のリファレンス。振る舞いを変えるなら
 先に該当のものを読み、変えたら直す。設計ドキュメントは 2026-08-16 に削除した ——

@@ -1,5 +1,5 @@
 /**
- * The bridge that lets a Drizzle `SQL` fragment render inside a d1zzle query.
+ * The bridge that lets a Drizzle `SQL` fragment render inside an orm-d1 query.
  *
  * Nothing here imports `drizzle-orm`. Drizzle's entity system is built on
  * `Symbol.for('drizzle:entityKind')` statics walked up the constructor chain,
@@ -39,7 +39,7 @@ export const isDrizzleSQL = (value: unknown): boolean =>
  * Anything Drizzle can turn into a fragment: a `SQL`, or a `SQLWrapper` such as
  * a Drizzle column, table or aggregate.
  *
- * Our own chunks are excluded by the `toQuery` test — a d1zzle `Column` also has
+ * Our own chunks are excluded by the `toQuery` test — an orm-d1 `Column` also has
  * `getSQL()` (it is a `SQLWrapper` on purpose), and it must keep rendering
  * through our own path.
  */
@@ -59,7 +59,7 @@ export const isForeignSQL = (value: unknown): boolean => {
  * `ph` slots, which is exactly the same deferral.
  */
 /**
- * A d1zzle `Placeholder` that has been interpolated into a Drizzle fragment.
+ * An orm-d1 `Placeholder` that has been interpolated into a Drizzle fragment.
  *
  * Drizzle does not recognise it, so it wraps it as a plain bound value and it
  * would reach `.bind()` as an object — `D1_TYPE_ERROR: Type 'object' not

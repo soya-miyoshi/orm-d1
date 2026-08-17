@@ -1,7 +1,7 @@
 /**
- * A database d1zzle did not create.
+ * A database orm-d1 did not create.
  *
- * Every other test in this suite starts from a d1zzle schema, so both sides of
+ * Every other test in this suite starts from an orm-d1 schema, so both sides of
  * every comparison only ever see the five canonical type spellings —
  * `integer`, `text`, `real`, `blob`, `numeric`. The fuzz generator draws from
  * three of those. That is the wrong shape for `pull`, whose entire purpose is a
@@ -68,7 +68,7 @@ describe('SQLite type affinity', () => {
 	});
 });
 
-describe('introspecting a database d1zzle did not write', () => {
+describe('introspecting a database orm-d1 did not write', () => {
 	it('reads every column back', async () => {
 		const snapshot = await introspect(runner);
 		expect(Object.keys(snapshot.tables['accounts']!.columns)).toEqual([
@@ -98,7 +98,7 @@ describe('introspecting a database d1zzle did not write', () => {
 	it('does not see a type change merely because the spelling is not canonical', async () => {
 		const live = await introspect(runner);
 
-		// The same table as a d1zzle schema would describe it: canonical
+		// The same table as an orm-d1 schema would describe it: canonical
 		// spellings throughout, which is what `pull` writes into the module.
 		const canonical = structuredClone(live) as typeof live;
 		const columns = canonical.tables['accounts']!.columns as Record<string, { type: string }>;
@@ -128,7 +128,7 @@ describe('introspecting a database d1zzle did not write', () => {
 
 	it('does not mistake a hand-written conditional guard for the append-only trigger', async () => {
 		// The standard conditional-constraint idiom: a bare `SELECT RAISE(ABORT,
-		// …) WHERE <cond>` — not d1zzle's unconditional guard.
+		// …) WHERE <cond>` — not orm-d1's unconditional guard.
 		await DB.prepare(
 			`create trigger "accounts_balance_immutable" before update on "accounts" begin `
 				+ `select raise(abort, 'balance is immutable') where new."balance" <> old."balance"; end`,

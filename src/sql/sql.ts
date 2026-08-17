@@ -3,7 +3,7 @@
  * themselves into `{ sql, params }`.
  *
  * D1 only speaks positional `?` parameters, so a query is fully described by a
- * string and a flat parameter list. Everything in d1zzle compiles down to this.
+ * string and a flat parameter list. Everything in orm-d1 compiles down to this.
  */
 
 import { CompileError } from '../errors.js';

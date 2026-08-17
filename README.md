@@ -1,22 +1,22 @@
-# d1zzle
+# orm-d1
 
-[![CI](https://github.com/soya-miyoshi/d1zzle/actions/workflows/ci.yml/badge.svg)](https://github.com/soya-miyoshi/d1zzle/actions/workflows/ci.yml)
-[![Release](https://github.com/soya-miyoshi/d1zzle/actions/workflows/release.yml/badge.svg)](https://github.com/soya-miyoshi/d1zzle/actions/workflows/release.yml)
-[![d1zzle on npm](https://img.shields.io/npm/v/d1zzle?label=d1zzle)](https://www.npmjs.com/package/d1zzle)
-[![d1zzle-migrate on npm](https://img.shields.io/npm/v/d1zzle-migrate?label=d1zzle-migrate)](https://www.npmjs.com/package/d1zzle-migrate)
+[![CI](https://github.com/soya-miyoshi/orm-d1/actions/workflows/ci.yml/badge.svg)](https://github.com/soya-miyoshi/orm-d1/actions/workflows/ci.yml)
+[![Release](https://github.com/soya-miyoshi/orm-d1/actions/workflows/release.yml/badge.svg)](https://github.com/soya-miyoshi/orm-d1/actions/workflows/release.yml)
+[![orm-d1 on npm](https://img.shields.io/npm/v/orm-d1?label=orm-d1)](https://www.npmjs.com/package/orm-d1)
+[![orm-d1-kit on npm](https://img.shields.io/npm/v/orm-d1-kit?label=orm-d1-kit)](https://www.npmjs.com/package/orm-d1-kit)
 
-d1zzle is an ORM for Cloudflare D1. It supports D1 and nothing else. Its API is taken from
+orm-d1 is an ORM for Cloudflare D1. It supports D1 and nothing else. Its API is taken from
 Drizzle — the same schema DSL, the same query builder, the same inferred types — and the
-parts that exist to abstract over other databases are removed. `d1zzle-migrate` is the
+parts that exist to abstract over other databases are removed. `orm-d1-kit` is the
 migration CLI, installed separately and used only during development.
 
 ```bash
-npm install d1zzle
-npm install -D d1zzle-migrate
+npm install orm-d1
+npm install -D orm-d1-kit
 ```
 
 ```ts
-import { drizzle, eq, integer, sqliteTable, text } from 'd1zzle';
+import { drizzle, eq, integer, sqliteTable, text } from 'orm-d1';
 
 export const users = sqliteTable('users', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -52,7 +52,7 @@ SQL it emits, and the error text.
 ### [`db.insert(users).values(rows)`][d-insert] — 500 rows, 4 columns each
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 One statement carrying 2,000 bound parameters. D1 rejects it: `D1_ERROR: too many SQL variables`. Splitting the array is left to the caller, and the pieces are then separate writes — a failure in the fourth leaves the first three applied.
@@ -67,7 +67,7 @@ One statement carrying 2,000 bound parameters. D1 rejects it: `D1_ERROR: too man
 ### [`where(inArray(users.id, ids))`][d-inarray] — 201 ids
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 `in (?, ?, ?, …)` — one parameter per value, so the same 100-parameter limit rejects it. Staying under it means splitting the query and merging the results.
@@ -82,7 +82,7 @@ One statement carrying 2,000 bound parameters. D1 rejects it: `D1_ERROR: too man
 ### [`db.transaction(async (tx) => …)`][d-batch]
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 Runs `begin`, your statements, then `commit` as separate statements. D1 does not guarantee they reach the same connection, so the `begin` can apply where the writes do not: a failure part-way leaves earlier writes applied and `rollback` with nothing to undo.
@@ -97,7 +97,7 @@ Runs `begin`, your statements, then `commit` as separate statements. D1 does not
 ### [`db.batch([db.select({ a: users.id, b: posts.id })…])`][d-collision] — a join projecting two `id` columns
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 `batch()` returns keyed row objects, and two columns named `id` occupy one key. The conversion back to an array (`Object.keys(row).map(…)`) therefore runs on a row that is already one value short. Drizzle's source notes the case in a comment.
@@ -112,7 +112,7 @@ The collision is found while compiling, when the projection is still known, and 
 ### [`db.withSession(bookmark)`][d-session]
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 Not available: `withSession` does not appear in the package. Reading from a replica means calling `env.DB.withSession()` directly and writing the SQL by hand.
@@ -127,7 +127,7 @@ Returns the same API — `select`, `insert`, `db.query` — plus `session.bookma
 ### [`drizzle(env.DB, { onQuery })`][d-onquery] — reading `rows_read` / `rows_written`
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 `logger` receives the SQL and its parameters. Selects read through `.raw()`, which returns rows without D1's `meta`, so the billed row counts never reach the caller.
@@ -142,7 +142,7 @@ Returns the same API — `select`, `insert`, `db.query` — plus `session.bookma
 ### [`query.select()…compile()`][d-compile] — building SQL once per isolate
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 `.prepare()` is a method on a builder that holds a session, and the session holds the binding. On Workers the binding arrives with the request, so the SQL string is built again inside every `fetch`.
@@ -157,7 +157,7 @@ Compilation is separate from execution: `query.select()` needs no binding, so a 
 ### [Exceeding another D1 limit][d-limits]
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 The statement is sent and D1's error comes back naming the constraint but not the call site: `too many SQL variables` does not say which `inArray`, and `too many arguments on function coalesce` does not say which `coalesce`.
@@ -172,7 +172,7 @@ The limits knowable at compile time are checked there, once per isolate, and the
 ### [Free and paid plan caps][d-plan]
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 No plan awareness. 50 statements per Worker invocation and 500 MB on the free plan are found by hitting them.
@@ -187,7 +187,7 @@ No plan awareness. 50 statements per Worker invocation and 500 MB on the free pl
 ### [Bundle size][d-size]
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 77.8 kB minified, 22.2 kB gzipped, for driver + schema DSL: the dialect indirection, the transaction and savepoint subsystem, and prepared-statement abstractions covering sync and async drivers are all reachable from the entry point.
@@ -205,7 +205,7 @@ Drizzle][beyond] covers each one in full.
 ### [Append-only tables, and append-only columns][b-append]
 
 <table>
-<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 Neither `drizzle-orm/sqlite-core` nor `drizzle-kit` has a spelling for a trigger, so a `before update … raise(abort)` guard is written by hand inside a migration. The schema does not record it, and nothing reports its absence afterwards.
@@ -220,7 +220,7 @@ Neither `drizzle-orm/sqlite-core` nor `drizzle-kit` has a spelling for a trigger
 ### [`latestPerGroup(db, table, { partitionBy, orderBy, tiebreak })`][b-latest]
 
 <table>
-<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-orm@1.0.0-rc.4</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 SQLite has no `distinct on`, and `row_number()` cannot appear in `where`. One row per group is written by hand: `order by … limit 1` per group is one query per group and not deterministic on a millisecond timestamp, and keeping the first row seen per key in JavaScript transfers the whole history to return its last page.
@@ -235,7 +235,7 @@ One statement: a `row_number() over (partition by …)` subquery with an outer f
 ### [`STRICT` and `WITHOUT ROWID`][b-strict]
 
 <table>
-<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 No spelling for either. The clause is added to the generated `create table` by hand, and whether the table satisfies it is found out when the migration runs.
@@ -247,10 +247,10 @@ Table options in the same sidecar module, both validated at `generate` against b
 </td></tr>
 </table>
 
-### [`d1zzle-migrate impact`][b-impact]
+### [`orm-d1-kit impact`][b-impact]
 
 <table>
-<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 No command. D1 rejects `PRAGMA foreign_keys = OFF` inside a migration, so rebuilding a referenced table means dropping every foreign key pointing at it first — and dropping a foreign key rebuilds the table holding it, transitively. What a rebuild costs is worked out by reading the schema.
@@ -262,10 +262,10 @@ No command. D1 rejects `PRAGMA foreign_keys = OFF` inside a migration, so rebuil
 </td></tr>
 </table>
 
-### [`d1zzle-migrate backfill`][b-backfill]
+### [`orm-d1-kit backfill`][b-backfill]
 
 <table>
-<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 No command. Filling a column on an append-only table means dropping the guard, writing, and re-creating it by hand. Both failure modes are silent: a re-created list one column short reads as protection without being it, and an omitted re-create leaves the table accepting `UPDATE`s indefinitely.
@@ -280,7 +280,7 @@ The guard is read out of `sqlite_master`, dropped, and re-created **from the cap
 ### [`generate --emit-roundtrip`][b-roundtrip]
 
 <table>
-<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 The rebuild is emitted as one migration, and splitting it into passes that D1 can apply is left to the caller. The obvious three passes — drop the children's foreign keys, rebuild the parent, restore them — do not work: dropping a child's foreign key is a rebuild of that child, refused for the same reason whenever that child has children of its own.
@@ -295,7 +295,7 @@ One draft file per refused table, under `<out>/roundtrip/`, holding the passes i
 ### [Vocabulary divergence between `check` constraints][b-vocab]
 
 <table>
-<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On d1zzle</th></tr>
+<tr><th width="50%">On <code>drizzle-kit</code></th><th width="50%">On orm-d1</th></tr>
 <tr><td>
 
 `check ("method" in ('card', 'cash'))` is per table, and nothing compares one table's copy with another's. A vocabulary widened at three call sites and missed at the fourth fails at an `INSERT`, on the one path that writes the new value.
@@ -324,7 +324,7 @@ for a single reason: `db.transaction is not a function` says nothing about what 
 instead, and the thrown message does. That costs one error class in the bundle; the
 transaction and savepoint subsystem it would otherwise pull in is not there.
 
-**`experimental.joins` (Better Auth adapter) — throws `D1zzleAdapterError`, naming the
+**`experimental.joins` (Better Auth adapter) — throws `OrmD1AdapterError`, naming the
 models the call asked to join.** The adapter is built on `select` / `insert` / `update` /
 `delete` alone. The alternative to failing is dropping the joined models from the result,
 which returns rows that look complete, so the option is refused rather than partly
@@ -337,7 +337,7 @@ table. `defineRelations()` states the join once, explicitly, on either side. Kee
 as well would ship a second relation resolver to every isolate to express the same graph
 less precisely.
 
-**Views (`sqliteView`) — not exported.** `d1zzle-migrate` reads
+**Views (`sqliteView`) — not exported.** `orm-d1-kit` reads
 `type in ('table', 'index', 'trigger')` out of `sqlite_master`, so a view declared in a
 schema file would never be created, diffed, or dropped: the schema would name an object the
 migrations do not manage. Create one in a migration and query it with
@@ -361,9 +361,9 @@ query cost are `rows_read` and `rows_written`, which arrive on the response `met
 `onQuery` reports those. `schema` took a v0 schema module; the v1 replacement is
 `relations`.
 
-**`drizzle-kit studio` — `d1zzle-migrate` has no `studio` command.** There is nothing to
+**`drizzle-kit studio` — `orm-d1-kit` has no `studio` command.** There is nothing to
 reimplement: the Drizzle Studio browser extension introspects the live database and never
-loads a schema file, so it works against a d1zzle project unchanged, and Cloudflare's D1
+loads a schema file, so it works against an orm-d1 project unchanged, and Cloudflare's D1
 console covers ad-hoc queries.
 
 ## Documentation
@@ -377,7 +377,7 @@ console covers ad-hoc queries.
 | [Adapters][adapters] | `@pothos/plugin-drizzle`, and the Better Auth adapter |
 | [Entry points and dependencies][entry-points] | The seven import paths, and which optional peer each needs |
 | [Security][security] | What the compiler guarantees, the three APIs that opt out of it, and why the filter DSL is a trust boundary |
-| [`d1zzle-migrate`][kit] | The CLI: configuration, environment resolution, commands, and what it does differently from `drizzle-kit` |
+| [`orm-d1-kit`][kit] | The CLI: configuration, environment resolution, commands, and what it does differently from `drizzle-kit` |
 
 ## Scope
 
@@ -409,7 +409,7 @@ compilation output; `test/workers/` and `kit/test/workers/` run inside workerd a
 real D1 binding, and every claim about SQLite's or D1's actual behaviour is asserted
 there.
 
-`d1zzle` and `d1zzle-migrate` are published together from one GitHub Release — the Release
+`orm-d1` and `orm-d1-kit` are published together from one GitHub Release — the Release
 badge above is that workflow — using npm trusted publishing (OIDC, no long-lived token),
 with provenance attestations. `npm run version:set <version>` moves both packages and the
 kit's peer range together. See [RELEASING.md](./RELEASING.md).
@@ -443,28 +443,28 @@ MIT — see [LICENSE](./LICENSE). The warranty and liability clauses mean what t
 
 <!-- Absolute URLs: npm rewrites relative links against a branch that may not exist. -->
 
-[kit]: https://github.com/soya-miyoshi/d1zzle/blob/main/kit/README.md
-[security]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/07-security.md
-[differences]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md
-[beyond]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/02-beyond-drizzle.md
-[relational]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/03-relational-queries.md
-[migrating]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/04-migrating-from-drizzle.md
-[adapters]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/05-adapters.md
-[entry-points]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/06-entry-points.md
-[d-insert]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#inserting-more-rows-than-one-statement-can-carry
-[d-inarray]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#matching-a-column-against-a-long-list
-[d-batch]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#grouping-writes-so-that-they-all-succeed-or-all-fail
-[d-collision]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#a-joined-select-inside-batch-that-projects-two-columns-with-the-same-name
-[d-session]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#reading-from-a-replica-and-reading-your-own-writes
-[d-onquery]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#seeing-what-a-query-cost
-[d-compile]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#building-a-query-once-per-isolate-instead-of-once-per-request
-[d-limits]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#d1s-other-limits
-[d-plan]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#plan-dependent-limits
-[d-size]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/01-differences.md#bundle-size
-[b-append]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/02-beyond-drizzle.md#append-only-tables-and-append-only-columns
-[b-latest]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/02-beyond-drizzle.md#latestpergroup
-[b-strict]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/02-beyond-drizzle.md#strict-and-without-rowid
-[b-impact]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/02-beyond-drizzle.md#impact
-[b-backfill]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/02-beyond-drizzle.md#backfill
-[b-roundtrip]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/02-beyond-drizzle.md#generate---emit-roundtrip
-[b-vocab]: https://github.com/soya-miyoshi/d1zzle/blob/main/docs/02-beyond-drizzle.md#vocabulary-divergence
+[kit]: https://github.com/soya-miyoshi/orm-d1/blob/main/kit/README.md
+[security]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/07-security.md
+[differences]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md
+[beyond]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/02-beyond-drizzle.md
+[relational]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/03-relational-queries.md
+[migrating]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/04-migrating-from-drizzle.md
+[adapters]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/05-adapters.md
+[entry-points]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/06-entry-points.md
+[d-insert]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#inserting-more-rows-than-one-statement-can-carry
+[d-inarray]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#matching-a-column-against-a-long-list
+[d-batch]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#grouping-writes-so-that-they-all-succeed-or-all-fail
+[d-collision]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#a-joined-select-inside-batch-that-projects-two-columns-with-the-same-name
+[d-session]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#reading-from-a-replica-and-reading-your-own-writes
+[d-onquery]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#seeing-what-a-query-cost
+[d-compile]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#building-a-query-once-per-isolate-instead-of-once-per-request
+[d-limits]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#d1s-other-limits
+[d-plan]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#plan-dependent-limits
+[d-size]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/01-differences.md#bundle-size
+[b-append]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/02-beyond-drizzle.md#append-only-tables-and-append-only-columns
+[b-latest]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/02-beyond-drizzle.md#latestpergroup
+[b-strict]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/02-beyond-drizzle.md#strict-and-without-rowid
+[b-impact]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/02-beyond-drizzle.md#impact
+[b-backfill]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/02-beyond-drizzle.md#backfill
+[b-roundtrip]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/02-beyond-drizzle.md#generate---emit-roundtrip
+[b-vocab]: https://github.com/soya-miyoshi/orm-d1/blob/main/docs/02-beyond-drizzle.md#vocabulary-divergence

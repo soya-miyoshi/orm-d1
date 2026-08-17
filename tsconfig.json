@@ -22,9 +22,9 @@
     "noEmit": true,
 
     "paths": {
-      "d1zzle": ["./src/index.ts"],
-      "d1zzle/ddl": ["./src/ddl.ts"],
-      "d1zzle/relations": ["./src/relations/index.ts"]
+      "orm-d1": ["./src/index.ts"],
+      "orm-d1/ddl": ["./src/ddl.ts"],
+      "orm-d1/relations": ["./src/relations/index.ts"]
     }
   },
   "include": ["src", "test", "kit/test"],

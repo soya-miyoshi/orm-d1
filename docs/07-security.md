@@ -1,8 +1,8 @@
 # Security
 
-What d1zzle guarantees, what it does not, and where the boundary sits.
+What orm-d1 guarantees, what it does not, and where the boundary sits.
 
-Values are always bound and identifiers are always quoted, so d1zzle does not produce
+Values are always bound and identifiers are always quoted, so orm-d1 does not produce
 injectable SQL from data. What it does produce, on request, is a query — and a query built
 from an attacker's description is an attacker's query, however carefully every value in it
 was bound.
@@ -25,13 +25,13 @@ These hold for every query the builder emits.
 - **DDL parameter inlining uses a NUL sentinel**, not a `?` count, so a literal `?` inside
   a `sql.raw(...)` check constraint cannot be mistaken for a bound slot.
 - **Bound parameters do not leave the process outside development builds.** They are
-  stripped from `QueryEvent` and `D1zzleQueryError`; the SQL text always rides along, and
+  stripped from `QueryEvent` and `OrmD1QueryError`; the SQL text always rides along, and
   contains no values. `test/workers/integration.test.ts` asserts the omission.
 
 ## The escape hatches, and what they cost
 
 Three APIs let text you supply reach the statement without being checked. None of them can
-be made safe by d1zzle:
+be made safe by orm-d1:
 
 | API | What it skips |
 | --- | --- |
@@ -92,7 +92,7 @@ That is what a filter language is; the boundary belongs to the application:
   caller-supplied `OR` at the top level answers around it.
 
 The same applies to `columns` (which fields come back), `with` (how far the traversal goes)
-and `orderBy`. For `limit`, d1zzle validates the type only; a caller-chosen `limit` of
+and `orderBy`. For `limit`, orm-d1 validates the type only; a caller-chosen `limit` of
 100000 is a caller-chosen `rows_read` bill.
 
 ### Prototype keys
@@ -113,7 +113,7 @@ spelled: a real column named `constructor` still works. The sites are pinned by
 
 An unknown filter field is refused with the list of columns and relations that would have
 been valid — useful for a developer typo, useful to a probing client. **Do not forward
-d1zzle error messages to untrusted callers.** `CompileError` and `D1zzleQueryError` are the
+orm-d1 error messages to untrusted callers.** `CompileError` and `OrmD1QueryError` are the
 two to catch; the latter also carries `.sql`.
 
 Compile-time refusals are reachable from caller-controlled input in a few places by size
@@ -123,11 +123,11 @@ caller's to choose.
 
 ## The migration CLI
 
-`d1zzle-migrate` is a devDependency and ships no bytes to the Worker, but it holds
+`orm-d1-kit` is a devDependency and ships no bytes to the Worker, but it holds
 credentials and writes to production databases.
 
 - **`--remote` needs a Cloudflare API token with D1 write scope.** Prefer
-  `CLOUDFLARE_API_TOKEN` in the environment. `d1.token` in `d1zzle.config.ts` is supported,
+  `CLOUDFLARE_API_TOKEN` in the environment. `d1.token` in `orm-d1.config.ts` is supported,
   but a config file is a thing that gets committed; the token is never logged either way.
 - **It imports your schema module to read it**, which executes that module. The schema is
   your own source, but the CLI runs code rather than parsing files.

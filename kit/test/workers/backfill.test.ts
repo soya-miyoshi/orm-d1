@@ -8,8 +8,8 @@
  * against different transaction semantics than the ones this runs on.
  */
 import { env } from 'cloudflare:test';
-import { appendOnlyTrigger, createSchema, tableOptions } from 'd1zzle/ddl';
-import { integer, sqliteTable, text } from 'd1zzle';
+import { appendOnlyTrigger, createSchema, tableOptions } from 'orm-d1/ddl';
+import { integer, sqliteTable, text } from 'orm-d1';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { backfill } from '../../src/core/backfill.js';
 import type { SqlRunner } from '../../src/core/apply.js';

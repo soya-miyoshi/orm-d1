@@ -24,7 +24,7 @@ import { Executor } from './session.js';
  */
 export type RelationalStrategy = 'split' | 'joined';
 
-export interface D1zzleOptions {
+export interface OrmD1Options {
 	/** Applied to column names that don't specify one explicitly. */
 	casing?: 'preserve' | 'snake_case';
 	/** Called after every executed statement, including each one in a batch. */
@@ -64,7 +64,7 @@ export interface D1zzleOptions {
 	 * Only two D1 limits differ by plan — statements per Worker invocation
 	 * (50 free / 1,000 paid) and database size (500 MB / 10 GB) — and neither
 	 * can be checked until a statement has already run. Setting this turns on
-	 * a dev-only warning for each. Everything else d1zzle enforces, the
+	 * a dev-only warning for each. Everything else orm-d1 enforces, the
 	 * bound-parameter budget included, is identical on both plans and needs no
 	 * configuration.
 	 *
@@ -79,12 +79,12 @@ export interface D1zzleOptions {
  * `D1DatabaseSession`, which is why this is written against `D1Target`.
  */
 /** A database bound to a `D1DatabaseSession`, plus its bookmark. */
-export type D1zzleSession = D1zzleDatabase & {
+export type OrmD1Session = OrmD1Database & {
 	/** Stash in a cookie or DO for read-your-writes across requests. */
 	bookmark(): D1SessionBookmark | null;
 };
 
-export class D1zzleDatabase {
+export class OrmD1Database {
 	/** @internal */
 	readonly executor: Executor;
 
@@ -177,7 +177,7 @@ export class D1zzleDatabase {
 	 * @internal Re-attaches `query`/`_` to a database derived from this one.
 	 * Set by `withRelations`; absent when no relations were supplied.
 	 */
-	$reattach?: (db: D1zzleDatabase) => void;
+	$reattach?: (db: OrmD1Database) => void;
 
 	withSession(
 		constraintOrBookmark?: D1SessionConstraint | D1SessionBookmark,
@@ -187,12 +187,12 @@ export class D1zzleDatabase {
 			throw new Error('withSession() requires a D1Database binding; sessions cannot be nested.');
 		}
 		const session = binding.withSession(constraintOrBookmark);
-		const db = new D1zzleDatabase(session as unknown as D1Target, this.options);
+		const db = new OrmD1Database(session as unknown as D1Target, this.options);
 		// Composition, not inheritance: the query surface is identical, and a
 		// session only adds its bookmark.
 		//
 		// `db.query` and `db._` are attached by `withRelations`, which lives
-		// behind `d1zzle/relations` and must stay unreachable from here — the
+		// behind `orm-d1/relations` and must stay unreachable from here — the
 		// core bundle does not pay for the relational layer. So the derived
 		// database is handed back to whatever attached them, through a hook
 		// rather than an import. Without this, `withSession()` silently
@@ -214,7 +214,7 @@ export class D1zzleDatabase {
 	}
 }
 
-export function d1zzle(binding: D1Database, options: D1zzleOptions = {}): D1zzleDatabase {
+export function ormD1(binding: D1Database, options: OrmD1Options = {}): OrmD1Database {
 	if (options.casing) configureCasing(options.casing);
 	// Fail at construction rather than on whichever query happens to trip it:
 	// the two options constrain each other, and a mismatch is a config bug.
@@ -238,12 +238,12 @@ export function d1zzle(binding: D1Database, options: D1zzleOptions = {}): D1zzle
 		// `withSession()` derives share the count — they are the same invocation.
 		budget: options.plan ? new InvocationBudget(options.plan, PLAN_LIMITS[options.plan]) : undefined,
 	};
-	return new D1zzleDatabase(binding, resolved);
+	return new OrmD1Database(binding, resolved);
 }
 
 /**
  * Drizzle-compatible entry point, so the setup line migrates cleanly too.
  * The `schema` option is accepted and ignored: tables are imported directly.
  */
-export const drizzle = (binding: D1Database, options: D1zzleOptions = {}): D1zzleDatabase =>
-	d1zzle(binding, options);
+export const drizzle = (binding: D1Database, options: OrmD1Options = {}): OrmD1Database =>
+	ormD1(binding, options);

@@ -3,7 +3,7 @@ import type { Column, ReferentialAction } from './columns.js';
 
 /**
  * Table-level constraints. These are inert metadata in the core bundle — only
- * `d1zzle/ddl` and the CLI ever read them.
+ * `orm-d1/ddl` and the CLI ever read them.
  *
  * Each is a small immutable builder wrapping a `meta` record, so that chained
  * methods (`.where()`, `.onDelete()`) can coexist with fields of the same name.
@@ -137,7 +137,7 @@ export const check = (name: string, value: SQLChunk): CheckConstraint =>
  * Derived constraint names.
  *
  * Drizzle names an unnamed constraint after its table and columns, and so does
- * our DDL. Both `d1zzle/ddl` and `getTableConfig` need the same answer — a
+ * our DDL. Both `orm-d1/ddl` and `getTableConfig` need the same answer — a
  * `getTableConfig` that reported a different index name from the one the
  * migration created would make the kit's diff see a rename on every run — so
  * the rules live here rather than in either caller.
