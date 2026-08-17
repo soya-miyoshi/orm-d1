@@ -429,6 +429,19 @@ export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
 				);
 			}
 		}
+		// Same gap, one more constraint kind down: a composite primary key
+		// member's own collation is introspected correctly but has no
+		// `.collate()` spelling either.
+		for (const pk of Object.values(table.compositePrimaryKeys)) {
+			for (const member of pk.columns.map(normalizeUniqueColumn)) {
+				if (!member.collate || member.collate.toLowerCase() === 'binary') continue;
+				warnings.push(
+					`"${table.name}"."${pk.name}" has a member "${member.name}" collate ${member.collate} in the live `
+						+ `database, but the schema DSL has no way to express a primary key member's collation — `
+						+ `the rendered schema module will not state it.`,
+				);
+			}
+		}
 	}
 	return warnings;
 }

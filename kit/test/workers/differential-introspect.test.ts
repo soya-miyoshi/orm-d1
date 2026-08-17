@@ -328,6 +328,44 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 				expect(byMember.get('b')).toEqual({ name: 'b', collate: 'rtrim' });
 			},
 		},
+		{
+			label: '[Finding 1] table-level `primary key (col autoincrement)` must still be read as AUTOINCREMENT',
+			ddl: [
+				'create table "t25" ("id" integer, "v" text, primary key ("id" autoincrement))',
+			],
+			table: 't25',
+			assert: (s) => {
+				const id = s.tables['t25']!.columns['id']!;
+				expect(id.primaryKey).toBe(true);
+				expect(id.autoincrement).toBe(true);
+			},
+		},
+		{
+			label: '[Finding 3] single-column table-level `primary key (col collate x)` must capture the collation',
+			ddl: [
+				'create table "t26" ("a" text, constraint "t26_pk" primary key ("a" collate nocase))',
+			],
+			table: 't26',
+			assert: (s) => {
+				const a = s.tables['t26']!.columns['a']!;
+				expect(a.primaryKey).toBe(true);
+				expect(a.collate).toBe('nocase');
+			},
+		},
+		{
+			label: '[Finding 4] an index member whose own name literally contains the word "collate" must not fabricate a collation',
+			ddl: [
+				'create table "t27" ("collate nocase" text, "b" text)',
+				'create index "t27_idx" on "t27" ("collate nocase", "b")',
+			],
+			table: 't27',
+			assert: (s) => {
+				const idx = s.tables['t27']!.indexes['t27_idx']!;
+				const first = normalizeIndexColumn(idx.columns[0]!);
+				expect(first.expression).toBe('collate nocase');
+				expect(first.collate).toBeUndefined();
+			},
+		},
 	];
 
 	for (const c of cases) {

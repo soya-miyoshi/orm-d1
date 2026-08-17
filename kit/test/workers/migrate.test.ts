@@ -8,7 +8,7 @@
  */
 import { env } from 'cloudflare:test';
 import { appendOnlyTrigger, createSchema, tableOptions } from 'orm-d1/ddl';
-import { integer, real, sql, sqliteTable, text, unique, uniqueIndex } from 'orm-d1';
+import { integer, primaryKey, real, sql, sqliteTable, text, unique, uniqueIndex } from 'orm-d1';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { applyMigrations, appliedMigrations, checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
@@ -842,6 +842,53 @@ describe('[F-115] unique constraint member collation carry-forward, against real
 		await DB.prepare('insert into "members" ("id", "email") values (\'m1\', \'A@X.COM\')').run();
 		await expect(
 			DB.prepare('insert into "members" ("id", "email") values (\'m2\', \'a@x.com\')').run(),
+		).rejects.toThrow();
+	});
+
+	it('persists a live composite PRIMARY KEY member collation past a second `generate` (Finding 2)', async () => {
+		// Same shape as the unique-member sibling above, for a composite
+		// primary key member's own collation instead: `generate #1`'s persisted
+		// baseline must still carry it, or `generate #2` (diffed against that
+		// baseline, not the live database) silently re-renders the PK without
+		// it.
+		await DB.prepare(
+			'create table "memberships" ("club_id" text, "user_id" text, '
+				+ 'constraint "memberships_pk" primary key ("club_id" collate nocase, "user_id"))',
+		).run();
+
+		const pulledBaseline = await introspect(runner);
+
+		const t1 = sqliteTable('memberships', {
+			clubId: text('club_id'),
+			userId: text('user_id'),
+		}, (c) => [primaryKey({ columns: [c.clubId, c.userId] })]);
+
+		const diff1 = diffSnapshots(pulledBaseline, snapshotFromSchema([t1]));
+		expect(diff1.statements).toEqual([]); // nothing to change yet
+		const persisted1 = carryForwardCollations(pulledBaseline, snapshotFromSchema([t1]));
+		const persistedPk1 = Object.values(persisted1.tables['memberships']!.compositePrimaryKeys)[0]!;
+		expect(
+			persistedPk1.columns.map((c) => (typeof c === 'string' ? { name: c } : c)),
+		).toEqual([{ name: 'club_id', collate: 'nocase' }, { name: 'user_id' }]);
+
+		// `generate #2`: an unrelated column-type change forces a rebuild.
+		const t2 = sqliteTable('memberships', {
+			clubId: text('club_id'),
+			userId: integer('user_id'),
+		}, (c) => [primaryKey({ columns: [c.clubId, c.userId] })]);
+		const diff2 = diffSnapshots(persisted1, snapshotFromSchema([t2]));
+		expect(diff2.errors).toEqual([]);
+
+		const createTemp = diff2.statements.find((s) => s.sql.includes('create table "__new_memberships"'));
+		expect(createTemp?.sql).toContain('primary key ("club_id" collate nocase, "user_id")');
+
+		await applyMigrations(runner, [{ tag: 'm_finding2b', sql: renderMigration(diff2) }]);
+
+		// The collation is still actually enforced after generate #2 applies:
+		// 'C1' and 'c1' collide under nocase for the same "user_id".
+		await DB.prepare('insert into "memberships" ("club_id", "user_id") values (\'C1\', 1)').run();
+		await expect(
+			DB.prepare('insert into "memberships" ("club_id", "user_id") values (\'c1\', 1)').run(),
 		).rejects.toThrow();
 	});
 });

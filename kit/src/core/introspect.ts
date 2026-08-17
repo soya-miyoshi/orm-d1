@@ -15,6 +15,13 @@ import { foldAsciiCase } from './sql.js';
 interface RawUniqueMember {
 	readonly name: string;
 	readonly collate?: string;
+	/**
+	 * Only ever set by {@link parseTablePrimaryKeyClause} — a unique
+	 * constraint member cannot carry `AUTOINCREMENT` (SQLite rejects it
+	 * outside a primary key clause), so `parseTableUniqueConstraints` never
+	 * populates this.
+	 */
+	readonly autoincrement?: boolean;
 }
 /** A whole table-level `[constraint <name>] UNIQUE (…)` clause. */
 interface RawUniqueClause {
@@ -294,8 +301,21 @@ const computeDepths = (scan: string): number[] => {
  * a `references "users"("id")` clause that happens to contain `("id")` before
  * the real `"id"` column definition ever appears (`[F-112]`).
  */
-const findColumnDefinitionAnchor = (scan: string, columnName: string): RegExpExecArray | undefined => {
-	const depths = computeDepths(scan);
+const findColumnDefinitionAnchor = (
+	scan: string,
+	columnName: string,
+	// `computeDepths` and `blankLiterals` are pure functions of the *table's*
+	// whole `CREATE TABLE` text, not of any one column — every per-column
+	// caller in this file (`hasAutoincrement`, `parseColumnCollation`,
+	// `parseGenerated`) used to recompute both, from scratch, on every single
+	// column, tripling the work for a 3-column table and worse beyond that.
+	// Accepting the already-computed depths here (and `blankLiterals`'s
+	// result via `scan` itself, already a parameter) lets a per-table caller
+	// hoist both out of the per-column loop instead; a caller with no table
+	// context (a direct unit-test call, say) still gets the same answer by
+	// leaving this unset.
+	depths: readonly number[] = computeDepths(scan),
+): RegExpExecArray | undefined => {
 	for (const match of scan.matchAll(new RegExp(columnDefinitionStart(columnName), 'gi'))) {
 		// `depths[match.index]` is the depth *at* the separator (`(` or `,`)
 		// itself — for the table's very own opening `(`, that is still 0 (the
@@ -309,14 +329,33 @@ const findColumnDefinitionAnchor = (scan: string, columnName: string): RegExpExe
 	return undefined;
 };
 
-export const hasAutoincrement = (sql: string, columnName: string): boolean => {
-	const scan = blankLiterals(sql);
-	const anchor = findColumnDefinitionAnchor(scan, columnName);
-	if (!anchor) return false;
-	const rest = scan.slice(anchor.index + anchor[0].length);
-	const commaIdx = rest.indexOf(',');
-	const span = commaIdx === -1 ? rest : rest.slice(0, commaIdx);
-	return /autoincrement/i.test(span);
+export const hasAutoincrement = (
+	sql: string,
+	columnName: string,
+	// See `findColumnDefinitionAnchor`'s matching parameter: hoisted per-table
+	// by `snapshotFromIntrospection`'s column loop, computed fresh otherwise.
+	precomputed?: { scan: string; depths: readonly number[]; pkClause?: readonly RawUniqueMember[] | undefined },
+): boolean => {
+	const scan = precomputed?.scan ?? blankLiterals(sql);
+	const depths = precomputed?.depths ?? computeDepths(scan);
+	const anchor = findColumnDefinitionAnchor(scan, columnName, depths);
+	if (anchor) {
+		const rest = scan.slice(anchor.index + anchor[0].length);
+		const commaIdx = rest.indexOf(',');
+		const span = commaIdx === -1 ? rest : rest.slice(0, commaIdx);
+		if (/autoincrement/i.test(span)) return true;
+	}
+	// SQLite also accepts AUTOINCREMENT stated inside a *table-level*
+	// `primary key (col autoincrement)` clause rather than on the column's own
+	// definition — legal only for a single, INTEGER-affinity column, but
+	// nothing here assumes that; `parseTablePrimaryKeyClause` already knows
+	// how to find the clause regardless of how many members it has. The
+	// column-definition anchor above can never see this: the clause is a
+	// separate, later, top-level constraint, not part of the column's own
+	// span. Falling through to it here (rather than requiring the caller to
+	// know which shape the DDL used) makes both spellings equivalent.
+	const pkMembers = precomputed?.pkClause ?? parseTablePrimaryKeyClause(sql);
+	return pkMembers?.some((m) => m.autoincrement && foldAsciiCase(m.name) === foldAsciiCase(columnName)) ?? false;
 };
 
 /**
@@ -369,9 +408,14 @@ const skipQuotedIdentifier = (scan: string, i: number): number => {
 	return i;
 };
 
-export const parseColumnCollation = (sql: string, columnName: string): string | undefined => {
-	const scan = blankLiterals(sql);
-	const anchor = findColumnDefinitionAnchor(scan, columnName);
+export const parseColumnCollation = (
+	sql: string,
+	columnName: string,
+	precomputed?: { scan: string; depths: readonly number[] },
+): string | undefined => {
+	const scan = precomputed?.scan ?? blankLiterals(sql);
+	const depths = precomputed?.depths ?? computeDepths(scan);
+	const anchor = findColumnDefinitionAnchor(scan, columnName, depths);
 	if (!anchor) return undefined;
 
 	// The column definition's own span: from right after its name to the next
@@ -463,9 +507,11 @@ export const parseColumnCollation = (sql: string, columnName: string): string | 
 export const parseGenerated = (
 	sql: string,
 	columnName: string,
+	precomputed?: { scan: string; depths: readonly number[] },
 ): { as: string; mode: 'stored' | 'virtual' } | undefined => {
-	const scan = blankLiterals(sql);
-	const anchor = findColumnDefinitionAnchor(scan, columnName);
+	const scan = precomputed?.scan ?? blankLiterals(sql);
+	const depths = precomputed?.depths ?? computeDepths(scan);
+	const anchor = findColumnDefinitionAnchor(scan, columnName, depths);
 	if (!anchor) return undefined;
 	const tailStart = anchor.index + anchor[0].length;
 	const genMatch = /^[^,]*?generated\s+always\s+as\s*\(/i.exec(scan.slice(tailStart));
@@ -613,7 +659,17 @@ const parseIndexCollations = (sql: string | null): (string | undefined)[] | unde
 		// `blankLiterals` exists to close everywhere else in this file). Blanking
 		// here, not in `parseIndexColumns`, keeps the *stored* member text
 		// literal-faithful for re-rendering while still scanning it safely.
-		const match = collateRe.exec(blankLiterals(member));
+		// Anchored the same way `parseTableUniqueConstraints` anchors a member:
+		// scan only *after* the leading identifier/name, not the whole member
+		// text. `blankLiterals` blanks string literals but deliberately leaves
+		// quoted *identifiers* alone, so a column named `"collate nocase"` used
+		// as a plain index member — `create index i on t("collate nocase")` —
+		// still carries the literal word "collate" in `blanked`, and scanning
+		// the whole member misread that identifier as an actual `COLLATE`
+		// clause the index member never stated.
+		const blanked = blankLiterals(member);
+		const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)/.exec(blanked);
+		const match = collateRe.exec(blanked.slice(nameMatch ? nameMatch[0].length : 0));
 		return match ? unquote(match[1]!) : undefined;
 	});
 };
@@ -805,7 +861,15 @@ const parseTablePrimaryKeyClause = (sql: string): readonly RawUniqueMember[] | u
 				blanked.slice(nameMatch ? nameMatch[0].length : 0),
 			);
 			const collateToken = collateMatch ? (collateMatch[1] ?? collateMatch[2]) : undefined;
-			return { name: unquote(rawName), ...(collateToken ? { collate: unquote(collateToken) } : {}) };
+			// `[F-1xx]`: a table-level `primary key (col autoincrement)` states
+			// AUTOINCREMENT on the *member*, not on the column definition — see
+			// `hasAutoincrement`'s fallback, which is the only reader of this flag.
+			const autoincrement = /\bautoincrement\b/i.test(blanked.slice(nameMatch ? nameMatch[0].length : 0));
+			return {
+				name: unquote(rawName),
+				...(collateToken ? { collate: unquote(collateToken) } : {}),
+				...(autoincrement ? { autoincrement: true } : {}),
+			};
 		});
 	}
 	return undefined;
@@ -982,6 +1046,23 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 		const info = input.tableInfo[row.name] ?? [];
 		const pkColumns = info.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk);
 		const compositePk = pkColumns.length > 1;
+		// Parsed once per table, regardless of whether the primary key is
+		// composite: needed for a composite member's own `collate` (`[F-115]`,
+		// below) *and* for the single-column case — a table-level
+		// `constraint "pk" primary key ("a" collate nocase)` states its
+		// collation on the PK clause's member, not on the column's own
+		// definition, so `parseColumnCollation` (which only reads a column's
+		// *own* inline `COLLATE`) never sees it. Consulting this unconditionally
+		// (not only when `compositePk`) is what recovers that case.
+		const pkClause = pkColumns.length > 0 ? parseTablePrimaryKeyClause(createSql) : undefined;
+		// Hoisted out of the per-column loop below: `blankLiterals`/
+		// `computeDepths` are pure functions of the whole table's `CREATE TABLE`
+		// text, not of any one column, so recomputing them for every column
+		// (as `hasAutoincrement`/`parseColumnCollation`/`parseGenerated` used to,
+		// independently, three times each) redid the same work once per column.
+		const tableScan = blankLiterals(createSql);
+		const tableDepths = computeDepths(tableScan);
+		const tableScanContext = { scan: tableScan, depths: tableDepths };
 
 		const fks = input.foreignKeys[row.name] ?? [];
 		const groupedFks = new Map<number, ForeignKeyRow[]>();
@@ -1102,9 +1183,20 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 				// The pragma says *that* it is generated and with which storage;
 				// only the expression has to come out of the CREATE TABLE text.
 				? {
-					as: parseGenerated(createSql, column.name)?.as ?? '',
+					as: parseGenerated(createSql, column.name, tableScanContext)?.as ?? '',
 					mode: (column.hidden === 3 ? 'stored' : 'virtual') as 'stored' | 'virtual',
 				}
+				: undefined;
+
+			// A single-column table-level `primary key (col collate x)` states
+			// its collation on the PK clause's own member, not on the column's
+			// definition — `parseColumnCollation` cannot see it, so it is
+			// consulted separately here and only used when the column's own
+			// definition stated none (the two are not expected to differ, but if
+			// they did, the column's own explicit `COLLATE` is the more direct
+			// statement of intent).
+			const pkMemberCollate = single
+				? pkClause?.find((m) => foldAsciiCase(m.name) === foldAsciiCase(column.name))?.collate
 				: undefined;
 
 			columns[column.name] = {
@@ -1123,7 +1215,8 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 				declaredType: column.type,
 				primaryKey: single,
 				notNull: column.notnull === 1 || isRowidAlias,
-				autoincrement: single && hasAutoincrement(createSql, column.name),
+				autoincrement: single
+					&& hasAutoincrement(createSql, column.name, { ...tableScanContext, pkClause }),
 				// A single-column UNIQUE constraint is reported as an index; it is
 				// recorded there rather than duplicated onto the column.
 				unique: false,
@@ -1133,7 +1226,7 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 				default: column.dflt_value === null ? undefined : defaultExpression(column.dflt_value),
 				generated,
 				references: undefined,
-				collate: parseColumnCollation(createSql, column.name),
+				collate: parseColumnCollation(createSql, column.name, tableScanContext) ?? pkMemberCollate,
 			};
 		}
 
@@ -1143,10 +1236,10 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			const name = `${row.name}_pk`;
 			// `[F-115]`: a composite primary key member can carry its own
 			// `collate`, exactly like a unique constraint member (`[F-111]`) — see
-			// `parseTablePrimaryKeyClause`. Matched to `pkColumns` by position: a
-			// table has at most one primary-key clause, so there is nothing to
-			// disambiguate by column-list matching the way `matchUniqueClause` does.
-			const pkClause = parseTablePrimaryKeyClause(createSql);
+			// `parseTablePrimaryKeyClause` (`pkClause`, parsed once per table
+			// above). Matched to `pkColumns` by position: a table has at most one
+			// primary-key clause, so there is nothing to disambiguate by
+			// column-list matching the way `matchUniqueClause` does.
 			compositePrimaryKeys[name] = {
 				name,
 				columns: pkColumns.map((c, i) => {

@@ -504,6 +504,43 @@ describe('rendering a schema module from a snapshot', () => {
 		expect(warnings).toEqual([]);
 	});
 
+	// [Finding 2]: same gap as a unique constraint member's own collation, one
+	// more constraint kind down — a composite primary key member's `collate`
+	// is introspected correctly but has no `.collate()` spelling either, so
+	// `pull` has to warn about it the same way.
+	it('warns, naming the table and member, when a composite PRIMARY KEY member collation cannot be expressed', async () => {
+		const { unexpressibleTableOptionWarnings } = await import('../../src/node/commands.js');
+		const snapshot = {
+			...snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }),
+			tables: {
+				memberships: {
+					name: 'memberships',
+					columns: {
+						club_id: column('club_id', 'text'),
+						user_id: column('user_id', 'text'),
+					},
+					indexes: {},
+					foreignKeys: {},
+					compositePrimaryKeys: {
+						memberships_pk: {
+							name: 'memberships_pk',
+							columns: [{ name: 'club_id', collate: 'nocase' }, 'user_id'],
+						},
+					},
+					uniqueConstraints: {},
+					checkConstraints: {},
+				},
+			},
+		};
+
+		const warnings = unexpressibleTableOptionWarnings(snapshot as never);
+
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain('"memberships"');
+		expect(warnings[0]).toContain('"club_id"');
+		expect(warnings[0]).toContain('nocase');
+	});
+
 	it('imports every factory it uses, blob included', async () => {
 		const { renderSchemaModule } = await import('../../src/node/commands.js');
 		const rendered = renderSchemaModule(snapshotOf({
