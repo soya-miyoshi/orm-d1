@@ -13,6 +13,7 @@ After the iteration-5 efficiency + bugs pass (`efe70a4`): **green, 677 passed / 
 After the iteration-6 security pass (`37db699`): **green, 702 passed / 4 skipped**.
 After the iteration-8 efficiency + bugs pass: **green, 908 passed / 5 skipped**.
 After the iteration-7 feature pass (`5051bc7`): **green, 718 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
+After the standing-authorization batch (2026-08-18, this session — 12 findings: `[F-009]`, `[F-011]`, `[F-012]`, `[F-014]`, `[F-015]`, `[F-016]`, `[F-032]`, `[F-052]`, `[F-053]`, `[F-094]`, `[F-095]`, `[F-096]`): **green, 944 passed / 7 skipped** (`npm run test:unit` + `npm run test:workers`). Minified `dist/core.js` is 42,853 bytes (+468 vs the 42,385-byte baseline this run started from — `[F-009]`'s `String` decode and `[F-012]`'s `text(n)` length rendering are both in `src/`; `[F-094]` is type-only and cost nothing; `[F-095]`'s `assertSameDrizzle` lives in `src/drizzle.ts`, a separate entry point not counted in this measurement).
 
 ## Rotation
 
@@ -175,11 +176,12 @@ Statuses: `todo` → `in-progress` → `done` (+ commit SHA) | `blocked` (+ reas
 - **Fix**: distinguish "no `columns` key" from "empty `columns` object" — `if (!selection) return keys;` then treat an entry-less selection as `[]` before the existing two branches. `compileSelect` already throws `'A select must project at least one column'` when nothing survives, which matches Drizzle throwing in the same spot.
 - **Prove it**: `pickColumns(cols, {})` → `[]`; a workers test asserting `findMany({ columns: {}, with: { posts: true } })` rows have exactly the key `posts`.
 
-### [F-009] `sum()` / `avg()` decode to `number`; Drizzle decodes to `string` — status: needs-human — severity: med — area: drizzle-compat — lens: feature — COMPAT-DEFECT
+### [F-009] `sum()` / `avg()` decode to `number`; Drizzle decodes to `string` — status: done (this batch) — severity: med — area: drizzle-compat — lens: feature — COMPAT-DEFECT
 - **Where**: `src/sql/functions.ts:36,39`
 - **Defect**: `drizzle-orm/sql/functions/aggregate.js` uses `.mapWith(String)` for `sum`/`avg` in every dialect, deliberately, because a 64-bit sum does not survive an IEEE double. orm-d1 uses `nullable(Number)`.
 - **Failure scenario**: `select({ total: sum(orders.cents) })` over a ledger past 2^53 returns a silently rounded number; code ported from Drizzle doing `BigInt(row.total)` throws `Cannot convert 1.2e+21 to a BigInt`.
 - **Question for the human**: parity (`nullable(String)`, matching Drizzle, breaking every existing orm-d1 caller) or keep `number` and document the divergence in `docs/08`'s "what compatibility does not extend to"? The reviewer flagged this as a judgement call, not a mechanical fix. Either answer touches published behaviour or `docs/`.
+- **Resolved**: standing authorization from the human (2026-08-18) picked parity. `src/sql/functions.ts:36,39` now decode with `nullable(String)`; `docs/01-differences.md` gained a "`sum()` and `avg()` decode to `string`" section; `test/unit/functions.test.ts` is new.
 
 ### [F-010] Three schema-facing spellings `drizzle-orm/sqlite-core` does not have — status: needs-human — severity: med — area: drizzle-compat — lens: feature — COMPAT-DEFECT
 - **Where**: `src/core.ts:25` (`boolean`), `src/schema/constraints.ts:51` (`index()` with no name), `src/schema/constraints.ts:99` (`IndexConstraint.onOnly()`)
@@ -188,11 +190,13 @@ Statuses: `todo` → `in-progress` → `done` (+ commit SHA) | `blocked` (+ reas
 - **Question for the human**: deprecate-and-keep (mirroring `json()`), or remove from the root entry? All three options change the published API surface, which this sweep may not do.
 - **Reviewer's suggested test, if accepted**: a static assertion that every value exported from `src/sqlite-core.ts` is also a key of `import * as dz from 'drizzle-orm/sqlite-core'`.
 
-### [F-011] `blob()` default-mode change may contradict `docs/` — status: needs-human — severity: low — area: docs — lens: feature
+### [F-011] `blob()` default-mode change may contradict `docs/` — status: done (this batch, no doc found stating the old default) — severity: low — area: docs — lens: feature
 - Follow-up to `[F-003]`. If any design doc states the old `buffer` default, the doc is now wrong. The sweep may not edit `docs/`, so a human decides the wording.
+- **Resolved**: swept `docs/`, `README.md` and `kit/README.md` for any statement that `blob()` defaults to `'buffer'` mode. None exists — the only blob-related doc lines are about the `in (...)` JSON-array optimization and D1's own size limits. Nothing to correct; recorded as checked.
 
-### [F-012] `text(n)` / `getSQLType()` length in emitted DDL — status: needs-human — severity: low — area: ddl/render — lens: feature — COMPAT-DEFECT
+### [F-012] `text(n)` / `getSQLType()` length in emitted DDL — status: done (this batch) — severity: low — area: ddl/render — lens: feature — COMPAT-DEFECT
 - Split out of `[F-007]`. drizzle-kit writes `text(5)`; orm-d1 writes `text`, so an emitted migration stops being byte-comparable with one an existing project has committed. `kit/src/core/snapshot.ts:411 typeAffinity` maps `TEXT(5)` → `text`, so the reviewer expects the snapshot diff to be unaffected — but this changes migration bytes for every existing `text({length})` column and needs a human to accept that.
+- **Resolved**: standing authorization accepted the migration-byte change. `Column.getSQLType()` (`src/schema/columns.ts:250`) now emits `text(5)` for a `text` column with `length` set; `src/ddl.ts`'s `typeName()` delegates to it, so both DDL rendering and the STRICT-table type check see the same string. `test/unit/ddl.test.ts` gained two cases.
 
 ### [F-013] `NEW-SURFACE` proposals from the feature lens — status: needs-human — severity: n/a — area: api — lens: feature
 Recorded, not built — this sweep may not add published API surface. Ranked as the reviewer ranked them:
@@ -207,18 +211,21 @@ Recorded, not built — this sweep may not add published API surface. Ranked as 
 8. **`update().from()` / `.orderBy()` / `.limit()`, `delete().orderBy()` / `.limit()`** — `.from()` is supported by D1 and currently unexpressible. `LIMIT` on `UPDATE`/`DELETE` needs `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`, which `docs/10:252` records D1 as lacking, so those must throw with that explanation rather than emit SQL D1 rejects.
 9. **Set operations, CTEs, views, window functions** — already deferred at `docs/07:207`. `sqliteView`/`getViewConfig` additionally gate two adapter paths: Drizzle's `getColumns()` branches on `is(table, View)`, and Pothos accepts a view in `SchemaEntry`.
 
-### [F-014] Interop tests assert against constants, not against Drizzle — status: todo — severity: med — area: test-harness — lens: efficiency + bugs (OFF-LENS from feature)
+### [F-014] Interop tests assert against constants, not against Drizzle — status: done (this batch) — severity: med — area: test-harness — lens: efficiency + bugs (OFF-LENS from feature)
 - **Where**: `test/unit/drizzle-interop.test.ts:85-104`
 - **Defect**: the file imports real `drizzle-orm` but asserts orm-d1's own `dataType` values as literals rather than comparing them against a Drizzle-built fixture. That shape — assert against a constant read off the implementation — is what let `[F-002]` and `[F-007]` ship, while `docs/10-ecosystem-interop.md:76` claims "Verified, not assumed".
 - **Fix**: sweep the interop suite for assertions that never actually reference the `drizzle-orm` import, and convert them to comparisons.
+- **Resolved**: the two offending tests (`'exposes dataType, columnType and the SQL type'`, `'classifies every blob mode'`) now build an equivalent table with the real `drizzle-orm/sqlite-core` and compare field by field, instead of asserting orm-d1's own strings as literals. Swept the rest of the file; the remaining assertions test orm-d1's own encode/decode and naming *behaviour* (not a Drizzle spelling), so left alone.
 
-### [F-015] Foreign-key derived name differs from Drizzle's — status: todo — severity: low — area: drizzle-compat — lens: efficiency + bugs (OFF-LENS from feature)
+### [F-015] Foreign-key derived name differs from Drizzle's — status: done (this batch) — severity: low — area: drizzle-compat — lens: efficiency + bugs (OFF-LENS from feature)
 - **Where**: `src/schema/table.ts:301`
 - **Defect**: orm-d1 derives `${table}_${column}_fk`; Drizzle's `ForeignKey.getName()` derives `${table}_${cols}_${foreignTable}_${foreignCols}_fk`. The kit compares FKs by content (`canonicalFk`, `kit/src/core/snapshot.ts:385`) so migrations are unaffected, but `getTableConfig(t).foreignKeys[i].name` differs from what an adapter reading Drizzle's would expect. No consumer found — recorded, not claimed.
+- **Resolved**: `getTableConfig`'s inline-`.references()` branch (`src/schema/table.ts`, `getTableConfig`) now derives Drizzle's fuller `${table}_${cols}_${foreignTable}_${foreignCols}_fk`. The *table-level* `foreignKey()` extra keeps using `foreignKeyName()` (shared with `orm-d1/ddl`'s actual constraint-name emission), unchanged, so no migration bytes move. `test/unit/table-config.test.ts` pins the new name.
 
-### [F-016] `through.source` / `through.target` hold raw `Column`s, not `ColumnRef`s — status: todo — severity: low — area: relations — lens: efficiency + bugs (OFF-LENS from feature)
+### [F-016] `through.source` / `through.target` hold raw `Column`s, not `ColumnRef`s — status: done (this batch) — severity: low — area: relations — lens: efficiency + bugs (OFF-LENS from feature)
 - **Where**: `src/relations/define.ts:245`
 - **Defect**: Drizzle's `Relation.through` holds `ColumnRef`s (`drizzle-orm/relations.js` maps `.map((c) => c._.through)`). `asDrizzleRelations()` copies the field verbatim, so an adapter reading `relation.through.source[0]._.column` off a re-prototyped relation gets `undefined`. Nothing shipped reads it today.
+- **Resolved**: `ThroughColumns.source`/`.target` (`src/relations/define.ts`) now hold `ColumnRef`s built from `ref._.through`, matching Drizzle. Every internal consumer that dereferenced a raw `Column` off `.through` was updated to read `._.column` instead: `validateDeclared` (`define.ts`), the junction-column rebinding in `src/relations/filter.ts` and the `through` keys/`on` in `src/relations/query.ts`. `test/unit/relations-define.test.ts` updated to match.
 
 ## Unresolved objections merged anyway (`15f24ef`)
 
@@ -352,9 +359,10 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 - **Not live today**: across 64 tables × 3 indexes with microtask, macrotask, randomised and zero delay the peak was exactly 12 every time, because a table's `index_info` dispatch is always ordered after the woken waiter's resumption by `Promise.all`'s extra tick. It is a hazard for the next call site, not this one.
 - **Fix**: loop `while (this.inFlight >= this.limit) await …`, or increment the count in the releaser on behalf of the waiter.
 
-### [F-032] `IndexColumnSnapshot` / `normalizeIndexColumn` are unexported from the kit's public entry — status: needs-human — severity: low — area: api
+### [F-032] `IndexColumnSnapshot` / `normalizeIndexColumn` are unexported from the kit's public entry — status: done (this batch) — severity: low — area: api
 - **Where**: `kit/src/core/index.ts:27`
 - `IndexSnapshot.columns` is exported from `orm-d1-kit/core`, but the new `IndexColumnSnapshot` member type and the `normalizeIndexColumn` helper are not, so an external consumer now reads a union whose object member is unnameable from the public entry. Construction still compiles; only reading is affected. Exporting them changes the published API surface, which the sweep may not do.
+- **Resolved**: standing authorization covers this API-surface addition. `kit/src/core/index.ts` now re-exports `IndexColumnSnapshot` (type) and `normalizeIndexColumn` (value) alongside the existing `snapshot.js` exports.
 
 ## Findings — security lens (iteration 3)
 
@@ -513,14 +521,16 @@ Recorded, not built. Ranked as the reviewer ranked them:
 6. **Root `placeholder` / `param` / `name`** — orm-d1 has `ph`, `sql.placeholder`, `sql.identifier` and the `Param` class, but not Drizzle's free functions, so `import { placeholder } from 'drizzle-orm'` in a ported file fails to resolve.
 7. **`orm-d1-kit drop` and `export`** (`kit/src/cli.ts:16` claims the surface "deliberately mirrors drizzle-kit"). `drop` is the one that matters — without it, un-journalling a bad migration is a hand-edit of `meta/_journal.json`, the file `docs/09` says must stay consistent with the emitted SQL.
 
-### [F-052] `getTableConfig`'s element shapes do not match Drizzle's, despite the parity claim — status: todo — severity: low — area: drizzle-compat — lens: efficiency + bugs (OFF-LENS from feature)
+### [F-052] `getTableConfig`'s element shapes do not match Drizzle's, despite the parity claim — status: done (this batch) — severity: low — area: drizzle-compat — lens: efficiency + bugs (OFF-LENS from feature)
 - **Where**: `src/schema/table.ts:207` (the claim), `src/schema/table.ts:237-253` (the shapes), `src/schema/constraints.ts:151`
 - **Defect**: Drizzle's `Index` nests everything under `.config` (`{ config: { name, columns, unique, where, table }, isNameExplicit }`) and its `ForeignKey` exposes `reference()` as a *function* plus `getName()`; orm-d1 returns flat records for both. `primaryKeys[i].name` also differs — orm-d1 derives `${table}_pk` where Drizzle derives `${table}_${cols}_pk`, the same divergence `[F-015]` records for foreign keys.
 - **Not claimed as a defect**: the reviewer searched every package in `node_modules` and the only consumer is Pothos, which reads `columns` and `primaryKeys[].columns` — both of which match. Recorded because the doc's parity claim ("field for field") is false and the next adapter to read `indexes` will get `undefined`.
+- **Resolved**: `TableIndex` now nests under `.config` plus `isNameExplicit` (`src/schema/table.ts`); `TableForeignKey` exposes `reference()`/`getName()`/`isNameExplicit()` instead of flat fields, verified against the installed `drizzle-orm@1.0.0-rc.4`'s actual `.d.ts`/`.js`. `primaryKeys[i].name` is now derived as `${table}_${cols}_pk` inside `getTableConfig` specifically (not the shared `primaryKeyName()` that also drives real DDL, to avoid moving migration bytes). `test/unit/table-config.test.ts` updated for both shapes; the only consumer (Pothos, via `columns`/`primaryKeys[].columns`) is unaffected and covered by `test/workers/pothos.test.ts`.
 
-### [F-053] `renderSchemaModule`'s reserved-name list is missing `numeric` — status: todo — severity: low — area: kit/node — lens: efficiency + bugs (OFF-LENS from feature)
+### [F-053] `renderSchemaModule`'s reserved-name list is missing `numeric` — status: done (this batch) — severity: low — area: kit/node — lens: efficiency + bugs (OFF-LENS from feature)
 - **Where**: `kit/src/node/commands.ts:499` (`RESERVED`), against `commands.ts:330`
 - **Defect**: `factory` can be `'numeric'` and the import is added, but `numeric` is not in `RESERVED`, so a live table named `numeric` makes `pull` emit `export const numeric = sqliteTable("numeric", { x: numeric("x") })` — a TDZ error in a file whose entire job is to compile.
+- **Resolved**: added `'numeric'` to `RESERVED`. `kit/test/unit/cli.test.ts` gained a regression test asserting a `numeric`-named table renders `numeric_`, not `numeric`.
 
 ### [F-054] `lowerIn` has no bound-parameter guard — status: todo — severity: low — area: better-auth — lens: efficiency + bugs (OFF-LENS from feature)
 - **Where**: `src/better-auth.ts:169`
@@ -857,14 +867,15 @@ deletes user code) → `[F-091]`, `[F-093]` (new surface).
 - **Question for the human**: add the surface, or document the raw-SQL recipe in `docs/02` under a heading about atomicity on D1, next to the `batch()` discussion that already explains why transactions are absent? The second is cheap and would at least make the pattern findable; the first is what makes it checked.
 - **Prove it**: `test/workers/` gains a concurrency case issuing N simultaneous conditional inserts against a limit of 1 and asserting exactly one row lands; `npm run test:workers` red → green.
 
-### [F-094] `$inferSelect` / `$inferInsert` are missing from the table type — status: todo — severity: med — area: schema — COMPAT-DEFECT
+### [F-094] `$inferSelect` / `$inferInsert` are missing from the table type — status: done (this batch) — severity: med — area: schema — COMPAT-DEFECT
 - **Where**: `src/schema/table.ts` (the built-table type), helpers already present at `src/schema/infer.ts:58-59`
 - **Defect**: `drizzle-orm` exposes row types both as free helpers (`InferSelectModel<T>`) and as properties on the table (`typeof users.$inferSelect`, `typeof users.$inferInsert`). orm-d1 has only the first, so a schema ported by changing one import specifier keeps compiling while every `typeof X.$inferInsert` in the surrounding code becomes `TS2339`.
 - **Failure scenario**: the property spelling is what test fixtures and seed helpers use, because it needs no import. In the downstream app it appears **25 times across 9 files** and every one is an error — undetected until now only because that app's test tsconfig is not wired into any script, so the annotations have been silently inert rather than loudly wrong. An adopter whose tests *are* typechecked sees 25 errors on day one, in files that have nothing to do with the database driver.
 - **Fix**: declare `$inferSelect: InferSelect<this>` and `$inferInsert: InferInsert<this>` on the built-table type. Type-only, so no runtime bytes and no bundle cost; `InferSelect` / `InferInsert` already exist and are what `InferSelectModel` / `InferInsertModel` alias.
 - **Prove it**: `test/unit/` type-level assertions that `typeof users.$inferSelect` and `typeof users.$inferInsert` equal `InferSelectModel<typeof users>` / `InferInsertModel<typeof users>`, including a table with `$defaultFn` and a nullable column so the insert side's optionality is pinned; `npm run test:unit` red → green.
+- **Resolved**: `TableMeta` (`src/schema/table.ts`) gained `readonly $inferSelect: InferSelect<this>` / `readonly $inferInsert: InferInsert<this>` — type-only, the object literal in `buildTable` is cast rather than assigned these fields, so zero runtime bytes. `test/unit/drizzle-types.test.ts` gained the pinned assertions, including the `$defaultFn` + nullable-column case.
 
-### [F-095] Two resolved `drizzle-orm` copies break `instanceof Many` silently, and nothing detects it — status: todo — severity: med — area: drizzle-compat
+### [F-095] Two resolved `drizzle-orm` copies break `instanceof Many` silently, and nothing detects it — status: done (this batch, `assertSameDrizzle` added) — severity: med — area: drizzle-compat
 - **Where**: `src/drizzle.ts:120` (`asDrizzleRelations`), `:219` (`asPothosRelations`); named as a known failure mode under *Audit areas* → *Relational loading*
 - **Defect**: `asDrizzleRelations` re-prototypes onto the `Many` that **orm-d1** resolved. If the adapter (Pothos' drizzle plugin) resolves a different copy, `instanceof Many` is false for every relation and the plugin treats all of them as single objects. It is bug class #3 (wrong rows), it produces no error, and the only current defence is documentation.
 - **Failure scenario**: a lockfile that hoists two `drizzle-orm` versions — a range bump in any dependency does it. Every list field in the GraphQL schema starts returning one object instead of an array. Types do not catch it: the two copies' relation types are mutually unassignable, but adapters already require casts at exactly the seams where the assignability would have been checked. The downstream app defends against it by pinning `drizzle-orm` to an exact version and writing a warning in two places, which is a discipline, not a check.
@@ -877,13 +888,15 @@ deletes user code) → `[F-091]`, `[F-093]` (new surface).
   ```
   It fails exactly when the two copies diverge, because the `Many` on the left is the one the *app* resolves. An `assertSameDrizzle({ Many })` export would be friendlier but is public surface, so record it as an upgrade rather than doing it here.
 - **Prove it**: this repo cannot host the negative control without installing two `drizzle-orm` copies. Assert the positive direction in `test/unit/` (the recipe passes under a single copy) and note the limitation next to it; `npm run test:unit` stays green and the recipe is what ships. `npm run check` unaffected.
+- **Resolved**: standing authorization upgraded this past documentation-only to the friendlier export. `assertSameDrizzle({ Many })` (`src/drizzle.ts`, next to `asDrizzleRelations`) throws a clear message when the passed `Many` does not match the one this module resolved. Both recipes — the `toBeInstanceOf(Many)` one and the new export — are now in `docs/05-adapters.md` § Pothos. `test/unit/assert-same-drizzle.test.ts` covers the positive path and the throwing path (with a distinct fake class standing in for a second copy); the true two-copy negative control still cannot be hosted here, as noted.
 
-### [F-096] `pothosFindConfig` is exported and used everywhere, and documented nowhere — status: todo — severity: low — area: docs
+### [F-096] `pothosFindConfig` is exported and used everywhere, and documented nowhere — status: done (this batch) — severity: low — area: docs
 - **Where**: `src/drizzle.ts:259`; `docs/05-adapters.md` § Pothos lists three substitutions and not this one. `grep -rn pothosFindConfig docs/ README.md` returns nothing.
 - **Defect**: `docs/05` documents the *builder-construction* seam (`getTableConfig`, `asPothosRelations`, `asDrizzleTable`) and stops there. `pothosFindConfig` is the *resolver-side* seam, needed in every drizzle-backed resolver that passes a `where`, and it is reachable only by reading the source.
 - **Failure scenario**: an adopter follows `docs/05`, wires the builder correctly, writes their first resolver, and finds the plugin's `query()` result rejected by `findMany` because of the phantom `$pothosQueryFor` key. Nothing in the docs names the cause or the helper; the visible workarounds are `as never` on the whole config — which is what the helper's own docstring says the previous code did — and that silently gives up the schema-level checking of `where` / `columns` / `with` / `orderBy`. In the downstream app the helper is imported in **20 GraphQL type modules**, so it is not an edge case of the integration, it is the integration.
 - **Fix**: add it as the fourth bullet in `docs/05-adapters.md` § Pothos. The docstring at `src/drizzle.ts:259` is already the right text — why the phantom key exists, that it is never constructed, and that the return type keeps the config checked — plus the one-line usage example it carries.
 - **Prove it**: documentation only; `test/workers/pothos.test.ts` already exercises the helper. Acceptance is that `docs/05` alone is sufficient to write a resolver with a `where`, with no source reading.
+- **Resolved**: added as the fourth bullet in `docs/05-adapters.md` § Pothos, based on the docstring at `src/drizzle.ts` (`pothosFindConfig`) — the phantom-key explanation and the one-line usage example.
 
 ### [F-097] The published bundle numbers are a one-off measurement with no regression gate — status: todo — severity: low — area: efficiency
 - **Where**: `docs/01-differences.md:261` (§ Bundle size), `package.json` (`check`), `test/unit/module-resolution.test.ts`

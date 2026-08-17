@@ -284,7 +284,9 @@ export const literal = (value: unknown): string => {
 	return `'${String(value).replaceAll("'", "''")}'`;
 };
 
-const typeName = (column: Column<any>): string => column.config.declaredType ?? column.config.type;
+// `getSQLType()` is the same rendering Drizzle exposes on the column itself,
+// including `text(5)`-style length for `text({length})`. See `[F-012]`.
+const typeName = (column: Column<any>): string => column.getSQLType();
 
 const referenceClause = (column: Column<any>): string => {
 	const reference = column.config.references;

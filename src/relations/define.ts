@@ -28,10 +28,19 @@ import type { RelationsFilter } from './filter.js';
 
 export type RelationType = 'one' | 'many';
 
-/** Which junction columns a `through` relation hops via. */
+/**
+ * Which junction columns a `through` relation hops via.
+ *
+ * Holds `ColumnRef`s, not raw `Column`s — matching `drizzle-orm/relations.js`,
+ * which builds `through.source`/`through.target` as `config.from.map((c) =>
+ * c._.through)` (the value passed to `.through(column)`, itself a column
+ * reference). An adapter that re-prototypes onto Drizzle's `Relation` and
+ * reads `relation.through.source[0]._.column` needs this shape. See `[F-016]`
+ * in `AUDIT.md`.
+ */
 export interface ThroughColumns {
-	readonly source: readonly Column<any>[];
-	readonly target: readonly Column<any>[];
+	readonly source: readonly ColumnRef[];
+	readonly target: readonly ColumnRef[];
 }
 
 export class Relation {
@@ -242,8 +251,8 @@ const applyColumns = (
 
 	relation.throughTable = tables[junction._.tableName];
 	relation.through = {
-		source: from.map((ref) => ref._.through?._.column).filter((c): c is Column<any> => c !== undefined),
-		target: to.map((ref) => ref._.through?._.column).filter((c): c is Column<any> => c !== undefined),
+		source: from.map((ref) => ref._.through).filter((c): c is ColumnRef => c !== undefined),
+		target: to.map((ref) => ref._.through).filter((c): c is ColumnRef => c !== undefined),
 	};
 };
 
@@ -319,8 +328,8 @@ const validateDeclared = (relation: Relation, where: string, sourceTsName: strin
 			throw new Error(`${where}: use ".through(column)" on every column of "from" and "to", or on none of them.`);
 		}
 		const junction = getTableName(relation.throughTable!);
-		for (const column of [...relation.through.source, ...relation.through.target]) {
-			if (column.tableName !== junction) {
+		for (const ref of [...relation.through.source, ...relation.through.target]) {
+			if (ref._.column.tableName !== junction) {
 				throw new Error(`${where}: every ".through(column)" must belong to the same table, "${junction}".`);
 			}
 		}

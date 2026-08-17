@@ -62,6 +62,41 @@ describe('inference matches Drizzle’s, field for field', () => {
 		const drizzleSchema = asDrizzleSchema(schema);
 		expectTypeOf<InferSelectModel<typeof drizzleSchema.posts>>().toEqualTypeOf<InferSelect<typeof posts>>();
 	});
+
+	// `[F-094]`: `typeof table.$inferSelect` / `$inferInsert`, the property
+	// spelling — alongside the free `InferSelectModel<T>` / `InferInsertModel<T>`
+	// helpers above — so a schema ported by changing one import specifier keeps
+	// every `typeof X.$inferInsert` annotation compiling.
+	it('exposes $inferSelect / $inferInsert as properties on the table, like Drizzle', () => {
+		expectTypeOf<typeof users.$inferSelect>().toEqualTypeOf<TheirUser>();
+		expectTypeOf<typeof users.$inferSelect>().toEqualTypeOf<OurUser>();
+		expectTypeOf<typeof users.$inferInsert>().toExtend<TheirNewUser>();
+		expectTypeOf<typeof users.$inferInsert>().toEqualTypeOf<OurNewUser>();
+	});
+});
+
+describe('$inferSelect / $inferInsert pin optionality through $defaultFn and nullability', () => {
+	const t = sqliteTable('t_infer_props', {
+		id: integer('id').primaryKey(),
+		token: text('token').notNull().$defaultFn(() => 'x'),
+		note: text('note'),
+	});
+
+	it('$inferSelect keeps a nullable column nullable, not optional', () => {
+		expectTypeOf<typeof t.$inferSelect>().toEqualTypeOf<{
+			id: number;
+			token: string;
+			note: string | null;
+		}>();
+	});
+
+	it('$inferInsert makes a $defaultFn column optional', () => {
+		expectTypeOf<typeof t.$inferInsert>().toEqualTypeOf<{
+			id?: number;
+			token?: string;
+			note?: string | null;
+		}>();
+	});
 });
 
 describe('generated columns are absent from the insert model', () => {

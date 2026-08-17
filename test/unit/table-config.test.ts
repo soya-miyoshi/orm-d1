@@ -28,7 +28,9 @@ describe('the v1 field set', () => {
 		const [pk, ...rest] = getTableConfig(postTags).primaryKeys;
 		expect(rest).toEqual([]);
 		expect(names(pk!.columns)).toEqual(['post_id', 'tag']);
-		expect(pk!.name).toBe('post_tags_pk');
+		// `${table}_${cols}_pk`, matching Drizzle's `PrimaryKey.getName()` — not
+		// the bare `${table}_pk` this used to derive. See `[F-052]`.
+		expect(pk!.name).toBe('post_tags_post_id_tag_pk');
 		expect(pk!.table).toBe(postTags);
 	});
 
@@ -45,9 +47,11 @@ describe('the v1 field set', () => {
 	});
 
 	it('reports indexes with their derived names and partial predicates', () => {
+		// Nested under `.config`, plus `isNameExplicit`, matching
+		// `drizzle-orm/sqlite-core`'s `Index` instance shape. See `[F-052]`.
 		const indexes = getTableConfig(users).indexes;
-		expect(indexes.map((i) => i.name)).toEqual(['users_name_idx', 'users_email_active_idx']);
-		expect(indexes.find((i) => i.unique)!.where).toBeDefined();
+		expect(indexes.map((i) => i.config.name)).toEqual(['users_name_idx', 'users_email_active_idx']);
+		expect(indexes.find((i) => i.config.unique)!.config.where).toBeDefined();
 	});
 
 	it('derives an index name the same way the DDL does', () => {
@@ -64,16 +68,24 @@ describe('the v1 field set', () => {
 	});
 
 	it('folds inline .references() into foreignKeys alongside table-level ones', () => {
+		// `columns`/`foreignColumns`/`foreignTable` live behind `reference()`, a
+		// function, matching `drizzle-orm/sqlite-core`'s `ForeignKey` instance
+		// shape; `onUpdate`/`onDelete` stay top-level. See `[F-052]`.
 		// `posts.authorId` is declared with `.references(() => users.id)`.
 		const [inline] = getTableConfig(posts).foreignKeys;
-		expect(names(inline!.columns)).toEqual(['author_id']);
-		expect(names(inline!.foreignColumns)).toEqual(['id']);
-		expect(inline!.foreignTable).toBe(users);
+		const inlineRef = inline!.reference();
+		expect(names(inlineRef.columns)).toEqual(['author_id']);
+		expect(names(inlineRef.foreignColumns)).toEqual(['id']);
+		expect(inlineRef.foreignTable).toBe(users);
 		expect(inline!.onDelete).toBe('cascade');
+		// `${table}_${cols}_${foreignTable}_${foreignCols}_fk`, matching
+		// Drizzle's `ForeignKey.getName()`. See `[F-015]`.
+		expect(inline!.getName()).toBe('posts_author_id_users_id_fk');
 
 		const [tableLevel] = getTableConfig(postTags).foreignKeys;
-		expect(names(tableLevel!.columns)).toEqual(['post_id']);
-		expect(tableLevel!.foreignTable).toBe(posts);
+		const tableLevelRef = tableLevel!.reference();
+		expect(names(tableLevelRef.columns)).toEqual(['post_id']);
+		expect(tableLevelRef.foreignTable).toBe(posts);
 		expect(tableLevel!.onDelete).toBe('cascade');
 	});
 });

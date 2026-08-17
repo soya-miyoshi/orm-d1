@@ -327,8 +327,8 @@ const compileRelationFilter = (
 		const junction = alias(relation.throughTable, `ormd1_ft${depth}`);
 		const junctionColumns = getTableColumns(junction) as Record<string, Column<any>>;
 		const junctionByName = new Map(Object.values(junctionColumns).map((c) => [c.name, c]));
-		const viaSource = relation.through.source.map((c) => junctionByName.get(c.name) ?? c);
-		const viaTarget = relation.through.target.map((c) => junctionByName.get(c.name) ?? c);
+		const viaSource = relation.through.source.map((ref) => junctionByName.get(ref._.column.name) ?? ref._.column);
+		const viaTarget = relation.through.target.map((ref) => junctionByName.get(ref._.column.name) ?? ref._.column);
 
 		joinTable = sql`${sql.identifier(getTableOriginalName(relation.targetTable))} as ${target} inner join ${
 			sql.identifier(getTableOriginalName(relation.throughTable))

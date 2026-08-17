@@ -33,11 +33,14 @@ export const count = (operand?: Column<any> | SQLChunk): DecodedChunk<number> =>
 export const countDistinct = (operand: Column<any> | SQLChunk): DecodedChunk<number> =>
 	withDecode<number>(sql`count(distinct ${operand})`, Number);
 
-export const sum = (operand: Column<any> | SQLChunk): DecodedChunk<number | null> =>
-	withDecode<number | null>(sql`sum(${operand})`, nullable(Number));
+// Drizzle deliberately decodes `sum`/`avg` to `string` in every dialect
+// (`drizzle-orm/sql/functions/aggregate.js`, `.mapWith(String)`): a 64-bit sum
+// does not survive an IEEE double. See `[F-009]` in `AUDIT.md`.
+export const sum = (operand: Column<any> | SQLChunk): DecodedChunk<string | null> =>
+	withDecode<string | null>(sql`sum(${operand})`, nullable(String));
 
-export const avg = (operand: Column<any> | SQLChunk): DecodedChunk<number | null> =>
-	withDecode<number | null>(sql`avg(${operand})`, nullable(Number));
+export const avg = (operand: Column<any> | SQLChunk): DecodedChunk<string | null> =>
+	withDecode<string | null>(sql`avg(${operand})`, nullable(String));
 
 export const min = <T>(operand: Column<any> | SQLChunk<T>): DecodedChunk<T | null> =>
 	withDecode<T | null>(sql`min(${operand})`, nullable(passthroughDecoder(operand)));

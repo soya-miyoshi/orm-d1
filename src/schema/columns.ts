@@ -248,7 +248,11 @@ export class Column<M extends ColumnMeta = ColumnMeta> extends SQLiteColumnEntit
 	}
 
 	getSQLType(): string {
-		return this.config.declaredType ?? this.config.type;
+		const base = this.config.declaredType ?? this.config.type;
+		// Matches drizzle-kit: `text(name, { length })` emits `text(5)`, not
+		// bare `text`. Only the plain `text` base type carries `length` at all
+		// (customType's `declaredType` bypasses this branch). See `[F-012]`.
+		return base === 'text' && this.config.length !== undefined ? `text(${this.config.length})` : base;
 	}
 
 	/** Drizzle's `Column['length']` — set for `text(name, { length })`. */

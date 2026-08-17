@@ -556,8 +556,10 @@ export class RelationalQueryBuilder {
 		const through: ThroughFetch | undefined = junction && relation.through
 			? {
 				junction,
-				keys: relation.through.source.map(rebind!),
-				on: and(...relation.through.target.map((c, i) => eq(rebind!(c), relation.targetColumns![i]!)))!,
+				keys: relation.through.source.map((ref) => rebind!(ref._.column)),
+				on: and(
+					...relation.through.target.map((ref, i) => eq(rebind!(ref._.column), relation.targetColumns![i]!)),
+				)!,
 			}
 			: undefined;
 

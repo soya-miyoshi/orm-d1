@@ -863,6 +863,39 @@ describe('renderSchemaModule identifiers', () => {
 		expect(rendered).not.toMatch(/export const new\b/);
 		expect(rendered).toMatch(/export const new_ = sqliteTable\("new"/);
 	});
+
+	it('does not emit "numeric" as a binding — it is imported for the column factory', async () => {
+		// `[F-053]`: `numeric` can be a `factory` spelling for a column, so it is
+		// imported into the rendered module; a table named `numeric` used to
+		// collide with that import (a TDZ error) because it was missing from
+		// `RESERVED`.
+		const { renderSchemaModule } = await import('../../src/node/commands.js');
+		const rendered = renderSchemaModule({
+			version: '1',
+			dialect: 'sqlite' as const,
+			id: '',
+			prevId: '',
+			tables: {
+				numeric: {
+					...table('numeric', ['id']),
+					columns: {
+						id: { name: 'id', type: 'text', primaryKey: false, notNull: false, autoincrement: false, unique: false },
+						amount: {
+							name: 'amount',
+							type: 'numeric',
+							primaryKey: false,
+							notNull: false,
+							autoincrement: false,
+							unique: false,
+						},
+					},
+				},
+			},
+		} as never);
+
+		expect(rendered).not.toMatch(/export const numeric = sqliteTable/);
+		expect(rendered).toMatch(/export const numeric_ = sqliteTable\("numeric"/);
+	});
 });
 
 describe('check drift classification', () => {

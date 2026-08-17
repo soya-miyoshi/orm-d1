@@ -21,6 +21,20 @@ describe('ddl generation', () => {
 		);
 	});
 
+	it('emits length in the DDL for text(name, { length }), matching drizzle-kit', () => {
+		// See `[F-012]` in `AUDIT.md`: drizzle-kit writes `text(5)`, not bare
+		// `text`, so an emitted migration stays byte-comparable with one an
+		// existing Drizzle project committed.
+		const t = sqliteTable('t', { n: text('n', { length: 5 }) });
+		expect(createTable(t)).toContain('"n" text(5)');
+	});
+
+	it('leaves plain text() with no length as bare "text"', () => {
+		const t = sqliteTable('t', { n: text('n') });
+		expect(createTable(t)).toContain('"n" text');
+		expect(createTable(t)).not.toContain('text(');
+	});
+
 	it('emits a column-level foreign key with its actions', () => {
 		expect(createTable(posts)).toContain(
 			'"author_id" integer not null references "users"("id") on delete cascade',

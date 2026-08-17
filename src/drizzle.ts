@@ -132,6 +132,44 @@ export function asDrizzleRelations<TRelations extends Record<string, unknown>>(r
 	return adapted as TRelations;
 }
 
+/**
+ * Guard against two resolved `drizzle-orm` copies — see `[F-095]` in
+ * `AUDIT.md`.
+ *
+ * `asDrizzleRelations` re-prototypes onto the `Many`/`One` classes **this
+ * module** resolved. If the adapter reading the result (e.g. Pothos' drizzle
+ * plugin) resolves a *different* copy of `drizzle-orm` — a lockfile that
+ * hoists two versions, a range bump in any dependency — its own `instanceof
+ * Many` is `false` for every relation, and every list field silently
+ * resolves as a single object instead of an array. No error, no type
+ * failure: the two copies' relation types are mutually unassignable, but
+ * adapters already require casts at exactly the seams where that
+ * assignability would have been checked.
+ *
+ * Call this once, in the adopter's own test suite, with the `Many` *the app
+ * itself* resolves:
+ *
+ * ```ts
+ * import { Many } from 'drizzle-orm';
+ * import { assertSameDrizzle } from 'orm-d1/drizzle';
+ * assertSameDrizzle({ Many });
+ * ```
+ *
+ * It throws exactly when the two copies diverge. Pinning `drizzle-orm` to an
+ * exact version sidesteps the class of bug; this catches the day someone
+ * changes that.
+ */
+export function assertSameDrizzle(other: { readonly Many: unknown }): void {
+	if (other.Many !== DrizzleMany) {
+		throw new Error(
+			'orm-d1/drizzle resolved a different `drizzle-orm` copy than the one this check was called with. '
+				+ '`instanceof Many` will be false for every relation an adapter reads through '
+				+ '`asDrizzleRelations`, and every "many" relation will silently resolve as a single object. '
+				+ 'Pin `drizzle-orm` to one exact version across the dependency tree.',
+		);
+	}
+}
+
 // ------------------------------------------------------- Pothos' generic slot
 
 /**

@@ -43,6 +43,30 @@ const builder = new SchemaBuilder<{ DrizzleRelations: PothosRelations<typeof rel
   structural match satisfies it; without this, every `many` relation resolves as a single
   object.
 
+  `instanceof` also fails silently if the *adapter* resolves a different `drizzle-orm`
+  copy than orm-d1 did — a lockfile that hoists two versions, a range bump in any
+  dependency — because `asDrizzleRelations` re-prototypes onto the copy it resolved, and
+  `instanceof` checks the caller's own `Many`. Put one of these in your own suite:
+
+  ```ts
+  import { Many } from 'drizzle-orm';
+  import { asDrizzleRelations } from 'orm-d1/drizzle';
+  const r = asDrizzleRelations(relations);
+  expect(Object.values(Object.values(r)[0].relations)[0]).toBeInstanceOf(Many);
+  ```
+
+  or call `assertSameDrizzle({ Many })` (also from `orm-d1/drizzle`) with the `Many` your
+  own code resolves — it throws with a clear message when the two copies diverge, instead
+  of leaving every list field silently returning one object.
+
+- `pothosFindConfig(query, selection)` is the resolver-side counterpart: `query()` — the
+  merged selection `@pothos/plugin-drizzle` hands every drizzle-backed resolver — carries a
+  phantom `$pothosQueryFor` key in its type that is never actually constructed, so the
+  merged config type-checks against nothing without it. `pothosFindConfig` drops that key
+  and returns the selection's own type, so `db.query.<table>.findMany(pothosFindConfig(query,
+  { where: { clubId } }))` still gets the schema-checked `where`/`columns`/`with`/`orderBy`
+  that an `as never` cast would otherwise give up.
+
 `asDrizzleSchema` / `asDrizzleTable` are identity functions at runtime. They exist because
 Drizzle's `Column` declares a `protected` member, and TypeScript accepts protected members
 only from the declaring class, so no independent implementation is assignable — they

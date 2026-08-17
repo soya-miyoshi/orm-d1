@@ -1,11 +1,12 @@
 import { CompileError } from '../errors.js';
+import type { InferInsert, InferSelect } from './infer.js';
 import { MAX_COLUMNS_PER_TABLE } from '../limits.js';
 import type { Query, SQLChunk } from '../sql/sql.js';
 import { quoteIdentifier } from '../sql/sql.js';
 import type { Column, ColumnBuilder, ColumnMeta, ReferentialAction } from './columns.js';
 import { isColumn } from './columns.js';
 import type { TableExtra } from './constraints.js';
-import { foreignKeyName, indexName, isTableExtra, primaryKeyName, uniqueConstraintName } from './constraints.js';
+import { foreignKeyName, indexName, isTableExtra, uniqueConstraintName } from './constraints.js';
 import {
 	DrizzleBaseName,
 	DrizzleColumns,
@@ -60,6 +61,16 @@ export interface TableMeta<TColumns extends ColumnsMap, TName extends string = s
 	readonly [TableOriginalName]: string;
 	readonly [TableColumns]: TColumns;
 	readonly [TableExtras]: readonly TableExtra[];
+	/**
+	 * Type-only — never assigned at runtime. Matches Drizzle's
+	 * `typeof table.$inferSelect` / `typeof table.$inferInsert` property
+	 * spelling, alongside the free-standing `InferSelectModel<T>` /
+	 * `InferInsertModel<T>` helpers, so a schema ported by changing one import
+	 * specifier keeps every `typeof X.$inferInsert` annotation compiling.
+	 * See `[F-094]` in `AUDIT.md`.
+	 */
+	readonly $inferSelect: InferSelect<this>;
+	readonly $inferInsert: InferInsert<this>;
 }
 
 /**
@@ -102,14 +113,16 @@ const buildTable = (
 	extras: readonly TableExtra[],
 	isAliasOf = false,
 ): Table => {
-	const meta: TableMeta<ColumnsMap> = {
+	// `$inferSelect`/`$inferInsert` are type-only — never assigned, so the
+	// literal below is not a `TableMeta` until cast. See `[F-094]`.
+	const meta = {
 		[IsTable]: true,
 		[TableName]: name,
 		[TableOriginalName]: originalName,
 		[TableColumns]: columns,
 		[TableExtras]: extras,
 		toQuery: (): Query => ({ sql: quoteIdentifier(name), params: [] }),
-	};
+	} as unknown as TableMeta<ColumnsMap>;
 
 	const drizzleMeta = {
 		[DrizzleTableName]: name,
@@ -234,20 +247,37 @@ export interface TableConfig {
 	readonly extras: readonly TableExtra[];
 }
 
+/**
+ * Matches `drizzle-orm/sqlite-core`'s `Index` instance shape: everything but
+ * `isNameExplicit` nests under `.config`. See `[F-052]` in `AUDIT.md`.
+ */
 export interface TableIndex {
-	readonly name: string;
-	readonly table: Table;
-	readonly columns: readonly (Column<any> | SQLChunk)[];
-	readonly unique: boolean;
-	readonly where: SQLChunk | undefined;
+	readonly config: {
+		readonly name: string;
+		readonly table: Table;
+		readonly columns: readonly (Column<any> | SQLChunk)[];
+		readonly unique: boolean;
+		readonly where: SQLChunk | undefined;
+	};
+	readonly isNameExplicit: boolean;
 }
 
+/**
+ * Matches `drizzle-orm/sqlite-core`'s `ForeignKey` instance shape: the column
+ * lists and foreign table live behind `reference()`, a function, alongside a
+ * `getName()`/`isNameExplicit()` pair — only `table`, `onUpdate` and
+ * `onDelete` are plain properties. See `[F-052]` in `AUDIT.md`.
+ */
 export interface TableForeignKey {
-	readonly name: string;
 	readonly table: Table;
-	readonly columns: readonly Column<any>[];
-	readonly foreignTable: Table | undefined;
-	readonly foreignColumns: readonly Column<any>[];
+	readonly reference: () => {
+		readonly name: string | undefined;
+		readonly columns: readonly Column<any>[];
+		readonly foreignTable: Table | undefined;
+		readonly foreignColumns: readonly Column<any>[];
+	};
+	readonly getName: () => string;
+	readonly isNameExplicit: () => boolean;
 	readonly onUpdate: ReferentialAction | undefined;
 	readonly onDelete: ReferentialAction | undefined;
 }
@@ -282,6 +312,34 @@ export interface TableUniqueConstraint {
  * `foreignKeys` includes the inline ones declared with `.references()`, which
  * Drizzle also folds in.
  */
+/**
+ * Wraps an already-derived foreign key name into Drizzle's `ForeignKey`
+ * instance shape — `reference()` as a function, `getName()`/`isNameExplicit()`
+ * as methods — instead of a flat record. See `[F-052]` in `AUDIT.md`. The
+ * name itself is derived by the caller so it stays whatever `orm-d1/ddl`
+ * actually emits for a *table-level* `foreignKey()` extra; only the *inline*
+ * `.references()` case below derives Drizzle's fuller
+ * `${table}_${cols}_${foreignTable}_${foreignCols}_fk` (`[F-015]`), because
+ * inline references have no `name` option to be explicit about.
+ */
+const buildForeignKey = (
+	t: Table,
+	name: string,
+	explicitName: string | undefined,
+	columns: readonly Column<any>[],
+	foreignTable: Table | undefined,
+	foreignColumns: readonly Column<any>[],
+	onUpdate: ReferentialAction | undefined,
+	onDelete: ReferentialAction | undefined,
+): TableForeignKey => ({
+	table: t,
+	reference: () => ({ name: explicitName, columns, foreignTable, foreignColumns }),
+	getName: () => name,
+	isNameExplicit: () => explicitName !== undefined,
+	onUpdate,
+	onDelete,
+});
+
 export const getTableConfig = (t: Table): TableConfig => {
 	const columns = Object.values(getTableColumns(t)) as Column<any>[];
 	const extras = getTableExtras(t);
@@ -297,30 +355,51 @@ export const getTableConfig = (t: Table): TableConfig => {
 		const reference = column.config.references;
 		if (!reference) continue;
 		const target = reference.ref();
-		foreignKeys.push({
-			name: `${name}_${column.name}_fk`,
-			table: t,
-			columns: [column],
-			foreignTable: target.table as Table | undefined,
-			foreignColumns: [target],
-			onUpdate: reference.onUpdate,
-			onDelete: reference.onDelete,
-		});
+		const foreignTable = target.table as Table | undefined;
+		// Drizzle's `ForeignKey.getName()`: `${table}_${cols}_${foreignTable}_${foreignCols}_fk`.
+		// Inline `.references()` has no `name` option, so this is always derived. See `[F-015]`.
+		const derivedName = [name, column.name, foreignTable ? getTableName(foreignTable) : '', target.name]
+			.join('_') + '_fk';
+		foreignKeys.push(
+			buildForeignKey(
+				t,
+				derivedName,
+				undefined,
+				[column],
+				foreignTable,
+				[target],
+				reference.onUpdate,
+				reference.onDelete,
+			),
+		);
 	}
 
 	for (const extra of extras) {
 		switch (extra.kind) {
 			case 'index':
 				indexes.push({
-					name: indexName(extra.meta, name),
-					table: t,
-					columns: extra.meta.columns,
-					unique: extra.meta.unique,
-					where: extra.meta.where,
+					config: {
+						name: indexName(extra.meta, name),
+						table: t,
+						columns: extra.meta.columns,
+						unique: extra.meta.unique,
+						where: extra.meta.where,
+					},
+					isNameExplicit: extra.meta.name !== undefined,
 				});
 				break;
 			case 'primaryKey':
-				primaryKeys.push({ name: primaryKeyName(extra.meta, name), table: t, columns: extra.meta.columns });
+				// Drizzle's `PrimaryKey.getName()` is `${table}_${cols}_pk`, not the
+				// bare `${table}_pk` that `primaryKeyName()` (shared with the actual
+				// DDL emitted for an unnamed composite PK) derives — the same
+				// divergence `[F-015]` records for foreign keys. Reported only
+				// here, on the `getTableConfig` shape, so real migration bytes for
+				// existing unnamed composite-PK tables stay unchanged. See `[F-052]`.
+				primaryKeys.push({
+					name: extra.meta.name ?? `${name}_${extra.meta.columns.map((c) => c.name).join('_')}_pk`,
+					table: t,
+					columns: extra.meta.columns,
+				});
 				break;
 			case 'unique':
 				uniqueConstraints.push({
@@ -330,15 +409,18 @@ export const getTableConfig = (t: Table): TableConfig => {
 				});
 				break;
 			case 'foreignKey':
-				foreignKeys.push({
-					name: foreignKeyName(extra.meta, name),
-					table: t,
-					columns: extra.meta.columns,
-					foreignTable: extra.meta.foreignColumns[0]?.table as Table | undefined,
-					foreignColumns: extra.meta.foreignColumns,
-					onUpdate: extra.meta.onUpdate,
-					onDelete: extra.meta.onDelete,
-				});
+				foreignKeys.push(
+					buildForeignKey(
+						t,
+						foreignKeyName(extra.meta, name),
+						extra.meta.name,
+						extra.meta.columns,
+						extra.meta.foreignColumns[0]?.table as Table | undefined,
+						extra.meta.foreignColumns,
+						extra.meta.onUpdate,
+						extra.meta.onDelete,
+					),
+				);
 				break;
 			case 'check':
 				checks.push({ name: extra.meta.name, table: t, value: extra.meta.value });

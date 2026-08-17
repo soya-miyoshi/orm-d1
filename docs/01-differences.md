@@ -310,6 +310,13 @@ Verify the current values against
 <https://developers.cloudflare.com/d1/platform/limits/> before relying on a specific
 number; the ones above were last checked on 2026-07-27.
 
+## `sum()` and `avg()` decode to `string`
+
+`sum(orders.cents)` and `avg(orders.cents)` decode to `string | null`, matching Drizzle's
+`.mapWith(String)` for both functions in every dialect — not `number`. A 64-bit sum does
+not survive an IEEE double; code that needs the numeric value should parse it explicitly
+(`BigInt(row.total)` or `Number(row.total)`), the same as against Drizzle.
+
 ## What is not a difference
 
 The schema DSL, the query builder, the inferred types and the `db.query` interface are
