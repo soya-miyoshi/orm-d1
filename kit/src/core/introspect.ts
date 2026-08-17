@@ -9,6 +9,7 @@
 import { defaultExpression } from 'orm-d1/ddl';
 import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { SNAPSHOT_VERSION } from './snapshot.js';
+import { foldAsciiCase } from './sql.js';
 
 export interface MasterRow {
 	readonly type: string;
@@ -543,9 +544,16 @@ export const appendOnlyTriggerGuard = (sql: string, tableName: string): boolean 
 	// collapsed so keywords can be found, `source` is the same collapse without
 	// the case folding, so a column name keeps the case it was declared with.
 	// Offsets line up because both transforms are length-preserving per run.
+	// `foldAsciiCase`, not `.toLowerCase()`: this text is sliced by offset
+	// below (`listStart`/`head[1].length`) to recover the case-preserving
+	// column list, which only lines up when the fold is length-preserving.
+	// `.toLowerCase()` is not — Turkish İ (U+0130) folds to two UTF-16 code
+	// units ('i' + combining dot above, U+0307), corrupting every offset past
+	// it and slicing the wrong span out of `source`. `foldAsciiCase` only
+	// touches ASCII `A`-`Z`, so it can never change the string's length.
 	const source = blankLiterals(sql).replaceAll(/\s+/g, ' ');
-	const text = source.toLowerCase();
-	const quoted = tableName.toLowerCase();
+	const text = foldAsciiCase(source);
+	const quoted = foldAsciiCase(tableName);
 
 	const begin = text.indexOf(' begin ');
 	const end = text.lastIndexOf(' end');

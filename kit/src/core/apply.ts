@@ -14,8 +14,12 @@ import type { Snapshot } from './snapshot.js';
 import {
 	applicableStatements,
 	createMigrationsTable,
+	foldAsciiCase,
+	IDENTIFIER_SOURCE,
+	lookupCaseInsensitive,
 	MIGRATIONS_TABLE,
-	packIntoBatches,
+	normalizeIdentifierToken,
+	packStatementsWithTrailer,
 	quoteIdentifier,
 	tablesRebuiltIn,
 } from './sql.js';
@@ -115,10 +119,22 @@ export async function introspect(runner: SqlRunner, foreignTriggers?: Record<str
 	);
 
 	if (foreignTriggers) {
+		// `foreignTriggers` is caller-supplied (an out-param) and documented as
+		// a plain `Record<string, string[]>` — every real caller in this repo
+		// passes an ordinary `{}` literal, which inherits `Object.prototype`.
+		// `??=` only initializes on `undefined`, so a live table literally
+		// named `constructor`/`toString`/`valueOf`/etc. resolves
+		// `foreignTriggers[row.tbl_name]` to the *inherited* prototype member
+		// (a function) instead of `undefined`, and `.push` on it throws
+		// `TypeError`. `Object.hasOwn` checks *own*-property presence, which is
+		// unaffected by what the prototype carries, so this works for any
+		// caller-supplied object shape without requiring a null-prototype
+		// object from the caller.
 		for (const row of master) {
 			if (row.type !== 'trigger' || !row.sql) continue;
 			if (isAppendOnlyTrigger(row.sql, row.tbl_name)) continue;
-			(foreignTriggers[row.tbl_name] ??= []).push(row.name);
+			if (!Object.hasOwn(foreignTriggers, row.tbl_name)) foreignTriggers[row.tbl_name] = [];
+			foreignTriggers[row.tbl_name]!.push(row.name);
 		}
 	}
 
@@ -234,21 +250,28 @@ export async function applyMigration(
 	// throws outright if a single group cannot fit in one batch, rather than
 	// splitting it.
 	//
-	// The migrations-table insert is packed in together with the real
-	// statements, not appended after batching completes — packing it
-	// separately used to push it into its own trailing one-statement batch
-	// whenever the real statements happened to fill the last batch exactly,
-	// which is a batch boundary indistinguishable from any other and defeats
-	// the whole point of riding along with the migration's own last effect.
-	// Handing it to `packIntoBatches` as one more (singleton-group) statement
-	// lets it spill into a new batch only when there truly is no room.
+	// The migrations-table insert rides along with real statements whenever
+	// there is any way to make that happen, rather than landing in a trailing
+	// batch of its own — a lone `insert into "d1_migrations"` batch is exactly
+	// as fragile as any other split (if it is the one that fails, the schema
+	// change already applied comes back unrecorded, and the retry dies on
+	// "table … already exists" with no way to mark the migration done).
+	// `packStatementsWithTrailer` (`sql.ts`) is the packer that actually
+	// guarantees this: `packIntoBatches([...statements, record], limit)` looks
+	// like it should, since `record` is a singleton run that ought to spill
+	// into the previous batch when there is room, but that packing loop only
+	// ever starts a *new* batch when a run does not fit in the current one —
+	// it never goes back to top up a batch a full-sized run already closed
+	// before `record` is reached. So whenever the real statements exactly
+	// fill a batch, `record` still lands alone in the next one, identical to
+	// always appending it after batching. `packStatementsWithTrailer` shifts
+	// the last batch's last run out to make room instead of accepting that.
 	//
 	// The ceiling comes from the runner, not from a constant here. A migration
 	// that goes through file import — or that runs against local SQLite — has
 	// no ceiling, and splitting it would give away atomicity for nothing.
-	const all = [...statements, record];
-	const limit = runner.atomicLimit?.(all) ?? MAX_STATEMENTS_PER_BATCH;
-	const batches = packIntoBatches(all, limit);
+	const limit = runner.atomicLimit?.([...statements, record]) ?? MAX_STATEMENTS_PER_BATCH;
+	const batches = packStatementsWithTrailer(statements, record, limit);
 
 	if (batches.length > 1) {
 		warnings.push(
@@ -275,20 +298,76 @@ export async function applyMigration(
  * rebuilt table invisible to the refusal below.
  */
 function renamesInMigration(statements: readonly string[]): Record<string, string> {
-	const renames: Record<string, string> = {};
-	const pattern = /^\s*alter\s+table\s+"((?:[^"]|"")+)"\s+rename\s+to\s+"((?:[^"]|"")+)"\s*$/i;
-	for (const statement of statements) {
+	// Null-prototype for the same `[F-078]` reason as `foreignTriggers`/
+	// `accumulated` below: `to`/`from` are parsed table names, not internal
+	// literals, so `renames['constructor']` must not resolve to
+	// `Object.prototype.constructor`.
+	const renames: Record<string, string> = Object.create(null) as Record<string, string>;
+	// Kit's own `recreateTable` always emits `create table "__new_X"` with the
+	// double-quoted spelling, but `renames` below already has to recognise a
+	// hand-written rename in any of the four spellings — and a hand-written
+	// `create table` (or a rebuild produced by some other tool feeding this
+	// same applier) is under no obligation to match kit's own spelling either.
+	// Recognising only `"…"` here left `createdAt` unpopulated for any other
+	// spelling, which made `isRebuildsOwnClose` below always false and caused
+	// the rebuild's own closing rename to be misfiled as a genuine live-table
+	// rename — corrupting `accumulated` in `checkForeignTriggerConflicts`
+	// silently rather than merely missing a guard. [Finding 1]
+	const createPattern = new RegExp(`^\\s*create\\s+table\\s+(${IDENTIFIER_SOURCE})`, 'i');
+	// A hand-written or `--rename-table` rename is under no obligation to use
+	// the kit's own double-quoted spelling — `alter table orders rename to
+	// sales;` (bare, no quotes) is completely ordinary SQL, and used to be
+	// invisible to this scan entirely.
+	const pattern = new RegExp(
+		`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+to\\s+(${IDENTIFIER_SOURCE})\\s*$`,
+		'i',
+	);
+
+	// A rebuild's own closing rename (`"__new_X"` -> `"X"`) is not a live
+	// table's identity change; excluding it keeps this map limited to actual
+	// `--rename-table` renames, which is all `tablesRebuiltIn`'s post-rename
+	// names need resolving through. `from.startsWith('__new_')` used to be the
+	// test for that, but a genuine `--rename-table __new_orders=orders_v2` —
+	// a real table someone named `__new_orders`, the same case `diff.ts:412`
+	// already acknowledges exists — starts with `__new_` too and was wrongly
+	// excluded, silently hiding it from the trigger guard. Recording *where*
+	// (not just *whether*) this migration created `"__new_X"` fixes the
+	// follow-on hole that plain membership reopened: a migration can both
+	// genuinely rename a live `__new_orders` *and* separately rebuild `orders`
+	// (whose rebuild creates its own `"__new_orders"` scratch table) — after
+	// which `createdHere.has('__new_orders')` is true again, for a completely
+	// unrelated table, and the genuine rename is discarded a second time.
+	// What actually distinguishes the rebuild's own closing rename is BOTH
+	// that this migration created `"__new_X"` earlier in the statement list
+	// AND that this specific rename's target is `X` (the name with the
+	// `__new_` prefix stripped) — the exact shape `recreateTable` emits and
+	// nothing else has reason to produce.
+	const createdAt = new Map<string, number>();
+	statements.forEach((statement, index) => {
+		const created = createPattern.exec(statement);
+		if (!created) return;
+		// Normalized the same way `pattern`'s matches are below, not with the
+		// double-quote-specific unescape this used to do — a bare or
+		// backtick-/bracket-quoted `create table __new_x` produced a name that
+		// never matched `from`'s normalized form, for the same reason.
+		const name = normalizeIdentifierToken(created[1]!);
+		if (!foldAsciiCase(name).startsWith('__new_')) return;
+		const key = foldAsciiCase(name);
+		if (!createdAt.has(key)) createdAt.set(key, index);
+	});
+
+	statements.forEach((statement, index) => {
 		const match = pattern.exec(statement);
-		if (!match) continue;
-		const from = match[1]!.replaceAll('""', '"');
-		const to = match[2]!.replaceAll('""', '"');
-		// The rebuild's own closing rename (`"__new_X"` -> `"X"`) is not a live
-		// table's identity change; excluding it keeps this map limited to actual
-		// `--rename-table` renames, which is all `tablesRebuiltIn`'s post-rename
-		// names need resolving through.
-		if (from.startsWith('__new_')) continue;
+		if (!match) return;
+		const from = normalizeIdentifierToken(match[1]!);
+		const to = normalizeIdentifierToken(match[2]!);
+		const strippedTarget = foldAsciiCase(from).startsWith('__new_') ? from.slice('__new_'.length) : undefined;
+		const createdIndex = createdAt.get(foldAsciiCase(from));
+		const isRebuildsOwnClose = strippedTarget !== undefined && foldAsciiCase(to) === foldAsciiCase(strippedTarget)
+			&& createdIndex !== undefined && createdIndex < index;
+		if (isRebuildsOwnClose) return;
 		renames[to] = from;
-	}
+	});
 	return renames;
 }
 
@@ -327,7 +406,13 @@ export async function checkForeignTriggerConflicts(
 	const master = await runner.all<MasterRow>(
 		"select type, name, tbl_name, sql from sqlite_master where type = 'trigger'",
 	);
-	const foreignTriggers: Record<string, string[]> = {};
+	// Null-prototype: `row.tbl_name` is a live table name straight from
+	// `sqlite_master`, so a table named `constructor`/`__proto__`/`toString`
+	// (the `[F-078]` class) must not resolve to `Object.prototype`'s own
+	// members — a plain `{}` literal made `(foreignTriggers['constructor'] ??=
+	// []).push(...)` throw `TypeError: … .push is not a function` instead of
+	// recording the trigger.
+	const foreignTriggers: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
 	for (const row of master) {
 		if (!row.sql) continue;
 		if (isAppendOnlyTrigger(row.sql, row.tbl_name)) continue;
@@ -335,10 +420,76 @@ export async function checkForeignTriggerConflicts(
 	}
 	if (Object.keys(foreignTriggers).length === 0) return;
 
+	// `migration.renames` only resolves a rename performed *within that one
+	// migration file*. A table renamed in an earlier pending migration and
+	// then rebuilt in a later one — the ordinary `generate --rename-table`
+	// workflow, split across two runs of `generate` the way any two-step
+	// schema change is — needs its name resolved back through every rename
+	// since the run started, not just the last one. `accumulated` carries
+	// that: it maps a name as it exists going into the migration currently
+	// being checked to the table's true live name in the database (before
+	// this `migrate` run touched anything), and is folded forward after each
+	// migration is considered so the next one inherits it.
+	// Null-prototype for the same `[F-078]` reason as `foreignTriggers` above:
+	// a live table literally named `constructor` would otherwise resolve
+	// `accumulated['constructor']` to `Object.prototype.constructor` instead
+	// of `undefined`, corrupting the rename chain rather than starting it.
+	const accumulated: Record<string, string> = Object.create(null) as Record<string, string>;
+
 	for (const migration of parsed) {
 		for (const table of migration.tables) {
-			const liveName = migration.renames[table] ?? table;
-			const triggers = foreignTriggers[liveName];
+			// Both hops below used to be exact-match/case-sensitive lookups while
+			// only the final `foreignTriggers` lookup was case-insensitive, and the
+			// within-file hop only ever followed one rename, not a chain — two
+			// independent ways a real trigger went unguarded. [Finding 4]
+			//
+			// (a) `alter table orders rename to Sales;` then a rebuild of `sales`
+			// (lowercase) in the same file: `migration.renames` is keyed exactly as
+			// written (`Sales`), so a case-sensitive `renames[table]` with
+			// `table === 'sales'` misses it entirely.
+			//
+			// (b) A two-hop chain within one migration file — `orders` -> `tmp` ->
+			// `sales` — followed by a rebuild of `sales` in that same file.
+			// `migration.renames` maps each post-rename name to its immediately
+			// preceding name (`renames['sales'] === 'tmp'`, `renames['tmp'] ===
+			// 'orders'`); a single lookup stops at `tmp` and never reaches `orders`,
+			// the table's actual live identity before this migration ran.
+			// `accumulated`'s cross-file fold (below) already walks a chain, but
+			// only across *previous* migrations — this walks the chain *within*
+			// the current one before handing off to `accumulated`.
+			// Both hops below used to be exact-match/case-sensitive lookups while
+			// only the final `foreignTriggers` lookup was case-insensitive, and the
+			// within-file hop only ever followed one rename, not a chain — two
+			// independent ways a real trigger went unguarded. [Finding 4]
+			//
+			// (a) `alter table orders rename to Sales;` then a rebuild of `sales`
+			// (lowercase) in the same file: `migration.renames` is keyed exactly as
+			// written (`Sales`), so a case-sensitive `renames[table]` with
+			// `table === 'sales'` misses it entirely.
+			//
+			// (b) A two-hop chain within one migration file — `orders` -> `tmp` ->
+			// `sales` — followed by a rebuild of `sales` in that same file.
+			// `migration.renames` maps each post-rename name to its immediately
+			// preceding name (`renames['sales'] === 'tmp'`, `renames['tmp'] ===
+			// 'orders'`); a single lookup stops at `tmp` and never reaches `orders`,
+			// the table's actual live identity before this migration ran.
+			// `accumulated`'s cross-file fold (below) already walks a chain, but
+			// only across *previous* migrations — this walks the chain *within*
+			// the current one before handing off to `accumulated`.
+			let preMigrationName = table;
+			const visited = new Set<string>([preMigrationName]);
+			for (;;) {
+				const next = lookupCaseInsensitive(migration.renames, preMigrationName);
+				if (next === undefined || visited.has(next)) break;
+				preMigrationName = next;
+				visited.add(next);
+			}
+			const liveName = lookupCaseInsensitive(accumulated, preMigrationName) ?? preMigrationName;
+			// Case-insensitive: `sqlite_master.tbl_name` is stored exactly as the
+			// hand-written trigger spelled it, and identifiers are
+			// case-insensitive, so a trigger on `Orders` still guards the schema's
+			// `orders`. See `lookupCaseInsensitive`.
+			const triggers = lookupCaseInsensitive(foreignTriggers, liveName);
 			if (!triggers || triggers.length === 0) continue;
 			throw new Error(
 				`Migration "${migration.tag}" would rebuild "${table}", but it carries trigger(s) `
@@ -347,6 +498,33 @@ export async function checkForeignTriggerConflicts(
 					+ 'orm-d1 does not know the definition of. Drop the trigger, recreate it by hand after this '
 					+ 'migration runs, or bring it into the schema so orm-d1 can carry it across rebuilds.',
 			);
+		}
+
+		// Fold this migration's renames into the running map before moving to
+		// the next migration, so a rename here is visible to a rebuild in any
+		// later pending migration.
+		//
+		// Both sides of this fold used to be raw, case-sensitive
+		// `Record<string, string>` lookups/writes. `accumulated[from]` missed a
+		// seam where one migration's rename target and the next migration's
+		// rename source differ only in case (`orders -> Sales` then
+		// `sales -> sales_v2`): the chain back to the true live name silently
+		// broke, and a rebuild several migrations later became invisible to
+		// the guard. [Finding 9]
+		//
+		// The write side has to be case-insensitive too, and consistently so:
+		// if an earlier iteration (of this same loop, or the within-file walk
+		// above) already recorded the live table under some case spelling of
+		// `to`, reuse that exact key rather than adding a second, differently
+		// cased key for the same table — two keys for one table would let
+		// later folds see one and miss the other, drifting apart across
+		// further renames.
+		for (const [to, from] of Object.entries(migration.renames)) {
+			const resolved = lookupCaseInsensitive(accumulated, from) ?? from;
+			const existingKey = Object.keys(accumulated).find(
+				(key) => foldAsciiCase(key) === foldAsciiCase(to),
+			);
+			accumulated[existingKey ?? to] = resolved;
 		}
 	}
 }

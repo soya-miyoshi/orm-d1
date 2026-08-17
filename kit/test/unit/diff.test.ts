@@ -1778,6 +1778,27 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			expect(diff.errors[0]).toMatch(/"users_audit"/);
 		});
 
+		it('refuses when the live foreign trigger is recorded under a differently-cased table name (diff.ts:808)', () => {
+			// `options.foreignTriggers` is keyed the way `introspect()` populates
+			// it — exactly as `sqlite_master.tbl_name` spelled it, "USERS" here —
+			// while the diff's own table name is "users" (lowercase). A direct
+			// `options.foreignTriggers[liveTableNames[name] ?? name]` lookup would
+			// miss the "USERS"-keyed entry.
+			const before = withOptions(users, {});
+			const after = withOptions(
+				sqliteTable('users', { id: text('id').primaryKey(), email: text('email') }),
+				{},
+			);
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { USERS: ['users_audit'] },
+			});
+
+			expect(diff.statements).toEqual([]);
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"users_audit"/);
+		});
+
 		it('does not refuse when the only trigger present is the append-only guard itself', () => {
 			const before = withOptions(users, { appendOnly: true });
 			const after = withOptions(
@@ -1818,6 +1839,23 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			// happen, and the first one found is reported.
 			expect(diff.errors).toHaveLength(1);
 			expect(diff.errors[0]).toMatch(/"child".*references it/);
+		});
+
+		// [F-046]: `recreateTable`'s contract is "no statements alongside a
+		// refusal", but the append-only-loss block used to run unconditionally
+		// after the `recreateTable` call regardless of whether it refused, so a
+		// refused rebuild still emitted a lone destructive `drop trigger`.
+		it('emits no statements at all — not even the append-only-loss drop trigger — when the rebuild is refused for carrying a foreign trigger', () => {
+			const before = withOptions(users, { appendOnly: true });
+			const after = withOptions(
+				sqliteTable('users', { id: text('id').primaryKey(), email: integer('email') }),
+				{},
+			);
+
+			const diff = diffSnapshots(before, after, { foreignTriggers: { users: ['users_audit'] } });
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.statements).toEqual([]);
 		});
 
 		it('still refuses when the trigger-carrying table is also renamed in the same migration', () => {
@@ -1862,6 +1900,68 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
 		});
 
+		// [Finding 7c]: SQLite trigger names are database-global, not scoped to
+		// the table gaining the guard, so the collision check has to scan every
+		// table's foreign triggers — not just look up `foreignTriggers[name]` for
+		// the table becoming append-only. Reverting to that per-table
+		// `.includes(guardName)` shape (main's old check) left every existing
+		// test in this file green, because they all happen to put the collider
+		// on the table gaining the guard, or on a table this same diff drops.
+		// This one puts it on a *different* table that neither is rebuilt nor
+		// dropped — untouched by this diff except for being where the colliding
+		// trigger happens to live.
+		it('refuses when the colliding trigger lives on a different table entirely, which survives untouched', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, events);
+			const after = snapshotFromSchema([audit, events], '', tableOptions([[events, { appendOnly: true }]]));
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"events_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
+			// "audit" itself is untouched by this diff — it is neither rebuilt nor
+			// dropped, just the table the collider happens to live on.
+			expect(diff.statements.some((s) => s.sql.includes('"audit"'))).toBe(false);
+		});
+
+		// `tableGuardCollides`'s `droppedTriggerNames` exemption: a rename of an
+		// append-only table drops its OLD guard under the OLD name (step 1, see
+		// the comment at diff.ts ~569-593 on why SQLite does not rename a
+		// trigger along with its table). If this same diff also creates a
+		// brand-new table that happens to reuse that freed-up name — legal,
+		// since the old name no longer appears in `after` once the rename takes
+		// it — the new table's own derived guard name is identical to the one
+		// just dropped. `options.foreignTriggers` (a pre-diff snapshot) has no
+		// way to know that literal name is about to be vacated by this diff's
+		// own rename, so a naive scan over it would refuse a guard creation
+		// this diff's own earlier statement already made safe.
+		it('does not refuse a new table\'s guard whose name was already vacated by an earlier rename in the same diff', () => {
+			const legacyBefore = sqliteTable('legacy', { id: text('id').primaryKey() });
+			const before = snapshotFromSchema([legacyBefore], '', tableOptions([[legacyBefore, { appendOnly: true }]]));
+
+			const ordersAfter = sqliteTable('orders', { id: text('id').primaryKey() });
+			const legacyNew = sqliteTable('legacy', { id: text('id').primaryKey() });
+			const after = snapshotFromSchema(
+				[ordersAfter, legacyNew],
+				'',
+				tableOptions([[legacyNew, { appendOnly: true }]]),
+			);
+
+			const diff = diffSnapshots(before, after, {
+				renamedTables: { legacy: 'orders' },
+				// A stale pre-diff record of a trigger literally named
+				// "legacy_no_update" — as if it lived on some unrelated table.
+				foreignTriggers: { misc: ['legacy_no_update'] },
+			});
+
+			expect(diff.errors).toEqual([]);
+			expect(diff.statements.some((s) => s.sql === 'drop trigger if exists "legacy_no_update"')).toBe(true);
+			expect(diff.statements.some((s) => /create trigger "legacy_no_update"/.test(s.sql))).toBe(true);
+		});
+
 		it('still creates the guard normally when no foreign trigger occupies the name', () => {
 			const before = withOptions(events, {});
 			const after = withOptions(events, { appendOnly: true });
@@ -1870,6 +1970,122 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 
 			expect(diff.errors).toEqual([]);
 			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(true);
+		});
+
+		// [F-079], regression half: `options.foreignTriggers` is a pre-diff
+		// snapshot, so a naive scan over it refuses a migration that is itself
+		// the fix — dropping the table the collider lives on, in the same
+		// batch, removes the collider before `create trigger` ever runs.
+		it('does not refuse when the colliding trigger\'s own table is dropped in the same diff', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, events);
+			const after = snapshotFromSchema([events], '', tableOptions([[events, { appendOnly: true }]]));
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			expect(diff.errors).toEqual([]);
+			expect(diff.statements.some((s) => s.sql === 'drop table "audit"')).toBe(true);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(true);
+		});
+
+		// [Finding 2]: `tableGuardCollides`'s `droppedTables` exemption used to be
+		// pure membership — "this diff drops that table eventually" — not order.
+		// `diffSnapshots` emits created tables (step 2) *before* dropped tables
+		// (step 3), so a brand-new append-only table whose guard collides with a
+		// trigger on a table this same diff also drops used to be exempted here
+		// even though, in the emitted SQL, the colliding `create trigger` runs
+		// before the `drop table` that was supposed to clear the name — the
+		// create fails on apply (or, worse, silently attaches to whichever table
+		// SQLite still has under that name). Both "audit" and "log" are dropped
+		// (neither survives into `after`), so nothing in the emitted statements
+		// removes the collider before the new "events" guard would try to claim
+		// its name.
+		it('refuses a brand-new append-only table whose guard collides with a live trigger on a table dropped later in the same diff', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const log = sqliteTable('log', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, log);
+			const after = snapshotFromSchema([events], '', tableOptions([[events, { appendOnly: true }]]));
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"events_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
+		});
+
+		// [F-079], narrowness half: the created-table path never checked at all.
+		it('refuses a brand-new append-only table whose guard name collides with a live foreign trigger on a table that survives', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit);
+			const after = snapshotFromSchema([audit, events], '', tableOptions([[events, { appendOnly: true }]]));
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"events_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
+		});
+
+		// [F-079], narrowness half: the rebuild path never checked at all — a
+		// table rebuilt for some unrelated reason (here, a type change) that
+		// also turns on `appendOnly` used to re-create the guard with no check.
+		it('refuses a rebuild that turns a table append-only when the guard name collides with a live foreign trigger on a table that survives', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, events);
+			// A type change on "at" forces `recreateTable`'s rebuild path, which
+			// is also where this diff turns "events" append-only.
+			const rebuiltEvents = sqliteTable('events', { id: text('id').primaryKey(), at: text('at') });
+			const after = snapshotFromSchema(
+				[audit, rebuiltEvents],
+				'',
+				tableOptions([[rebuiltEvents, { appendOnly: true }]]),
+			);
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			// [Finding 6]: a guard-collision refusal here used to fall through and
+			// still return the full destructive rebuild alongside the error — the
+			// `create table "__new_events"`, the data copy, the `drop table`, the
+			// rename — unapplyable SQL sitting next to an error that says the
+			// rebuild cannot happen. It must refuse the same way the other two
+			// `recreateTable` refusals do: an error, and no statements at all.
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"events_no_update"/);
+			expect(diff.statements).toEqual([]);
+		});
+
+		// [Round 3, Finding 3]: `tableGuardCollides` used to fold case with
+		// `.toLowerCase()`, not the ASCII-only `foldAsciiCase` this file already
+		// uses elsewhere for identifier comparison. `.toLowerCase()` maps U+212A
+		// KELVIN SIGN to ordinary ASCII "k" — SQLite's own identifier comparison
+		// is ASCII-only and treats them as different characters — so a table
+		// named with a Kelvin sign turning append-only used to be refused
+		// against a live trigger that, to SQLite, has an entirely different
+		// name. `create trigger` would actually succeed.
+		it('does not refuse when the guard name only collides after non-ASCII case folding (Kelvin sign vs "k")', () => {
+			const kelvinSign = String.fromCharCode(0x212a);
+			const eventK = sqliteTable(`event${kelvinSign}`, { id: text('id').primaryKey() });
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, eventK);
+			const after = snapshotFromSchema([audit, eventK], '', tableOptions([[eventK, { appendOnly: true }]]));
+
+			// A live foreign trigger spelled with an ordinary ASCII "k" — distinct
+			// from `event<KELVIN SIGN>_no_update` to SQLite, but `.toLowerCase()`
+			// would fold both to the same string.
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['eventk_no_update'] },
+			});
+
+			expect(diff.errors).toEqual([]);
+			expect(diff.statements.some((s) => s.sql.includes(`"event${kelvinSign}_no_update"`))).toBe(true);
 		});
 	});
 
