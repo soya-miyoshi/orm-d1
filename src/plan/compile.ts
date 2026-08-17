@@ -577,12 +577,14 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 		// write pass below splices it in instead of rendering the row again —
 		// see `rowParamCount`.
 		// Two pre-sized parallel arrays rather than `group.rows.map(row =>
-		// rowParamCount(...))`: the latter allocates one `{ count, rendered }`
-		// wrapper object per row on top of the array itself, for a value only ever
-		// read back as `rowCounts[i]`/`rowRendered[i]`. `rowCounts` is a typed
-		// array — every count is a small non-negative integer, so this is a flat
-		// unboxed buffer rather than a holey/boxed `number[]`, cheaper both to
-		// allocate and to scan in the `maxRowParams` loop below.
+		// rowParamCount(...))`: `rowParamCount` still allocates one `{ count,
+		// rendered }` wrapper object per row either way — the arrays avoid
+		// *storing* that wrapper (a `{ count, rendered }[]` array of boxed
+		// objects), not allocating it, since each wrapper is read once, right
+		// here, and then discarded. `rowCounts` is a typed array — every count is
+		// a small non-negative integer, so this is a flat unboxed buffer rather
+		// than a holey/boxed `number[]`, cheaper both to allocate and to scan in
+		// the `maxRowParams` loop below.
 		const rowCounts = new Int32Array(group.rows.length);
 		const rowRendered: (Query | undefined)[] = new Array(group.rows.length);
 		for (let i = 0; i < group.rows.length; i++) {

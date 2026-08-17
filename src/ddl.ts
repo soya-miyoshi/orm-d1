@@ -99,12 +99,12 @@ const isBareBooleanFragment = (queryChunks: readonly unknown[]): boolean => {
 	return text === 'true' || text === 'false';
 };
 
-const hasEmptyArrayChunk = (queryChunks: readonly unknown[]): boolean => {
-	if (isBareBooleanFragment(queryChunks)) return true;
+const hasEmptyArrayChunk = (queryChunks: readonly unknown[], checkBareBoolean: boolean): boolean => {
+	if (checkBareBoolean && isBareBooleanFragment(queryChunks)) return true;
 	for (const chunk of queryChunks) {
 		if (Array.isArray(chunk) && chunk.length === 0) return true;
 		if (typeof chunk === 'object' && chunk !== null && isDrizzleSQL(chunk)) {
-			if (hasEmptyArrayChunk((chunk as { queryChunks: readonly unknown[] }).queryChunks)) return true;
+			if (hasEmptyArrayChunk((chunk as { queryChunks: readonly unknown[] }).queryChunks, checkBareBoolean)) return true;
 		}
 	}
 	return false;
@@ -124,6 +124,20 @@ const hasEmptyArrayChunk = (queryChunks: readonly unknown[]): boolean => {
  * though nothing is bound. Both are set to effectively infinite so DDL
  * rendering always takes the literal `in (...)` list branch.
  */
+/**
+ * Base DDL render context. `onForeignFragment` here only refuses a genuine
+ * empty-array chunk (`in ()` / `not in ()`) — it does NOT consult
+ * `isBareBooleanFragment`. That heuristic is meaningful only for a predicate
+ * (a `check`/partial-index `where` that would go permanently inert), and this
+ * context is shared by every `renderInline` call, including `defaultClause`
+ * and the generated-column expression in `columnDDL` — neither of which is a
+ * predicate. A `default(sql\`true\`)` or `.generatedAlwaysAs(sql\`true\`)` is
+ * a perfectly ordinary, meaningful expression there; refusing it because it
+ * happens to collapse to the same one-`StringChunk` shape Drizzle's
+ * `inArray([])`/`notInArray([])` produce was a false positive with no
+ * predicate anywhere nearby. See `predicateDdlContext` below for the
+ * predicate-only variant that layers the bare-boolean check back on.
+ */
 const ddlContext: RenderContext = {
 	...defaultRenderContext,
 	bareColumns: true,
@@ -132,7 +146,21 @@ const ddlContext: RenderContext = {
 	maxParams: Number.POSITIVE_INFINITY,
 	onEmptyArrayPredicate: refuseEmptyArrayPredicate,
 	onForeignFragment: (queryChunks): void => {
-		if (hasEmptyArrayChunk(queryChunks)) refuseEmptyArrayPredicate();
+		if (hasEmptyArrayChunk(queryChunks, false)) refuseEmptyArrayPredicate();
+	},
+};
+
+/**
+ * Used only by `checkDDL` and `createIndex`'s `where()` — the two DDL
+ * positions that are actually predicates, and so the only positions where
+ * Drizzle's `inArray([])`/`notInArray([])` collapsing to a bare
+ * `sql\`true\`\`/`sql\`false\`` fragment is a real hazard (see the long
+ * comment on `isBareBooleanFragment` above).
+ */
+const predicateDdlContext: RenderContext = {
+	...ddlContext,
+	onForeignFragment: (queryChunks): void => {
+		if (hasEmptyArrayChunk(queryChunks, true)) refuseEmptyArrayPredicate();
 	},
 };
 
@@ -355,9 +383,9 @@ export function validateTableOptions(t: Table, options: TableOptions): string | 
  * value never compared equal to itself and `check` and `push` re-emitted it on
  * every run.
  */
-export const renderInline = (chunk: SQLChunk | string): string => {
+export const renderInline = (chunk: SQLChunk | string, isPredicate = false): string => {
 	if (typeof chunk === 'string') return chunk;
-	const { sql, params } = render(chunk, ddlContext);
+	const { sql, params } = render(chunk, isPredicate ? predicateDdlContext : ddlContext);
 	let index = 0;
 	return sql.replaceAll(PARAM_TOKEN, () => {
 		const slot = params[index++];
@@ -528,7 +556,7 @@ export const checkDDL = (meta: CheckMeta, tableName: string): string =>
 	withDDLContext(
 		tableName,
 		meta.name,
-		() => `${constraintName(meta.name)}check (${renderInline(meta.value)})`,
+		() => `${constraintName(meta.name)}check (${renderInline(meta.value, true)})`,
 	);
 
 export const createIndex = (meta: IndexMeta, tableName: string, options: DDLOptions = {}): string =>
@@ -537,7 +565,7 @@ export const createIndex = (meta: IndexMeta, tableName: string, options: DDLOpti
 		let ddl = `create ${meta.unique ? 'unique ' : ''}index ${options.ifNotExists ? 'if not exists ' : ''}${
 			quoteIdentifier(indexName(meta, tableName))
 		} on ${quoteIdentifier(tableName)} (${columns})`;
-		if (meta.where) ddl += ` where ${renderInline(meta.where)}`;
+		if (meta.where) ddl += ` where ${renderInline(meta.where, true)}`;
 		return ddl;
 	});
 

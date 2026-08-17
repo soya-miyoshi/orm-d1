@@ -286,6 +286,49 @@ describe('ddl generation', () => {
 		expect(() => createIndexes(t7)).toThrow(/empty array/);
 	});
 
+	// Regression: `isBareBooleanFragment` is only meaningful for a predicate
+	// (`check()`/partial-index `where()`) — it must NOT be consulted from
+	// `ddlContext`, which every `renderInline` call shares, including
+	// `defaultClause` and the generated-column expression in `columnDDL`. A
+	// Drizzle-tagged `default(sql\`true\`)` collapses to the exact same
+	// one-`StringChunk` shape as Drizzle's own `inArray([])`/`notInArray([])`
+	// short-circuit, but it is an ordinary, meaningful default — not an
+	// empty-array predicate — and must render, not throw.
+	it('does not refuse a Drizzle-tagged default(sql`true`)', () => {
+		const t = sqliteTable('members', {
+			active: integer('active', { mode: 'boolean' }).notNull().default(dSql`true` as unknown as SQLChunk),
+		});
+
+		let ddl = '';
+		expect(() => (ddl = createTable(t))).not.toThrow();
+		expect(ddl).toContain('"active" integer not null default true');
+	});
+
+	it('does not refuse a Drizzle-tagged generatedAlwaysAs(sql`true`)', () => {
+		const t = sqliteTable('t11', {
+			flag: integer('flag', { mode: 'boolean' }).generatedAlwaysAs(dSql`true` as unknown as SQLChunk),
+		});
+
+		let ddl = '';
+		expect(() => (ddl = createTable(t))).not.toThrow();
+		expect(ddl).toContain('generated always as (true)');
+	});
+
+	// The predicate positions must still refuse a bare `sql\`true\`` — this is
+	// the accepted false positive the long comment on `isBareBooleanFragment`
+	// documents: structurally indistinguishable from Drizzle's own
+	// `inArray([])`/`notInArray([])` collapse, and a `check` that is
+	// unconditionally satisfied has no reason to exist.
+	it('still refuses a check() built directly with Drizzle\'s sql`true`', () => {
+		const t = sqliteTable('t12', {
+			role: text('role'),
+		}, () => [
+			check('t12_always_check', dSql`true` as unknown as SQLChunk),
+		]);
+
+		expect(() => createTable(t)).toThrow(/empty array/);
+	});
+
 	// DDL binds nothing — every value is inlined as a literal (`renderInline`)
 	// — so the real D1 bound-parameter limits (`jsonEachThreshold: 30`,
 	// `maxParams: 100`) do not apply here. Left at their query-path defaults, a
