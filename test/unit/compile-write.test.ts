@@ -381,3 +381,77 @@ describe('generated columns are not writable', () => {
 		).toThrow(/"shout" is a generated column/);
 	});
 });
+
+// [F-3]: `compileInsert`'s per-row loop used to re-derive, for every row, both
+// "which fields belong in this row's VALUES list" (from each column's static
+// config — generated/defaultFn/onUpdateFn/default — the same answer every
+// row) and "is any of this row's values dynamic" via a fresh `{ count,
+// rendered }` wrapper object per row. Both were hoisted to run once per
+// column/pre-sized array instead of once per row. Golden output here is the
+// correctness backstop for that change: a pure-scalar batch and a batch
+// mixing static and dynamic (`sql`...``) rows must still compile to exactly
+// the same SQL text and params as before.
+describe('insert compile output is unaffected by the per-row hoisting', () => {
+	const wide = sqliteTable('wide', {
+		id: integer('id').primaryKey(),
+		a: text('a').notNull(),
+		b: text('b'),
+		c: integer('c'),
+		d: integer('d'),
+		e: text('e'),
+		f: integer('f'),
+		g: text('g'),
+	});
+
+	it('compiles a batch of purely scalar rows', () => {
+		// 10 rows * 8 columns = 80 params, under the default 100-param budget,
+		// so this stays one statement rather than chunking — chunking is
+		// exercised separately elsewhere and is not what this test is about.
+		const rows = Array.from({ length: 10 }, (_, i) => ({
+			id: i,
+			a: `a${i}`,
+			b: `b${i}`,
+			c: i * 2,
+			d: i * 3,
+			e: `e${i}`,
+			f: i * 4,
+			g: `g${i}`,
+		}));
+
+		const compiled = query.insert(wide).values(rows).compile();
+
+		expect(compiled.parts).toHaveLength(1);
+		expect(compiled.sql).toBe(
+			'insert into "wide" ("id", "a", "b", "c", "d", "e", "f", "g") values '
+				+ Array.from({ length: 10 }, () => '(?, ?, ?, ?, ?, ?, ?, ?)').join(', '),
+		);
+		// 8 columns * 10 rows, every one a plain bound `const` slot.
+		expect(compiled.params).toHaveLength(80);
+		expect(compiled.params.every((p) => (p as { k: string }).k === 'const')).toBe(true);
+		expect(compiled.params.slice(0, 8).map((p) => (p as { v: unknown }).v))
+			.toEqual([0, 'a0', 'b0', 0, 0, 'e0', 0, 'g0']);
+		expect(compiled.params.slice(-8).map((p) => (p as { v: unknown }).v))
+			.toEqual([9, 'a9', 'b9', 18, 27, 'e9', 36, 'g9']);
+	});
+
+	it('compiles a batch mixing static rows and sql`...` fragment rows', () => {
+		const rows = [
+			{ id: 1, a: 'a1', b: 'b1', c: 1, d: 1, e: 'e1', f: 1, g: 'g1' },
+			{ id: 2, a: sql`upper(${'a2'})`, b: 'b2', c: 2, d: 2, e: 'e2', f: 2, g: 'g2' },
+			{ id: 3, a: 'a3', b: 'b3', c: 3, d: 3, e: 'e3', f: 3, g: 'g3' },
+		];
+
+		const compiled = query.insert(wide).values(rows).compile();
+
+		expect(compiled.sql).toBe(
+			'insert into "wide" ("id", "a", "b", "c", "d", "e", "f", "g") values '
+				+ '(?, ?, ?, ?, ?, ?, ?, ?), (?, upper(?), ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?)',
+		);
+		expect(compiled.params).toHaveLength(24);
+		expect(compiled.params.map((p) => (p as { v?: unknown }).v)).toEqual([
+			1, 'a1', 'b1', 1, 1, 'e1', 1, 'g1',
+			2, 'a2', 'b2', 2, 2, 'e2', 2, 'g2',
+			3, 'a3', 'b3', 3, 3, 'e3', 3, 'g3',
+		]);
+	});
+});

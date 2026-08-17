@@ -202,10 +202,14 @@ export class OrmD1Database {
 	 * way out of the builder is a reason for better diagnostics, not worse.
 	 */
 	async execute(sql: string, params: unknown[] = []): Promise<D1Result> {
-		const stmt = this.$client.prepare(sql);
+		// Routed through `Executor#prepare` (via `prepareRaw`) rather than
+		// `this.$client.prepare()` directly, so `logger`/`onQuery` observe this
+		// statement the same way they observe every built one — see the comment
+		// on `Executor#prepare` in `runtime/session.ts`.
+		const stmt = this.executor.prepareRaw(sql, params as D1Param[]);
 		const started = Date.now();
 		try {
-			const result = await (params.length > 0 ? stmt.bind(...params) : stmt).run();
+			const result = await stmt.run();
 			// Counts like any other statement: D1 does not care that we did not
 			// build this one.
 			this.options.budget?.record(result.meta?.size_after);

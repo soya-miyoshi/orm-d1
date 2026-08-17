@@ -126,11 +126,22 @@ export class Executor implements QueryExecutor {
 
 	#prepare(sql: string, params: readonly D1Param[]): D1PreparedStatement {
 		// Every statement actually sent to D1 passes through here — each chunk
-		// of a chunked write, each member of a `batch()` — which is what makes
-		// this the one place to log rather than the call sites above it.
+		// of a chunked write, each member of a `batch()`, and `db.execute()`'s
+		// raw escape hatch via `prepareRaw` below — which is what makes this
+		// the one place to log rather than the call sites above it.
 		this.options.logger?.logQuery(sql, [...params]);
 		const stmt = this.target.prepare(sql);
 		return params.length > 0 ? stmt.bind(...params) : stmt;
+	}
+
+	/**
+	 * The public seam for `db.execute()` — Database's raw escape hatch — so
+	 * that path observes `logger`/`onQuery` the same as every built statement,
+	 * instead of calling `$client.prepare()` directly and skipping this class
+	 * entirely.
+	 */
+	prepareRaw(sql: string, params: readonly D1Param[]): D1PreparedStatement {
+		return this.#prepare(sql, params);
 	}
 
 	async executeRows<T>(query: CompiledQuery<T>, input: Record<string, unknown> = {}): Promise<T[]> {

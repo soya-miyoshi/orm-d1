@@ -97,30 +97,6 @@ const toSlot = (param: unknown): ParamSlot => {
 const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
 /**
- * Structurally walk a Drizzle `SQL` fragment's own `queryChunks`, looking for
- * a bare `[]` interpolated directly into the template (`sql\`... in
- * ${arr}\``) — Drizzle's `SQL.toQuery` renders that as `()`, which is exactly
- * the empty-array-predicate hazard `src/sql/sql.ts`'s own `toQuery` refuses
- * via `ctx.onEmptyArrayPredicate`. That hook is only ever consulted from our
- * own template tag, so a DDL predicate written with Drizzle's `sql` tag
- * (`and`/`eq`/`inArray` included — they nest as `SQL` chunks inside
- * `queryChunks` rather than flattening) sailed straight past it and rendered
- * `check("role" not in ())` — a permanently inert constraint D1 accepts
- * silently. No text/string heuristics: this only inspects the chunk array
- * Drizzle itself builds, recursing into nested `SQL` fragments (`and()` etc.)
- * the same way `toQuery` does when it flattens them.
- */
-const hasEmptyArrayChunk = (fragment: { queryChunks: readonly unknown[] }): boolean => {
-	for (const chunk of fragment.queryChunks) {
-		if (Array.isArray(chunk) && chunk.length === 0) return true;
-		if (typeof chunk === 'object' && chunk !== null && isDrizzleSQL(chunk)) {
-			if (hasEmptyArrayChunk(chunk as { queryChunks: readonly unknown[] })) return true;
-		}
-	}
-	return false;
-};
-
-/**
  * Render a Drizzle fragment into our `{ sql, params }`.
  *
  * `casing` is not read by every Drizzle version but is cheap to supply, and
@@ -135,8 +111,16 @@ export const fromDrizzleSQL = (value: unknown, ctx?: RenderContext): Query => {
 		? value as { toQuery: (config: unknown) => { sql: string; params: unknown[] } }
 		: (value as { getSQL: () => { toQuery: (config: unknown) => { sql: string; params: unknown[] } } }).getSQL();
 
-	if (ctx?.bareColumns && isDrizzleSQL(fragment) && hasEmptyArrayChunk(fragment as unknown as { queryChunks: readonly unknown[] })) {
-		ctx.onEmptyArrayPredicate?.();
+	// Whether one of this fragment's own `queryChunks` is a bare `[]` — the
+	// empty-array-predicate hazard `src/sql/sql.ts`'s own `toQuery` refuses via
+	// `ctx.onEmptyArrayPredicate` for our own template tag — is DDL-only
+	// detection logic. Scanning `queryChunks` here would ship a Drizzle-specific
+	// tree walk in the core runtime bundle for a check that can only ever fire
+	// under `ctx.bareColumns` (set only by `src/ddl.ts`, which never reaches a
+	// deployed Worker). So this only hands the fragment's own chunk list to
+	// whatever the caller supplied; the walk itself lives in `src/ddl.ts`.
+	if (ctx?.bareColumns && isDrizzleSQL(fragment)) {
+		ctx.onForeignFragment?.((fragment as unknown as { queryChunks: readonly unknown[] }).queryChunks);
 	}
 
 	const token = ctx?.paramToken ?? '?';

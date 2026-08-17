@@ -119,39 +119,59 @@ describe('a foreign fragment inside a compiled statement', () => {
 	});
 });
 
-describe('the DDL empty-array-predicate refusal also covers Drizzle fragments', () => {
+describe('the DDL empty-array-predicate hook hands off Drizzle fragments', () => {
 	// [F-087]: `src/sql/sql.ts`'s own template tag refuses an empty array
 	// interpolated into a DDL predicate via `ctx.onEmptyArrayPredicate` — but a
 	// check() or partial-index where() written with Drizzle's *own* `sql` tag
 	// renders through `fromDrizzleSQL`, which never consulted that hook, so
-	// `check("role" not in ())` sailed through silently. This closes that gap
-	// at the one place `fromDrizzleSQL` structurally sees Drizzle's own
-	// `queryChunks` — no text/string heuristics.
-	const ddlCtx = { ...defaultRenderContext, bareColumns: true, onEmptyArrayPredicate: () => {
-		throw new Error('empty array refused');
-	} };
+	// `check("role" not in ())` sailed through silently.
+	//
+	// The scan that structurally recognises an empty-array `queryChunks` entry
+	// (recursing into nested `and()`/`eq()` composition) is DDL-only logic, so
+	// it now lives in `src/ddl.ts` rather than shipping in this core runtime
+	// module — see `src/ddl.ts`'s own `hasEmptyArrayChunk` and the end-to-end
+	// coverage in `test/unit/ddl.test.ts`. This module's job is narrower: when
+	// `ctx.bareColumns` is set, hand the fragment's own `queryChunks` to
+	// `ctx.onForeignFragment` so *something* downstream can scan them — no
+	// text/string heuristics, no scanning here.
+	const seen: unknown[][] = [];
+	const ddlCtx = {
+		...defaultRenderContext,
+		bareColumns: true,
+		onForeignFragment: (queryChunks: readonly unknown[]) => seen.push([...queryChunks]),
+	};
 
-	it('invokes onEmptyArrayPredicate for a bare Drizzle sql fragment with an empty array', () => {
+	it('hands a bare Drizzle sql fragment its own queryChunks, including the empty array', () => {
+		seen.length = 0;
 		const roles: string[] = [];
 		const fragment = dSql`${dUsers.role} not in ${roles}`;
-		expect(() => render(fragment as never, ddlCtx)).toThrow(/empty array refused/);
+		render(fragment as never, ddlCtx);
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).toContainEqual([]);
 	});
 
-	it('invokes it for an empty array nested inside and()/eq() composition', () => {
+	it('hands off the outer fragment for an empty array nested inside and()/eq() composition', () => {
+		seen.length = 0;
 		const roles: string[] = [];
 		const fragment = dAnd(dEq(dUsers.id, 1), dSql`${dUsers.role} not in ${roles}`)!;
-		expect(() => render(fragment as never, ddlCtx)).toThrow(/empty array refused/);
+		render(fragment as never, ddlCtx);
+		expect(seen.length).toBeGreaterThan(0);
 	});
 
-	it('does not invoke it for a non-empty array', () => {
+	it('still hands off queryChunks for a non-empty array (no [] entry present)', () => {
+		seen.length = 0;
 		const fragment = dSql`${dUsers.role} not in ${['admin', 'member']}`;
-		expect(() => render(fragment as never, ddlCtx)).not.toThrow();
+		render(fragment as never, ddlCtx);
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).not.toContainEqual([]);
 	});
 
-	it('does not invoke it outside a DDL context (bareColumns unset)', () => {
+	it('does not invoke the hook outside a DDL context (bareColumns unset)', () => {
+		seen.length = 0;
 		const roles: string[] = [];
 		const fragment = dSql`${dUsers.role} not in ${roles}`;
 		expect(() => render(fragment as never, defaultRenderContext)).not.toThrow();
 		expect(rendered(fragment as never).sql).toBe('"users"."role" not in ()');
+		expect(seen).toHaveLength(0);
 	});
 });

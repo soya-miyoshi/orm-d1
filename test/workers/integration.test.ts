@@ -536,6 +536,32 @@ describe('observability and errors', () => {
 		}
 	});
 
+	// [F-5]: `db.execute()` used to call `this.$client.prepare(sql)` directly
+	// instead of routing through `Executor#prepare` — the one place `logger`/
+	// `onQuery` are wired for every other statement (`session.ts`'s own
+	// comment: "Every statement actually sent to D1 passes through here"). So
+	// `execute()`'s raw escape hatch was invisible to `logger`, even though it
+	// already reported to `onQuery` by hand.
+	it('observes db.execute() through logger, the same as every built statement', async () => {
+		const logged: { query: string; params: unknown[] }[] = [];
+		const db = ormD1(DB, { logger: { logQuery: (query, params) => logged.push({ query, params }) } });
+
+		await db.execute('select 1');
+
+		expect(logged).toHaveLength(1);
+		expect(logged[0]!.query).toBe('select 1');
+	});
+
+	it('observes db.execute() through onQuery, the same as every built statement', async () => {
+		const events: QueryEvent[] = [];
+		const db = ormD1(DB, { onQuery: (event) => events.push(event) });
+
+		await db.execute('select 1');
+
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({ kind: 'raw', sql: 'select 1' });
+	});
+
 	it('refuses transaction() with a pointer to batch()', () => {
 		expect(() => ormD1(DB).transaction()).toThrow(NoTransactionsError);
 		expect(() => ormD1(DB).transaction()).toThrow(/batch/);

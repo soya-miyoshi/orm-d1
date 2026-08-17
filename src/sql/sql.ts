@@ -61,6 +61,15 @@ export interface RenderContext {
 	 * supplies this hook only while generating DDL and throws from it.
 	 */
 	readonly onEmptyArrayPredicate?: () => void;
+	/**
+	 * Called with a foreign (Drizzle) `SQL` fragment's own `queryChunks` when
+	 * one is rendered under `bareColumns`, so the tree walk that looks for an
+	 * interpolated empty array nested inside it (`and`/`eq`/`inArray` built
+	 * with Drizzle's own `sql` tag) can live in `src/ddl.ts` — Node, DDL-only —
+	 * instead of the core runtime bundle. A no-op when absent, so production
+	 * pays nothing beyond the field check itself.
+	 */
+	readonly onForeignFragment?: (queryChunks: readonly unknown[]) => void;
 }
 
 export const defaultRenderContext: RenderContext = {

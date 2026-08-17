@@ -22,6 +22,7 @@ import { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from 
 export { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from './schema/constraints.js';
 import type { Table } from './schema/table.js';
 import { getTableColumns, getTableExtras, getTableName } from './schema/table.js';
+import { isDrizzleSQL } from './sql/drizzle-sql.js';
 import type { RenderContext, SQLChunk } from './sql/sql.js';
 import { defaultRenderContext, quoteIdentifier, render } from './sql/sql.js';
 
@@ -51,12 +52,43 @@ const refuseEmptyArrayPredicate = (): never => {
 	);
 };
 
+/**
+ * Structurally walk a Drizzle `SQL` fragment's own `queryChunks`, looking for
+ * a bare `[]` interpolated directly into the template (`sql\`... in
+ * ${arr}\``) — Drizzle's `SQL.toQuery` renders that as `()`, which is exactly
+ * the empty-array-predicate hazard above. That hook is only ever consulted
+ * from our own template tag, so a DDL predicate written with Drizzle's `sql`
+ * tag (`and`/`eq`/`inArray` included — they nest as `SQL` chunks inside
+ * `queryChunks` rather than flattening) would otherwise sail straight past it
+ * and render `check("role" not in ())` — a permanently inert constraint D1
+ * accepts silently. No text/string heuristics: this only inspects the chunk
+ * array Drizzle itself builds, recursing into nested `SQL` fragments
+ * (`and()` etc.) the same way `toQuery` does when it flattens them.
+ *
+ * This is DDL-only detection logic (it only ever runs under `bareColumns`,
+ * set only here), so it lives in this module rather than in
+ * `src/sql/drizzle-sql.ts` — which ships to the Worker — even though it is
+ * invoked *from* that module's `fromDrizzleSQL` via `onForeignFragment`.
+ */
+const hasEmptyArrayChunk = (queryChunks: readonly unknown[]): boolean => {
+	for (const chunk of queryChunks) {
+		if (Array.isArray(chunk) && chunk.length === 0) return true;
+		if (typeof chunk === 'object' && chunk !== null && isDrizzleSQL(chunk)) {
+			if (hasEmptyArrayChunk((chunk as { queryChunks: readonly unknown[] }).queryChunks)) return true;
+		}
+	}
+	return false;
+};
+
 /** DDL cannot qualify column names with a table, and cannot bind parameters. */
 const ddlContext: RenderContext = {
 	...defaultRenderContext,
 	bareColumns: true,
 	paramToken: PARAM_TOKEN,
 	onEmptyArrayPredicate: refuseEmptyArrayPredicate,
+	onForeignFragment: (queryChunks): void => {
+		if (hasEmptyArrayChunk(queryChunks)) refuseEmptyArrayPredicate();
+	},
 };
 
 export interface DDLOptions {
@@ -425,12 +457,23 @@ export const foreignKeyDDL = (meta: ForeignKeyMeta, tableName: string): string =
  * *does* have that context, so it is added on the way back out rather than
  * threaded down into the render.
  */
-const withDDLContext = <T>(tableName: string, constraint: string, render: () => T): T => {
+export const withDDLContext = <T>(tableName: string, constraint: string, render: () => T): T => {
 	try {
 		return render();
 	} catch (error) {
-		if (error instanceof Error && error.message.startsWith('An empty array was interpolated')) {
-			throw new Error(`${error.message} (table "${tableName}", constraint "${constraint}")`);
+		if (
+			error instanceof Error
+			&& error.message.startsWith('An empty array was interpolated')
+			// Already wrapped by an outer `withDDLContext` call (e.g. `checkDDL`
+			// calling `renderInline` on a value that was already rendered once
+			// through this same helper elsewhere) — appending a second `(table
+			// "…", constraint "…")` suffix would misname or double up the
+			// context rather than add anything true.
+			&& !error.message.includes('(table "')
+		) {
+			// `{ cause }` keeps the original throw site (and its stack) reachable
+			// for debugging instead of discarding it for a fresh, contextless one.
+			throw new Error(`${error.message} (table "${tableName}", constraint "${constraint}")`, { cause: error });
 		}
 		throw error;
 	}

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { asDrizzleTable } from '../../src/drizzle.js';
 import { createIndexes, createSchema, createTable, dropTable, literal } from '../../src/ddl.js';
 import { blob, check, customType, integer, numeric, real, sql, sqliteTable, text, uniqueIndex } from '../../src/index.js';
+import { inArray, notInArray } from '../../src/sql/expressions.js';
 import type { SQLChunk } from '../../src/sql/sql.js';
 import { allTables, postTags, posts, users } from '../schema.js';
 
@@ -184,6 +185,47 @@ describe('ddl generation', () => {
 		]);
 
 		expect(() => createTable(withCheck)).toThrow(/empty array/);
+	});
+
+	// [F-1] orm-d1's own `inArray()`/`notInArray()` (src/sql/expressions.ts)
+	// short-circuit an empty array to a bare `'1 = 1'`/`'1 = 0'` string for
+	// query correctness/performance — but that short-circuit used to bypass
+	// the DDL empty-array refusal entirely, since it never went through
+	// `sql.ts`'s own array-interpolation path that `ctx.onEmptyArrayPredicate`
+	// hooks into. A `check()`/partial-index `where()` built with `inArray`/
+	// `notInArray` over an empty array therefore rendered a permanently
+	// true/false constraint with no error, the exact hazard [F-087] closed for
+	// a hand-written `sql` template and for Drizzle's own fragments.
+	it('refuses a check built with notInArray() over an empty array', () => {
+		const t = sqliteTable('t1', {
+			role: text('role'),
+		}, (c) => [
+			check('t1_role_check', notInArray(c.role, [])),
+		]);
+
+		expect(() => createTable(t)).toThrow(/empty array/);
+		expect(() => createTable(t)).toThrow(/table "t1"/);
+		expect(() => createTable(t)).toThrow(/constraint "t1_role_check"/);
+	});
+
+	it('refuses a partial index built with inArray() over an empty array', () => {
+		const t = sqliteTable('t2', {
+			role: text('role'),
+		}, (c) => [
+			uniqueIndex('t2_role_idx').on(c.role).where(inArray(c.role, [])),
+		]);
+
+		expect(() => createIndexes(t)).toThrow(/empty array/);
+	});
+
+	it('does not refuse inArray()/notInArray() with a non-empty array in a check', () => {
+		const t = sqliteTable('t3', {
+			role: text('role'),
+		}, (c) => [
+			check('t3_role_check', notInArray(c.role, ['admin', 'member'])),
+		]);
+
+		expect(() => createTable(t)).not.toThrow();
 	});
 
 	it('renders sql defaults inline and value defaults as literals', () => {

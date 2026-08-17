@@ -6,7 +6,7 @@
  * drizzle-kit's shape — it is a reasonable design, and matching it is what
  * makes importing an existing migration history possible.
  */
-import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName } from 'orm-d1/ddl';
+import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName, withDDLContext } from 'orm-d1/ddl';
 import type { TableOptionsMap } from 'orm-d1/ddl';
 import { appendOnlyKey, assertAppendOnlyColumns } from 'orm-d1/ddl';
 import type { Column, Table } from 'orm-d1';
@@ -376,8 +376,15 @@ export function snapshotFromSchema(
 					break;
 				}
 				case 'check': {
+					// `renderInline` can throw the empty-array DDL refusal
+					// (`src/ddl.ts`'s `onEmptyArrayPredicate`/`onForeignFragment`),
+					// which comes back anonymous — no table or constraint name.
+					// Snapshot generation runs before the diff engine's own
+					// `checkDDL` call would normally attach that context, so it is
+					// wrapped here through the same `withDDLContext` helper
+					// `checkDDL` uses, rather than calling `renderInline` bare.
+					const value = withDDLContext(name, extra.meta.name, () => renderInline(extra.meta.value));
 					if (Object.hasOwn(checkConstraints, extra.meta.name)) {
-						const value = renderInline(extra.meta.value);
 						throw new Error(
 							`"${name}" declares two check constraints both named "${extra.meta.name}" `
 								+ `(the second is "${value}"). `
@@ -386,7 +393,7 @@ export function snapshotFromSchema(
 					}
 					checkConstraints[extra.meta.name] = {
 						name: extra.meta.name,
-						value: renderInline(extra.meta.value),
+						value,
 					};
 					break;
 				}

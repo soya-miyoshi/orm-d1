@@ -522,6 +522,18 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 	// different field lists can never produce the same key. Written as an escape
 	// rather than a literal so tools do not read this file as binary.
 	const FIELD_SEPARATOR = '\u0000';
+	// Whether a column is eligible for a row's field list depends only on the
+	// column's own static config — never on which row is being looked at — so
+	// it is decided once per column here rather than re-read (several
+	// `.config.*` property chases through every column, every row) inside the
+	// per-row loop below. Only `row[field] !== undefined` genuinely varies per
+	// row and stays there.
+	const columnEntries = Object.entries(columns).map(([field, column]) => ({
+		field,
+		notGenerated: !column.config.generated,
+		alwaysIncluded: column.config.defaultFn !== undefined
+			|| (column.config.onUpdateFn !== undefined && column.config.default === undefined),
+	}));
 	const groups: { fields: string[]; rows: Record<string, unknown>[] }[] = [];
 	for (const row of plan.values) {
 		// A generated column can never be written: SQLite rejects the statement.
@@ -533,13 +545,10 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 				throw new CompileError(`"${field}" is a generated column and cannot be inserted into.`);
 			}
 		}
-		const fields = Object.keys(columns).filter(
-			(field) =>
-				!columns[field]!.config.generated
-				&& (row[field] !== undefined
-					|| columns[field]!.config.defaultFn !== undefined
-					|| (columns[field]!.config.onUpdateFn !== undefined && columns[field]!.config.default === undefined)),
-		);
+		const fields: string[] = [];
+		for (const entry of columnEntries) {
+			if (entry.notGenerated && (row[entry.field] !== undefined || entry.alwaysIncluded)) fields.push(entry.field);
+		}
 		if (fields.length === 0) throw new CompileError('An inserted row has no values and no defaults.');
 		const key = fields.join(FIELD_SEPARATOR);
 		const last = groups.at(-1);
@@ -567,12 +576,22 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 		// was needed, it is kept (`.rendered`) rather than thrown away, so the
 		// write pass below splices it in instead of rendering the row again —
 		// see `rowParamCount`.
-		const rowResults = group.rows.map((row) => rowParamCount(row, group.fields, cols, ctx));
-		// Not `Math.max(...rowResults.map(r => r.count))`: spreading one call
-		// argument per row overflows the call stack around ~125k rows
-		// (`RangeError: Maximum call stack size exceeded`).
+		// Two pre-sized parallel arrays rather than `group.rows.map(row =>
+		// rowParamCount(...))`: the latter allocates one `{ count, rendered }`
+		// wrapper object per row on top of the array itself, for a value only ever
+		// read back as `rowCounts[i]`/`rowRendered[i]`.
+		const rowCounts: number[] = new Array(group.rows.length);
+		const rowRendered: (Query | undefined)[] = new Array(group.rows.length);
+		for (let i = 0; i < group.rows.length; i++) {
+			const result = rowParamCount(group.rows[i]!, group.fields, cols, ctx);
+			rowCounts[i] = result.count;
+			rowRendered[i] = result.rendered;
+		}
+		// Not `Math.max(...rowCounts)`: spreading one call argument per row
+		// overflows the call stack around ~125k rows (`RangeError: Maximum call
+		// stack size exceeded`).
 		let maxRowParams = 0;
-		for (const r of rowResults) if (r.count > maxRowParams) maxRowParams = r.count;
+		for (const count of rowCounts) if (count > maxRowParams) maxRowParams = count;
 		if (maxRowParams + reservedParams > ctx.maxParams) {
 			throw new CompileError(
 				`A row binds ${maxRowParams} parameter(s) plus ${reservedParams} bound parameter(s) from `
@@ -597,10 +616,10 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 			let end = start;
 			while (
 				end < group.rows.length
-				&& sum + rowResults[end]!.count <= budget
+				&& sum + rowCounts[end]! <= budget
 				&& end - start < rowsPerChunk
 			) {
-				sum += rowResults[end]!.count;
+				sum += rowCounts[end]!;
 				end++;
 			}
 			// `maxRowParams + reservedParams <= ctx.maxParams` above guarantees
@@ -616,11 +635,11 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 
 			for (let i = chunkStart; i < end; i++) {
 				if (i > chunkStart) writer.text(', ');
-				const result = rowResults[i]!;
+				const rendered = rowRendered[i];
 				// Already rendered once while counting its params — splice it in
 				// verbatim rather than rendering this row's columns again.
-				if (result.rendered) {
-					writer.query(result.rendered);
+				if (rendered) {
+					writer.query(rendered);
 					continue;
 				}
 				const row = group.rows[i]!;
