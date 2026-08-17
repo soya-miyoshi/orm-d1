@@ -18,6 +18,7 @@ import {
 } from 'orm-d1/ddl';
 import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
+import { lookupCaseInsensitive } from './sql.js';
 
 export interface Statement {
 	readonly sql: string;
@@ -306,6 +307,48 @@ export const carryForwardCollations = (before: Snapshot, after: Snapshot, option
 	return tables === after.tables ? after : { ...after, tables };
 };
 
+/**
+ * Whether creating a trigger named `guardName` would collide with a live
+ * foreign trigger `options.foreignTriggers` knows about — but only counting a
+ * collider that actually **survives this diff**. `options.foreignTriggers` is
+ * a pre-diff snapshot (populated by `introspect()` before any of this diff's
+ * own statements exist), so a naive scan over it refuses migrations that are
+ * themselves the fix: dropping the table the collider lives on, in the same
+ * diff, removes the collider before the create ever runs.
+ *
+ * @param droppedTables Tables this diff drops outright (`diffSnapshots`'s
+ * `dropped`). A collider on one of these cannot collide — it is gone by the
+ * time `create trigger` would run.
+ * @param statementsSoFar Everything this diff has decided to emit before the
+ * check point. A `drop trigger if exists "<name>"` in here (from `dropped
+ * AppendOnlyTrigger`, via a rename or an in-place `appendOnly` transition
+ * elsewhere in this same diff) also removes a collider under that literal
+ * name, independent of which table it lived on.
+ */
+const tableGuardCollides = (
+	guardName: string,
+	foreignTriggers: Record<string, readonly string[]> | undefined,
+	droppedTables: readonly string[],
+	statementsSoFar: readonly Statement[],
+): boolean => {
+	if (!foreignTriggers) return false;
+	const lowerGuard = guardName.toLowerCase();
+
+	const droppedTriggerNames = new Set(
+		statementsSoFar
+			.map((s) => /^drop\s+trigger\s+(?:if\s+exists\s+)?"((?:[^"]|"")+)"/i.exec(s.sql)?.[1])
+			.filter((n): n is string => n !== undefined)
+			.map((n) => n.replaceAll('""', '"').toLowerCase()),
+	);
+	if (droppedTriggerNames.has(lowerGuard)) return false;
+
+	const droppedTablesLower = new Set(droppedTables.map((t) => t.toLowerCase()));
+	return Object.entries(foreignTriggers).some(([table, triggers]) => {
+		if (droppedTablesLower.has(table.toLowerCase())) return false;
+		return triggers.some((t) => t.toLowerCase() === lowerGuard);
+	});
+};
+
 const recreateTable = (
 	before: TableSnapshot,
 	after: TableSnapshot,
@@ -324,6 +367,14 @@ const recreateTable = (
 	 * into the rebuilt table rather than dropped.
 	 */
 	afterIsSchemaDerived = true,
+	/**
+	 * Whether re-creating `after`'s append-only guard (if `after.appendOnly`)
+	 * would collide with a live foreign trigger sharing its name — precomputed
+	 * by the caller with `tableGuardCollides`, which is the only place that
+	 * has the full-diff context (every table's foreign triggers, every table
+	 * this diff drops) this function does not.
+	 */
+	guardCollides = false,
 ): { statements: Statement[]; errors: string[] } => {
 	const errors: string[] = [];
 
@@ -426,7 +477,20 @@ const recreateTable = (
 	// So is the append-only trigger. Leaving it out silently unprotected an
 	// append-only table the first time it was rebuilt for any other reason —
 	// the failure mode being that nothing fails, and UPDATEs start working.
-	if (after.appendOnly) {
+	if (after.appendOnly && guardCollides) {
+		// Matches the in-place transition's refusal below (same name pattern,
+		// same reasoning): creating the guard here would fail on apply because
+		// a live foreign trigger already has this exact name, and this rebuild's
+		// own drop of "before.name" does not remove it — `guardCollides` is
+		// already survivor-aware and only true when the collider outlives this
+		// diff.
+		errors.push(
+			`"${after.name}" is becoming append-only, but a trigger named "${appendOnlyTriggerName(after.name)}" `
+				+ 'already exists and orm-d1 did not create it. Creating the guard would fail on apply because the '
+				+ 'name is taken. Drop or rename that trigger, or bring it into the schema so orm-d1 can carry it '
+				+ 'across rebuilds.',
+		);
+	} else if (after.appendOnly) {
 		statements.push({
 			sql: appendOnlyTrigger(after.name, appendOnlyColumns(after.appendOnly)),
 			destructive: false,
@@ -532,26 +596,12 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		}
 	}
 
-	// 2. Created tables, referenced tables first so foreign keys resolve.
-	for (const name of orderByDependency(after, afterNames)) {
-		if (effectiveBefore[name]) continue;
-		const t = after.tables[name]!;
-		statements.push({ sql: createTableFromSnapshot(t), destructive: false });
-		for (const index of Object.values(t.indexes)) {
-			statements.push({ sql: createIndexFromSnapshot(index, name), destructive: false });
-		}
-		if (t.appendOnly) {
-			statements.push({
-				sql: appendOnlyTrigger(name, appendOnlyColumns(t.appendOnly)),
-				destructive: false,
-			});
-		}
-	}
-
-	// 3. Dropped tables, children before parents — the reverse of creation
-	// order. Dropping a parent first leaves the child's foreign key pointing at
-	// a table that no longer exists, which D1 enforces (it cannot be turned off
-	// inside a migration) and which fails the whole batch.
+	// Dropped tables, computed early (rather than inline in step 3 below, where
+	// this used to live) because the guard-collision check in step 2 also
+	// needs it: `options.foreignTriggers` is a pre-diff snapshot, so a trigger
+	// living on a table *this diff drops* is not a real collision (see
+	// `tableGuardCollides`), and step 2 runs before step 3 emits the actual
+	// `drop table` statements.
 	// A `__new_<table>` leftover from a rebuild that failed to `batch()`
 	// atomically (a split migration hitting D1's cross-batch atomicity gap) is
 	// never auto-dropped here, even though it looks exactly like an ordinary
@@ -566,6 +616,37 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 	const survivors = Object.fromEntries(
 		Object.entries(effectiveBefore).filter(([name]) => !dropped.includes(name)),
 	);
+
+	// 2. Created tables, referenced tables first so foreign keys resolve.
+	for (const name of orderByDependency(after, afterNames)) {
+		if (effectiveBefore[name]) continue;
+		const t = after.tables[name]!;
+		statements.push({ sql: createTableFromSnapshot(t), destructive: false });
+		for (const index of Object.values(t.indexes)) {
+			statements.push({ sql: createIndexFromSnapshot(index, name), destructive: false });
+		}
+		if (t.appendOnly) {
+			const guardName = appendOnlyTriggerName(name);
+			if (tableGuardCollides(guardName, options.foreignTriggers, dropped, statements)) {
+				errors.push(
+					`"${name}" is being created append-only, but a trigger named "${guardName}" already exists and `
+						+ 'orm-d1 did not create it. Creating the guard would fail on apply because the name is '
+						+ 'taken. Drop or rename that trigger, or bring it into the schema so orm-d1 can carry it '
+						+ 'across rebuilds.',
+				);
+			} else {
+				statements.push({
+					sql: appendOnlyTrigger(name, appendOnlyColumns(t.appendOnly)),
+					destructive: false,
+				});
+			}
+		}
+	}
+
+	// 3. Dropped tables, children before parents — the reverse of creation
+	// order. Dropping a parent first leaves the child's foreign key pointing at
+	// a table that no longer exists, which D1 enforces (it cannot be turned off
+	// inside a migration) and which fails the whole batch.
 
 	// The `__new_` tables excluded from `dropped` above are silently left
 	// alone for the reason stated there — but silent is only safe for the
@@ -690,7 +771,11 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			?? (unaddable && `column "${unaddable.columnName}" cannot be added in place: ${unaddable.blocker}`);
 
 		if (reason) {
-			const foreignTriggersForTable = options.foreignTriggers?.[liveTableNames[name] ?? name] ?? [];
+			const foreignTriggersForTable = lookupCaseInsensitive(options.foreignTriggers, liveTableNames[name] ?? name)
+				?? [];
+			const guardCollides = next.appendOnly
+				? tableGuardCollides(appendOnlyTriggerName(next.name), options.foreignTriggers, dropped, statements)
+				: false;
 			const recreated = recreateTable(
 				previous,
 				next,
@@ -699,6 +784,7 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 				after.tables,
 				foreignTriggersForTable,
 				afterIsSchemaDerived,
+				guardCollides,
 			);
 			statements.push(...recreated.statements);
 			errors.push(...recreated.errors);
@@ -808,8 +894,15 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 				// so the collision check has to look across every live trigger
 				// `options.foreignTriggers` knows about, not just the ones already
 				// keyed under this table's own (possibly renamed) live name.
-				const collides = Object.values(options.foreignTriggers ?? {})
-					.some((triggers) => triggers.some((t) => t.toLowerCase() === guardName.toLowerCase()));
+				//
+				// But `options.foreignTriggers` is a *pre-diff* snapshot — read by
+				// `introspect()` before any statement in this diff has run — so a
+				// naive scan over it also flags a collider this very diff is about
+				// to remove: dropping the table it lives on (or dropping the
+				// trigger itself, e.g. via a rename elsewhere in this diff) takes
+				// it out before `create trigger` ever runs. `tableGuardCollides`
+				// only counts a collider that survives this diff.
+				const collides = tableGuardCollides(guardName, options.foreignTriggers, dropped, statements);
 				if (!previousGuard && collides) {
 					errors.push(
 						`"${name}" is becoming append-only, but a trigger named "${guardName}" already exists and `

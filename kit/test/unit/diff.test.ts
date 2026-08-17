@@ -1812,6 +1812,23 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			expect(diff.errors[0]).toMatch(/"child".*references it/);
 		});
 
+		// [F-046]: `recreateTable`'s contract is "no statements alongside a
+		// refusal", but the append-only-loss block used to run unconditionally
+		// after the `recreateTable` call regardless of whether it refused, so a
+		// refused rebuild still emitted a lone destructive `drop trigger`.
+		it('emits no statements at all — not even the append-only-loss drop trigger — when the rebuild is refused for carrying a foreign trigger', () => {
+			const before = withOptions(users, { appendOnly: true });
+			const after = withOptions(
+				sqliteTable('users', { id: text('id').primaryKey(), email: integer('email') }),
+				{},
+			);
+
+			const diff = diffSnapshots(before, after, { foreignTriggers: { users: ['users_audit'] } });
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.statements).toEqual([]);
+		});
+
 		it('still refuses when the trigger-carrying table is also renamed in the same migration', () => {
 			// `options.foreignTriggers` is keyed by the LIVE (pre-rename) name,
 			// the same way `introspect()` populates it — `users`, not `people`.
@@ -1862,6 +1879,64 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 
 			expect(diff.errors).toEqual([]);
 			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(true);
+		});
+
+		// [F-079], regression half: `options.foreignTriggers` is a pre-diff
+		// snapshot, so a naive scan over it refuses a migration that is itself
+		// the fix — dropping the table the collider lives on, in the same
+		// batch, removes the collider before `create trigger` ever runs.
+		it('does not refuse when the colliding trigger\'s own table is dropped in the same diff', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, events);
+			const after = snapshotFromSchema([events], '', tableOptions([[events, { appendOnly: true }]]));
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			expect(diff.errors).toEqual([]);
+			expect(diff.statements.some((s) => s.sql === 'drop table "audit"')).toBe(true);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(true);
+		});
+
+		// [F-079], narrowness half: the created-table path never checked at all.
+		it('refuses a brand-new append-only table whose guard name collides with a live foreign trigger on a table that survives', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit);
+			const after = snapshotFromSchema([audit, events], '', tableOptions([[events, { appendOnly: true }]]));
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"events_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
+		});
+
+		// [F-079], narrowness half: the rebuild path never checked at all — a
+		// table rebuilt for some unrelated reason (here, a type change) that
+		// also turns on `appendOnly` used to re-create the guard with no check.
+		it('refuses a rebuild that turns a table append-only when the guard name collides with a live foreign trigger on a table that survives', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, events);
+			// A type change on "at" forces `recreateTable`'s rebuild path, which
+			// is also where this diff turns "events" append-only.
+			const rebuiltEvents = sqliteTable('events', { id: text('id').primaryKey(), at: text('at') });
+			const after = snapshotFromSchema(
+				[audit, rebuiltEvents],
+				'',
+				tableOptions([[rebuiltEvents, { appendOnly: true }]]),
+			);
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			expect(diff.statements.some((s) => /create table "__new_events"/.test(s.sql))).toBe(true);
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"events_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
 		});
 	});
 

@@ -142,6 +142,35 @@ export const applicableStatements = (sql: string): string[] => splitStatements(s
 const escapeRegExpChars = (value: string): string => value.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
+ * Any of SQLite's four identifier spellings, as a regex alternation source —
+ * for splicing into a larger pattern, not for standalone use. A hand-written
+ * migration is not obliged to use the kit's own double-quoted spelling, and
+ * `alter table orders rename to sales;` (bare, no quotes at all) is completely
+ * ordinary SQL. Two call sites used to recognise only `"…"`, which is why a
+ * bare-identifier rename could sail past the foreign-trigger guard with no
+ * refusal (see the callers below).
+ */
+export const IDENTIFIER_SOURCE =
+	'"(?:[^"]|"")+"|`(?:[^`]|``)+`|\\[[^\\]]+\\]|[A-Za-z_][A-Za-z0-9_$]*';
+
+/**
+ * Strip one of the four spellings down to the bare name, undoing whichever
+ * escape that spelling uses. A bare identifier has nothing to strip.
+ */
+export function normalizeIdentifierToken(token: string): string {
+	if (token.length >= 2 && token.startsWith('"') && token.endsWith('"')) {
+		return token.slice(1, -1).replaceAll('""', '"');
+	}
+	if (token.length >= 2 && token.startsWith('`') && token.endsWith('`')) {
+		return token.slice(1, -1).replaceAll('``', '`');
+	}
+	if (token.length >= 2 && token.startsWith('[') && token.endsWith(']')) {
+		return token.slice(1, -1);
+	}
+	return token;
+}
+
+/**
  * Which statements must land in the same `batch()` or not run at all.
  *
  * By the time a migration is applied, it has already been flattened to plain
@@ -239,11 +268,15 @@ export function statementGroups(statements: readonly string[]): number[] {
  * this is how it can still ask "does this migration rebuild a table that
  * carries a foreign trigger?" before running anything.
  */
+const createTableNamePattern = new RegExp(`^\\s*create\\s+table\\s+(${IDENTIFIER_SOURCE})`, 'i');
+
 export function tablesRebuiltIn(statements: readonly string[]): string[] {
 	const names: string[] = [];
 	for (const statement of statements) {
-		const match = /^\s*create\s+table\s+"(__new_(?:[^"]|"")+)"/i.exec(statement);
-		if (match) names.push(match[1]!.slice('__new_'.length).replaceAll('""', '"'));
+		const match = createTableNamePattern.exec(statement);
+		if (!match) continue;
+		const name = normalizeIdentifierToken(match[1]!);
+		if (name.startsWith('__new_')) names.push(name.slice('__new_'.length));
 	}
 	return names;
 }
@@ -364,6 +397,25 @@ export function packStatementsWithTrailer(
 	}
 
 	return batchRuns.map((runsInBatch) => runsInBatch.flat());
+}
+
+/**
+ * Look a key up in a map the way SQLite compares identifiers: case-sensitively
+ * first (the common, cheap case), falling back to a case-insensitive scan.
+ * `sqlite_master.tbl_name` is stored exactly as `CREATE TRIGGER` spelled it,
+ * and identifiers are case-insensitive — so a hand-written trigger can be
+ * attached to a table under a different spelling than the schema uses
+ * (`Orders` in the trigger, `orders` in the schema). A plain `map[key]` lookup
+ * makes that trigger invisible to the foreign-trigger guard.
+ */
+export function lookupCaseInsensitive<T>(map: Record<string, T> | undefined, key: string): T | undefined {
+	if (!map) return undefined;
+	if (Object.hasOwn(map, key)) return map[key];
+	const lower = key.toLowerCase();
+	for (const k of Object.keys(map)) {
+		if (k.toLowerCase() === lower) return map[k];
+	}
+	return undefined;
 }
 
 /** Wrangler's own migration bookkeeping table, reused so both appliers agree. */

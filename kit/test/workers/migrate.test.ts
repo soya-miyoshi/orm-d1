@@ -242,18 +242,41 @@ describe('introspection', () => {
 
 describe('batching a large migration cannot cut a table rebuild in half (finding 1)', () => {
 	it('keeps the rebuilt table intact, with its rows, when a later batch fails', async () => {
-		// 96 plain table creates, plus a rebuild of one more table — 5 more
-		// statements — for 101 total: one over `MAX_STATEMENTS_PER_BATCH`
-		// (100), forcing a split. Under the old fixed-stride slicing, the
-		// rebuild's `drop table "rebuilt"` and its `alter table "__new_rebuilt"
-		// rename to "rebuilt"` would land in different batches.
-		const before = sqliteTable('rebuilt', { id: integer('id').primaryKey(), age: text('age') });
+		// 95 plain table creates, plus a rebuild of one more table — 6 more
+		// statements (pragma, create, insert, drop, rename, unique index) — for
+		// 101 total: one over `MAX_STATEMENTS_PER_BATCH` (100), forcing a split.
+		// Under the old fixed-stride slicing, the rebuild's `drop table
+		// "rebuilt"` and its `alter table "__new_rebuilt" rename to "rebuilt"`
+		// would land in different batches.
+		//
+		// [F-041]: 95, not 96, is deliberate — it is what makes this end-to-end
+		// coverage of that finding too. `recreateTable` emits the constraint-
+		// restoring `create unique index` *after* the rename, and the old
+		// `statementGroups` closed the rebuild's indivisible group right at the
+		// rename (5 statements), one statement too early. With exactly 95
+		// fillers, 95 + 5 == 100 lands the boundary exactly between the rename
+		// and the index create under that old grouping — batch 1 commits the
+		// drop-and-rename, batch 2 (index create + the migrations-table record)
+		// fails, and the table comes back rebuilt with its UNIQUE constraint
+		// silently gone. With the fixed grouping (6 statements, through the
+		// index) the whole rebuild lands in batch 2 together, so a batch-2
+		// failure loses none of it — table and index either both come back
+		// unrebuilt (this test) or both fully rebuilt, never split.
+		const before = sqliteTable('rebuilt', {
+			id: integer('id').primaryKey(),
+			age: text('age'),
+			code: text('code'),
+		}, (c) => [uniqueIndex('rebuilt_code_idx').on(c.code)]);
 		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
-		await DB.prepare(`insert into rebuilt (id, age) values (1, '30')`).run();
+		await DB.prepare(`insert into rebuilt (id, age, code) values (1, '30', 'A')`).run();
 
-		const filler = Array.from({ length: 96 }, (_, i) => sqliteTable(`filler_${i}`, { id: integer('id').primaryKey() }));
+		const filler = Array.from({ length: 95 }, (_, i) => sqliteTable(`filler_${i}`, { id: integer('id').primaryKey() }));
 		// A type change on "age" forces `recreateTable`'s rebuild path.
-		const after = sqliteTable('rebuilt', { id: integer('id').primaryKey(), age: integer('age') });
+		const after = sqliteTable('rebuilt', {
+			id: integer('id').primaryKey(),
+			age: integer('age'),
+			code: text('code'),
+		}, (c) => [uniqueIndex('rebuilt_code_idx').on(c.code)]);
 
 		const diff = diffSnapshots(snapshotFromSchema([before]), snapshotFromSchema([...filler, after]));
 		expect(diff.errors).toEqual([]);
@@ -282,7 +305,7 @@ describe('batching a large migration cannot cut a table rebuild in half (finding
 			applyMigrations(throwingRunner, [{ tag: 'm_rebuild_split', sql }]),
 		).rejects.toThrow(/simulated failure/);
 
-		// The rebuild group is 5 statements — far short of the 100-statement
+		// The rebuild group is 6 statements — far short of the 100-statement
 		// cap — so with correct grouping it always lands whole in one batch,
 		// and that batch either fully ran (before the injected failure) or
 		// never started at all (if the failure landed on an earlier batch).
@@ -297,6 +320,20 @@ describe('batching a large migration cannot cut a table rebuild in half (finding
 		expect(rows).toHaveLength(1);
 		expect(rows[0]!.id).toBe(1);
 		expect(Number(rows[0]!.age)).toBe(30);
+
+		// [F-041]: the group used to close at the rename, so the trailing
+		// `create unique index "rebuilt_code_idx"` — which `recreateTable`
+		// emits *after* the rename to restore the constraint the rebuild's
+		// `DROP TABLE` took with it — could be split off into a batch of its
+		// own and lost to a later failure, with the table looking rebuilt and
+		// the UNIQUE constraint simply gone.
+		const indexes = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'index' and tbl_name = 'rebuilt' and sql is not null",
+		);
+		expect(indexes.map((i) => i.name)).toEqual(['rebuilt_code_idx']);
+		await DB.prepare(`insert into rebuilt (id, age, code) values (2, 40, 'B')`).run();
+		await expect(DB.prepare(`insert into rebuilt (id, age, code) values (3, 41, 'B')`).run())
+			.rejects.toThrow();
 	});
 });
 
@@ -411,6 +448,146 @@ describe('a rename in the same migration cannot bypass the foreign-trigger refus
 		expect(tables.map((t) => t.name)).toEqual(['orders']);
 		const triggers = await runner.all<{ name: string }>(
 			"select name from sqlite_master where type = 'trigger' and name = 'orders_audit'",
+		);
+		expect(triggers).toHaveLength(1);
+	});
+});
+
+describe('a rename in an earlier pending migration cannot bypass the foreign-trigger refusal (F-042)', () => {
+	it('folds a rename from an earlier pending migration into the running name map before checking a later rebuild', async () => {
+		const before = sqliteTable('orders', { id: integer('id').primaryKey(), amount: integer('amount') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+
+		await DB.prepare(
+			'create trigger "orders_audit" after insert on "orders" '
+				+ "begin insert into audit_log (id) values (new.id); end",
+		).run();
+		await DB.prepare('create table "audit_log" ("id" integer)').run();
+
+		// Migration 1: a plain rename, on its own, standing in for what
+		// `generate --rename-table orders=sales` would have written.
+		const migration1 = { tag: 'm1_rename', sql: 'alter table "orders" rename to "sales";' };
+
+		// Migration 2: a type change forcing a rebuild of "sales" — generated
+		// as if "sales" were already the live name, the way `generate` would
+		// see it once migration 1 has applied. It carries no `renamedTables` of
+		// its own: the rename already happened, in the *other* file.
+		const salesBefore = sqliteTable('sales', { id: integer('id').primaryKey(), amount: integer('amount') });
+		const salesAfter = sqliteTable('sales', { id: integer('id').primaryKey(), amount: text('amount') });
+		const offlineDiff = diffSnapshots(snapshotFromSchema([salesBefore]), snapshotFromSchema([salesAfter]));
+		expect(offlineDiff.errors).toEqual([]);
+		expect(offlineDiff.statements.some((s) => s.sql.includes('__new_sales'))).toBe(true);
+		const migration2 = { tag: 'm2_retype', sql: renderMigration(offlineDiff) };
+
+		const migrations = [migration1, migration2];
+
+		await expect(checkForeignTriggerConflicts(runner, migrations)).rejects.toThrow(/"orders_audit"/);
+		await expect(applyMigrations(runner, migrations)).rejects.toThrow(/"orders_audit"/);
+
+		// Refused before anything ran: the trigger, and the table under its
+		// original name, are both still there.
+		const tables = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'table' and name in ('orders', 'sales')",
+		);
+		expect(tables.map((t) => t.name)).toEqual(['orders']);
+		const triggers = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'trigger' and name = 'orders_audit'",
+		);
+		expect(triggers).toHaveLength(1);
+	});
+});
+
+describe('a genuine "__new_"-named table\'s own rename is not mistaken for a rebuild\'s closing rename (F-045)', () => {
+	it('still resolves the rebuilt table back through the rename when the renamed table is itself named "__new_orders"', async () => {
+		// A real table someone genuinely named `__new_orders` — the same case
+		// `diff.ts` already acknowledges exists — carrying a foreign trigger.
+		const before = sqliteTable('__new_orders', { id: integer('id').primaryKey(), amount: integer('amount') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([before]));
+
+		await DB.prepare(
+			'create trigger "nn_audit" after insert on "__new_orders" '
+				+ "begin insert into audit_log (id) values (new.id); end",
+		).run();
+		await DB.prepare('create table "audit_log" ("id" integer)').run();
+
+		// `generate --rename-table __new_orders=orders_v2` plus a type change,
+		// in the same migration. The rebuild's own scratch table is
+		// `__new_orders_v2` — a different name — so this is not the compound
+		// case where the rebuild recreates its *own* temp table under the exact
+		// name being renamed; it is the plainer case of a genuine table whose
+		// name happens to start with `__new_`.
+		const after = sqliteTable('orders_v2', { id: integer('id').primaryKey(), amount: text('amount') });
+		const offlineDiff = diffSnapshots(
+			snapshotFromSchema([before]),
+			snapshotFromSchema([after]),
+			{ renamedTables: { __new_orders: 'orders_v2' } },
+		);
+		expect(offlineDiff.errors).toEqual([]);
+		expect(offlineDiff.statements.some((s) => s.sql.includes('__new_orders_v2'))).toBe(true);
+
+		const migrations = [{ tag: 'm_rename_and_rebuild', sql: renderMigration(offlineDiff) }];
+
+		await expect(checkForeignTriggerConflicts(runner, migrations)).rejects.toThrow(/"nn_audit"/);
+		await expect(applyMigrations(runner, migrations)).rejects.toThrow(/"nn_audit"/);
+
+		const tables = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'table' and name in ('__new_orders', 'orders_v2')",
+		);
+		expect(tables.map((t) => t.name)).toEqual(['__new_orders']);
+		const triggers = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'trigger' and name = 'nn_audit'",
+		);
+		expect(triggers).toHaveLength(1);
+	});
+});
+
+describe('a rebuild\'s own scratch table does not swallow a genuine rename of a same-named live table in the same migration (gap 2)', () => {
+	it('does not let a rebuild of "orders" elsewhere in the migration hide a genuine rename of live "__new_orders"', async () => {
+		// Two live tables: the genuine one named `__new_orders` (carrying a
+		// foreign trigger), and an ordinary `orders` that this same migration
+		// also happens to rebuild — whose rebuild creates its OWN scratch table
+		// under the exact same name, `"__new_orders"`. `createdHere` used to be
+		// a plain membership set, so the rebuild's own create re-poisoned it for
+		// the unrelated genuine rename below, discarding it a second time.
+		const ordersLive = sqliteTable('orders', { id: integer('id').primaryKey(), total: integer('total') });
+		const newOrdersLive = sqliteTable('__new_orders', { id: integer('id').primaryKey(), amount: integer('amount') });
+		await migrateTo(emptySnapshot(), snapshotFromSchema([ordersLive, newOrdersLive]));
+
+		await DB.prepare(
+			'create trigger "nn_audit" after insert on "__new_orders" '
+				+ "begin insert into audit_log (id) values (new.id); end",
+		).run();
+		await DB.prepare('create table "audit_log" ("id" integer)').run();
+
+		// One migration: rename the genuine "__new_orders" to "orders_v2" AND
+		// force a rebuild of it too (a type change on "amount"), so it is
+		// itself among the tables `tablesRebuiltIn` names — and, separately,
+		// force a rebuild of the unrelated live "orders" (a type change on
+		// "total"), whose own scratch table is, coincidentally, also named
+		// "__new_orders".
+		const ordersAfter = sqliteTable('orders', { id: integer('id').primaryKey(), total: text('total') });
+		const newOrdersAfter = sqliteTable('orders_v2', { id: integer('id').primaryKey(), amount: text('amount') });
+		const offlineDiff = diffSnapshots(
+			snapshotFromSchema([ordersLive, newOrdersLive]),
+			snapshotFromSchema([ordersAfter, newOrdersAfter]),
+			{ renamedTables: { __new_orders: 'orders_v2' } },
+		);
+		expect(offlineDiff.errors).toEqual([]);
+		// The rebuild of "orders" creates its own "__new_orders" scratch table —
+		// confirming this migration actually exercises the collision.
+		expect(offlineDiff.statements.some((s) => s.sql.includes('create table "__new_orders"'))).toBe(true);
+
+		const migrations = [{ tag: 'm_rename_and_rebuild_both', sql: renderMigration(offlineDiff) }];
+
+		await expect(checkForeignTriggerConflicts(runner, migrations)).rejects.toThrow(/"nn_audit"/);
+		await expect(applyMigrations(runner, migrations)).rejects.toThrow(/"nn_audit"/);
+
+		const tables = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'table' and name in ('__new_orders', 'orders_v2')",
+		);
+		expect(tables.map((t) => t.name)).toEqual(['__new_orders']);
+		const triggers = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'trigger' and name = 'nn_audit'",
 		);
 		expect(triggers).toHaveLength(1);
 	});

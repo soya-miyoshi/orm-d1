@@ -14,7 +14,10 @@ import type { Snapshot } from './snapshot.js';
 import {
 	applicableStatements,
 	createMigrationsTable,
+	IDENTIFIER_SOURCE,
+	lookupCaseInsensitive,
 	MIGRATIONS_TABLE,
+	normalizeIdentifierToken,
 	packStatementsWithTrailer,
 	quoteIdentifier,
 	tablesRebuiltIn,
@@ -283,8 +286,17 @@ export async function applyMigration(
  */
 function renamesInMigration(statements: readonly string[]): Record<string, string> {
 	const renames: Record<string, string> = {};
-	const createPattern = /^\s*create\s+table\s+"((?:[^"]|"")+)"/i;
-	const pattern = /^\s*alter\s+table\s+"((?:[^"]|"")+)"\s+rename\s+to\s+"((?:[^"]|"")+)"\s*$/i;
+	// Kit's own `recreateTable` always emits `create table "__new_X"` with the
+	// double-quoted spelling, so this pattern only needs to recognise that one.
+	const createPattern = /^\s*create\s+table\s+"(__new_(?:[^"]|"")+)"/i;
+	// A hand-written or `--rename-table` rename is under no obligation to use
+	// the kit's own double-quoted spelling — `alter table orders rename to
+	// sales;` (bare, no quotes) is completely ordinary SQL, and used to be
+	// invisible to this scan entirely.
+	const pattern = new RegExp(
+		`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+to\\s+(${IDENTIFIER_SOURCE})\\s*$`,
+		'i',
+	);
 
 	// A rebuild's own closing rename (`"__new_X"` -> `"X"`) is not a live
 	// table's identity change; excluding it keeps this map limited to actual
@@ -293,26 +305,38 @@ function renamesInMigration(statements: readonly string[]): Record<string, strin
 	// test for that, but a genuine `--rename-table __new_orders=orders_v2` —
 	// a real table someone named `__new_orders`, the same case `diff.ts:412`
 	// already acknowledges exists — starts with `__new_` too and was wrongly
-	// excluded, silently hiding it from the trigger guard. What actually
-	// distinguishes the rebuild's closing rename is that *this migration
-	// itself* created the temporary table by that exact name moments earlier
-	// (`recreateTable` always emits `create table "__new_X"` before the
-	// matching rename); a hand-authored or `--rename-table` rename never has
-	// a preceding `create table` under the source name in the same file.
-	const createdHere = new Set<string>();
-	for (const statement of statements) {
+	// excluded, silently hiding it from the trigger guard. Recording *where*
+	// (not just *whether*) this migration created `"__new_X"` fixes the
+	// follow-on hole that plain membership reopened: a migration can both
+	// genuinely rename a live `__new_orders` *and* separately rebuild `orders`
+	// (whose rebuild creates its own `"__new_orders"` scratch table) — after
+	// which `createdHere.has('__new_orders')` is true again, for a completely
+	// unrelated table, and the genuine rename is discarded a second time.
+	// What actually distinguishes the rebuild's own closing rename is BOTH
+	// that this migration created `"__new_X"` earlier in the statement list
+	// AND that this specific rename's target is `X` (the name with the
+	// `__new_` prefix stripped) — the exact shape `recreateTable` emits and
+	// nothing else has reason to produce.
+	const createdAt = new Map<string, number>();
+	statements.forEach((statement, index) => {
 		const created = createPattern.exec(statement);
-		if (created) createdHere.add(created[1]!.replaceAll('""', '"'));
-	}
+		if (!created) return;
+		const name = created[1]!.replaceAll('""', '"');
+		if (!createdAt.has(name)) createdAt.set(name, index);
+	});
 
-	for (const statement of statements) {
+	statements.forEach((statement, index) => {
 		const match = pattern.exec(statement);
-		if (!match) continue;
-		const from = match[1]!.replaceAll('""', '"');
-		const to = match[2]!.replaceAll('""', '"');
-		if (from.startsWith('__new_') && createdHere.has(from)) continue;
+		if (!match) return;
+		const from = normalizeIdentifierToken(match[1]!);
+		const to = normalizeIdentifierToken(match[2]!);
+		const strippedTarget = from.startsWith('__new_') ? from.slice('__new_'.length) : undefined;
+		const createdIndex = createdAt.get(from);
+		const isRebuildsOwnClose = strippedTarget !== undefined && to === strippedTarget
+			&& createdIndex !== undefined && createdIndex < index;
+		if (isRebuildsOwnClose) return;
 		renames[to] = from;
-	}
+	});
 	return renames;
 }
 
@@ -375,7 +399,11 @@ export async function checkForeignTriggerConflicts(
 		for (const table of migration.tables) {
 			const preMigrationName = migration.renames[table] ?? table;
 			const liveName = accumulated[preMigrationName] ?? preMigrationName;
-			const triggers = foreignTriggers[liveName];
+			// Case-insensitive: `sqlite_master.tbl_name` is stored exactly as the
+			// hand-written trigger spelled it, and identifiers are
+			// case-insensitive, so a trigger on `Orders` still guards the schema's
+			// `orders`. See `lookupCaseInsensitive`.
+			const triggers = lookupCaseInsensitive(foreignTriggers, liveName);
 			if (!triggers || triggers.length === 0) continue;
 			throw new Error(
 				`Migration "${migration.tag}" would rebuild "${table}", but it carries trigger(s) `
