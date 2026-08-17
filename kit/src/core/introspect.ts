@@ -7,9 +7,20 @@
  * verified by those tests rather than assumed from documentation.
  */
 import { defaultExpression } from 'orm-d1/ddl';
-import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
+import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot, UniqueColumnSnapshot } from './snapshot.js';
 import { SNAPSHOT_VERSION } from './snapshot.js';
 import { foldAsciiCase } from './sql.js';
+
+/** A table-level `UNIQUE (…)` member, as recovered from `CREATE TABLE` text. */
+interface RawUniqueMember {
+	readonly name: string;
+	readonly collate?: string;
+}
+/** A whole table-level `[constraint <name>] UNIQUE (…)` clause. */
+interface RawUniqueClause {
+	readonly name: string | undefined;
+	readonly members: readonly RawUniqueMember[];
+}
 
 export interface MasterRow {
 	readonly type: string;
@@ -146,6 +157,31 @@ const blankLiterals = (text: string): string =>
 		},
 	);
 
+/**
+ * Blank *only* comments from a value already sliced out of the DDL for
+ * storage in a snapshot (a `check` expression, a generated column's `as`, an
+ * index member) — string literals and quoted identifiers pass through
+ * verbatim, unlike {@link blankLiterals}, because this text is re-emitted on
+ * the next rebuild and a literal's real contents must survive.
+ *
+ * A trailing `-- …` comment left in used to re-render as invalid SQL: `check
+ * ("a" > 0 -- positive\n)` is captured with the comment attached, and the
+ * `.trim()` every caller applies afterward strips the newline that made it
+ * harmless as a *comment*, leaving `check ("a" > 0 -- positive)` — everything
+ * after `--`, including the closing paren, is now commented out, and D1
+ * refuses it with `incomplete input` (`[F-113]`). Blanking the comment's own
+ * text to spaces (not deleting it) keeps the trailing newline that follows
+ * `-- …` — the match itself excludes `\n` — so this still ends the comment,
+ * and the caller's `.trim()` then removes the now-all-whitespace tail
+ * cleanly. Spaces rather than deletion also can't accidentally fuse two
+ * identifiers that a comment used to separate.
+ */
+const blankComments = (text: string): string =>
+	text.replaceAll(
+		/'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|--[^\n]*|\/\*[\s\S]*?\*\//g,
+		(span) => (span[0] === '-' || span[0] === '/' ? ' '.repeat(span.length) : span),
+	);
+
 export const parseChecks = (
 	sql: string,
 	tableName = 'table',
@@ -182,7 +218,7 @@ export const parseChecks = (
 			else if (ch === ')') depth--;
 			i++;
 		}
-		checks[name] = { name, value: sql.slice(start, i - 1).trim() };
+		checks[name] = { name, value: blankComments(sql.slice(start, i - 1)).trim() };
 	}
 
 	return checks;
@@ -199,12 +235,78 @@ const escapeRegExp = (value: string): string => value.replaceAll(/[.*+?^${}()|[\
  * Anchored on a column *definition*, not on the name wherever it appears: the
  * name is matched only after a `(` or `,` (with optional whitespace), so a
  * literal inside another column's string default cannot stand in for it.
+ *
+ * All four identifier spellings SQLite accepts — `"…"`, `` `…` ``, `[…]`, and
+ * bare — are matched, not just `"…"` and bare: a backtick- or bracket-quoted
+ * column used to be invisible to every caller of this anchor (`hasAutoincrement`,
+ * `parseGenerated`, `parseColumnCollation`), silently dropping whatever they
+ * were looking for (`[F-112]`).
  */
-const columnDefinitionStart = (columnName: string): string =>
-	`[(,]\\s*(?:"${escapeRegExp(columnName).replaceAll('"', '""')}"|\\b${escapeRegExp(columnName)}\\b)`;
+const columnDefinitionStart = (columnName: string): string => {
+	const escaped = escapeRegExp(columnName);
+	return `[(,]\\s*(?:"${escaped.replaceAll('"', '""')}"|\`${escaped.replaceAll('`', '``')}\`|\\[${escaped}\\]|\\b${escaped}\\b)`;
+};
 
-export const hasAutoincrement = (sql: string, columnName: string): boolean =>
-	new RegExp(`${columnDefinitionStart(columnName)}[^,]*autoincrement`, 'i').test(sql);
+/**
+ * Paren depth (quote-aware, via {@link skipQuotedIdentifier}) at every offset
+ * of `scan`, so a caller can tell a "definition start" match that is actually
+ * nested inside an earlier column's own parenthesised sub-expression — a
+ * foreign-key reference's column list, a `check (…)`, a `generated always as
+ * (…)` — from one that is a genuine top-level column/constraint boundary.
+ */
+const computeDepths = (scan: string): number[] => {
+	const depths: number[] = [];
+	let depth = 0;
+	let i = 0;
+	while (i < scan.length) {
+		const ch = scan[i];
+		if (ch === '"' || ch === '`' || ch === '[') {
+			const end = skipQuotedIdentifier(scan, i);
+			for (let k = i; k < end && k < scan.length; k++) depths[k] = depth;
+			i = end;
+			continue;
+		}
+		depths[i] = depth;
+		if (ch === '(') depth++;
+		else if (ch === ')') depth--;
+		i++;
+	}
+	return depths;
+};
+
+/**
+ * The shared anchor every column-definition scan in this file uses. Finds
+ * `columnDefinitionStart`'s match — not the *first* one in the text, but the
+ * first that sits at paren depth 1 (directly inside the table's own column
+ * list, not nested inside another column's foreign-key reference or
+ * expression). Taking the first match unconditionally used to anchor on, say,
+ * a `references "users"("id")` clause that happens to contain `("id")` before
+ * the real `"id"` column definition ever appears (`[F-112]`).
+ */
+const findColumnDefinitionAnchor = (scan: string, columnName: string): RegExpExecArray | undefined => {
+	const depths = computeDepths(scan);
+	for (const match of scan.matchAll(new RegExp(columnDefinitionStart(columnName), 'gi'))) {
+		// `depths[match.index]` is the depth *at* the separator (`(` or `,`)
+		// itself — for the table's very own opening `(`, that is still 0 (the
+		// increment to 1 happens only once the character is consumed), even
+		// though the column right after it is exactly as "top-level" as one
+		// after a top-level `,` (already at depth 1, since a comma does not
+		// change depth). Checking one position later — the first character of
+		// what the separator introduces — reports 1 uniformly for both.
+		if (depths[match.index + 1] === 1) return match;
+	}
+	return undefined;
+};
+
+export const hasAutoincrement = (sql: string, columnName: string): boolean => {
+	const scan = blankLiterals(sql);
+	const anchor = findColumnDefinitionAnchor(scan, columnName);
+	if (!anchor) return false;
+	const rest = scan.slice(anchor.index + anchor[0].length);
+	const commaIdx = rest.indexOf(',');
+	const span = commaIdx === -1 ? rest : rest.slice(0, commaIdx);
+	return /autoincrement/i.test(span);
+};
 
 /**
  * A column's own `COLLATE` clause, from the `CREATE TABLE` text — no pragma
@@ -258,7 +360,7 @@ const skipQuotedIdentifier = (scan: string, i: number): number => {
 
 export const parseColumnCollation = (sql: string, columnName: string): string | undefined => {
 	const scan = blankLiterals(sql);
-	const anchor = new RegExp(columnDefinitionStart(columnName), 'i').exec(scan);
+	const anchor = findColumnDefinitionAnchor(scan, columnName);
 	if (!anchor) return undefined;
 
 	// The column definition's own span: from right after its name to the next
@@ -320,10 +422,16 @@ export const parseColumnCollation = (sql: string, columnName: string): string | 
 			// stores verbatim; only matching the `"…"` spelling left the other two
 			// invisible, so a rebuild silently dropped the collation (and the
 			// meaning of any unique index built over the column).
+			//
+			// The separator before the name is optional whitespace when the name is
+			// quoted (`collate"NOCASE"`, no space, is legal SQLite and D1 stores it
+			// verbatim) but *required* before a bare word — otherwise `collatenocase`,
+			// one identifier with no `collate` keyword in it at all, would match as
+			// `collate` + `nocase` (`[F-112]`).
 			const rest = scan.slice(i);
-			const match = /^collate\s+("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|\w+)/i.exec(rest);
+			const match = /^collate(?:\s+(\w+)|\s*("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]))/i.exec(rest);
 			if (match) {
-				const name = match[1]!;
+				const name = (match[1] ?? match[2])!;
 				collate = name.startsWith('"')
 					? name.slice(1, -1).replaceAll('""', '"')
 					: name.startsWith('`')
@@ -346,11 +454,11 @@ export const parseGenerated = (
 	columnName: string,
 ): { as: string; mode: 'stored' | 'virtual' } | undefined => {
 	const scan = blankLiterals(sql);
-	const match = new RegExp(
-		`${columnDefinitionStart(columnName)}[^,]*?generated\\s+always\\s+as\\s*\\(`,
-		'i',
-	).exec(scan);
-	if (!match) return undefined;
+	const anchor = findColumnDefinitionAnchor(scan, columnName);
+	if (!anchor) return undefined;
+	const tailStart = anchor.index + anchor[0].length;
+	const genMatch = /^[^,]*?generated\s+always\s+as\s*\(/i.exec(scan.slice(tailStart));
+	if (!genMatch) return undefined;
 
 	// Balanced scan, not `[^)]*`: an expression is far more likely to contain
 	// parentheses than not — `upper("name")` used to come back as `upper("name`
@@ -362,7 +470,7 @@ export const parseGenerated = (
 	// with `unknown table option: virtual` ([F-108], the sub-issue this
 	// function shared with `parseColumnCollation` before both used
 	// `skipQuotedIdentifier`).
-	const start = match.index + match[0].length;
+	const start = tailStart + genMatch[0].length;
 	let depth = 1;
 	let i = start;
 	while (i < scan.length && depth > 0) {
@@ -378,7 +486,7 @@ export const parseGenerated = (
 	if (depth > 0) return undefined;
 
 	const mode = /^\s*(stored|virtual)/i.exec(sql.slice(i))?.[1]?.toLowerCase();
-	return { as: sql.slice(start, i - 1).trim(), mode: (mode as 'stored' | 'virtual') ?? 'virtual' };
+	return { as: blankComments(sql.slice(start, i - 1)).trim(), mode: (mode as 'stored' | 'virtual') ?? 'virtual' };
 };
 
 const parseIndexWhere = (sql: string | null): string | undefined => {
@@ -443,12 +551,12 @@ const parseIndexColumns = (sql: string | null): string[] | undefined => {
 		if (ch === '(') nesting++;
 		else if (ch === ')') nesting--;
 		if (ch === ',' && nesting === 0) {
-			members.push(sql.slice(memberStart, j).trim());
+			members.push(blankComments(sql.slice(memberStart, j)).trim());
 			memberStart = j + 1;
 		}
 		j++;
 	}
-	const last = sql.slice(memberStart, bodyEnd).trim();
+	const last = blankComments(sql.slice(memberStart, bodyEnd)).trim();
 	if (last.length > 0) members.push(last);
 	return members;
 };
@@ -482,7 +590,15 @@ const parseIndexCollations = (sql: string | null): (string | undefined)[] | unde
 		return token;
 	};
 	return members.map((member) => {
-		const match = collateRe.exec(member);
+		// `member` is sliced from the *original* `sql` (`parseIndexColumns`
+		// deliberately keeps string-literal contents intact), so a literal
+		// containing the word `collate` — `replace("a", ' collate x ', '')` — would
+		// otherwise be read as the member's own collation clause and re-emitted
+		// as an unescaped, uninterpolated `COLLATE x` (`[F-069]`, the same hazard
+		// `blankLiterals` exists to close everywhere else in this file). Blanking
+		// here, not in `parseIndexColumns`, keeps the *stored* member text
+		// literal-faithful for re-rendering while still scanning it safely.
+		const match = collateRe.exec(blankLiterals(member));
 		return match ? unquote(match[1]!) : undefined;
 	});
 };
@@ -599,6 +715,136 @@ export const appendOnlyTriggerGuard = (sql: string, tableName: string): boolean 
 export const isAppendOnlyTrigger = (sql: string, tableName: string): boolean =>
 	appendOnlyTriggerGuard(sql, tableName) !== false;
 
+/**
+ * Every table-level `[constraint <name>] unique (…)` clause in a
+ * `CREATE TABLE`'s text, in declaration order, with each member's own
+ * `COLLATE` if it states one.
+ *
+ * `pragma index_list`/`index_info` report a table-level unique constraint as
+ * an automatic index (`origin: 'u'`), but an automatic index has no
+ * `sqlite_master.sql` row of its own — only the owning table's does — so a
+ * member's collation, like an index member's, can only be recovered from
+ * this text (`[F-111]`). A single-column `unique` written on the column
+ * itself (`"email" text collate nocase unique`, or plain `... unique`) never
+ * matches this pattern at all — there is no parenthesised member list to
+ * find — and is left to `parseColumnCollation` on the column, which already
+ * covers it.
+ */
+const parseTableUniqueConstraints = (sql: string): RawUniqueClause[] => {
+	const scan = blankLiterals(sql);
+	const clauses: RawUniqueClause[] = [];
+	// Anchored the same way `columnDefinitionStart` anchors a column: only after
+	// a top-level `(` or `,`, so a check constraint's text merely mentioning the
+	// word `unique` cannot be mistaken for the clause.
+	const pattern = /[(,]\s*(?:constraint\s+("(?:[^"]|"")+"|\w+)\s+)?unique\s*\(/gi;
+	const depths = computeDepths(scan);
+
+	for (const match of scan.matchAll(pattern)) {
+		// Depth 1 is directly inside the table's own column-list parens — the
+		// same level `findColumnDefinitionAnchor` requires for a column boundary,
+		// checked one position past the separator for the same reason (see its
+		// comment): the table's own opening `(` is itself still at depth 0.
+		if (depths[match.index + 1] !== 1) continue; // not a table-level clause
+		const start = match.index + match[0].length;
+		let depth = 1;
+		let i = start;
+		while (i < scan.length && depth > 0) {
+			const ch = scan[i];
+			if (ch === '"' || ch === '`' || ch === '[') {
+				i = skipQuotedIdentifier(scan, i);
+				continue;
+			}
+			if (ch === '(') depth++;
+			else if (ch === ')') depth--;
+			i++;
+		}
+		if (depth > 0) continue;
+		const bodyEnd = i - 1;
+
+		const rawMembers: string[] = [];
+		let memberStart = start;
+		let nesting = 0;
+		for (let j = start; j < bodyEnd;) {
+			const ch = scan[j];
+			if (ch === '"' || ch === '`' || ch === '[') {
+				j = skipQuotedIdentifier(scan, j);
+				continue;
+			}
+			if (ch === '(') nesting++;
+			else if (ch === ')') nesting--;
+			if (ch === ',' && nesting === 0) {
+				rawMembers.push(blankComments(sql.slice(memberStart, j)).trim());
+				memberStart = j + 1;
+			}
+			j++;
+		}
+		const last = blankComments(sql.slice(memberStart, bodyEnd)).trim();
+		if (last.length > 0) rawMembers.push(last);
+
+		const members: RawUniqueMember[] = rawMembers.map((raw) => {
+			// Scan `blankLiterals(raw)`, not `raw` itself, for the same reason
+			// `parseIndexCollations` does ([F-069]'s class): a string literal in the
+			// member text could otherwise contain the word `collate` and be misread
+			// as the member's own clause. Quoted *identifiers* are unaffected —
+			// `blankLiterals` passes them through verbatim — so the name/collation
+			// captured below is still the real text.
+			const blanked = blankLiterals(raw);
+			const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)/.exec(blanked);
+			const rawName = nameMatch ? nameMatch[1]! : blanked.trim();
+			const name = rawName.startsWith('"')
+				? rawName.slice(1, -1).replaceAll('""', '"')
+				: rawName.startsWith('`')
+				? rawName.slice(1, -1)
+				: rawName.startsWith('[')
+				? rawName.slice(1, -1)
+				: rawName;
+			const collateMatch = /\bcollate(?:\s+(\w+)|\s*("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]))/i.exec(blanked);
+			const collateToken = collateMatch ? (collateMatch[1] ?? collateMatch[2]) : undefined;
+			const collate = collateToken === undefined ? undefined : collateToken.startsWith('"')
+				? collateToken.slice(1, -1).replaceAll('""', '"')
+				: collateToken.startsWith('`')
+				? collateToken.slice(1, -1)
+				: collateToken.startsWith('[')
+				? collateToken.slice(1, -1)
+				: collateToken;
+			return { name, ...(collate ? { collate } : {}) };
+		});
+
+		clauses.push({ name: match[1] ? unquote(match[1]) : undefined, members });
+	}
+
+	return clauses;
+};
+
+/**
+ * Associates a `pragma index_list` `origin: 'u'` entry (already resolved to
+ * its plain column names via `pragma index_info`) with the parsed table-level
+ * `unique (…)` clause it came from, by comparing column lists rather than
+ * position — a named constraint's automatic index is reliably named after it,
+ * but an *unnamed* one is `sqlite_autoindex_<table>_<n>`, numbered across
+ * every automatic index the table has (primary key included), not just the
+ * unique clauses, so declaration order alone cannot be trusted to line the
+ * two lists up.
+ */
+const matchUniqueClause = (
+	clauses: readonly RawUniqueClause[],
+	used: Set<number>,
+	columnNames: readonly string[],
+): RawUniqueClause | undefined => {
+	for (let i = 0; i < clauses.length; i++) {
+		if (used.has(i)) continue;
+		const clause = clauses[i]!;
+		if (
+			clause.members.length === columnNames.length
+			&& clause.members.every((m, mi) => m.name === columnNames[mi])
+		) {
+			used.add(i);
+			return clause;
+		}
+	}
+	return undefined;
+};
+
 export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): Snapshot {
 	const tables: Record<string, TableSnapshot> = {};
 	const indexSql = new Map<string, string | null>();
@@ -643,7 +889,12 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 		}
 
 		const indexes: Record<string, IndexSnapshot> = {};
-		const uniqueConstraints: Record<string, { name: string; columns: readonly string[] }> = {};
+		const uniqueConstraints: Record<string, { name: string; columns: readonly (string | UniqueColumnSnapshot)[] }> =
+			{};
+		// Parsed once per table: every table-level `[constraint <name>] unique (…)`
+		// clause in declaration order, for `[F-111]`'s per-member collation.
+		const uniqueClauses = parseTableUniqueConstraints(createSql);
+		const usedUniqueClauses = new Set<number>();
 
 		for (const index of input.indexList[row.name] ?? []) {
 			const sortedMembers = (input.indexInfo[index.name] ?? []).slice().sort((a, b) => a.seqno - b.seqno);
@@ -659,18 +910,48 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			const collations = parseIndexCollations(indexSql.get(index.name) ?? null);
 			const memberColumns: { expression: string; isExpression: boolean; desc?: boolean; collate?: string }[] =
 				sortedMembers
-					.map((m, i) => ({
-						...(m.name !== null
-							? { expression: m.name, isExpression: false }
-							: { expression: rawColumns?.[i] ?? '', isExpression: true }),
-						...(m.desc === 1 ? { desc: true } : {}),
-						...(collations?.[i] ? { collate: collations[i] } : {}),
-					}))
+					.map((m, i) => {
+						const isExpression = m.name === null;
+						return {
+							...(isExpression
+								? { expression: rawColumns?.[i] ?? '', isExpression: true as const }
+								: { expression: m.name!, isExpression: false as const }),
+							// An expression member's text (recovered above via
+							// `parseIndexColumns`) already carries its own `desc`/`collate`
+							// verbatim — `sql\`lower("a") desc\`` is stored, and re-parsed,
+							// as `"lower(\"a\") desc"`. Attaching `index_xinfo`'s `desc`/`coll`
+							// on top of that duplicated the modifier: `createIndexFromSnapshot`
+							// rendered `lower("a") desc desc` (a syntax error), and even before
+							// that the schema side (`decorateIndexColumn`, which only
+							// recognises a bare quoted identifier) never attaches either for a
+							// genuine expression, so the two sides could never converge —
+							// `check`/`push`/`generate` all looped on a no-op-turned-rebuild
+							// forever (`[F-068]`, a regression: `main` skipped this correctly
+							// because it only decorated the `cid !== -2` branch).
+							...(!isExpression && m.desc === 1 ? { desc: true } : {}),
+							...(!isExpression && collations?.[i] ? { collate: collations[i] } : {}),
+						};
+					})
 					.filter((c) => c.expression !== '');
 
 			if (index.origin === 'pk') continue;
 			if (index.origin === 'u') {
-				uniqueConstraints[index.name] = { name: index.name, columns: memberColumns.map((c) => c.expression) };
+				// `sqlite_autoindex_*`/a named constraint's automatic index has no
+				// `sqlite_master.sql` row of its own, so a member's `COLLATE` — legal
+				// only in the *table-level* `unique (col collate x)` idiom, since a
+				// column-level `unique` combined with `collate` is captured on the
+				// column itself via `parseColumnCollation` — has to come from the
+				// owning `CREATE TABLE` text, matched up by its column list
+				// (`[F-111]`).
+				const plainNames = memberColumns.map((c) => c.expression);
+				const clause = matchUniqueClause(uniqueClauses, usedUniqueClauses, plainNames);
+				uniqueConstraints[index.name] = {
+					name: index.name,
+					columns: plainNames.map((n, i) => {
+						const collate = clause?.members[i]?.collate;
+						return collate ? { name: n, collate } : n;
+					}),
+				};
 				continue;
 			}
 			indexes[index.name] = {
@@ -687,6 +968,19 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			if (column.hidden === 1) continue;
 
 			const single = !compositePk && column.pk === 1;
+			// SQLite makes a lone primary key `NOT NULL` structurally only when it
+			// is the rowid alias — a column declared with the *exact* type
+			// `INTEGER` (case-insensitive; `INT`, `BIGINT` etc. do not qualify,
+			// same rule `ColumnBuilder.primaryKey()`'s `hasDefault` uses on the
+			// schema side, `src/schema/columns.ts:423`). Any other single-column
+			// primary key (`TEXT PRIMARY KEY`, say) can legally hold `NULL`, and
+			// `pragma table_info`'s own `notnull` already says so correctly — it
+			// was being overridden by `|| single` regardless of type. Forcing
+			// `not null` onto it here made `createTableFromSnapshot` emit a
+			// constraint the live table never had, and the rebuild it drove failed
+			// with `NOT NULL constraint failed` the moment a `NULL` row existed
+			// (`[F-114]`).
+			const isRowidAlias = single && column.type.trim().toLowerCase() === 'integer';
 			const generated = column.hidden === 2 || column.hidden === 3
 				// The pragma says *that* it is generated and with which storage;
 				// only the expression has to come out of the CREATE TABLE text.
@@ -711,7 +1005,7 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 				// existed, which genuinely has no `declaredType` on disk.
 				declaredType: column.type,
 				primaryKey: single,
-				notNull: column.notnull === 1 || single,
+				notNull: column.notnull === 1 || isRowidAlias,
 				autoincrement: single && hasAutoincrement(createSql, column.name),
 				// A single-column UNIQUE constraint is reported as an index; it is
 				// recorded there rather than duplicated onto the column.

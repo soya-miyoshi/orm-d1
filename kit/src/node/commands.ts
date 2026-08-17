@@ -23,7 +23,7 @@ import type { BackfillResult } from '../core/backfill.js';
 import { carryForwardCollations, diffSnapshots, renderMigration } from '../core/diff.js';
 import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
-import { normalizeIndexColumn, snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
+import { normalizeIndexColumn, normalizeUniqueColumn, snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
 import type { Snapshot } from '../core/snapshot.js';
 import { describeResolution } from './config.js';
 import type { Config } from './config.js';
@@ -549,7 +549,16 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 
 		for (const u of Object.values(table.uniqueConstraints)) {
 			imports.add('unique');
-			extras.push(`unique(${JSON.stringify(u.name)}).on(${u.columns.map((c) => `t.${columnId(c)}`).join(', ')})`);
+			// `unique().on(...)` (`src/schema/constraints.ts:82`) only accepts plain
+			// columns — Drizzle's own `.unique()` builder has no per-member `COLLATE`
+			// spelling, and this ORM cannot add one that Drizzle lacks (`docs/04`).
+			// A member's collation ([F-111]) therefore has no schema-module spelling
+			// here and is left off the rendered `unique()`, the same loss the
+			// column-level DESC/COLLATE family already has (`[F-061]`'s "no snapshot
+			// representation at all" case) — `check`/`generate` still see it via the
+			// snapshot's `columns`, which is what round-trips it, not this text.
+			const names = u.columns.map(normalizeUniqueColumn).map((c) => c.name);
+			extras.push(`unique(${JSON.stringify(u.name)}).on(${names.map((n) => `t.${columnId(n)}`).join(', ')})`);
 		}
 
 		for (const fk of Object.values(table.foreignKeys)) {

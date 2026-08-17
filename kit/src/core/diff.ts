@@ -1026,8 +1026,19 @@ const dependenciesOf = (t: TableSnapshot | undefined): string[] => [
  * entirely, and only literal segments (recovered the same way
  * `blankLiterals` finds them, but kept instead of blanked) survive verbatim.
  */
+// Quoted identifiers — `"…"`, `` `…` ``, `[…]` — are protected the same way a
+// `'…'` string literal is, not just blanked from consideration but kept
+// verbatim: SQLite allows a space inside a quoted identifier (`"a b"` and
+// `"ab"` are different columns), and dropping every non-literal space used to
+// drop that one too, so `lower("a b")` and `lower("ab")` canonicalised to the
+// same string and compared equal — a column-pointing index silently drifted
+// to name whichever of the two columns happened to be typed on the schema
+// side next, with no diff ever reported (`[F-030]`).
 const canonicalizeExpression = (text: string): string =>
-	text.replaceAll(/'(?:[^']|'')*'|\s+/g, (match) => (match[0] === "'" ? match : ''));
+	text.replaceAll(
+		/'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|\s+/g,
+		(match) => (/^\s+$/.test(match) ? '' : match),
+	);
 
 const canonicalIndex = (index: IndexSnapshot): string =>
 	JSON.stringify([
