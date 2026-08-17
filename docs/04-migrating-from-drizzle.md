@@ -74,3 +74,18 @@ configured in a separate `tableOptions` module rather than on the table.
 
 Where the behaviour differs once the imports are changed is
 [01-differences](./01-differences.md).
+
+### Upgrading past the empty-array DDL refusal
+
+A `check()` or a partial index's `where()` written with a Drizzle `sql` fragment
+(`sql\`${col} not in ${roles}\``, or the same built through `and`/`eq`/`inArray`) that
+interpolates an *empty* array used to generate `not in ()` / `in ()` silently — SQLite
+accepts it, but it is unconditionally true/false, so the constraint or partial index was
+permanently inert. `orm-d1-kit generate` now refuses to emit DDL for it instead (the same
+refusal orm-d1's own `sql` tag has always applied). If an existing table's schema has one of
+these, regenerating a migration on top of this fix produces a one-time `create table` /
+copy / `drop` / rename recreation for that table — not because the column list changed, but
+because the check/`where` clause's *text* changed from the old inert `()` form to whatever
+non-empty predicate the schema now supplies (or the call fails until the array is fixed).
+This is expected: the old migration already shipped an inert constraint, and there is no
+migration-free way to make SQLite re-evaluate a `check`'s text without rebuilding the table.

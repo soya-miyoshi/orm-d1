@@ -206,7 +206,7 @@ class SQL<T = unknown> implements SQLChunk<T> {
 				params.push(...nested.params);
 			} else if (Array.isArray(value)) {
 				// An empty array renders `()`, matching `drizzle-orm` exactly (see
-				// `docs/08`'s reverse-alias invariant — diverging here would break
+				// `docs/04`'s reverse-alias invariant — diverging here would break
 				// it). In a DDL predicate that is not safe the way it is at
 				// runtime: `x not in ()` is unconditionally true and `x in ()` is
 				// unconditionally false, so a CHECK or partial-index `where` built

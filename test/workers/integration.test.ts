@@ -275,6 +275,24 @@ describe('joins', () => {
 		expect(direct).toEqual([{ users: expect.objectContaining({ name: 'Bob' }), posts: null }]);
 		expect(viaSubquery).toEqual(direct);
 	});
+
+	it('collapses a group produced by joining to a nested subquery, not an object of nulls', async () => {
+		// `s` is itself an inner join wrapped in `.as()`, so every leaf under
+		// the outer `s` group sits two levels deeper than a plain joined
+		// table's leaves (`s.posts.id` / `s.users.id` rather than `s.id`) —
+		// `s` has no *direct* depth-2 Column leaf of its own to key a null
+		// check off. Cara has no posts, so the inner join inside `s` never
+		// produces a row for her, and the outer left join to `s` must read
+		// back as `s: null` — not `{ posts: {...}, users: {...} }` with every
+		// field null.
+		const db = ormD1(DB);
+		await db.insert(users).values({ id: 3, email: 'c@b.c', name: 'Cara', active: true });
+		const s = db.select().from(posts).innerJoin(users, eq(users.id, posts.authorId)).as('s');
+
+		const rows = await db.select().from(users).leftJoin(s, eq(s.users.id, users.id)).where(eq(users.id, 3));
+
+		expect(rows).toEqual([{ users: expect.objectContaining({ name: 'Cara' }), s: null }]);
+	});
 });
 
 describe('expressions against real SQLite', () => {
@@ -486,27 +504,32 @@ describe('observability and errors', () => {
 	// [F-064]: error mapping used `parts[0].sql` unconditionally, so a chunked
 	// write failing on a later chunk reported the *first* chunk's SQL and no
 	// parameters — contradicting the documented "errors carry the SQL that
-	// caused them".
-	it('attaches the failing chunk\'s SQL and params, not just the first chunk\'s, on a chunked write', async () => {
+	// caused them". Fixed by reporting the first and last part (D1's `batch()`
+	// gives no indication of which member actually failed) — bounded rather
+	// than every part's SQL/params unbounded, which measured 62KB+ for a
+	// 3000-row insert failing on its last chunk.
+	it('attaches the first and last chunk\'s SQL and params, bounded, on a chunked write', async () => {
 		setDev(true);
 		try {
 			const db = ormD1(DB, { maxParams: 8 });
-			// 4 params/row (id, email, name, active) at maxParams: 8 chunks 2 rows
-			// per statement. Row 3 (third row, second chunk) collides with the
-			// seeded user's email — chunk 1 succeeds, chunk 2 fails.
+			// Each row encodes to 6 params (id, email, name, active, score,
+			// settings) at maxParams: 8, so one row per chunk — 3 chunks. The
+			// third (last) row collides with the seeded user's email.
 			const rows = [
 				{ id: 100, email: 'x100@b.c', name: 'x', active: true },
 				{ id: 101, email: 'x101@b.c', name: 'x', active: true },
 				{ id: 102, email: 'a@b.c', name: 'x', active: true }, // duplicates seed's user 1
-				{ id: 103, email: 'x103@b.c', name: 'x', active: true },
 			];
 
 			await expect(db.insert(users).values(rows).run()).rejects.toMatchObject({
 				name: 'OrmD1QueryError',
 				// The bug: `query.sql` is always the *first* chunk, which binds
 				// none of these values, so the error's params never contained
-				// the row that actually caused the failure.
+				// the row that actually caused the failure. The fix always
+				// includes the last chunk's params (plus the first's), so the
+				// failing row here — the last one sent — is covered.
 				params: expect.arrayContaining(['a@b.c', 102]) as unknown as unknown[],
+				sql: expect.stringContaining('3 parts') as unknown as string,
 			});
 		} finally {
 			setDev(false);

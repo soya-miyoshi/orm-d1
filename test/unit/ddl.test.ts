@@ -1,4 +1,4 @@
-import { gt as dGt } from 'drizzle-orm';
+import { gt as dGt, sql as dSql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { asDrizzleTable } from '../../src/drizzle.js';
 import { createIndexes, createSchema, createTable, dropTable, literal } from '../../src/ddl.js';
@@ -129,7 +129,7 @@ describe('ddl generation', () => {
 	// which SQLite accepts — `not in ()` is unconditionally true, `in ()` is
 	// unconditionally false, so the constraint goes permanently inert with no
 	// error. Matching `drizzle-orm`'s own `()` rendering is correct (the
-	// `docs/08` reverse-alias invariant), so `createTable` refuses outright
+	// `docs/04` reverse-alias invariant), so `createTable` refuses outright
 	// rather than silently emitting an inert constraint — DDL generation runs
 	// in Node (via `orm-d1-kit`), so it is free to throw.
 	it('refuses to generate DDL for a check built from an empty interpolated array', () => {
@@ -151,6 +151,39 @@ describe('ddl generation', () => {
 		]);
 
 		expect(() => createTable(t)).not.toThrow();
+	});
+
+	// The `RenderContext` hook that throws has no access to which table or
+	// constraint it is rendering for — the raw error was anonymous. The DDL
+	// call sites (`checkDDL`, `createIndex`, `columnDDL`) all have that
+	// context, so it is attached on the way back out.
+	it('names the table and constraint in the empty-array refusal', () => {
+		const ROLES: string[] = [];
+		const t = sqliteTable('t', {
+			role: text('role'),
+		}, (c) => [
+			check('t_role_check', sql`${c.role} not in ${ROLES}`),
+		]);
+
+		expect(() => createTable(t)).toThrow(/table "t"/);
+		expect(() => createTable(t)).toThrow(/constraint "t_role_check"/);
+	});
+
+	it('also refuses a check built with a Drizzle sql fragment interpolating an empty array', () => {
+		// Closes the gap `fromDrizzleSQL` left: a check() written with
+		// Drizzle's own `sql` tag rendered `not in ()` silently because
+		// `ctx.onEmptyArrayPredicate` was only ever consulted from orm-d1's
+		// own template tag.
+		const roles: string[] = [];
+		const t = sqliteTable('t', { role: text('role') });
+		const dRole = asDrizzleTable(t).role;
+		const withCheck = sqliteTable('t', {
+			role: text('role'),
+		}, () => [
+			check('t_role_check', dSql`${dRole} not in ${roles}` as unknown as SQLChunk),
+		]);
+
+		expect(() => createTable(withCheck)).toThrow(/empty array/);
 	});
 
 	it('renders sql defaults inline and value defaults as literals', () => {

@@ -374,23 +374,24 @@ const defaultClause = (column: Column<any>): string => {
 };
 
 /** One `column-def`, in SQLite's constraint order. */
-export const columnDDL = (column: Column<any>, inlinePrimaryKey: boolean): string => {
-	let ddl = `${quoteIdentifier(column.name)} ${typeName(column)}`;
+export const columnDDL = (column: Column<any>, inlinePrimaryKey: boolean, tableName: string): string =>
+	withDDLContext(tableName, column.name, () => {
+		let ddl = `${quoteIdentifier(column.name)} ${typeName(column)}`;
 
-	if (inlinePrimaryKey && column.config.primaryKey) {
-		ddl += ' primary key';
-		if (column.config.autoIncrement) ddl += ' autoincrement';
-	}
-	if (column.config.notNull) ddl += ' not null';
-	if (column.config.unique) ddl += ' unique';
-	if (column.config.generated) {
-		ddl += ` generated always as (${renderInline(column.config.generated.as)}) ${column.config.generated.mode}`;
-	}
-	ddl += defaultClause(column);
-	ddl += referenceClause(column);
+		if (inlinePrimaryKey && column.config.primaryKey) {
+			ddl += ' primary key';
+			if (column.config.autoIncrement) ddl += ' autoincrement';
+		}
+		if (column.config.notNull) ddl += ' not null';
+		if (column.config.unique) ddl += ' unique';
+		if (column.config.generated) {
+			ddl += ` generated always as (${renderInline(column.config.generated.as)}) ${column.config.generated.mode}`;
+		}
+		ddl += defaultClause(column);
+		ddl += referenceClause(column);
 
-	return ddl;
-};
+		return ddl;
+	});
 
 const constraintName = (name: string): string => `constraint ${quoteIdentifier(name)} `;
 
@@ -417,17 +418,40 @@ export const foreignKeyDDL = (meta: ForeignKeyMeta, tableName: string): string =
 	return ddl;
 };
 
-export const checkDDL = (meta: CheckMeta): string =>
-	`${constraintName(meta.name)}check (${renderInline(meta.value)})`;
-
-export const createIndex = (meta: IndexMeta, tableName: string, options: DDLOptions = {}): string => {
-	const columns = meta.columns.map((c) => (isColumn(c) ? quoteIdentifier(c.name) : renderInline(c))).join(', ');
-	let ddl = `create ${meta.unique ? 'unique ' : ''}index ${options.ifNotExists ? 'if not exists ' : ''}${
-		quoteIdentifier(indexName(meta, tableName))
-	} on ${quoteIdentifier(tableName)} (${columns})`;
-	if (meta.where) ddl += ` where ${renderInline(meta.where)}`;
-	return ddl;
+/**
+ * `renderInline` throws through `ddlContext.onEmptyArrayPredicate`, which is a
+ * `RenderContext` hook with no access to which table/constraint it is
+ * rendering for — the error it throws is anonymous. Every call site here
+ * *does* have that context, so it is added on the way back out rather than
+ * threaded down into the render.
+ */
+const withDDLContext = <T>(tableName: string, constraint: string, render: () => T): T => {
+	try {
+		return render();
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith('An empty array was interpolated')) {
+			throw new Error(`${error.message} (table "${tableName}", constraint "${constraint}")`);
+		}
+		throw error;
+	}
 };
+
+export const checkDDL = (meta: CheckMeta, tableName: string): string =>
+	withDDLContext(
+		tableName,
+		meta.name,
+		() => `${constraintName(meta.name)}check (${renderInline(meta.value)})`,
+	);
+
+export const createIndex = (meta: IndexMeta, tableName: string, options: DDLOptions = {}): string =>
+	withDDLContext(tableName, indexName(meta, tableName), () => {
+		const columns = meta.columns.map((c) => (isColumn(c) ? quoteIdentifier(c.name) : renderInline(c))).join(', ');
+		let ddl = `create ${meta.unique ? 'unique ' : ''}index ${options.ifNotExists ? 'if not exists ' : ''}${
+			quoteIdentifier(indexName(meta, tableName))
+		} on ${quoteIdentifier(tableName)} (${columns})`;
+		if (meta.where) ddl += ` where ${renderInline(meta.where)}`;
+		return ddl;
+	});
 
 /** `CREATE TABLE` for one table, excluding its indexes. */
 export function createTable(t: Table, options: DDLOptions = {}): string {
@@ -436,13 +460,13 @@ export function createTable(t: Table, options: DDLOptions = {}): string {
 	const extras = getTableExtras(t);
 	const compositePk = extras.find((e): e is PrimaryKeyConstraint => e.kind === 'primaryKey');
 
-	const parts: string[] = columns.map((column) => columnDDL(column, compositePk === undefined));
+	const parts: string[] = columns.map((column) => columnDDL(column, compositePk === undefined, name));
 
 	if (compositePk) parts.push(primaryKeyDDL(compositePk.meta, name));
 	for (const extra of extras) {
 		if (extra.kind === 'unique') parts.push(uniqueDDL(extra.meta, name));
 		if (extra.kind === 'foreignKey') parts.push(foreignKeyDDL(extra.meta, name));
-		if (extra.kind === 'check') parts.push(checkDDL(extra.meta));
+		if (extra.kind === 'check') parts.push(checkDDL(extra.meta, name));
 	}
 
 	const body = parts.map((p) => `\t${p}`).join(',\n');

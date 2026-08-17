@@ -118,3 +118,40 @@ describe('a foreign fragment inside a compiled statement', () => {
 		expect(rendered(eq(fragment as never, 'x')).sql).toBe(`coalesce("users"."name", 'anon') = ?`);
 	});
 });
+
+describe('the DDL empty-array-predicate refusal also covers Drizzle fragments', () => {
+	// [F-087]: `src/sql/sql.ts`'s own template tag refuses an empty array
+	// interpolated into a DDL predicate via `ctx.onEmptyArrayPredicate` — but a
+	// check() or partial-index where() written with Drizzle's *own* `sql` tag
+	// renders through `fromDrizzleSQL`, which never consulted that hook, so
+	// `check("role" not in ())` sailed through silently. This closes that gap
+	// at the one place `fromDrizzleSQL` structurally sees Drizzle's own
+	// `queryChunks` — no text/string heuristics.
+	const ddlCtx = { ...defaultRenderContext, bareColumns: true, onEmptyArrayPredicate: () => {
+		throw new Error('empty array refused');
+	} };
+
+	it('invokes onEmptyArrayPredicate for a bare Drizzle sql fragment with an empty array', () => {
+		const roles: string[] = [];
+		const fragment = dSql`${dUsers.role} not in ${roles}`;
+		expect(() => render(fragment as never, ddlCtx)).toThrow(/empty array refused/);
+	});
+
+	it('invokes it for an empty array nested inside and()/eq() composition', () => {
+		const roles: string[] = [];
+		const fragment = dAnd(dEq(dUsers.id, 1), dSql`${dUsers.role} not in ${roles}`)!;
+		expect(() => render(fragment as never, ddlCtx)).toThrow(/empty array refused/);
+	});
+
+	it('does not invoke it for a non-empty array', () => {
+		const fragment = dSql`${dUsers.role} not in ${['admin', 'member']}`;
+		expect(() => render(fragment as never, ddlCtx)).not.toThrow();
+	});
+
+	it('does not invoke it outside a DDL context (bareColumns unset)', () => {
+		const roles: string[] = [];
+		const fragment = dSql`${dUsers.role} not in ${roles}`;
+		expect(() => render(fragment as never, defaultRenderContext)).not.toThrow();
+		expect(rendered(fragment as never).sql).toBe('"users"."role" not in ()');
+	});
+});

@@ -97,6 +97,30 @@ const toSlot = (param: unknown): ParamSlot => {
 const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
 /**
+ * Structurally walk a Drizzle `SQL` fragment's own `queryChunks`, looking for
+ * a bare `[]` interpolated directly into the template (`sql\`... in
+ * ${arr}\``) — Drizzle's `SQL.toQuery` renders that as `()`, which is exactly
+ * the empty-array-predicate hazard `src/sql/sql.ts`'s own `toQuery` refuses
+ * via `ctx.onEmptyArrayPredicate`. That hook is only ever consulted from our
+ * own template tag, so a DDL predicate written with Drizzle's `sql` tag
+ * (`and`/`eq`/`inArray` included — they nest as `SQL` chunks inside
+ * `queryChunks` rather than flattening) sailed straight past it and rendered
+ * `check("role" not in ())` — a permanently inert constraint D1 accepts
+ * silently. No text/string heuristics: this only inspects the chunk array
+ * Drizzle itself builds, recursing into nested `SQL` fragments (`and()` etc.)
+ * the same way `toQuery` does when it flattens them.
+ */
+const hasEmptyArrayChunk = (fragment: { queryChunks: readonly unknown[] }): boolean => {
+	for (const chunk of fragment.queryChunks) {
+		if (Array.isArray(chunk) && chunk.length === 0) return true;
+		if (typeof chunk === 'object' && chunk !== null && isDrizzleSQL(chunk)) {
+			if (hasEmptyArrayChunk(chunk as { queryChunks: readonly unknown[] })) return true;
+		}
+	}
+	return false;
+};
+
+/**
  * Render a Drizzle fragment into our `{ sql, params }`.
  *
  * `casing` is not read by every Drizzle version but is cheap to supply, and
@@ -111,6 +135,10 @@ export const fromDrizzleSQL = (value: unknown, ctx?: RenderContext): Query => {
 		? value as { toQuery: (config: unknown) => { sql: string; params: unknown[] } }
 		: (value as { getSQL: () => { toQuery: (config: unknown) => { sql: string; params: unknown[] } } }).getSQL();
 
+	if (ctx?.bareColumns && isDrizzleSQL(fragment) && hasEmptyArrayChunk(fragment as unknown as { queryChunks: readonly unknown[] })) {
+		ctx.onEmptyArrayPredicate?.();
+	}
+
 	const token = ctx?.paramToken ?? '?';
 	const { sql, params } = fragment.toQuery({
 		escapeName: quote,
@@ -119,14 +147,22 @@ export const fromDrizzleSQL = (value: unknown, ctx?: RenderContext): Query => {
 		casing: { getColumnCasing: (column: { name: string }): string => column.name },
 		inlineParams: false,
 		// `check('c', drizzleSql\`${col} > 0\`)` must not render "t"."c" > 0 —
-		// SQLite rejects a table-qualified column inside a CHECK constraint.
-		// Drizzle itself special-cases this: `SQL.toQuery` (drizzle-orm/sql/sql.js)
-		// checks `_config.invokeSource === 'indexes'` at the `Column` chunk and, if
-		// so, renders just `escapeName(columnName)` with no table qualifier — the
-		// flag propagates through nested fragments automatically. Asking for it
-		// structurally here means only actual column-reference nodes are affected;
-		// text inside string literals (e.g. a JSON path like '$."a"."b"') is
-		// untouched, unlike a text-level regex over the rendered SQL. See [F-067].
+		// a table-qualified column is fine in a CHECK constraint on D1 (`check
+		// ("t"."c" <> 'bad')` and `where "t"."c" = 'x'` are both accepted); the
+		// real restriction is narrower and applies only to a *generated*
+		// column's expression, where the `.` operator is rejected outright
+		// (`the "." operator prohibited in generated columns`). Bare-columns
+		// rendering here still strips the qualifier regardless — it reads more
+		// naturally and avoids relying on a table alias the DDL context never
+		// declares — it just is not a correctness requirement for `check`/
+		// `where`. Drizzle itself special-cases this: `SQL.toQuery`
+		// (drizzle-orm/sql/sql.js) checks `_config.invokeSource === 'indexes'`
+		// at the `Column` chunk and, if so, renders just `escapeName(columnName)`
+		// with no table qualifier — the flag propagates through nested
+		// fragments automatically. Asking for it structurally here means only
+		// actual column-reference nodes are affected; text inside string
+		// literals (e.g. a JSON path like '$."a"."b"') is untouched, unlike a
+		// text-level regex over the rendered SQL. See [F-067].
 		...(ctx?.bareColumns ? { invokeSource: 'indexes' } : {}),
 	});
 

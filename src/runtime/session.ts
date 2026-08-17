@@ -34,6 +34,35 @@ export interface ResolvedOptions {
 const now = (): number => Date.now();
 
 /**
+ * Summarise a chunked statement's parts for `wrapQueryError`, instead of
+ * joining every part's SQL. D1's `batch()` gives no indication of which
+ * member failed, so the earlier approach reported every part — measured at
+ * 62KB+ for a 3000-row insert failing on its last chunk (~1KB baseline). The
+ * first and last part plus the total count is almost always enough to place
+ * the failure (an insert's parts are otherwise identical text with different
+ * bound values) without scaling with the number of chunks. See [F-064].
+ */
+const summarizeParts = (sqls: readonly string[]): string => {
+	if (sqls.length === 1) return sqls[0]!;
+	const first = sqls[0]!;
+	const last = sqls.at(-1)!;
+	return `${sqls.length} parts; first: ${first}${first === last ? '' : `; last: ${last}`}`;
+};
+
+/**
+ * Parameters to attach to a chunked-statement error — `__DEV__` only, same as
+ * `OrmD1QueryError.params`, so the potentially-large `bound.flat()` allocation
+ * is skipped entirely outside dev rather than computed and then discarded by
+ * the constructor. Bounded to the first and last part's params, matching
+ * `summarizeParts`.
+ */
+const summarizedParams = (bound: readonly (readonly D1Param[])[]): D1Param[] | undefined => {
+	if (!isDev()) return undefined;
+	if (bound.length <= 2) return bound.flat();
+	return [...bound[0]!, ...bound.at(-1)!];
+};
+
+/**
  * Fold the results of a statement that compiled to several parts back into one.
  *
  * Returning only the last part's meta made `.run()` on a chunked bulk insert
@@ -166,10 +195,15 @@ export class Executor implements QueryExecutor {
 		} catch (cause) {
 			// `query.sql` is always `parts[0].sql` — reporting only it named the
 			// wrong statement for anything but a failure in the first chunk. D1's
-			// `batch()` gives no indication of which member failed, so every
-			// part's SQL and bound parameters are reported rather than guessing
-			// which one to blame. See [F-064].
-			throw wrapQueryError(cause, query.parts.map((part) => part.sql).join('; '), bound.flat());
+			// `batch()` gives no indication of which member failed, so the first
+			// and last part's SQL and bound parameters are reported rather than
+			// guessing which one to blame (or joining every part unbounded — see
+			// `summarizeParts`). See [F-064].
+			throw wrapQueryError(
+				cause,
+				summarizeParts(query.parts.map((part) => part.sql)),
+				summarizedParams(bound),
+			);
 		}
 	}
 
@@ -220,8 +254,9 @@ export class Executor implements QueryExecutor {
 			// part — an item that itself compiled to several chunked statements
 			// (a wide insert inside `batch()`) lost every part but the first.
 			// D1 gives no indication of which statement in the batch failed, so
-			// every part actually sent is reported. See [F-064].
-			throw wrapQueryError(cause, sqls.join('; '), bound.flat());
+			// the first and last statement actually sent are reported (not every
+			// part unbounded — see `summarizeParts`). See [F-064].
+			throw wrapQueryError(cause, summarizeParts(sqls), summarizedParams(bound));
 		}
 
 		return compiled.map(({ query }, i) => {

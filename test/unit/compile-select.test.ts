@@ -357,6 +357,24 @@ describe('the surface a subquery exposes', () => {
 		expect(mapped!.users).not.toBeNull();
 	});
 
+	it('collapses a joined nested subquery whose own leaves have no direct depth-2 Column of their own', () => {
+		// `s` is itself a join wrapped in `.as()`, so every leaf under the `s`
+		// group sits at depth 3 (`s.users.id`, `s.posts.id`, …) — `s` has no
+		// *direct* depth-2 Column leaf of its own. Gating collapse on
+		// `columnIndexes.length > 0` alone made `s` permanently non-collapsible:
+		// a row where every column under `s` is null rendered as
+		// `{ users: {...}, posts: null }` (a live object) instead of `null`.
+		const s = query.select().from(users).leftJoin(posts, on).as('s');
+		const compiled = query.select().from(users).leftJoin(s, eq(users.id, users.id)).compile();
+
+		const userColumns = Object.keys(getTableColumns(users)).length;
+		const row = compiled.columnNames.map((_, i) => (i < userColumns ? 1 : null));
+		const [mapped] = compiled.map([row]);
+
+		expect(mapped!.users).not.toBeNull();
+		expect(mapped!.s).toBeNull();
+	});
+
 	it('treats an untyped sql fragment as one column, not a group', () => {
 		// `SubqueryLeaf` enumerates scalars, so `unknown` — what a bare
 		// `sql\`…\`` produces — fell to the group branch and expanded the
