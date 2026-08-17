@@ -45,19 +45,18 @@ export interface Logger {
  */
 class DefaultLogger implements Logger {
 	logQuery(query: string, params: unknown[]): void {
-		if (!isDev()) {
+		if (!isDev() || params.length === 0) {
 			console.log(`Query: ${query}`);
 			return;
 		}
-		const stringifiedParams = params.map((p) => {
+		const strs = params.map((p) => {
 			try {
 				return JSON.stringify(p);
 			} catch {
 				return String(p);
 			}
 		});
-		const paramsStr = stringifiedParams.length ? ` -- params: [${stringifiedParams.join(', ')}]` : '';
-		console.log(`Query: ${query}${paramsStr}`);
+		console.log(`Query: ${query} -- params: [${strs.join(', ')}]`);
 	}
 }
 

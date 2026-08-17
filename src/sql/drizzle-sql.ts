@@ -36,6 +36,21 @@ export const isDrizzleSQL = (value: unknown): boolean =>
 	typeof value === 'object' && value !== null && hasEntityKind(value, 'SQL');
 
 /**
+ * A Drizzle `StringChunk` — a literal fragment of SQL text, as opposed to a
+ * bound value or a nested `SQL`. Exported for `src/ddl.ts`'s DDL-only
+ * empty-array detection: Drizzle's `inArray`/`notInArray` helpers
+ * short-circuit an empty array to `sql\`true\`` / `sql\`false\`` *before*
+ * building any array chunk, which renders as a whole fragment whose
+ * `queryChunks` is exactly one `StringChunk(["true"])` / `StringChunk(["false"])`
+ * — structurally different from (and not caught by) a scan for a bare `[]`.
+ */
+export const isStringChunk = (value: unknown): value is { readonly value: readonly string[] } =>
+	typeof value === 'object' && value !== null && hasEntityKind(value, 'StringChunk');
+
+/** The text a Drizzle `StringChunk` carries — its `value` array, joined. */
+export const stringChunkText = (chunk: { readonly value: readonly string[] }): string => chunk.value.join('');
+
+/**
  * Anything Drizzle can turn into a fragment: a `SQL`, or a `SQLWrapper` such as
  * a Drizzle column, table or aggregate.
  *

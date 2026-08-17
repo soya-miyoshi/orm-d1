@@ -22,7 +22,7 @@ import { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from 
 export { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from './schema/constraints.js';
 import type { Table } from './schema/table.js';
 import { getTableColumns, getTableExtras, getTableName } from './schema/table.js';
-import { isDrizzleSQL } from './sql/drizzle-sql.js';
+import { isDrizzleSQL, isStringChunk, stringChunkText } from './sql/drizzle-sql.js';
 import type { RenderContext, SQLChunk } from './sql/sql.js';
 import { defaultRenderContext, quoteIdentifier, render } from './sql/sql.js';
 
@@ -69,8 +69,38 @@ const refuseEmptyArrayPredicate = (): never => {
  * set only here), so it lives in this module rather than in
  * `src/sql/drizzle-sql.ts` — which ships to the Worker — even though it is
  * invoked *from* that module's `fromDrizzleSQL` via `onForeignFragment`.
+ *
+ * Drizzle's own `inArray`/`notInArray` helpers (`drizzle-orm/sql/expressions/
+ * conditions.js`) do not go through the array-chunk path at all for an empty
+ * array: they short-circuit *before* building any fragment, returning
+ * `sql\`true\`` (notInArray) or `sql\`false\`` (inArray) — a whole `SQL`
+ * fragment whose `queryChunks` is exactly one `StringChunk(["true"])` /
+ * `StringChunk(["false"])`. `and()`/`eq()` compositions nest that fragment as
+ * a `chunk` here the same way they nest any other `SQL`, so the existing
+ * recursion already reaches it — `isBareBooleanFragment` below is what
+ * recognises the shape once it does.
+ *
+ * A bare single-`StringChunk` fragment of `true`/`false` is, on its own,
+ * structurally indistinguishable from a deliberate `check(sql\`true\`)`
+ * sentinel written directly with Drizzle's `sql` tag — there is nothing left
+ * in `queryChunks` at that point to tell "Drizzle collapsed an empty array"
+ * from "the user wrote the literal". That spelling is a vanishingly rare way
+ * to write a DDL predicate (a `check` that is unconditionally satisfied has
+ * no reason to exist), so this accepts the false positive there in exchange
+ * for closing the silent-inert-DDL hole: refusing a deliberate `sql\`true\``
+ * is a loud, fixable error; silently emitting a permanently-inert constraint
+ * is not.
  */
+const isBareBooleanFragment = (queryChunks: readonly unknown[]): boolean => {
+	if (queryChunks.length !== 1) return false;
+	const [chunk] = queryChunks;
+	if (!isStringChunk(chunk)) return false;
+	const text = stringChunkText(chunk).trim().toLowerCase();
+	return text === 'true' || text === 'false';
+};
+
 const hasEmptyArrayChunk = (queryChunks: readonly unknown[]): boolean => {
+	if (isBareBooleanFragment(queryChunks)) return true;
 	for (const chunk of queryChunks) {
 		if (Array.isArray(chunk) && chunk.length === 0) return true;
 		if (typeof chunk === 'object' && chunk !== null && isDrizzleSQL(chunk)) {
@@ -80,11 +110,26 @@ const hasEmptyArrayChunk = (queryChunks: readonly unknown[]): boolean => {
 	return false;
 };
 
-/** DDL cannot qualify column names with a table, and cannot bind parameters. */
+/**
+ * DDL cannot qualify column names with a table, and cannot bind parameters —
+ * every value is inlined as a literal (see `renderInline`).
+ *
+ * `jsonEachThreshold`/`maxParams` are the real D1 platform limits on *bound*
+ * queries (`src/sql/sql.ts`'s `defaultRenderContext`), and DDL binds nothing,
+ * so neither applies here. Left at their defaults, an `inArray`/`notInArray`
+ * of >= 30 values inside a `check()` or partial-index `where()` would render
+ * as a `json_each(...)` subquery — which D1 rejects outright inside a CHECK
+ * constraint ("subqueries prohibited") — and one of > 100 values would throw
+ * the bound-parameter-limit `CompileError` from `src/sql/expressions.ts` even
+ * though nothing is bound. Both are set to effectively infinite so DDL
+ * rendering always takes the literal `in (...)` list branch.
+ */
 const ddlContext: RenderContext = {
 	...defaultRenderContext,
 	bareColumns: true,
 	paramToken: PARAM_TOKEN,
+	jsonEachThreshold: Number.POSITIVE_INFINITY,
+	maxParams: Number.POSITIVE_INFINITY,
 	onEmptyArrayPredicate: refuseEmptyArrayPredicate,
 	onForeignFragment: (queryChunks): void => {
 		if (hasEmptyArrayChunk(queryChunks)) refuseEmptyArrayPredicate();

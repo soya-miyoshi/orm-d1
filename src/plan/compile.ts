@@ -579,8 +579,11 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 		// Two pre-sized parallel arrays rather than `group.rows.map(row =>
 		// rowParamCount(...))`: the latter allocates one `{ count, rendered }`
 		// wrapper object per row on top of the array itself, for a value only ever
-		// read back as `rowCounts[i]`/`rowRendered[i]`.
-		const rowCounts: number[] = new Array(group.rows.length);
+		// read back as `rowCounts[i]`/`rowRendered[i]`. `rowCounts` is a typed
+		// array — every count is a small non-negative integer, so this is a flat
+		// unboxed buffer rather than a holey/boxed `number[]`, cheaper both to
+		// allocate and to scan in the `maxRowParams` loop below.
+		const rowCounts = new Int32Array(group.rows.length);
 		const rowRendered: (Query | undefined)[] = new Array(group.rows.length);
 		for (let i = 0; i < group.rows.length; i++) {
 			const result = rowParamCount(group.rows[i]!, group.fields, cols, ctx);
@@ -756,7 +759,17 @@ const renderRow = (
  * is safe), and not an array (never valid as a single column's value, but not
  * this function's job to reject it).
  */
-const isDynamicRowValue = (value: unknown): boolean => isSQLChunk(value) || isPlaceholder(value) || Array.isArray(value);
+const isDynamicRowValue = (value: unknown): boolean => {
+	// The overwhelming common case — a plain scalar (string, number, boolean,
+	// bigint, null, undefined) — is not an object at all, so this single
+	// `typeof` check discards it without ever calling `isSQLChunk`/
+	// `isPlaceholder`/`Array.isArray`, each of which is its own function call
+	// (and `isSQLChunk` repeats this same `typeof`/`null` check internally).
+	// At 5000 rows × 8 columns that is up to 120,000 calls avoided for the
+	// common shape; only an actual object pays for the three checks below.
+	if (typeof value !== 'object' || value === null) return false;
+	return Array.isArray(value) || isPlaceholder(value) || isSQLChunk(value);
+};
 
 /**
  * How many bound parameters one row of `VALUES` will add, plus — when it had
