@@ -87,4 +87,19 @@ describe('min() / max() decode', () => {
 		expectTypeOf(min(expr)).toEqualTypeOf<DecodedChunk<string | null>>();
 		expectTypeOf(max(expr)).toEqualTypeOf<DecodedChunk<string | null>>();
 	});
+
+	it('distributes over a union operand instead of collapsing to the SQLChunk branch', () => {
+		// The regression this guards against: an overload pair (`C extends
+		// Column<any>` / `SQLChunk`) does NOT distribute over a union — a
+		// `Column | SQLChunk` argument isn't assignable to `C extends
+		// Column<any>`, so it falls through to the `SQLChunk` overload and the
+		// column branch is silently dropped from the type, typing as bare
+		// `string | null` instead of `Column['_']['data'] | string | null`.
+		// The single-generic distributive-conditional signature keeps the
+		// union distributing through `T extends Column<any> ? … : string`.
+		const pick = (col: typeof t.n | ReturnType<typeof sql<number>>) => min(col);
+		expectTypeOf(pick).returns.toEqualTypeOf<DecodedChunk<number | string | null>>();
+		const pickMax = (col: typeof t.n | ReturnType<typeof sql<number>>) => max(col);
+		expectTypeOf(pickMax).returns.toEqualTypeOf<DecodedChunk<number | string | null>>();
+	});
 });

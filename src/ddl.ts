@@ -10,8 +10,15 @@ import { isColumn } from './schema/columns.js';
 import type { CheckMeta, ForeignKeyMeta, IndexMeta, PrimaryKeyConstraint, PrimaryKeyMeta, UniqueMeta } from './schema/constraints.js';
 import { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from './schema/constraints.js';
 
-/** Re-exported: the derivation moved to `schema/constraints.ts`, which
- * `getTableConfig` also reads, so the two cannot report different names. */
+/** Re-exported: the derivation lives in `schema/constraints.ts`. This module's
+ * DDL/snapshot rendering is the only caller that keys migration identity on
+ * these names — `getTableConfig` (`schema/table.ts`) deliberately derives its
+ * own, fuller, Drizzle-shaped FK/PK names for its own introspection surface
+ * (see `[F-015]`/AUDIT.md), so the two *can* and do report different names
+ * for the same constraint. That divergence is safe only because no kit path
+ * reads `getTableConfig()` — the diff engine and the applier both read the
+ * DDL/snapshot layer, which still keys everything on `foreignKeyName()` /
+ * `primaryKeyName()` / `indexName()` / `uniqueConstraintName()` from here. */
 export { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from './schema/constraints.js';
 import type { Table } from './schema/table.js';
 import { getTableColumns, getTableExtras, getTableName } from './schema/table.js';
