@@ -36,15 +36,11 @@ describe('inference matches Drizzle’s, field for field', () => {
 	});
 
 	it('requires the same keys on insert', () => {
-		// Mutual assignability rather than strict equality: under
-		// `exactOptionalPropertyTypes` our optional keys are `k?: T` where
-		// Drizzle's are `k?: T | undefined`. Every key and every value type
-		// matches — the assertions below check them one by one.
-		// Ours is assignable to theirs — the direction that matters, since it is
-		// our values that get handed to Drizzle-typed code. The reverse fails
-		// only because `exactOptionalPropertyTypes` distinguishes `k?: T` from
-		// `k?: T | undefined`.
+		// `[F-094]`: our optional keys now spell `k?: T | undefined`, matching
+		// Drizzle's own `InferInsertModel` exactly (`drizzle-orm/table.d.ts`),
+		// so `toExtend` here holds in both directions, not just ours-into-theirs.
 		expectTypeOf<OurNewUser>().toExtend<TheirNewUser>();
+		expectTypeOf<TheirNewUser>().toExtend<OurNewUser>();
 		expectTypeOf<Exclude<keyof OurNewUser, keyof TheirNewUser>>().toEqualTypeOf<never>();
 		expectTypeOf<Exclude<keyof TheirNewUser, keyof OurNewUser>>().toEqualTypeOf<never>();
 		expectTypeOf<TheirNewUser['role']>().toEqualTypeOf<'admin' | 'member' | undefined>();
@@ -61,6 +57,62 @@ describe('inference matches Drizzle’s, field for field', () => {
 	it('keeps a whole schema module assignable', () => {
 		const drizzleSchema = asDrizzleSchema(schema);
 		expectTypeOf<InferSelectModel<typeof drizzleSchema.posts>>().toEqualTypeOf<InferSelect<typeof posts>>();
+	});
+
+	// `[F-094]`: `typeof table.$inferSelect` / `$inferInsert`, the property
+	// spelling — alongside the free `InferSelectModel<T>` / `InferInsertModel<T>`
+	// helpers above — so a schema ported by changing one import specifier keeps
+	// every `typeof X.$inferInsert` annotation compiling.
+	it('exposes $inferSelect / $inferInsert as properties on the table, like Drizzle', () => {
+		expectTypeOf<typeof users.$inferSelect>().toEqualTypeOf<TheirUser>();
+		expectTypeOf<typeof users.$inferSelect>().toEqualTypeOf<OurUser>();
+		expectTypeOf<typeof users.$inferInsert>().toExtend<TheirNewUser>();
+		expectTypeOf<typeof users.$inferInsert>().toEqualTypeOf<OurNewUser>();
+	});
+});
+
+describe('$inferSelect / $inferInsert pin optionality through $defaultFn and nullability', () => {
+	const t = sqliteTable('t_infer_props', {
+		id: integer('id').primaryKey(),
+		token: text('token').notNull().$defaultFn(() => 'x'),
+		note: text('note'),
+	});
+
+	// Built the same way against real `drizzle-orm/sqlite-core`, not a
+	// hand-written literal — a literal `id?: number` (no `| undefined`) checks
+	// only that orm-d1 agrees with itself, and would not have caught `[F-094]`:
+	// real drizzle-orm's `InferInsertModel` spells the optional half
+	// `?: GetColumnData<…> | undefined` (`drizzle-orm/table.d.ts`), which
+	// differs from a bare `?: T` under `exactOptionalPropertyTypes`.
+	const dzT = drizzleSqliteTable('t_infer_props_dz', {
+		id: drizzleInteger('id').primaryKey(),
+		token: drizzleText('token').notNull().$defaultFn(() => 'x'),
+		note: drizzleText('note'),
+	});
+
+	it('$inferSelect keeps a nullable column nullable, not optional', () => {
+		expectTypeOf<typeof t.$inferSelect>().toEqualTypeOf<typeof dzT.$inferSelect>();
+		expectTypeOf<typeof t.$inferSelect>().toEqualTypeOf<{
+			id: number;
+			token: string;
+			note: string | null;
+		}>();
+	});
+
+	it('$inferInsert makes a $defaultFn column optional, matching real drizzle-orm exactly', () => {
+		// `toEqualTypeOf`, not just mutual `toExtend`: this is the type
+		// `[F-094]` fixed, so it has to be checked for exact equality against
+		// Drizzle's own type, not merely assignability in one direction.
+		expectTypeOf<typeof t.$inferInsert>().toEqualTypeOf<typeof dzT.$inferInsert>();
+
+		// The `exactOptionalPropertyTypes` edge case itself: an object literal
+		// that sets an optional key to an explicit `undefined` must assign to
+		// both sides. Before the fix, `?: Out<C[K]>` (no `| undefined`)
+		// rejected this under `exactOptionalPropertyTypes`, while Drizzle's
+		// `?: GetColumnData<…> | undefined` accepted it.
+		const withExplicitUndefined: typeof dzT.$inferInsert = { id: undefined, token: 'x', note: undefined };
+		const ours: typeof t.$inferInsert = withExplicitUndefined;
+		void ours;
 	});
 });
 

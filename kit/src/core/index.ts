@@ -35,10 +35,18 @@ export {
 	createIndexFromSnapshot,
 	createTableFromSnapshot,
 	emptySnapshot,
+	normalizeIndexColumn,
 	snapshotFromSchema,
 	SNAPSHOT_VERSION,
 } from './snapshot.js';
-export type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
+export type {
+	ColumnSnapshot,
+	ForeignKeySnapshot,
+	IndexColumnSnapshot,
+	IndexSnapshot,
+	Snapshot,
+	TableSnapshot,
+} from './snapshot.js';
 
 export { renderRoundtrip, roundtripPlan } from './roundtrip.js';
 export type { RoundtripLeg, RoundtripPlan } from './roundtrip.js';

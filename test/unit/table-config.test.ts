@@ -6,9 +6,11 @@
  * these fields, and throws if all three miss. Before this shape existed, a
  * composite-key table missed all three.
  */
+import * as dz from 'drizzle-orm/sqlite-core';
 import { describe, expect, it } from 'vitest';
+import { createSchema } from '../../src/ddl.js';
 import type { Column } from '../../src/index.js';
-import { getTableConfig, integer, sqliteTable, text, unique } from '../../src/index.js';
+import { foreignKey, getTableConfig, integer, primaryKey, sqliteTable, text, unique } from '../../src/index.js';
 import { postTags, posts, users } from '../schema.js';
 
 const names = (columns: readonly Column<any>[]) => columns.map((c) => c.name);
@@ -28,13 +30,20 @@ describe('the v1 field set', () => {
 		const [pk, ...rest] = getTableConfig(postTags).primaryKeys;
 		expect(rest).toEqual([]);
 		expect(names(pk!.columns)).toEqual(['post_id', 'tag']);
-		expect(pk!.name).toBe('post_tags_pk');
+		// Real drizzle-orm's `PrimaryKey.name` is `undefined` for an unnamed PK
+		// — only `.getName()` derives `${table}_${cols}_pk`. See `[F-052]`.
+		expect(pk!.name).toBeUndefined();
+		expect(pk!.isNameExplicit).toBe(false);
+		expect(pk!.getName()).toBe('post_tags_post_id_tag_pk');
 		expect(pk!.table).toBe(postTags);
 	});
 
 	it('reports a table-level unique() constraint', () => {
 		const [uq] = getTableConfig(postTags).uniqueConstraints;
 		expect(uq!.name).toBe('post_tags_tag_unique');
+		// `postTags` names this constraint explicitly (`unique('post_tags_tag_unique')`).
+		expect(uq!.isNameExplicit).toBe(true);
+		expect(uq!.getName()).toBe('post_tags_tag_unique');
 		expect(names(uq!.columns)).toEqual(['tag']);
 	});
 
@@ -45,9 +54,11 @@ describe('the v1 field set', () => {
 	});
 
 	it('reports indexes with their derived names and partial predicates', () => {
+		// Nested under `.config`, plus `isNameExplicit`, matching
+		// `drizzle-orm/sqlite-core`'s `Index` instance shape. See `[F-052]`.
 		const indexes = getTableConfig(users).indexes;
-		expect(indexes.map((i) => i.name)).toEqual(['users_name_idx', 'users_email_active_idx']);
-		expect(indexes.find((i) => i.unique)!.where).toBeDefined();
+		expect(indexes.map((i) => i.config.name)).toEqual(['users_name_idx', 'users_email_active_idx']);
+		expect(indexes.find((i) => i.config.unique)!.config.where).toBeDefined();
 	});
 
 	it('derives an index name the same way the DDL does', () => {
@@ -64,17 +75,67 @@ describe('the v1 field set', () => {
 	});
 
 	it('folds inline .references() into foreignKeys alongside table-level ones', () => {
+		// `columns`/`foreignColumns`/`foreignTable` live behind `reference()`, a
+		// function, matching `drizzle-orm/sqlite-core`'s `ForeignKey` instance
+		// shape; `onUpdate`/`onDelete` stay top-level. See `[F-052]`.
 		// `posts.authorId` is declared with `.references(() => users.id)`.
 		const [inline] = getTableConfig(posts).foreignKeys;
-		expect(names(inline!.columns)).toEqual(['author_id']);
-		expect(names(inline!.foreignColumns)).toEqual(['id']);
-		expect(inline!.foreignTable).toBe(users);
+		const inlineRef = inline!.reference();
+		expect(names(inlineRef.columns)).toEqual(['author_id']);
+		expect(names(inlineRef.foreignColumns)).toEqual(['id']);
+		expect(inlineRef.foreignTable).toBe(users);
 		expect(inline!.onDelete).toBe('cascade');
+		// `${table}_${cols}_${foreignTable}_${foreignCols}_fk`, matching
+		// Drizzle's `ForeignKey.getName()`. See `[F-015]`.
+		expect(inline!.getName()).toBe('posts_author_id_users_id_fk');
 
 		const [tableLevel] = getTableConfig(postTags).foreignKeys;
-		expect(names(tableLevel!.columns)).toEqual(['post_id']);
-		expect(tableLevel!.foreignTable).toBe(posts);
+		const tableLevelRef = tableLevel!.reference();
+		expect(names(tableLevelRef.columns)).toEqual(['post_id']);
+		expect(tableLevelRef.foreignTable).toBe(posts);
 		expect(tableLevel!.onDelete).toBe('cascade');
+		// An unnamed table-level `foreignKey()` gets the same
+		// `${table}_${cols}_${foreignTable}_${foreignCols}_fk` shape as the
+		// inline case above, matching Drizzle's `ForeignKey.getName()` — not
+		// `foreignKeyName()`'s DDL-facing `${table}_${cols}_fk` (`[F-015]`
+		// follow-up; the DDL/snapshot side is asserted unchanged below).
+		expect(tableLevel!.getName()).toBe('post_tags_post_id_posts_id_fk');
+		expect(tableLevel!.isNameExplicit()).toBe(false);
+	});
+
+	it('an unnamed table-level foreignKey()\'s getName() matches real drizzle-orm, including multi-column', () => {
+		const dzParent = dz.sqliteTable('parent', {
+			a: dz.integer('a'),
+			b: dz.integer('b'),
+		}, (t) => [dz.primaryKey({ columns: [t.a, t.b] })]);
+		const dzChild = dz.sqliteTable('child', {
+			x: dz.integer('x'),
+			y: dz.integer('y'),
+		}, (t) => [dz.foreignKey({ columns: [t.x, t.y], foreignColumns: [dzParent.a, dzParent.b] })]);
+		const [dzFk] = dz.getTableConfig(dzChild).foreignKeys;
+
+		const parent = sqliteTable('parent', {
+			a: integer('a'),
+			b: integer('b'),
+		}, (t) => [primaryKey({ columns: [t.a, t.b] })]);
+		const child = sqliteTable('child', {
+			x: integer('x'),
+			y: integer('y'),
+		}, (t) => [foreignKey({ columns: [t.x, t.y], foreignColumns: [parent.a, parent.b] })]);
+		const [fk] = getTableConfig(child).foreignKeys;
+
+		expect(fk!.getName()).toBe(dzFk!.getName());
+		expect(fk!.getName()).toBe('child_x_y_parent_a_b_fk');
+	});
+
+	it('leaves DDL rendering unaffected by the getTableConfig() FK name change', () => {
+		// `foreignKeyName()` (`src/schema/constraints.ts`), which
+		// `createSchema`/the kit's snapshot both key foreign keys by, still
+		// derives the shorter `${table}_${cols}_fk` — this pins that the DDL
+		// text for `postTags` did not pick up the foreign side.
+		const schema = createSchema([postTags]).join('\n');
+		expect(schema).toContain('constraint "post_tags_post_id_fk"');
+		expect(schema).not.toContain('post_tags_post_id_posts_id_fk');
 	});
 });
 

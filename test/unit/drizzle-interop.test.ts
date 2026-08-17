@@ -191,14 +191,26 @@ describe('the column surface adapters read', () => {
 		expect(plainColumn.dataType).toBe('string');
 	});
 
-	it('exposes dataType, columnType and the SQL type', () => {
-		expect(users.id).toMatchObject({ dataType: 'number int53', columnType: 'SQLiteInteger', primary: true });
-		expect(users.email).toMatchObject({ dataType: 'string', columnType: 'SQLiteText', notNull: true });
-		expect(users.active).toMatchObject({ dataType: 'boolean', columnType: 'SQLiteBoolean' });
-		expect(users.createdAt).toMatchObject({ dataType: 'object date', columnType: 'SQLiteTimestamp' });
-		expect(users.settings).toMatchObject({ dataType: 'object json', columnType: 'SQLiteTextJson' });
-		expect(users.id.getSQLType()).toBe('integer');
-		expect(users.active.getSQLType()).toBe('integer');
+	it('exposes dataType, columnType and the SQL type, matching a real drizzle-orm build of the same columns', () => {
+		// Built the same way `users` is (`test/schema.ts`), against the real
+		// `drizzle-orm/sqlite-core`, so this fails the moment orm-d1's dataType
+		// or columnType strings diverge from an actual Drizzle build — not just
+		// from a literal read off orm-d1's own implementation. See `[F-014]`.
+		const dzUsers = dz.sqliteTable('users_dz', {
+			id: dz.integer('id').primaryKey({ autoIncrement: true }),
+			email: dz.text('email').notNull().unique(),
+			active: dz.integer('active', { mode: 'boolean' }).notNull().default(true),
+			createdAt: dz.integer('created_at', { mode: 'timestamp' }).notNull(),
+			settings: dz.text('settings', { mode: 'json' }),
+		});
+
+		for (const key of ['id', 'email', 'active', 'createdAt', 'settings'] as const) {
+			expect(users[key].dataType).toBe(dzUsers[key].dataType);
+			expect(users[key].columnType).toBe(dzUsers[key].columnType);
+			expect(users[key].getSQLType()).toBe(dzUsers[key].getSQLType());
+		}
+		expect(users.id.primary).toBe(dzUsers.id.primary);
+		expect(users.email.notNull).toBe(dzUsers.email.notNull);
 	});
 
 	it('changes zod behaviour: a timestamp column now rejects a non-date value', () => {
@@ -213,16 +225,22 @@ describe('the column surface adapters read', () => {
 		expect(shape.createdAt!.safeParse('not a date').success).toBe(false);
 	});
 
-	it('classifies every blob mode', () => {
+	it('classifies every blob mode, matching a real drizzle-orm build of the same columns', () => {
 		const t = sqliteTable('t', {
 			bytes: blob('bytes', { mode: 'buffer' }),
 			payload: blob('payload'),
 			big: blob('big', { mode: 'bigint' }),
 		});
+		const dzT = dz.sqliteTable('t_dz', {
+			bytes: dz.blob('bytes', { mode: 'buffer' }),
+			payload: dz.blob('payload'),
+			big: dz.blob('big', { mode: 'bigint' }),
+		});
 
-		expect(t.bytes).toMatchObject({ dataType: 'object buffer', columnType: 'SQLiteBlobBuffer' });
-		expect(t.payload).toMatchObject({ dataType: 'object json', columnType: 'SQLiteBlobJson' });
-		expect(t.big).toMatchObject({ dataType: 'bigint int64', columnType: 'SQLiteBigInt' });
+		for (const key of ['bytes', 'payload', 'big'] as const) {
+			expect(t[key].dataType).toBe(dzT[key].dataType);
+			expect(t[key].columnType).toBe(dzT[key].columnType);
+		}
 	});
 
 	it('defaults blob() to json mode, not buffer', () => {
@@ -241,6 +259,23 @@ describe('the column surface adapters read', () => {
 		expect(d1.length).toBe(5);
 		expect(d1.length).toBe(dzCol.length);
 		expect(d1.isLengthExact).toBe(dzCol.isLengthExact);
+	});
+
+	// `[F-012]`: getSQLType() is Drizzle-faithful and includes the length —
+	// DDL/snapshot rendering reads `declaredType ?? type` separately and is
+	// unaffected (see `test/unit/ddl.test.ts` and `kit/test/unit/`).
+	it('folds text length into getSQLType(), matching drizzle-orm exactly', () => {
+		const d1 = sqliteTable('a', { long: text('long', { length: 255 }) }).long;
+		const dzCol = dz.sqliteTable('a', { long: dz.text('long', { length: 255 }) }).long;
+		expect(d1.getSQLType()).toBe('text(255)');
+		expect(d1.getSQLType()).toBe(dzCol.getSQLType());
+	});
+
+	it('drops length from getSQLType() for a json-mode text column, matching drizzle-orm', () => {
+		const d1 = sqliteTable('a', { j: text('j', { mode: 'json' }) }).j;
+		const dzCol = dz.sqliteTable('a', { j: dz.text('j', { mode: 'json' }) }).j;
+		expect(d1.getSQLType()).toBe('text');
+		expect(d1.getSQLType()).toBe(dzCol.getSQLType());
 	});
 
 	it('exposes enum values, defaults and uniqueness', () => {

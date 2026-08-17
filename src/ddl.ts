@@ -10,8 +10,15 @@ import { isColumn } from './schema/columns.js';
 import type { CheckMeta, ForeignKeyMeta, IndexMeta, PrimaryKeyConstraint, PrimaryKeyMeta, UniqueMeta } from './schema/constraints.js';
 import { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from './schema/constraints.js';
 
-/** Re-exported: the derivation moved to `schema/constraints.ts`, which
- * `getTableConfig` also reads, so the two cannot report different names. */
+/** Re-exported: the derivation lives in `schema/constraints.ts`. This module's
+ * DDL/snapshot rendering is the only caller that keys migration identity on
+ * these names — `getTableConfig` (`schema/table.ts`) deliberately derives its
+ * own, fuller, Drizzle-shaped FK/PK names for its own introspection surface
+ * (see `[F-015]`/AUDIT.md), so the two *can* and do report different names
+ * for the same constraint. That divergence is safe only because no kit path
+ * reads `getTableConfig()` — the diff engine and the applier both read the
+ * DDL/snapshot layer, which still keys everything on `foreignKeyName()` /
+ * `primaryKeyName()` / `indexName()` / `uniqueConstraintName()` from here. */
 export { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from './schema/constraints.js';
 import type { Table } from './schema/table.js';
 import { getTableColumns, getTableExtras, getTableName } from './schema/table.js';
@@ -181,8 +188,13 @@ export const dropAppendOnlyTrigger = (tableName: string): string =>
 /**
  * SQLite's `STRICT` allow-list, verified against D1 rather than taken from the
  * docs: a `NUMERIC` column in a strict table is rejected outright with
- * `unknown datatype`. `numeric()` is the only orm-d1 column type that produces
- * one, so it is the only type this can catch.
+ * `unknown datatype`. Among orm-d1's built-in column constructors, `numeric()`
+ * is the only one whose base `SQLiteType` falls outside this set — but
+ * `customType()` can produce any `declaredType` string at all (`varchar(10)`,
+ * `bigint`, …), and `typeName()` below checks that string, not the reduced
+ * `'numeric' | 'integer' | 'text' | 'real' | 'blob'` affinity — so a
+ * misspelled or decorated `customType` is caught here too, not just
+ * `numeric()`. See `[F-012]` in `AUDIT.md`.
  */
 const STRICT_TYPES = new Set(['int', 'integer', 'real', 'text', 'blob', 'any']);
 
@@ -284,6 +296,14 @@ export const literal = (value: unknown): string => {
 	return `'${String(value).replaceAll("'", "''")}'`;
 };
 
+// Deliberately NOT `column.getSQLType()`: that includes `text(5)`-style
+// length for `text({length})`, which real SQLite rejects in a STRICT table
+// ("unknown datatype") — STRICT only accepts the bare type names INT,
+// INTEGER, REAL, TEXT, BLOB, ANY, with no decoration. `[F-012]` tried
+// emitting the decorated spelling to match drizzle-kit's migration bytes and
+// was reverted: matching drizzle-kit's *type string* is not worth emitting
+// DDL that D1 refuses to run for any STRICT table with a `text({length})`
+// column. See `[F-012]` in `AUDIT.md`.
 const typeName = (column: Column<any>): string => column.config.declaredType ?? column.config.type;
 
 const referenceClause = (column: Column<any>): string => {

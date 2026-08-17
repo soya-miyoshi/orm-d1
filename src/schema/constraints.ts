@@ -137,10 +137,18 @@ export const check = (name: string, value: SQLChunk): CheckConstraint =>
  * Derived constraint names.
  *
  * Drizzle names an unnamed constraint after its table and columns, and so does
- * our DDL. Both `orm-d1/ddl` and `getTableConfig` need the same answer — a
- * `getTableConfig` that reported a different index name from the one the
- * migration created would make the kit's diff see a rename on every run — so
- * the rules live here rather than in either caller.
+ * our DDL. `orm-d1/ddl` (DDL rendering) and the kit's snapshot diff both key
+ * migration identity on exactly these functions, so the rules live here
+ * rather than in either caller — a renderer/diff pair that derived the name
+ * independently could drift and make the kit see a rename on every run.
+ *
+ * `getTableConfig()` (`schema/table.ts`) is a different consumer with a
+ * different contract: for foreign keys and primary keys it deliberately
+ * derives Drizzle's own fuller name shape instead of calling these (see
+ * `[F-015]` in `AUDIT.md`), so it can and does report a different FK/PK name
+ * than the one the migration used. That is safe because no kit path reads
+ * `getTableConfig()` — only DDL rendering and the snapshot diff decide what
+ * ships as a migration, and both still go through the functions below.
  */
 export const indexName = (meta: IndexMeta, tableName: string): string =>
 	meta.name

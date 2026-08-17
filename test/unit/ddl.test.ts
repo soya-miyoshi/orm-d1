@@ -21,6 +21,26 @@ describe('ddl generation', () => {
 		);
 	});
 
+	it('renders text(name, { length }) as bare "text", never a decorated spelling', () => {
+		// `[F-012]` in `AUDIT.md`: an earlier version of this rendered
+		// `text(5)` here to match drizzle-kit's type string, but real SQLite's
+		// STRICT mode rejects any decorated type name ("unknown datatype") —
+		// `TEXT(5)` is no more acceptable than `NUMERIC`. That would have made
+		// `createSchema` emit DDL D1 refuses to run for a STRICT table with a
+		// `text({length})` column, so it was reverted. `length`/`isLengthExact`
+		// stay readable on the column (Drizzle-compat getters) — they're just
+		// not folded into the DDL.
+		const t = sqliteTable('t', { n: text('n', { length: 5 }) });
+		expect(createTable(t)).toContain('"n" text');
+		expect(createTable(t)).not.toContain('text(');
+	});
+
+	it('leaves plain text() with no length as bare "text"', () => {
+		const t = sqliteTable('t', { n: text('n') });
+		expect(createTable(t)).toContain('"n" text');
+		expect(createTable(t)).not.toContain('text(');
+	});
+
 	it('emits a column-level foreign key with its actions', () => {
 		expect(createTable(posts)).toContain(
 			'"author_id" integer not null references "users"("id") on delete cascade',

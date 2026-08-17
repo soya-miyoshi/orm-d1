@@ -30,6 +30,12 @@ const articleTags = sqliteTable('article_tags', {
 
 const names = (columns: readonly { name: string }[] | undefined) => columns?.map((c) => c.name);
 
+// `relation.through.source`/`.target` hold `ColumnRef`s, matching
+// `drizzle-orm/relations.js`'s `.through` shape — not raw `Column`s. See
+// `[F-016]`.
+const throughNames = (refs: readonly { readonly _: { readonly column: { readonly name: string } } }[] | undefined) =>
+	refs?.map((ref) => ref._.column.name);
+
 describe('the output is the plain object Drizzle produces', () => {
 	const config = defineRelations({ users, articles }, (r) => ({
 		users: { articles: r.many.articles() },
@@ -202,8 +208,8 @@ describe('many-to-many, declared with .through()', () => {
 	it('records the junction table and the columns each side hops via', () => {
 		const relation = config['articles']!.relations['tags']!;
 		expect(relation.throughTable).toBe(articleTags);
-		expect(names(relation.through!.source)).toEqual(['article_id']);
-		expect(names(relation.through!.target)).toEqual(['tag_id']);
+		expect(throughNames(relation.through!.source)).toEqual(['article_id']);
+		expect(throughNames(relation.through!.target)).toEqual(['tag_id']);
 		expect(names(relation.sourceColumns)).toEqual(['id']);
 		expect(names(relation.targetColumns)).toEqual(['id']);
 	});
@@ -220,8 +226,8 @@ describe('many-to-many, declared with .through()', () => {
 		}));
 
 		const reverse = both['tags']!.relations['articles']!;
-		expect(names(reverse.through!.source)).toEqual(['tag_id']);
-		expect(names(reverse.through!.target)).toEqual(['article_id']);
+		expect(throughNames(reverse.through!.source)).toEqual(['tag_id']);
+		expect(throughNames(reverse.through!.target)).toEqual(['article_id']);
 		expect(reverse.throughTable).toBe(articleTags);
 	});
 

@@ -133,9 +133,12 @@ since only the caller knows which column is unique within a partition.
 
 Both are options in the same sidecar module, and both are validated at `generate` against
 behaviour confirmed on D1. `WITHOUT ROWID` on a table with no primary key fails with
-`PRIMARY KEY missing`. `STRICT` with a `NUMERIC` column fails with `unknown datatype`;
-`numeric()` is the only orm-d1 column type that renders one. The alternative to checking is
-a migration that applies to production halfway and then fails.
+`PRIMARY KEY missing`. `STRICT` only accepts the bare type names `INT`, `INTEGER`, `REAL`,
+`TEXT`, `BLOB` and `ANY` — any decorated or otherwise unrecognised spelling fails with
+`unknown datatype`. Among orm-d1's built-in column constructors, `numeric()` is the only one
+that renders outside that set, but `customType()` can declare any string at all
+(`varchar(10)`, a misspelling, …), so it is checked too. The alternative to checking is a
+migration that applies to production halfway and then fails.
 
 ## `impact`
 

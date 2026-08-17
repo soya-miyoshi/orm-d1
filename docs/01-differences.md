@@ -310,6 +310,22 @@ Verify the current values against
 <https://developers.cloudflare.com/d1/platform/limits/> before relying on a specific
 number; the ones above were last checked on 2026-07-27.
 
+## `sum()` and `avg()` decode to `string`
+
+`sum(orders.cents)` and `avg(orders.cents)` decode to `string | null`, matching Drizzle's
+`.mapWith(String)` for both functions in every dialect — not `number`. A 64-bit sum does
+not survive an IEEE double; code that needs the numeric value should parse it explicitly
+(`BigInt(row.total)` or `Number(row.total)`), the same as against Drizzle.
+
+## `min()` and `max()` over a non-`Column` expression decode to `string`
+
+`min(sql<number>\`unixepoch(${t.at})\`)` and the equivalent `max()` decode to
+`string | null`, matching Drizzle's `.mapWith(is(expression, Column) ? expression :
+String)` (`drizzle-orm/sql/functions/aggregate.js`): a `Column` operand decodes through
+that column's own type (so `min(t.createdAt)` still gives a `Date | null`), but any other
+expression — a raw `sql<number>` fragment, say — decodes through `String`, the same as
+`sum()`/`avg()` always do. Code that needs the numeric value should parse it explicitly.
+
 ## What is not a difference
 
 The schema DSL, the query builder, the inferred types and the `db.query` interface are

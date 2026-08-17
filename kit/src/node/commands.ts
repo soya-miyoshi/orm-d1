@@ -644,8 +644,11 @@ const RESERVED = new Set([
 	'import', 'in', 'instanceof', 'interface', 'let', 'new', 'null', 'package', 'private', 'protected',
 	'public', 'return', 'static', 'super', 'switch', 'this', 'throw', 'true', 'try', 'typeof', 'var',
 	'void', 'while', 'with', 'yield',
-	// Everything the rendered module imports.
-	'blob', 'check', 'foreignKey', 'index', 'integer', 'primaryKey', 'real', 'sql', 'sqliteTable',
+	// Everything the rendered module imports. `numeric` can be a column
+	// `factory` spelling (see the `factory` list above) but was missing here,
+	// so a live table named `numeric` produced a TDZ error — `export const
+	// numeric = sqliteTable("numeric", { x: numeric("x") })`. See `[F-053]`.
+	'blob', 'check', 'foreignKey', 'index', 'integer', 'numeric', 'primaryKey', 'real', 'sql', 'sqliteTable',
 	'text', 'unique', 'uniqueIndex',
 ]);
 

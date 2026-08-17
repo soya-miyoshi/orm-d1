@@ -43,6 +43,55 @@ const builder = new SchemaBuilder<{ DrizzleRelations: PothosRelations<typeof rel
   structural match satisfies it; without this, every `many` relation resolves as a single
   object.
 
+  `instanceof` also fails silently if *your app* resolves a different `drizzle-orm` copy
+  than orm-d1 did — a lockfile that hoists two versions, a range bump in any dependency —
+  because `asDrizzleRelations` re-prototypes onto the copy orm-d1 resolved, and
+  `instanceof` checks the caller's own `Many`. `assertSameDrizzle({ Many })` (also from
+  `orm-d1/drizzle`), called with the `Many` your own code resolves, proves exactly that —
+  the calling code and orm-d1 share one `Many`/instance. It cannot see what a third-party
+  adapter resolved *internally*: there is no way to import a package's private copy of
+  `drizzle-orm` from outside it. In the ordinary case — one `drizzle-orm` dependency,
+  nothing forcing npm/pnpm to hoist a second copy — the adapter shares the same resolution
+  as your app, so this transitively covers it; that is a fact about your dependency tree,
+  not something the call verifies on the adapter's behalf. Put this in your own suite:
+
+  ```ts
+  import { Many } from 'drizzle-orm';
+  import { assertSameDrizzle } from 'orm-d1/drizzle';
+  assertSameDrizzle({ Many });
+  ```
+
+  it throws with a clear message when the two copies diverge, instead of leaving every
+  list field silently returning one object.
+
+  If you would rather assert on a live relation object than on the class identity alone,
+  search every declared relation for one that is a `Many` — not `Object.values(r)[0]`,
+  which is wrong the moment a relation is declared from the *child* side (`r.one.users(…)`
+  on `posts`, with nothing declared on `users` itself — see `defineRelations` in
+  `src/relations/define.ts`) or the first relation you happen to hit is a `One`:
+
+  ```ts
+  import { Many } from 'drizzle-orm';
+  import { asDrizzleRelations } from 'orm-d1/drizzle';
+  const r = asDrizzleRelations(relations);
+  const anyMany = Object.values(r)
+    .flatMap((table) => Object.values(table.relations))
+    .find((relation) => relation instanceof Many);
+  expect(anyMany).toBeInstanceOf(Many);
+  ```
+
+  This needs at least one `many` relation declared anywhere in the schema to find; a
+  schema with only `one` relations has nothing for it to assert on, and
+  `assertSameDrizzle` above is the check to use instead.
+
+- `pothosFindConfig(query, selection)` is the resolver-side counterpart: `query()` — the
+  merged selection `@pothos/plugin-drizzle` hands every drizzle-backed resolver — carries a
+  phantom `$pothosQueryFor` key in its type that is never actually constructed, so the
+  merged config type-checks against nothing without it. `pothosFindConfig` drops that key
+  and returns the selection's own type, so `db.query.<table>.findMany(pothosFindConfig(query,
+  { where: { clubId } }))` still gets the schema-checked `where`/`columns`/`with`/`orderBy`
+  that an `as never` cast would otherwise give up.
+
 `asDrizzleSchema` / `asDrizzleTable` are identity functions at runtime. They exist because
 Drizzle's `Column` declares a `protected` member, and TypeScript accepts protected members
 only from the declaring class, so no independent implementation is assignable — they
