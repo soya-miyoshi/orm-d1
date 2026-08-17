@@ -850,6 +850,52 @@ describe('diffing snapshots', () => {
 		expect(createTemp?.sql).toContain('constraint "u2" unique ("a" collate rtrim)');
 	});
 
+	it('[F-115] a tableOptions collate statement (including an explicit "none") ends the carry-forward', () => {
+		// Without a stated intent, `carryForwardCollations` has no way to tell
+		// "the schema cannot say this" from "the operator wants it gone" and
+		// carries a collation forward forever. `collateStated` (set by
+		// `snapshotFromSchema` when the `tableOptions()` sidecar names a column)
+		// is the escape hatch: once present, the carry-forward must not
+		// override it, even when the stated value is "no collation".
+		const t = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		});
+
+		const persistedWithCollation: Snapshot = {
+			...snapshotOf(t),
+			tables: {
+				users: {
+					...snapshotOf(t).tables['users']!,
+					columns: {
+						...snapshotOf(t).tables['users']!.columns,
+						email: { ...snapshotOf(t).tables['users']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		// The operator states "no collation" via `tableOptions`'s `collate` map —
+		// `snapshotFromSchema` would set `collateStated: true` and `collate:
+		// undefined` for this; simulated directly here since this is a pure
+		// `diff.ts` unit test.
+		const nextWithStatedNone: Snapshot = {
+			...snapshotOf(t),
+			tables: {
+				users: {
+					...snapshotOf(t).tables['users']!,
+					columns: {
+						...snapshotOf(t).tables['users']!.columns,
+						email: { ...snapshotOf(t).tables['users']!.columns['email']!, collateStated: true },
+					},
+				},
+			},
+		};
+
+		const persisted = carryForwardCollations(persistedWithCollation, nextWithStatedNone);
+		expect(persisted.tables['users']!.columns['email']!.collate).toBeUndefined();
+	});
+
 	it('detects introspection-to-introspection collation drift instead of exempting it (F-101 follow-up)', () => {
 		// Right after `pull`, both sides of `check` are `origin: 'introspection'`
 		// — `undefined` there genuinely means BINARY, not "the schema DSL cannot
@@ -2221,6 +2267,24 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			const create = diff.statements.find((s) => /create trigger "audit_no_update"/.test(s.sql));
 			expect(create).toBeDefined();
 			expect(create?.destructive).toBe(false);
+		});
+
+		// A batch boundary can only ever land between two statements a diff
+		// emits *adjacently* — `statementGroups` (`sql.ts`) groups the three by
+		// scanning for the drop and the re-create immediately after the rename.
+		// Correct ordering with something else interleaved between them (the
+		// state before this fix: the re-create was pushed by a much later,
+		// unrelated per-table pass) would still leave the table unprotected
+		// across a split.
+		it('emits the rename, the old-name drop and the new-name re-create with nothing between them', () => {
+			const diff = diffSnapshots(opts(events, true), opts(renamed, true), {
+				renamedTables: { events: 'audit' },
+			});
+			const sql = diff.statements.map((s) => s.sql);
+			const renameIndex = sql.indexOf('alter table "events" rename to "audit"');
+			expect(renameIndex).toBeGreaterThanOrEqual(0);
+			expect(sql[renameIndex + 1]).toBe('drop trigger if exists "events_no_update"');
+			expect(sql[renameIndex + 2]).toMatch(/^create trigger "audit_no_update"/);
 		});
 	});
 

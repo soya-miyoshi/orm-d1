@@ -210,6 +210,26 @@ export interface TableOptions {
 	readonly strict?: boolean;
 	readonly withoutRowid?: boolean;
 	/**
+	 * Per-column collation intent, keyed by column name.
+	 *
+	 * The schema DSL has no `.collate()` spelling (`docs/04`), so a live
+	 * column's `COLLATE` was, until this option existed, only ever *read* —
+	 * `orm-d1-kit generate` carried a `before` snapshot's collation forward onto
+	 * `after` unconditionally, because it had no other way to tell "the schema
+	 * cannot say this" from "the operator wants it gone". That carry-forward is
+	 * self-perpetuating: once recorded, a collation can never leave `meta/`,
+	 * even after someone deliberately rebuilds the column as `BINARY` (see
+	 * `[F-115]` in this repo's own audit history).
+	 *
+	 * A string here states the collation the kit should treat as authoritative
+	 * — usually the one already live, so `check`/`generate` stop guessing.
+	 * `null` states the opposite: "no collation, and stop carrying one
+	 * forward" — the only way to retire a collation the kit once carried.
+	 * Omitting a column entirely leaves the old carry-forward behaviour
+	 * unchanged for it.
+	 */
+	readonly collate?: Readonly<Record<string, string | null>>;
+	/**
 	 * Reject `UPDATE` with a `BEFORE UPDATE … RAISE(ABORT)` trigger.
 	 *
 	 * `DELETE` stays allowed: what an append-only table protects is that a
@@ -352,6 +372,15 @@ export function validateTableOptions(t: Table, options: TableOptions): string | 
 		if (auto) {
 			return `"${name}" is declared WITHOUT ROWID but "${auto.name}" is AUTOINCREMENT; `
 				+ 'AUTOINCREMENT numbers rowids, which a WITHOUT ROWID table does not have.';
+		}
+	}
+
+	if (options.collate) {
+		const known = new Set(columns.map((c) => c.name));
+		const unknown = Object.keys(options.collate).filter((c) => !known.has(c));
+		if (unknown.length > 0) {
+			return `"${name}" declares collate for columns that do not exist: ${unknown.join(', ')}. `
+				+ `Known columns: ${[...known].sort().join(', ')}.`;
 		}
 	}
 

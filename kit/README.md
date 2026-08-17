@@ -24,10 +24,48 @@ export default defineConfig({
 ```
 
 `tableOptions` points at a module whose default export is `tableOptions([...])` from
-`orm-d1/ddl` — `STRICT`, `WITHOUT ROWID` and the append-only trigger, which have no
-spelling in `drizzle-orm/sqlite-core` and therefore live outside the schema file. What
-each does, and what `generate` checks about it, is
-[02-beyond-drizzle](../docs/02-beyond-drizzle.md).
+`orm-d1/ddl` — `STRICT`, `WITHOUT ROWID`, the append-only trigger, and (see below) a
+column's `COLLATE`, none of which have a spelling in `drizzle-orm/sqlite-core` and
+therefore live outside the schema file. What each does, and what `generate` checks about
+it, is [02-beyond-drizzle](../docs/02-beyond-drizzle.md).
+
+```ts
+// src/table-options.ts
+import { tableOptions } from 'orm-d1/ddl';
+import { users, reads } from './schema';
+
+export default tableOptions([
+  [users, { collate: { email: 'nocase' } }],
+  [reads, { strict: true, withoutRowid: true, appendOnly: true }],
+]);
+```
+
+### `collate`: stating a column's collation intent
+
+A schema-derived snapshot can never state a column's `COLLATE` — Drizzle has no
+`.collate()` — so by default the kit *carries a live collation forward* silently: once
+`generate` records one for a column, it keeps re-emitting it into `meta/` on every future
+run, because the alternative (dropping it) would make `check` re-report the exact loss
+this project exists to prevent.
+
+That carry-forward has one failure mode: if the team *deliberately* rebuilds a column back
+to `BINARY`, there is no way to tell the kit "I meant that" — `generate` keeps carrying the
+old collation forward forever, and `check` goes red for good. `tableOptions`'s `collate`
+map is the fix — it lets the schema state a collation explicitly, ending the guesswork:
+
+```ts
+export default tableOptions([
+  // A string is authoritative — `generate`/`check` treat it as the column's real
+  // collation and stop guessing from the live database.
+  [users, { collate: { email: 'nocase' } }],
+  // `null` states the opposite: "no collation, and stop carrying one forward" — the
+  // only way to retire a collation the kit once carried.
+  [accounts, { collate: { legacyId: null } }],
+]);
+```
+
+A column not named in `collate` keeps the old behaviour (carried forward from whatever the
+live database last had) unchanged.
 
 The database is read from `wrangler.jsonc` / `wrangler.toml` unless overridden here, so
 the binding is stated in one place rather than two.
@@ -96,7 +134,8 @@ Target: remote D1 (HTTP API)
 orm-d1-kit generate      # diff schema against the last snapshot → a new SQL migration
 orm-d1-kit migrate       # apply pending migrations (--local | --remote)
 orm-d1-kit push          # diff and apply directly, no migration file (dev only)
-orm-d1-kit pull          # introspect a live database → schema.ts + baseline snapshot
+orm-d1-kit pull          # introspect a live database → schema.ts (+ table-options.ts,
+                             #   see below) + baseline snapshot
 orm-d1-kit check         # detect drift and unapplied migrations; non-zero exit for CI
 orm-d1-kit verify        # replay the migrations into an empty DB and compare with the
                              #   schema; needs no database at all, so it runs in CI
@@ -116,6 +155,34 @@ writes a draft sequence for a rebuild that was refused because the table has chi
 optional `--table <name>`; without one it ranks every table in the schema by rebuild cost.
 What each is for, and why they exist rather than being assembled by hand, is
 [02-beyond-drizzle](../docs/02-beyond-drizzle.md).
+
+### `pull` and `config.tableOptions`
+
+`--schema-out <file>` (default `./schema.ts`) is where `pull` writes the schema module.
+`STRICT`, `WITHOUT ROWID`, an append-only guard, and a non-`BINARY` column `COLLATE` all
+have no spelling that module can express — the schema DSL is a strict subset of
+`drizzle-orm/sqlite-core` (`docs/04`) — so, alongside it, `pull` also renders a
+`tableOptions([...])` sidecar naming every one it found, written to
+`--table-options-out <file>` (default: `table-options.ts` next to `--schema-out`). It
+imports the exact bindings the schema module exports, so the two files are usable together
+immediately:
+
+```ts
+// table-options.ts, written by `pull`
+import { tableOptions } from 'orm-d1/ddl';
+import { reads, users } from './schema';
+
+export default tableOptions([
+  [users, { collate: { email: 'nocase' } }],
+  [reads, { strict: true, withoutRowid: true, appendOnly: true }],
+]);
+```
+
+No sidecar is written when nothing in the introspected snapshot needs one. `--force` (the
+same flag that lets `pull` overwrite an existing schema file) also governs overwriting an
+existing table-options file. Point `orm-d1.config.ts`'s `tableOptions` at the written file
+to put it to use — from then on, `generate`/`push`/`check` read it as the schema's stated
+intent instead of guessing from what was last introspected.
 
 ## What it does differently
 

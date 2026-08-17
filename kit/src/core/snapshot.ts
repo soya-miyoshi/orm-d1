@@ -73,6 +73,17 @@ export interface ColumnSnapshot {
 	 * (e.g. `nocase`) is a real, reportable difference — see `canonicalTable`.
 	 */
 	readonly collate?: string | undefined;
+	/**
+	 * True when `collate` (or its absence) is an explicit statement of intent —
+	 * from the `tableOptions()` sidecar's `collate` map (`orm-d1/ddl`) — rather
+	 * than structurally forced by the schema DSL having no `.collate()`
+	 * spelling. Only a schema-derived snapshot ever sets this; an introspected
+	 * one always reads the live `COLLATE` clause directly and has no need for
+	 * it. Lets `generate`'s collation carry-forward (`[F-115]`) and
+	 * `columnDifference`'s "unexpressible" exemption both tell "the schema
+	 * cannot say this" apart from "the operator said so, including 'gone'".
+	 */
+	readonly collateStated?: boolean | undefined;
 }
 
 /**
@@ -323,6 +334,23 @@ export function snapshotFromSchema(
 		const columns: Record<string, ColumnSnapshot> = {};
 		for (const column of Object.values(getTableColumns(t)) as Column<any>[]) {
 			columns[column.name] = columnSnapshot(column);
+		}
+
+		// `[F-115]`: apply the sidecar's stated collation intent, if any, before
+		// this snapshot is handed anywhere else. A `null` states "no collation" —
+		// as distinct from the DSL's structural inability to say anything at
+		// all — so `collateStated` is set either way.
+		const collateOptions = options?.byTable[name]?.collate;
+		if (collateOptions) {
+			for (const [columnName, value] of Object.entries(collateOptions)) {
+				const existing = columns[columnName];
+				if (!existing) continue;
+				columns[columnName] = {
+					...existing,
+					collate: value === null || value.toLowerCase() === 'binary' ? undefined : value.toLowerCase(),
+					collateStated: true,
+				};
+			}
 		}
 
 		// `Object.create(null)`, not `{}`: a constraint's derived or explicit name
@@ -663,6 +691,8 @@ export interface CanonicalColumn {
 	 * reportable collation.
 	 */
 	readonly collate: string | undefined;
+	/** Carried from `ColumnSnapshot.collateStated` — see there. */
+	readonly collateStated: boolean;
 }
 
 /**
@@ -751,7 +781,15 @@ export const columnDifference = (
 	// incapable of stating one; everything else — schema-to-schema,
 	// introspection-to-introspection, or a schema stating one where the live
 	// db states another — still needs to be caught.
-	if (!(bIsSchemaDerived && a.collate !== undefined && b.collate === undefined) && a.collate !== b.collate) {
+	// `[F-115]`: the exemption below only applies while `b.collate` is
+	// *structurally* forced to `undefined` — the DSL has no `.collate()`. Once
+	// the `tableOptions()` sidecar states a column's collation (`b.collateStated`),
+	// even as an explicit "none", that is a real statement of intent and a
+	// live divergence from it is genuine, reportable drift.
+	if (
+		!(bIsSchemaDerived && !b.collateStated && a.collate !== undefined && b.collate === undefined)
+		&& a.collate !== b.collate
+	) {
 		return 'changes its collation';
 	}
 	return undefined;
@@ -943,6 +981,7 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 			collate: column.collate && column.collate.toLowerCase() !== 'binary'
 				? column.collate.toLowerCase()
 				: undefined,
+			collateStated: column.collateStated ?? false,
 		};
 		// A single-column table-level PK clause with an explicit member
 		// `collate` is recorded in `table.compositePrimaryKeys` even at arity 1

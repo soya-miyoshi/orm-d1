@@ -7,7 +7,7 @@
  */
 import { existsSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { dirname, extname, join, relative, resolve } from 'node:path';
 import type { DiffOptions } from './core/diff.js';
 import { loadConfig } from './node/config.js';
 import type { CommandContext, TargetFlags } from './node/commands.js';
@@ -19,7 +19,8 @@ Usage
   orm-d1-kit generate [--name <name>] [--accept-data-loss] [--emit-roundtrip] [renames]
   orm-d1-kit migrate  [--env <name>] [--local | --remote]
   orm-d1-kit push     [--env <name>] [--local | --remote] [--accept-data-loss] [renames]
-  orm-d1-kit pull     [--env <name>] [--local | --remote] [--schema-out <file>] [--force]
+  orm-d1-kit pull     [--env <name>] [--local | --remote] [--schema-out <file>]
+                          [--table-options-out <file>] [--force]
   orm-d1-kit check    [--env <name>] [--local | --remote]
   orm-d1-kit verify
   orm-d1-kit up
@@ -51,7 +52,12 @@ Options
                           three-pass draft to <out>/roundtrip/. Not a migration.
   --name <name>         name for the generated migration
   --schema-out <file>   where \`pull\` writes the schema module
-  --force               let \`pull\` overwrite an existing schema file
+  --table-options-out <file>
+                        where \`pull\` writes the tableOptions() sidecar (default:
+                          table-options.ts next to --schema-out), when the live
+                          database has STRICT, WITHOUT ROWID, appendOnly or a
+                          non-BINARY column collation to state
+  --force               let \`pull\` overwrite an existing schema or tableOptions file
 
 Renames — repeatable, and the alternative to dropping the data
   --rename-table old_table=new_table
@@ -199,6 +205,17 @@ export const environmentFlag = (flags: Record<string, FlagValue>): string | unde
 	throw new Error('--env expects an environment name, as in `--env stg`.');
 };
 
+/**
+ * A relative `import`-style specifier from `fromFile` to `toFile`, extension
+ * stripped and with a leading `./` (Node's ESM resolver rejects a bare
+ * `schema` as a relative specifier without it).
+ */
+const relativeSpecifier = (fromFile: string, toFile: string): string => {
+	const rel = relative(dirname(fromFile), toFile).replaceAll('\\', '/');
+	const withoutExt = rel.slice(0, rel.length - extname(rel).length);
+	return withoutExt.startsWith('.') ? withoutExt : `./${withoutExt}`;
+};
+
 export async function run(argv: readonly string[]): Promise<number> {
 	const { command, flags } = parseArgs(argv);
 
@@ -240,6 +257,10 @@ export async function run(argv: readonly string[]): Promise<number> {
 		case 'pull': {
 			const out = typeof flags['schema-out'] === 'string' ? flags['schema-out'] : './schema.ts';
 			const path = resolve(cwd, out);
+			const tableOptionsOut = typeof flags['table-options-out'] === 'string'
+				? flags['table-options-out']
+				: join(dirname(out), 'table-options.ts');
+			const tableOptionsPath = resolve(cwd, tableOptionsOut);
 
 			// The default path is very likely to be the hand-written schema this
 			// project already has, and the rendered module is not a substitute
@@ -254,10 +275,27 @@ export async function run(argv: readonly string[]): Promise<number> {
 				);
 				return 1;
 			}
+			if (existsSync(tableOptionsPath) && flags['force'] !== true) {
+				ctx.log(
+					`${tableOptionsOut} already exists. Re-run with --force to overwrite it, or pass `
+						+ '--table-options-out <file> to write somewhere else.',
+				);
+				return 1;
+			}
 
-			const result = await pull(ctx, target);
+			// [F-100] The specifier the *sidecar* imports the schema module through
+			// — relative to where the sidecar itself is written, extension-less so
+			// the kit's own resolve hook (`node/import.ts`) picks it up whether the
+			// schema is `.ts`, `.mts` or `.js`.
+			const schemaModuleSpecifier = relativeSpecifier(tableOptionsPath, path);
+
+			const result = await pull(ctx, { ...target, schemaModuleSpecifier });
 			await writeFile(path, result.schema);
 			ctx.log(`Wrote ${out}.`);
+			if (result.tableOptions) {
+				await writeFile(tableOptionsPath, result.tableOptions);
+				ctx.log(`Wrote ${tableOptionsOut}.`);
+			}
 			return 0;
 		}
 		case 'check': {

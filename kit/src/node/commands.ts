@@ -24,7 +24,7 @@ import { carryForwardCollations, diffSnapshots, renderMigration } from '../core/
 import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
 import { normalizeIndexColumn, normalizeUniqueColumn, snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
-import type { Snapshot } from '../core/snapshot.js';
+import type { Snapshot, TableSnapshot } from '../core/snapshot.js';
 import { describeResolution } from './config.js';
 import type { Config } from './config.js';
 import { localRunner, remoteRunner, scratchRunner } from './runners.js';
@@ -58,6 +58,14 @@ export interface TargetFlags {
 	readonly renames?: DiffOptions;
 	/** Write the three-pass draft when a rebuild is refused. */
 	readonly emitRoundtrip?: boolean;
+	/**
+	 * [F-100] The specifier `pull`'s rendered `tableOptions([...])` sidecar
+	 * should import the schema module from — i.e. the path from wherever the
+	 * sidecar will be written to wherever `--schema-out` writes the schema.
+	 * Defaults to `'./schema'`, which is right only when both live in the same
+	 * directory; the CLI computes the real relative path.
+	 */
+	readonly schemaModuleSpecifier?: string;
 }
 
 /** Pick the database to act on. Ambiguity here is how the wrong one gets hit. */
@@ -324,8 +332,14 @@ export async function push(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	// Same pragma rule and same batch cap as `applyMigration` — a push that
 	// exceeded D1's per-batch limit used to be sent as one oversized batch.
 	// Packed by whole rebuild groups, never mid-group — see `packIntoBatches`.
+	// [F-116]: the ceiling is asked of the runner, not hardcoded — a remote
+	// runner sending a batch through D1's file-import endpoint may have no
+	// statement ceiling at all, while a stricter `/query` ceiling would be
+	// silently violated by always packing at the constant. Same computation
+	// `applyMigration` (`apply.ts`) already uses.
 	const statements = diff.statements.map((s) => s.sql).filter((s) => !isPragma(s));
-	const batches = packIntoBatches(statements, MAX_STATEMENTS_PER_BATCH);
+	const limit = runner.atomicLimit?.(statements) ?? MAX_STATEMENTS_PER_BATCH;
+	const batches = packIntoBatches(statements, limit);
 
 	// Logged before the first `batch()` call, not after: once a batch has run
 	// there is no undoing it, so the "this will be split, and atomicity is
@@ -333,7 +347,7 @@ export async function push(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	if (batches.length > 1) {
 		ctx.log(
 			`  ! ${statements.length} statements must be split into ${batches.length} batches of up to `
-				+ `${MAX_STATEMENTS_PER_BATCH}. Atomicity is lost at each split; if it fails part-way, the `
+				+ `${limit}. Atomicity is lost at each split; if it fails part-way, the `
 				+ 'database is left between states.',
 		);
 	}
@@ -349,6 +363,14 @@ export async function push(ctx: CommandContext, flags: TargetFlags = {}): Promis
 export interface PullResult {
 	readonly snapshot: Snapshot;
 	readonly schema: string;
+	/**
+	 * [F-100] The `tableOptions([...])` sidecar module text — `STRICT`,
+	 * `WITHOUT ROWID`, `appendOnly` and any non-BINARY column `collate` this
+	 * pull found, in the one shape `config.tableOptions` already reads.
+	 * `undefined` when nothing in the snapshot needs it, so a plain database
+	 * does not get a pointless sidecar file.
+	 */
+	readonly tableOptions: string | undefined;
 }
 
 export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promise<PullResult> {
@@ -357,6 +379,10 @@ export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	const journal = await readJournal(ctx.config.out);
 	const index = nextIndex(journal);
 	const tag = migrationTag(index, flags.name ?? migrationName(index));
+	// [F-066]: chain the pulled baseline into the snapshot history the same way
+	// `generate` does — otherwise `pull`'s own baseline is the one snapshot in
+	// `meta/` with no `prevId`, breaking the chain for any tooling that walks it.
+	const previous = await readLatestSnapshot(ctx.config.out);
 
 	// The snapshot has to be journalled, or `nextIndex` hands the same index to
 	// the next `generate`, which writes over the pulled baseline and diffs
@@ -364,24 +390,32 @@ export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	// the live database is already in this state, so applying it is a no-op
 	// that only records the baseline in the migrations table.
 	await writeMigration(ctx.config.out, tag, `-- Baseline introspected by orm-d1-kit pull; nothing to apply.`);
-	await writeSnapshot(ctx.config.out, index, { ...snapshot, id: tag });
+	await writeSnapshot(ctx.config.out, index, { ...snapshot, id: tag, prevId: previous.id });
 	await writeJournal(ctx.config.out, appendEntry(journal, tag, ctx.now()));
 
 	const schema = renderSchemaModule(snapshot);
+	const tableOptions = renderTableOptionsModule(snapshot, flags.schemaModuleSpecifier ?? './schema');
 	ctx.log(`Introspected ${Object.keys(snapshot.tables).length} tables.`);
-	for (const warning of unexpressibleTableOptionWarnings(snapshot)) ctx.log(`  ! ${warning}`);
-	return { snapshot, schema };
+	if (!tableOptions) {
+		for (const warning of unexpressibleTableOptionWarnings(snapshot)) ctx.log(`  ! ${warning}`);
+	}
+	return { snapshot, schema, tableOptions };
 }
 
 /**
  * F-100: `strict`, `withoutRowid` and `appendOnly` are captured correctly by
  * `snapshotFromIntrospection`, but the rendered schema module (plain
- * `sqliteTable` calls) has no spelling for any of them — no
- * `tableOptions([...])` sidecar is written. Left silent, the very next
- * `generate` against the rendered module reads all three back as `false` and
- * proposes rebuilding/dropping them with nothing naming what is being lost.
- * This does not block `pull` — it only warns, loudly, naming every affected
- * table and every option it cannot express.
+ * `sqliteTable` calls) has no spelling for any of them. `pull` now renders a
+ * `tableOptions([...])` sidecar ({@link renderTableOptionsModule}) that states
+ * them, so this warning only fires when there is nothing for that sidecar to
+ * say — which today means never, since the sidecar covers exactly the four
+ * things this function checks. Kept as a defence in depth: a caller of `pull`
+ * that discards `result.tableOptions` (or a future option this function
+ * checks but the sidecar renderer does not yet) would otherwise fail
+ * silently instead of loudly.
+ *
+ * F-110: the message now names `config.tableOptions` — the kit's actual
+ * mechanism for stating this — rather than only describing what is lost.
  *
  * F-101: the same gap applies per column, to a non-BINARY `COLLATE`. Drizzle
  * (and so this schema DSL) has no `.collate()` spelling, so a live column's
@@ -403,16 +437,17 @@ export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
 			warnings.push(
 				`"${table.name}" is ${lost.join(', ')} in the live database, but the rendered schema module has no way `
 					+ `to express ${lost.length > 1 ? 'any of them' : 'that'} — the next generate against this schema `
-					+ `will propose dropping ${lost.length > 1 ? 'them' : 'it'} unless you account for ${
+					+ `will propose dropping ${lost.length > 1 ? 'them' : 'it'} unless you state ${
 						lost.length > 1 ? 'them' : 'it'
-					} by hand.`,
+					} in a \`config.tableOptions\` sidecar (see kit/README.md).`,
 			);
 		}
 		for (const column of Object.values(table.columns)) {
 			if (!column.collate || column.collate.toLowerCase() === 'binary') continue;
 			warnings.push(
 				`"${table.name}"."${column.name}" is collate ${column.collate} in the live database, but the schema `
-					+ `DSL has no way to express a column collation — the rendered schema module will not state it.`,
+					+ `DSL has no way to express a column collation — state it in a \`config.tableOptions\` sidecar's `
+					+ `\`collate\` map (see kit/README.md), or the rendered schema module will not state it.`,
 			);
 		}
 		// Same gap as a column's own collation (F-101), one level down: a
@@ -446,14 +481,18 @@ export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
 	return warnings;
 }
 
-/** Turn an introspected snapshot back into a schema module. */
-export function renderSchemaModule(snapshot: Snapshot): string {
-	// The import list is accumulated rather than fixed: a `blob` column or an
-	// index used to be rendered against a name that was never imported, which
-	// is a schema module that does not compile.
-	const imports = new Set<string>(['sqliteTable']);
-	const lines: string[] = ['', ''];
-
+/**
+ * The bindings a rendered schema module gives its tables, in declaration order.
+ *
+ * Shared between {@link renderSchemaModule} and {@link renderTableOptionsModule}
+ * so a table-options sidecar imports the exact identifiers the schema module
+ * actually exports — recomputing this independently in two places would only
+ * need to disagree once (a duplicate or reserved-word name breaking the
+ * tie-break differently) to import a binding that does not exist.
+ */
+function orderedTableIdentifiers(
+	snapshot: Snapshot,
+): { ordered: TableSnapshot[]; tableIds: Map<string, string> } {
 	// A table-level `foreignKey({ foreignColumns: [other.id] })` reads the other
 	// table eagerly, so a table has to be declared after the ones it points at.
 	// Names are assigned up front, because a foreign key has to refer to the
@@ -463,6 +502,18 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 	const usedNames = new Set<string>();
 	const tableIds = new Map<string, string>();
 	for (const table of ordered) tableIds.set(table.name, uniqueIdentifier(table.name, usedNames));
+	return { ordered, tableIds };
+}
+
+/** Turn an introspected snapshot back into a schema module. */
+export function renderSchemaModule(snapshot: Snapshot): string {
+	// The import list is accumulated rather than fixed: a `blob` column or an
+	// index used to be rendered against a name that was never imported, which
+	// is a schema module that does not compile.
+	const imports = new Set<string>(['sqliteTable']);
+	const lines: string[] = ['', ''];
+
+	const { ordered, tableIds } = orderedTableIdentifiers(snapshot);
 
 	const idOf = (tableName: string): string => tableIds.get(tableName) ?? toIdentifier(tableName);
 
@@ -625,6 +676,63 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 	lines[0] = `import { ${[...imports].sort().join(', ')} } from 'orm-d1';`;
 
 	return lines.join('\n');
+}
+
+/**
+ * [F-100]/[F-115]: `strict`, `withoutRowid`, `appendOnly` and a non-BINARY
+ * column `collate` are introspected correctly, but the schema DSL — a strict
+ * subset of `drizzle-orm/sqlite-core`, per `docs/04` — has no spelling for any
+ * of them. Left as a warning alone, the very next `generate` against the
+ * rendered module reads all four back as unset and proposes tearing them
+ * down. Rendering this sidecar closes that gap the same way `renderSchemaModule`
+ * closes it for columns and constraints: state what was found, in the one
+ * mechanism the kit has for it (`config.tableOptions`, `orm-d1/ddl`'s
+ * `tableOptions()`), rather than leaving it to a warning the operator has to
+ * act on by hand before the loss becomes permanent.
+ *
+ * Returns `undefined` when no table in the snapshot needs any of the four —
+ * so `pull` does not write an empty, pointless module.
+ */
+export function renderTableOptionsModule(snapshot: Snapshot, schemaModuleSpecifier: string): string | undefined {
+	const { ordered, tableIds } = orderedTableIdentifiers(snapshot);
+	const entries: string[] = [];
+
+	for (const table of ordered) {
+		const optionParts: string[] = [];
+		if (table.strict) optionParts.push('strict: true');
+		if (table.withoutRowid) optionParts.push('withoutRowid: true');
+		if (table.appendOnly) {
+			optionParts.push(
+				`appendOnly: ${table.appendOnly === true ? 'true' : JSON.stringify([...table.appendOnly])}`,
+			);
+		}
+
+		const collateEntries = Object.values(table.columns)
+			.filter((c) => c.collate && c.collate.toLowerCase() !== 'binary')
+			.map((c) => `${JSON.stringify(c.name)}: ${JSON.stringify(c.collate)}`);
+		if (collateEntries.length > 0) {
+			optionParts.push(`collate: { ${collateEntries.join(', ')} }`);
+		}
+
+		if (optionParts.length === 0) continue;
+		const id = tableIds.get(table.name) ?? toIdentifier(table.name);
+		entries.push(`\t[${id}, { ${optionParts.join(', ')} }],`);
+	}
+
+	if (entries.length === 0) return undefined;
+
+	const usedTables = ordered.filter((t) => entries.some((e) => e.startsWith(`\t[${tableIds.get(t.name)},`)));
+	const importedIds = usedTables.map((t) => tableIds.get(t.name) ?? toIdentifier(t.name)).sort();
+
+	return [
+		`import { tableOptions } from 'orm-d1/ddl';`,
+		`import { ${importedIds.join(', ')} } from ${JSON.stringify(schemaModuleSpecifier)};`,
+		'',
+		'export default tableOptions([',
+		...entries,
+		']);',
+		'',
+	].join('\n');
 }
 
 /** Referenced tables first; cycles fall back to declaration order. */
@@ -812,11 +920,18 @@ export async function verify(ctx: CommandContext): Promise<VerifyResult> {
 	const journal = await readJournal(ctx.config.out);
 	const runner = await scratchRunner();
 
-	// In journal order, which is the order a new environment applies them in.
+	// [F-065] Sorted by `idx`, not the array order `_journal.json` happens to be
+	// in on disk — `migrate` (via `pendingMigrations`, `core/journal.ts`) always
+	// replays in `idx` order, the authoritative one; an out-of-order `entries`
+	// array (the ordinary result of resolving a git conflict between two
+	// branches that each generated a migration) used to make `verify` replay in
+	// a different order than `migrate` actually applies in, so a broken history
+	// `migrate` would have caught could pass `verify` clean, or vice versa.
 	// Reading from the journal rather than globbing the folder also means a
 	// migration that exists on disk but was never recorded is caught here.
+	const entries = [...journal.entries].sort((a, b) => a.idx - b.idx);
 	let applied = 0;
-	for (const entry of journal.entries) {
+	for (const entry of entries) {
 		const sql = await readMigration(ctx.config.out, entry.tag);
 		try {
 			await runner.batch(applicableStatements(sql));

@@ -277,7 +277,11 @@ const carryForwardCollation = (
 		if (!beforeColumn.collate) continue;
 		const target = columnRenames[beforeName] ?? beforeName;
 		const afterColumn = result[target];
-		if (afterColumn && !afterColumn.collate) {
+		// `[F-115]`: an explicit statement — including an explicit "none" via the
+		// `tableOptions()` sidecar's `collate` map — ends the carry-forward for
+		// this column. Without this check a deliberately-removed collation could
+		// never leave `meta/`: the very next `generate` would just re-carry it.
+		if (afterColumn && !afterColumn.collate && !afterColumn.collateStated) {
 			if (result === afterColumns) result = { ...afterColumns };
 			result[target] = { ...afterColumn, collate: beforeColumn.collate };
 		}
@@ -746,13 +750,21 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			// actually has, and let the guard be re-created below if it is still
 			// wanted (that is what clearing `appendOnly` here arranges).
 			if (t.appendOnly) {
-				// Carrying the guard across the rename is a separate, later step
-				// (re-creating it under the new name when `after` still wants it):
-				// this drop is unconditional. Whether it is *destructive* is not —
-				// dropping it here is safe exactly when it comes back under the new
-				// name in the same diff, which is the same test the in-place
-				// transition below uses (`next.appendOnly`), just against the
-				// renamed identity instead of the unchanged one.
+				// Re-creating the guard under the new name happens right here, in
+				// the same three-statement run as the rename and the drop — not
+				// deferred to the later per-table pass, which used to push the
+				// `create trigger` far away in the statement list (after every
+				// other renamed table's own rename+drop, then every created
+				// table's statements). `statementGroups` (`sql.ts`) only recognises
+				// the rebuild's `create table "__new_X" … rename … create index`
+				// shape as an indivisible run; three statements scattered like that
+				// are three ordinary singleton groups a batch boundary can land
+				// between. A boundary between the drop and a *distant* re-create
+				// left the table genuinely unprotected — UPDATE permitted — for
+				// however long batch 2 took to run, and unprotected for good if
+				// batch 2 then failed. Keeping the three statements adjacent lets
+				// `statementGroups` (extended below) treat them as one unit, the
+				// same way it already does for a rebuild's rename-then-restore.
 				const staysAppendOnly = Boolean(after.tables[renamed]?.appendOnly);
 				statements.push({
 					sql: dropAppendOnlyTrigger(name),
@@ -761,8 +773,22 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 						reason: `"${renamed}" is no longer append-only, so UPDATE is permitted again`,
 					}),
 				});
+				if (staysAppendOnly) {
+					statements.push({
+						sql: appendOnlyTrigger(renamed, appendOnlyColumns(after.tables[renamed]!.appendOnly)),
+						destructive: false,
+					});
+				}
 			}
-			effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: false };
+			// `appendOnly` on the effective (post-rename) entry is set to match
+			// `after` already when the guard was just re-created above, so the
+			// later per-table pass sees no further change to make for it — it
+			// would otherwise treat the freshly-created trigger's presence as
+			// drift it still needs to reconcile.
+			const carriedAppendOnly = t.appendOnly && after.tables[renamed]?.appendOnly
+				? after.tables[renamed]!.appendOnly
+				: false;
+			effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: carriedAppendOnly };
 		} else {
 			effectiveBefore[name] = t;
 		}

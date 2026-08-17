@@ -6,9 +6,11 @@
  * a `tableOptions` sidecar named by config, a migrations folder in the wrong
  * layout — so each gets a test rather than a comment saying it was fixed.
  */
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { importModule } from '../../src/node/import.js';
 import { loadTableOptions, unreadableMigrations } from '../../src/node/store.js';
@@ -36,6 +38,58 @@ describe('importModule', () => {
 
 		const module = await importModule<{ marker: string }>(join(dir, 'entry.ts'));
 		expect(module.marker).toBe('index');
+	});
+
+	// [F-038]: the CJS-forcing-ESM shim used to be written into the same
+	// directory as the module it copies. A crash between the write and the
+	// `finally` cleanup left an importable duplicate there that a `**/*.mts`
+	// glob in a build or test config would pick up. It now goes under the OS
+	// temp directory instead, so the source directory never gains a file.
+	// vitest's own module loader (vite-node) transforms every `.ts` it imports
+	// before Node's own CommonJS-vs-ESM detection ever runs, so calling
+	// `importModule` in-process here never actually reaches the CJS-forcing
+	// shim fallback — `import()` on the original path just succeeds. The real
+	// CLI runs under plain Node, where a `.ts` file in a project with no
+	// `"type": "module"` genuinely hits it. A child process is what makes this
+	// test exercise the same code path production does.
+	it('[F-038] never writes the ESM shim into the source directory, under plain Node', () => {
+		const dir = scratch();
+		// Node 22+ auto-detects ES module syntax even with no package.json, so
+		// an explicit `"type": "commonjs"` is what actually forces the `export
+		// const` syntax below to fail to parse — the real trigger for the shim
+		// fallback this test is about. Deliberately one self-contained file, not
+		// a schema importing a sibling: a *sibling* `.ts` file under an explicit
+		// `"type": "commonjs"` has its own, unrelated problem (it is not itself
+		// shimmed, so it stays CommonJS-typed and cannot serve a named ESM
+		// export either way) that has nothing to do with where the shim for
+		// *this* file is written, which is the only thing this test is about.
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		writeFileSync(join(dir, 'schema.ts'), "export const users = 'users-table';\n");
+
+		const importPath = join(dirname(fileURLToPath(import.meta.url)), '../../src/node/import.ts');
+		const scriptPath = join(dir, '.run-import.mjs');
+		writeFileSync(
+			scriptPath,
+			`import { importModule } from ${JSON.stringify(importPath)};\n`
+				+ `const m = await importModule(${JSON.stringify(join(dir, 'schema.ts'))});\n`
+				+ `console.log(JSON.stringify(m.users));\n`,
+		);
+
+		// `finally`-block cleanup removes the shim on every ordinary path, so a
+		// before/after directory listing alone would pass whether the shim was
+		// ever written into `dir` or not — the loss `[F-038]` is about only
+		// shows up if the process is killed between the write and that cleanup.
+		// Making `dir` read-only turns "was it written into `dir`?" into a
+		// pass/fail signal directly: a shim written there would fail outright
+		// with EACCES, so a clean run is itself the proof it went to the OS
+		// temp directory instead.
+		try {
+			chmodSync(dir, 0o555);
+			const output = execFileSync(process.execPath, [scriptPath], { encoding: 'utf8' });
+			expect(JSON.parse(output.trim())).toBe('users-table');
+		} finally {
+			chmodSync(dir, 0o755);
+		}
 	});
 
 	it('leaves bare specifiers to Node, so a real package is not shadowed', async () => {

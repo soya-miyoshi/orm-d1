@@ -365,6 +365,24 @@ describe('batching a large migration cannot cut a table rebuild in half (finding
 	});
 });
 
+describe('[F-047] applyMigrations calls onWarning as each split-batch warning is produced', () => {
+	it('invokes onWarning with the same text collected into ApplyResult.warnings', async () => {
+		// Same >100-statement split-forcing shape as "finding 1" above, without
+		// a throw: this just has to force `applyMigration` to split into more
+		// than one batch, so it emits its split warning.
+		const filler = Array.from({ length: 100 }, (_, i) => sqliteTable(`f_${i}`, { id: integer('id').primaryKey() }));
+		const diff = diffSnapshots(emptySnapshot(), snapshotFromSchema(filler));
+		expect(diff.errors).toEqual([]);
+		const sql = renderMigration(diff);
+
+		const seen: string[] = [];
+		const result = await applyMigrations(runner, [{ tag: 'm_onwarning', sql }], undefined, (w) => seen.push(w));
+
+		expect(result.warnings.length).toBeGreaterThan(0);
+		expect(seen).toEqual([...result.warnings]);
+	});
+});
+
 describe('a rebuild refuses to silently drop a foreign trigger (finding 2)', () => {
 	it('refuses a rebuild-forcing push when the live table carries a trigger orm-d1 did not author, naming it', async () => {
 		const before = sqliteTable('accounts', { id: integer('id').primaryKey(), balance: integer('balance') });

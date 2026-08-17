@@ -4,16 +4,21 @@
  * Node runs TypeScript directly, so no bundler is needed — the schema is a
  * value, not something to parse. One wrinkle: a `.ts` file in a project
  * without `"type": "module"` is loaded as CommonJS, and its `import`
- * statements fail. Copying it to a sibling `.mts` forces the ESM loader while
- * keeping bare and relative specifiers resolving from the project — which is
- * why the copy has to sit next to the original.
+ * statements fail. Copying it to a `.mts` shim forces the ESM loader. The
+ * shim is written under the OS temp directory (`[F-038]`) rather than next to
+ * the original — a copy left inside the user's source tree by a crash between
+ * the write and cleanup becomes an importable duplicate a `**\/*.mts` glob in
+ * a build or test config would pick up — and `shimOrigins` in
+ * `registerResolveHook` below is what still lets the shim's own relative
+ * imports resolve against the original file's directory.
  */
-import { copyFile, rm } from 'node:fs/promises';
+import { copyFile, mkdir, realpath, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 // `registerHooks` is Node 22.15+, which is why the package's `engines` says so:
 // a missing named export from a builtin is a link-time SyntaxError, so an older
 // runtime would fail to load the CLI at all rather than fail on first use.
 import { registerHooks } from 'node:module';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -38,6 +43,15 @@ let hooksRegistered = false;
 
 const CANDIDATE_SUFFIXES = ['.ts', '.mts', '.cts', '.js', '.mjs', '/index.ts', '/index.mts', '/index.js'];
 
+/**
+ * [F-038] A `.mts` shim (see {@link importModule}) lives in a scratch
+ * directory outside the user's source tree, so a sibling relative import it
+ * makes (`./helpers`) has to resolve as though the shim were still sitting
+ * next to the file it copies — not against the scratch directory it actually
+ * sits in. Keyed by the shim's own file URL, set right before importing it.
+ */
+const shimOrigins = new Map<string, string>();
+
 const registerResolveHook = (): void => {
 	if (hooksRegistered) return;
 	hooksRegistered = true;
@@ -52,7 +66,8 @@ const registerResolveHook = (): void => {
 			const parentUrl = context.parentURL;
 			if (!parentUrl?.startsWith('file:')) return nextResolve(specifier, context);
 
-			const base = join(dirname(fileURLToPath(parentUrl)), specifier);
+			const parentDir = shimOrigins.get(parentUrl) ?? dirname(fileURLToPath(parentUrl));
+			const base = join(parentDir, specifier);
 			for (const suffix of CANDIDATE_SUFFIXES) {
 				if (existsSync(base + suffix)) {
 					return nextResolve(pathToFileURL(base + suffix).href, context);
@@ -76,11 +91,27 @@ export async function importModule<T = Record<string, unknown>>(path: string): P
 	} catch (error) {
 		if (!isModuleSyntaxError(error) || !/\.[cm]?ts$/.test(path)) throw error;
 
-		const shim = join(dirname(path), `.orm-d1-${process.pid}-${shimCounter++}.mts`);
+		// [F-038] Written under the OS temp directory, not next to the original —
+		// a copy inside the user's source tree left there by a crash or SIGKILL
+		// between the write and the `finally` below (which never runs) becomes an
+		// importable duplicate of the schema that a `**/*.mts` glob in a build or
+		// test config picks up. `shimOrigins` (above) is what lets a relative
+		// import from *inside* the shim still resolve as though it were sitting
+		// next to the original.
+		const scratchDir = join(tmpdir(), 'orm-d1-kit-import');
+		await mkdir(scratchDir, { recursive: true });
+		// `tmpdir()` is a symlink on macOS (`/var` -> `/private/var`); Node's ESM
+		// loader reports `context.parentURL` against the resolved real path, so
+		// `shimOrigins` has to be keyed the same way or the lookup below misses.
+		const realScratchDir = await realpath(scratchDir);
+		const shim = join(realScratchDir, `.orm-d1-${process.pid}-${shimCounter++}.mts`);
 		await copyFile(path, shim);
+		const shimUrl = pathToFileURL(shim).href;
+		shimOrigins.set(shimUrl, dirname(path));
 		try {
-			return await import(pathToFileURL(shim).href) as T;
+			return await import(shimUrl) as T;
 		} finally {
+			shimOrigins.delete(shimUrl);
 			await rm(shim, { force: true });
 		}
 	}

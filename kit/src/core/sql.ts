@@ -213,17 +213,48 @@ const RENAME_TO_PATTERN = new RegExp(
 const escapeRegExpForOnPattern = (value: string): string =>
 	value.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-function buildCreateOnPattern(finalName: string): RegExp {
-	const escaped = escapeRegExpForOnPattern(finalName);
-	const escapedForBrackets = escapeRegExpForOnPattern(finalName.replaceAll(']', ']]'));
-	const spellings = [
-		`"${escapeRegExpForOnPattern(finalName.replaceAll('"', '""'))}"`,
-		`\`${escapeRegExpForOnPattern(finalName.replaceAll('`', '``'))}\``,
+/** Any of SQLite's four quoted spellings of `identifier`, escaped for use in a `RegExp`. */
+function quotedIdentifierAlternation(identifier: string): string {
+	const escaped = escapeRegExpForOnPattern(identifier);
+	const escapedForBrackets = escapeRegExpForOnPattern(identifier.replaceAll(']', ']]'));
+	return [
+		`"${escapeRegExpForOnPattern(identifier.replaceAll('"', '""'))}"`,
+		`\`${escapeRegExpForOnPattern(identifier.replaceAll('`', '``'))}\``,
 		`\\[${escapedForBrackets}\\]`,
 		`\\b${escaped}\\b`,
-	];
+	].join('|');
+}
+
+function buildCreateOnPattern(finalName: string): RegExp {
 	return new RegExp(
-		`^\\s*create\\s+(?:unique\\s+index|index|trigger)\\b[\\s\\S]*?\\bon\\s+(?:${spellings.join('|')})`,
+		`^\\s*create\\s+(?:unique\\s+index|index|trigger)\\b[\\s\\S]*?\\bon\\s+(?:${quotedIdentifierAlternation(finalName)})`,
+		'i',
+	);
+}
+
+/** `drop trigger if exists "<name>_no_update"`, any quoting. */
+function buildDropTriggerIfExistsPattern(triggerName: string): RegExp {
+	return new RegExp(
+		`^\\s*drop\\s+trigger\\s+if\\s+exists\\s+(?:${quotedIdentifierAlternation(triggerName)})\\s*$`,
+		'i',
+	);
+}
+
+/**
+ * `create trigger "<name>_no_update" ...`, any quoting.
+ *
+ * No trailing `\b` after the alternation: `quotedIdentifierAlternation`'s bare
+ * spelling already ends in one, but its quoted/backtick/bracket spellings end
+ * in a punctuation character (`"`, `` ` ``, `]`), and a `\b` right after one of
+ * those requires a word character on both sides of the boundary — which the
+ * statement text right there never has (the identifier is immediately
+ * followed by whitespace or a newline, both non-word). A trailing `\b` here
+ * made the quoted spelling — the one the kit itself always emits — never
+ * match at all.
+ */
+function buildCreateTriggerPattern(triggerName: string): RegExp {
+	return new RegExp(
+		`^\\s*create\\s+trigger\\s+(?:${quotedIdentifierAlternation(triggerName)})`,
 		'i',
 	);
 }
@@ -234,6 +265,44 @@ export function statementGroups(statements: readonly string[]): number[] {
 	let i = 0;
 
 	while (i < statements.length) {
+		// A plain `--rename-table` rename (not the closing rename of a rebuild —
+		// that shape starts at `create table "__new_X"` and is handled by the
+		// branch below, which consumes its own rename before this point in the
+		// loop ever sees it directly). `diffSnapshots` (`diff.ts`) emits the drop
+		// of the append-only guard under its *old* name right after the rename
+		// (SQLite keeps a trigger's name across `RENAME TO`), and — when the
+		// table stays append-only — the guard's re-create under the *new* name
+		// immediately after that, specifically so this scan finds all three
+		// adjacent. Left as three singleton groups, a batch boundary between the
+		// drop and the re-create left the table genuinely unprotected — UPDATE
+		// permitted — for as long as the next batch took, and unprotected for
+		// good if that batch then failed, the same class of hole `[F-041]`
+		// closed for a rebuild's own index/trigger restoration.
+		const renameMatch = RENAME_TO_PATTERN.exec(statements[i]!);
+		if (renameMatch) {
+			const fromName = normalizeIdentifierToken(renameMatch[1]!);
+			const toName = normalizeIdentifierToken(renameMatch[2]!);
+			let end = i;
+			if (
+				end + 1 < statements.length
+				&& buildDropTriggerIfExistsPattern(`${fromName}_no_update`).test(statements[end + 1]!)
+			) {
+				end += 1;
+				if (
+					end + 1 < statements.length
+					&& buildCreateTriggerPattern(`${toName}_no_update`).test(statements[end + 1]!)
+				) {
+					end += 1;
+				}
+			}
+			if (end > i) {
+				const group = nextGroup++;
+				for (let k = i; k <= end; k++) groups[k] = group;
+				i = end + 1;
+				continue;
+			}
+		}
+
 		// Looked ahead, not behind: a preceding PRAGMA would otherwise already
 		// have been consumed into its own singleton group by the time this loop
 		// reaches the `create table "__new_X"` that follows it.
