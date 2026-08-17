@@ -7,6 +7,7 @@ import { applicableStatements, splitStatements } from '../../src/core/sql.js';
 import { appendOnlyTriggerGuard, hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseColumnCollation, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
 import { assertRoundTrip, emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
 import type { Snapshot } from '../../src/core/snapshot.js';
+import { roundtripPlan } from '../../src/core/roundtrip.js';
 
 const indexOn = (name: string, column: Column<any>) => index(name).on(column);
 
@@ -93,6 +94,46 @@ describe('parsing a CREATE TABLE', () => {
 	it('[F-108] parses a quoted collation name', () => {
 		const sql = 'create table "u5" ("id" integer primary key, "email" text collate "NOCASE" not null)';
 		expect(parseColumnCollation(sql, 'email')).toBe('NOCASE');
+	});
+
+	it('does not read a COLLATE mentioned only in a "--" comment as the column\'s own', () => {
+		const sql = 'create table "c1" ("id" integer primary key, '
+			+ '"note" text -- TODO: collate nocase before launch\n\tnot null)';
+		expect(parseColumnCollation(sql, 'note')).toBeUndefined();
+	});
+
+	it('does not read a COLLATE mentioned only in a "/* */" comment as the column\'s own', () => {
+		const sql = 'create table "c1" ("id" integer primary key, "note" text /* TODO: collate nocase */ not null)';
+		expect(parseColumnCollation(sql, 'note')).toBeUndefined();
+	});
+
+	it('an unbalanced "(" inside a "--" comment does not desynchronise the depth counter', () => {
+		const sql = 'create table "c1" ("id" integer primary key, '
+			+ '"note" text -- legacy (was varchar\n\tcollate nocase)';
+		expect(parseColumnCollation(sql, 'note')).toBe('nocase');
+	});
+
+	it('a stray \'"\' inside a "--" comment does not swallow the rest of the column span', () => {
+		const sql = 'create table "c1" ("id" integer primary key, '
+			+ '"note" text -- see the "spec\n\t\tcollate nocase not null)';
+		expect(parseColumnCollation(sql, 'note')).toBe('nocase');
+	});
+
+	it('a backtick-quoted identifier containing "(" does not desynchronise the depth counter', () => {
+		const sql = 'create table "t" (`a(` text, "note" text check (`x(` <> \'\') collate nocase)';
+		expect(parseColumnCollation(sql, 'note')).toBe('nocase');
+	});
+
+	it('a bracket-quoted identifier containing "(" does not desynchronise the depth counter', () => {
+		const sql = 'create table "t" ([a(] text, "note" text check ([x(] <> \'\') collate nocase)';
+		expect(parseColumnCollation(sql, 'note')).toBe('nocase');
+	});
+
+	it('[F-108 in parseGenerated] a quoted identifier containing "(" inside another column does not '
+		+ 'swallow the rest of the table body into the generated expression', () => {
+		const sql = 'create table "t" ("a(" text, "b" text generated always as ("a(" || \'x\') virtual, '
+			+ '"email" text not null, unique ("email" collate nocase)) virtual';
+		expect(parseGenerated(sql, 'b')).toEqual({ as: '"a(" || \'x\'', mode: 'virtual' });
 	});
 });
 
@@ -397,6 +438,50 @@ describe('diffing snapshots', () => {
 
 		const { statements } = diffSnapshots(liveWithHandAddedCollation, pulledBaseline);
 		expect(statements.some((s) => s.reason?.includes('collation'))).toBe(true);
+	});
+
+	it("[roundtrip] a restore leg keeps the live collation legs 1 and 2 preserve, not just the detach/rebuild pair", () => {
+		// `roundtripPlan`'s restore legs merge a restored table straight out of
+		// the schema-derived `after` snapshot, which structurally cannot state a
+		// `collate` (Drizzle has no `.collate()`). Legs 1 and 2 diff against
+		// `detachedBefore`/`detachedAfter`, which still carry the live collation
+		// forward from `before`, so only a restore leg (3+) can lose it.
+		//
+		// `rt_orgs` is the roundtrip target; `rt_users` (which points at it, and
+		// carries a live `collate` on a column unrelated to the FK) sits in its
+		// closure, so leg 3 has to rebuild `rt_users` to put its foreign key
+		// back.
+		const orgs = sqliteTable('rt_orgs', {
+			id: integer('id').primaryKey(),
+			name: text('name').notNull(),
+		});
+		const users = sqliteTable('rt_users', {
+			id: integer('id').primaryKey(),
+			orgId: integer('org_id').notNull().references(() => orgs.id),
+			email: text('email').notNull(),
+		});
+
+		const after = snapshotOf(orgs, users);
+		const before: Snapshot = {
+			...after,
+			origin: 'introspection',
+			tables: {
+				...after.tables,
+				rt_users: {
+					...after.tables['rt_users']!,
+					columns: {
+						...after.tables['rt_users']!.columns,
+						email: { ...after.tables['rt_users']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		const plan = roundtripPlan(before, after, 'rt_orgs');
+		const restoreLeg = plan.legs.find((leg) => leg.title.startsWith('3.'));
+		expect(restoreLeg).toBeDefined();
+		expect(restoreLeg!.errors).toEqual([]);
+		expect(restoreLeg!.statements.some((s) => /collate\s+nocase/i.test(s.sql))).toBe(true);
 	});
 
 	it('drops a removed table, and marks it destructive', () => {

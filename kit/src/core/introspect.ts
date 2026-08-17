@@ -95,13 +95,33 @@ const unquote = (name: string): string =>
  * which is stable for a given CREATE TABLE and is what the rebuild re-emits.
  */
 /**
- * Blank the *contents* of single-quoted literals, keeping the quotes and the
- * length so offsets into the result still index the original SQL. `''` is
- * SQL's escape for a quote inside a literal, which a plain scan handles: the
- * closing quote of the pair immediately reopens.
+ * Blank the *contents* of single-quoted literals and both comment forms
+ * (`-- …` to end of line, `/* … *\/`), keeping delimiters where literals have
+ * them and the exact length everywhere, so offsets into the result still
+ * index the original SQL. `''` is SQL's escape for a quote inside a literal,
+ * which a plain scan handles: the closing quote of the pair immediately
+ * reopens.
+ *
+ * Comments have to be blanked here, not just literals: D1 stores a
+ * `CREATE TABLE` verbatim, comment text included, and every scan in this file
+ * that walks the DDL looking for `collate`/`check`/`generated always`/a
+ * balanced paren treats comment text as structure otherwise. A `-- TODO:
+ * collate nocase` in a comment used to be read as the column's own collation
+ * (misattributing a constraint the live column does not have — the rebuild
+ * then emits `COLLATE NOCASE` over a BINARY column, and applying it against a
+ * unique index fails with `SQLITE_CONSTRAINT`, unappliable). An unbalanced
+ * `(` or a stray `"` inside a comment used to desynchronise the paren/quote
+ * depth counters that come after this blanking, silently dropping a genuine
+ * collation that appears later in the same column span.
  */
 const blankLiterals = (text: string): string =>
-	text.replaceAll(/'(?:[^']|'')*'/g, (literal) => `'${' '.repeat(literal.length - 2)}'`);
+	text.replaceAll(
+		/'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\//g,
+		(span) =>
+			span[0] === "'"
+				? `'${' '.repeat(span.length - 2)}'`
+				: ' '.repeat(span.length),
+	);
 
 export const parseChecks = (
 	sql: string,
@@ -165,6 +185,43 @@ export const hasAutoincrement = (sql: string, columnName: string): boolean =>
  * function's, so a schema-side spelling and a live one still round-trip
  * byte-for-byte through `createTableFromSnapshot`.
  */
+/**
+ * If `scan[i]` opens a quoted identifier — `"…"`, `` `…` ``, or `[…]`, the
+ * three spellings SQLite accepts and `parseIndexColumns`'s anchor already
+ * treats as first-class — advance past its matching close (verbatim, `""`/
+ * ` `` ` escape included for the quote forms) and return the new index.
+ * Otherwise return `i` unchanged.
+ *
+ * Shared by every balanced-paren scan below so an identifier's embedded `(`,
+ * `)`, or `"` can never desynchronise paren depth: `"a("` used to push depth
+ * to 2 and swallow the rest of the table body ([F-108]), and the same was
+ * true, unfixed, of the backtick/bracket spellings and of `parseGenerated`'s
+ * own copy of this scan.
+ */
+const skipQuotedIdentifier = (scan: string, i: number): number => {
+	const ch = scan[i];
+	if (ch === '"' || ch === '`') {
+		let j = i + 1;
+		while (j < scan.length) {
+			if (scan[j] === ch) {
+				if (ch === '"' && scan[j + 1] === '"') {
+					j += 2;
+					continue;
+				}
+				j++;
+				break;
+			}
+			j++;
+		}
+		return j;
+	}
+	if (ch === '[') {
+		const close = scan.indexOf(']', i + 1);
+		return close === -1 ? scan.length : close + 1;
+	}
+	return i;
+};
+
 export const parseColumnCollation = (sql: string, columnName: string): string | undefined => {
 	const scan = blankLiterals(sql);
 	const anchor = new RegExp(columnDefinitionStart(columnName), 'i').exec(scan);
@@ -189,30 +246,18 @@ export const parseColumnCollation = (sql: string, columnName: string): string | 
 	// here regardless, since it comes after the span's closing top-level
 	// comma/paren.
 	//
-	// Depth is only counted outside a quoted identifier: `"a("` is a legal
-	// column name whose embedded `(` must not desynchronise the counter, or
-	// the span never returns to depth 0 and swallows everything after it,
-	// including a table-level `unique(...)` clause ([F-108]).
+	// Depth is only counted outside a quoted identifier: `"a("`, `` `a(` ``, and
+	// `[a(]` are all legal column names whose embedded `(` must not
+	// desynchronise the counter, or the span never returns to depth 0 and
+	// swallows everything after it, including a table-level `unique(...)`
+	// clause ([F-108]).
 	let depth = 0;
 	let i = anchor.index + anchor[0].length;
 	let collate: string | undefined;
 	while (i < scan.length) {
 		const ch = scan[i];
-		if (ch === '"') {
-			// Skip the whole quoted identifier verbatim, `""` escape included,
-			// so nothing inside it is ever inspected as structure.
-			i++;
-			while (i < scan.length) {
-				if (scan[i] === '"') {
-					if (scan[i + 1] === '"') {
-						i += 2;
-						continue;
-					}
-					i++;
-					break;
-				}
-				i++;
-			}
+		if (ch === '"' || ch === '`' || ch === '[') {
+			i = skipQuotedIdentifier(scan, i);
 			continue;
 		}
 		if (ch === '(') {
@@ -248,21 +293,34 @@ export const parseGenerated = (
 	sql: string,
 	columnName: string,
 ): { as: string; mode: 'stored' | 'virtual' } | undefined => {
+	const scan = blankLiterals(sql);
 	const match = new RegExp(
 		`${columnDefinitionStart(columnName)}[^,]*?generated\\s+always\\s+as\\s*\\(`,
 		'i',
-	).exec(sql);
+	).exec(scan);
 	if (!match) return undefined;
 
 	// Balanced scan, not `[^)]*`: an expression is far more likely to contain
 	// parentheses than not — `upper("name")` used to come back as `upper("name`
 	// with the trailing `stored` unmatched, silently downgrading the mode.
+	//
+	// Quote-aware over `scan`, the same as `parseColumnCollation`'s span scan:
+	// a column named `"a("` (legal SQLite) used to push depth to 2 and swallow
+	// the rest of the table body into `as`, producing a migration D1 refuses
+	// with `unknown table option: virtual` ([F-108], the sub-issue this
+	// function shared with `parseColumnCollation` before both used
+	// `skipQuotedIdentifier`).
 	const start = match.index + match[0].length;
 	let depth = 1;
 	let i = start;
-	while (i < sql.length && depth > 0) {
-		if (sql[i] === '(') depth++;
-		else if (sql[i] === ')') depth--;
+	while (i < scan.length && depth > 0) {
+		const ch = scan[i];
+		if (ch === '"' || ch === '`' || ch === '[') {
+			i = skipQuotedIdentifier(scan, i);
+			continue;
+		}
+		if (ch === '(') depth++;
+		else if (ch === ')') depth--;
 		i++;
 	}
 	if (depth > 0) return undefined;
