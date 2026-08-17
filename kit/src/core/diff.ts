@@ -16,7 +16,7 @@ import {
 	appendOnlyTriggerName,
 	dropAppendOnlyTrigger,
 } from 'orm-d1/ddl';
-import type { ColumnSnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
+import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
 import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
 
 export interface Statement {
@@ -407,6 +407,39 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: false };
 		} else {
 			effectiveBefore[name] = t;
+		}
+	}
+
+	// 1b. SQLite's `ALTER TABLE … RENAME TO` rewrites every `REFERENCES` clause
+	// naming the renamed table (since SQLite 3.25), including a table's own
+	// self-references. `effectiveBefore` above only renamed the table's own
+	// entry, leaving every *other* table's `ForeignKeySnapshot.tableTo` /
+	// `ColumnSnapshot.references.tableTo` pointing at the old name — which
+	// makes an otherwise-pure rename look like "a foreign key changes" and
+	// forces a destructive rebuild (or an unresolvable refusal for a
+	// self-reference) for a schema that the rename alone already satisfies.
+	// Repoint them here, across all tables in `effectiveBefore` (the renamed
+	// table included), before anything downstream compares foreign keys.
+	if (Object.keys(renamedTables).length > 0) {
+		const repoint = (tableTo: string): string => renamedTables[tableTo] ?? tableTo;
+		for (const name of Object.keys(effectiveBefore)) {
+			const t = effectiveBefore[name]!;
+			let changed = false;
+			const columns: Record<string, ColumnSnapshot> = { ...t.columns };
+			for (const [colName, col] of Object.entries(columns)) {
+				if (col.references && renamedTables[col.references.tableTo]) {
+					columns[colName] = { ...col, references: { ...col.references, tableTo: repoint(col.references.tableTo) } };
+					changed = true;
+				}
+			}
+			const foreignKeys: Record<string, ForeignKeySnapshot> = { ...t.foreignKeys };
+			for (const [fkName, fk] of Object.entries(foreignKeys)) {
+				if (renamedTables[fk.tableTo]) {
+					foreignKeys[fkName] = { ...fk, tableTo: repoint(fk.tableTo) };
+					changed = true;
+				}
+			}
+			if (changed) effectiveBefore[name] = { ...t, columns, foreignKeys };
 		}
 	}
 

@@ -152,6 +152,25 @@ const columnDefinitionStart = (columnName: string): string =>
 export const hasAutoincrement = (sql: string, columnName: string): boolean =>
 	new RegExp(`${columnDefinitionStart(columnName)}[^,]*autoincrement`, 'i').test(sql);
 
+/**
+ * A column's own `COLLATE` clause, from the `CREATE TABLE` text — no pragma
+ * reports it (`pragma table_info`'s `notnull`/`pk`/`dflt_value` say nothing
+ * about collation). Anchored on the column *definition* the same way
+ * `hasAutoincrement`/`parseGenerated` are, over `blankLiterals` so a string
+ * default containing the word `collate` cannot be mistaken for the clause.
+ *
+ * Kept in the raw case the DDL text used (mirroring `parseIndexCollations`,
+ * which does the same for an index member) — normalising away case
+ * differences is `canonicalTable`'s job at comparison time, not this
+ * function's, so a schema-side spelling and a live one still round-trip
+ * byte-for-byte through `createTableFromSnapshot`.
+ */
+export const parseColumnCollation = (sql: string, columnName: string): string | undefined => {
+	const scan = blankLiterals(sql);
+	const match = new RegExp(`${columnDefinitionStart(columnName)}[^,]*?\\bcollate\\s+(\\w+)`, 'i').exec(scan);
+	return match?.[1];
+};
+
 export const parseGenerated = (
 	sql: string,
 	columnName: string,
@@ -493,6 +512,7 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 				default: column.dflt_value === null ? undefined : defaultExpression(column.dflt_value),
 				generated,
 				references: undefined,
+				collate: parseColumnCollation(createSql, column.name),
 			};
 		}
 

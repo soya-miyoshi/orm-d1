@@ -77,6 +77,13 @@ let casingMode: 'preserve' | 'snake_case' = 'preserve';
 let casingConfigured = false;
 /** Set the first time a column name is resolved under the current setting. */
 let casingObserved = false;
+/**
+ * Test-only instrumentation: how many times `applyCasing` actually ran its
+ * tokenising regex, as opposed to how many times `Column.name` was read.
+ * `Column.name` memoizes per instance, so this is what proves the memoization
+ * actually cuts calls rather than merely changing where the count is paid.
+ */
+let applyCasingCallCount = 0;
 
 /**
  * Reconfiguring is refused rather than honoured, and so is configuring late.
@@ -118,6 +125,7 @@ export const resetCasing = (): void => {
 	casingMode = 'preserve';
 	casingConfigured = false;
 	casingObserved = false;
+	applyCasingCallCount = 0;
 };
 
 export const getCasing = (): 'preserve' | 'snake_case' => casingMode;
@@ -138,8 +146,12 @@ export const applyCasing = (name: string): string => {
 	// Latched here rather than in `Column.name`, so every path that resolves a
 	// name — DDL, snapshots, compilation — counts as having observed it.
 	casingObserved = true;
+	applyCasingCallCount++;
 	return casingMode === 'snake_case' ? toSnakeCase(name) : name;
 };
+
+/** @internal Test-only instrumentation; never call this from application code. */
+export const getApplyCasingCallCount = (): number => applyCasingCallCount;
 
 /**
  * The phantom metadata a column carries. One record, not five type parameters:
@@ -253,9 +265,21 @@ export class Column<M extends ColumnMeta = ColumnMeta> extends SQLiteColumnEntit
 		return this;
 	}
 
+	/**
+	 * Memoized: `applyCasing` runs Drizzle's tokenising regex, and `.name` is
+	 * read repeatedly per column over the lifetime of a query (DDL rendering,
+	 * snapshotting, compilation each read it at least once) — recomputing it
+	 * every time multiplied the regex cost by however many callers touch a
+	 * column. `#resolvedName` is per-instance, and `withTable` (below) builds a
+	 * fresh `Column` from the same `config` for an alias, so an alias still
+	 * resolves its own name once, independently, with nothing stale carried
+	 * over from the table it was aliased from.
+	 */
+	#resolvedName: string | undefined;
+
 	/** The database column name, resolved against the configured casing. */
 	get name(): string {
-		return this.config.explicitName ?? applyCasing(this.config.fieldName);
+		return this.#resolvedName ??= this.config.explicitName ?? applyCasing(this.config.fieldName);
 	}
 
 	get notNull(): boolean {

@@ -7,8 +7,8 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { toSnakeCase as drizzleToSnakeCase } from 'drizzle-orm/casing';
-import { applyCasing, configureCasing, isColumn, resetCasing } from '../../src/schema/columns.js';
-import { integer, sqliteTable, text } from '../../src/index.js';
+import { applyCasing, configureCasing, getApplyCasingCallCount, isColumn, resetCasing } from '../../src/schema/columns.js';
+import { integer, query, sqliteTable, text } from '../../src/index.js';
 
 afterEach(() => resetCasing());
 
@@ -92,5 +92,28 @@ describe('configureCasing', () => {
 		}
 		expect(applyCasing('user’sName')).toBe('users_name');
 		expect(applyCasing('some name')).toBe('some_name');
+	});
+
+	// F-102: `Column.name` used to re-run `applyCasing` (Drizzle's tokenising
+	// regex) on every read. `.name` is read repeatedly compiling a single
+	// query — once per rendered reference, again assigning the output name,
+	// again in any nested projection — so an unmemoized getter paid the regex
+	// cost that many times over for the same column.
+	it('memoizes the resolved name, so compiling a select over N columns runs applyCasing at most N times', () => {
+		configureCasing('snake_case');
+		const t = sqliteTable('t', {
+			firstName: text(),
+			lastName: text(),
+			emailAddress: text(),
+			isActive: integer(),
+		});
+		const columnCount = Object.values(t).filter(isColumn).length;
+
+		const before = getApplyCasingCallCount();
+		query.select().from(t).compile();
+		const calls = getApplyCasingCallCount() - before;
+
+		expect(calls).toBeLessThanOrEqual(columnCount);
+		expect(calls).toBeGreaterThan(0);
 	});
 });

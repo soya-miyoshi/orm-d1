@@ -64,6 +64,15 @@ export interface ColumnSnapshot {
 	readonly generated?: { readonly as: string; readonly mode: 'stored' | 'virtual' } | undefined;
 	/** A column-level foreign key. Table-level ones live in `foreignKeys`. */
 	readonly references?: ForeignKeySnapshot | undefined;
+	/**
+	 * The column's own `COLLATE` clause, in whatever case the DDL text used.
+	 * `undefined` means "not stated" — which is also what a schema-derived
+	 * snapshot always has, since Drizzle (and so orm-d1) has no `.collate()`
+	 * spelling. `undefined` and an explicit `binary` are equivalent (BINARY is
+	 * SQLite's default), but `undefined` against any *other* live collation
+	 * (e.g. `nocase`) is a real, reportable difference — see `canonicalTable`.
+	 */
+	readonly collate?: string | undefined;
 }
 
 /**
@@ -414,6 +423,7 @@ export function createTableFromSnapshot(t: TableSnapshot): string {
 
 	for (const column of Object.values(t.columns)) {
 		let ddl = `${quote(column.name)} ${column.declaredType ?? column.type}`;
+		if (column.collate) ddl += ` collate ${column.collate}`;
 		if (!hasCompositePk && column.primaryKey) {
 			ddl += ' primary key';
 			if (column.autoincrement) ddl += ' autoincrement';
@@ -502,6 +512,16 @@ export interface CanonicalColumn {
 	readonly default: string | null;
 	readonly autoincrement: boolean;
 	readonly generated: string | null;
+	/**
+	 * Folded to lowercase, with `binary` collapsed to `undefined` — same
+	 * technique `canonicalIndex` (`diff.ts`) already applies to an index
+	 * member's collation, for the same reason: D1 preserves a `COLLATE`
+	 * clause's original case verbatim, so `collate NoCase` (live) and
+	 * `NOCASE` (schema, hypothetically) would otherwise compare unequal.
+	 * `undefined` here means "unstated or BINARY"; anything else is a real,
+	 * reportable collation.
+	 */
+	readonly collate: string | undefined;
 }
 
 /**
@@ -542,6 +562,20 @@ export const columnDifference = (a: CanonicalColumn, b: CanonicalColumn): string
 	if (a.default !== b.default) return 'changes its default';
 	if (a.autoincrement !== b.autoincrement) return 'changes autoincrement';
 	if (a.generated !== b.generated) return 'changes its generated expression';
+	// A live column can carry a real, non-BINARY collation that the schema DSL
+	// has no way to author (Drizzle has no `.collate()`), so `after.collate` is
+	// `undefined` forever on a schema-derived snapshot even when the database
+	// genuinely has one. That is "unexpressible", not "changed to binary" —
+	// forcing a destructive recreate on the very first `generate` after a
+	// `pull` would be a permanent, unfixable false positive. `pull` reports the
+	// live value instead, via `unexpressibleTableOptionWarnings`. A genuine
+	// mismatch between two *stated* values — schema-to-schema, introspection-
+	// to-introspection, or a schema stating one where the live db states
+	// another — still needs to be caught, so only this one direction is
+	// exempted.
+	if (!(a.collate !== undefined && b.collate === undefined) && a.collate !== b.collate) {
+		return 'changes its collation';
+	}
 	return undefined;
 };
 
@@ -663,6 +697,9 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 			generated: column.generated
 				? JSON.stringify({ ...column.generated, as: column.generated.as.replaceAll(/\s+/g, ' ').trim() })
 				: null,
+			collate: column.collate && column.collate.toLowerCase() !== 'binary'
+				? column.collate.toLowerCase()
+				: undefined,
 		};
 		if (column.primaryKey) primaryKeyColumns.push(column.name);
 		if (column.unique) uniques.push(JSON.stringify([column.name]));

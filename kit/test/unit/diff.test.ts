@@ -165,6 +165,76 @@ describe('diffing snapshots', () => {
 		expect(diffSnapshots(fresh, preDescCollate).statements).toEqual([]);
 	});
 
+	it('does not force a destructive recreate for a live non-BINARY column collation the schema DSL cannot express (F-101)', () => {
+		// A table pulled from a live DB with `email text collate nocase` gets
+		// `collate: 'nocase'` on that column in the introspected snapshot. The
+		// schema DSL has no `.collate()`, so every schema-derived snapshot of
+		// the same table has `collate: undefined` on `email` forever. Diffing
+		// the two must not read that as "changed to binary" and force a
+		// destructive drop+recreate on the very first `generate` after `pull`.
+		const t = sqliteTable('people', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		});
+		const schemaSide = snapshotOf(t);
+		const liveSide: Snapshot = {
+			...schemaSide,
+			origin: 'introspection',
+			tables: {
+				people: {
+					...schemaSide.tables['people']!,
+					columns: {
+						...schemaSide.tables['people']!.columns,
+						email: { ...schemaSide.tables['people']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		const { statements } = diffSnapshots(liveSide, schemaSide);
+		expect(statements).toEqual([]);
+	});
+
+	it('still reports a genuine collation mismatch between two stated values', () => {
+		// The exemption is one-directional: a real value on the schema side that
+		// genuinely differs from the live database's real value must still be
+		// caught, so this is not a blanket "ignore collate" escape hatch.
+		const t = sqliteTable('people', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		});
+		const base = snapshotOf(t);
+		const before: Snapshot = {
+			...base,
+			origin: 'introspection',
+			tables: {
+				people: {
+					...base.tables['people']!,
+					columns: {
+						...base.tables['people']!.columns,
+						email: { ...base.tables['people']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+		const after: Snapshot = {
+			...base,
+			origin: 'introspection',
+			tables: {
+				people: {
+					...base.tables['people']!,
+					columns: {
+						...base.tables['people']!.columns,
+						email: { ...base.tables['people']!.columns['email']!, collate: 'rtrim' },
+					},
+				},
+			},
+		};
+
+		const { statements } = diffSnapshots(before, after);
+		expect(statements.some((s) => s.reason?.includes('collation'))).toBe(true);
+	});
+
 	it('drops a removed table, and marks it destructive', () => {
 		const t = sqliteTable('gone', { id: integer('id').primaryKey() });
 		const { statements } = diffSnapshots(snapshotOf(t), emptySnapshot());
@@ -774,6 +844,52 @@ describe('diffing snapshots', () => {
 			'alter table "users" rename to "people"',
 			'alter table "people" rename column "name" to "full_name"',
 		]);
+	});
+
+	it('repoints a referencing foreign key to the renamed table, instead of forcing a rebuild', () => {
+		// F-098: SQLite's `ALTER TABLE … RENAME TO` rewrites every `REFERENCES`
+		// clause naming the renamed table (since 3.25). `posts.author_id`
+		// references `users.id`; renaming `users` to `people` alone must not
+		// look like "a foreign key changes" on `posts`.
+		const users = sqliteTable('users', { id: integer('id').primaryKey() });
+		const posts = sqliteTable('posts', {
+			id: integer('id').primaryKey(),
+			authorId: integer('author_id').references(() => users.id),
+		});
+
+		const people = sqliteTable('people', { id: integer('id').primaryKey() });
+		const postsAfter = sqliteTable('posts', {
+			id: integer('id').primaryKey(),
+			authorId: integer('author_id').references(() => people.id),
+		});
+
+		const { statements, errors } = diffSnapshots(
+			snapshotOf(users, posts),
+			snapshotOf(people, postsAfter),
+			{ renamedTables: { users: 'people' } },
+		);
+
+		expect(errors).toEqual([]);
+		expect(statements.map((s) => s.sql)).toEqual(['alter table "users" rename to "people"']);
+	});
+
+	it('repoints a self-referencing foreign key across a rename', () => {
+		// F-098: a self-referencing table must also have its own reference
+		// repointed, not just other tables' references to it.
+		const nodes = sqliteTable('nodes', {
+			id: integer('id').primaryKey(),
+			parentId: integer('parent_id').references((): Column<any> => nodes.id),
+		});
+		const trees = sqliteTable('trees', {
+			id: integer('id').primaryKey(),
+			parentId: integer('parent_id').references((): Column<any> => trees.id),
+		});
+
+		const { errors } = diffSnapshots(snapshotOf(nodes), snapshotOf(trees), {
+			renamedTables: { nodes: 'trees' },
+		});
+
+		expect(errors).toEqual([]);
 	});
 
 	it('leaves the rename to the rebuild when the table is also recreated', () => {

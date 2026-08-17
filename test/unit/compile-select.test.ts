@@ -19,7 +19,7 @@ import {
 	sql,
 } from '../../src/index.js';
 import type { InferSelect } from '../../src/index.js';
-import { posts, users } from '../schema.js';
+import { postTags, posts, users } from '../schema.js';
 
 describe('select compilation', () => {
 	it('projects every column of the table by default', () => {
@@ -441,6 +441,46 @@ describe('explicit selections over an outer join', () => {
 		}).from(users).leftJoin(posts, on).compile();
 
 		expect(c.map([[1, 'alice', null, null]])[0]!.u).toEqual({ id: 1, name: 'alice' });
+	});
+
+	// F-099: a `right`/`full` join must nullify every table already joined
+	// before it, not only `plan.from` — Drizzle folds nullability as an
+	// ordered map over the join list
+	// (`drizzle-orm/sqlite-core/query-builders/select.js:111-121`), so a table
+	// joined earlier with `innerJoin`/`leftJoin` still collapses to `null` once
+	// a later `rightJoin`/`fullJoin` puts it on the nullable side.
+	it('collapses a group joined before a rightJoin, not just the base table', () => {
+		const c = query.select({
+			u: { id: users.id },
+			p: { id: posts.id },
+			t: { tag: postTags.tag },
+		})
+			.from(users)
+			.innerJoin(posts, eq(posts.authorId, users.id))
+			.rightJoin(postTags, eq(postTags.postId, posts.id))
+			.compile();
+
+		const [row] = c.map([[null, null, 'x']]);
+		expect(row!.u).toBeNull();
+		expect(row!.p).toBeNull();
+		expect(row!.t).toEqual({ tag: 'x' });
+	});
+
+	it('collapses every joined group over a fullJoin, including the newly joined one', () => {
+		const c = query.select({
+			u: { id: users.id },
+			p: { id: posts.id },
+			t: { tag: postTags.tag },
+		})
+			.from(users)
+			.innerJoin(posts, eq(posts.authorId, users.id))
+			.fullJoin(postTags, eq(postTags.postId, posts.id))
+			.compile();
+
+		const [row] = c.map([[null, null, null]]);
+		expect(row!.u).toBeNull();
+		expect(row!.p).toBeNull();
+		expect(row!.t).toBeNull();
 	});
 });
 

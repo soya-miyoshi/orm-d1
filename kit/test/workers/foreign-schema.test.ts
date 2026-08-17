@@ -19,7 +19,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots } from '../../src/core/diff.js';
-import { typeAffinity } from '../../src/core/snapshot.js';
+import { createTableFromSnapshot, typeAffinity } from '../../src/core/snapshot.js';
 
 const DB = (env as { DB: D1Database }).DB;
 
@@ -124,6 +124,22 @@ describe('introspecting a database orm-d1 did not write', () => {
 		const { statements } = diffSnapshots(live, changed);
 		expect(statements.length).toBeGreaterThan(0);
 		expect(statements.some((s) => s.sql.includes('__new_accounts'))).toBe(true);
+	});
+
+	it('captures a column-level COLLATE and round-trips it through createTableFromSnapshot', async () => {
+		// F-101: no pragma reports a column's own COLLATE, so it has to be
+		// parsed out of the CREATE TABLE text the same way `hasAutoincrement`
+		// and `parseGenerated` already do.
+		await DB.prepare('drop table if exists "people"').run();
+		await DB.prepare('create table "people" ("id" integer primary key, "email" text collate nocase not null)')
+			.run();
+
+		const live = await introspect(runner);
+		const email = live.tables['people']!.columns['email']!;
+		expect(email.collate).toBe('nocase');
+
+		const rendered = createTableFromSnapshot(live.tables['people']!);
+		expect(rendered).toContain('collate nocase');
 	});
 
 	it('does not mistake a hand-written conditional guard for the append-only trigger', async () => {
