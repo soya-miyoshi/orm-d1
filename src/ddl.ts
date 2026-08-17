@@ -181,8 +181,13 @@ export const dropAppendOnlyTrigger = (tableName: string): string =>
 /**
  * SQLite's `STRICT` allow-list, verified against D1 rather than taken from the
  * docs: a `NUMERIC` column in a strict table is rejected outright with
- * `unknown datatype`. `numeric()` is the only orm-d1 column type that produces
- * one, so it is the only type this can catch.
+ * `unknown datatype`. Among orm-d1's built-in column constructors, `numeric()`
+ * is the only one whose base `SQLiteType` falls outside this set — but
+ * `customType()` can produce any `declaredType` string at all (`varchar(10)`,
+ * `bigint`, …), and `typeName()` below checks that string, not the reduced
+ * `'numeric' | 'integer' | 'text' | 'real' | 'blob'` affinity — so a
+ * misspelled or decorated `customType` is caught here too, not just
+ * `numeric()`. See `[F-012]` in `AUDIT.md`.
  */
 const STRICT_TYPES = new Set(['int', 'integer', 'real', 'text', 'blob', 'any']);
 
@@ -284,9 +289,15 @@ export const literal = (value: unknown): string => {
 	return `'${String(value).replaceAll("'", "''")}'`;
 };
 
-// `getSQLType()` is the same rendering Drizzle exposes on the column itself,
-// including `text(5)`-style length for `text({length})`. See `[F-012]`.
-const typeName = (column: Column<any>): string => column.getSQLType();
+// Deliberately NOT `column.getSQLType()`: that includes `text(5)`-style
+// length for `text({length})`, which real SQLite rejects in a STRICT table
+// ("unknown datatype") — STRICT only accepts the bare type names INT,
+// INTEGER, REAL, TEXT, BLOB, ANY, with no decoration. `[F-012]` tried
+// emitting the decorated spelling to match drizzle-kit's migration bytes and
+// was reverted: matching drizzle-kit's *type string* is not worth emitting
+// DDL that D1 refuses to run for any STRICT table with a `text({length})`
+// column. See `[F-012]` in `AUDIT.md`.
+const typeName = (column: Column<any>): string => column.config.declaredType ?? column.config.type;
 
 const referenceClause = (column: Column<any>): string => {
 	const reference = column.config.references;

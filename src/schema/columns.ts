@@ -248,11 +248,15 @@ export class Column<M extends ColumnMeta = ColumnMeta> extends SQLiteColumnEntit
 	}
 
 	getSQLType(): string {
-		const base = this.config.declaredType ?? this.config.type;
-		// Matches drizzle-kit: `text(name, { length })` emits `text(5)`, not
-		// bare `text`. Only the plain `text` base type carries `length` at all
-		// (customType's `declaredType` bypasses this branch). See `[F-012]`.
-		return base === 'text' && this.config.length !== undefined ? `text(${this.config.length})` : base;
+		// `[F-012]` tried appending `text({length})`'s length here
+		// (`text(5)`, matching drizzle-kit's type string) and was reverted: a
+		// STRICT table's DDL is checked against this exact string
+		// (`typeName()` in `src/ddl.ts`), and real SQLite's STRICT mode rejects
+		// any decorated type name — `TEXT(5)` fails with `unknown datatype`
+		// just like `NUMERIC` does. Emitting it would make `createSchema`
+		// produce DDL that D1 refuses to run for any STRICT table with a
+		// `text({length})` column. See `[F-012]` in `AUDIT.md`.
+		return this.config.declaredType ?? this.config.type;
 	}
 
 	/** Drizzle's `Column['length']` — set for `text(name, { length })`. */

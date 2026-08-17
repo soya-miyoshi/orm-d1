@@ -47,9 +47,19 @@ type GeneratedKeys<C> = {
 
 type Writable<C> = Exclude<keyof C, GeneratedKeys<C>>;
 
+/**
+ * The optional half is `?: Out<C[K]> | undefined`, not just `?: Out<C[K]>` —
+ * matching real drizzle-orm's `InferInsertModel`
+ * (`node_modules/drizzle-orm/table.d.ts`: `{ [Key in …]?: GetColumnData<…,
+ * 'query'> | undefined }`). Under `exactOptionalPropertyTypes` (set in this
+ * repo's `tsconfig.json`) the two spellings are NOT equivalent: an object
+ * literal that sets an optional key to an explicit `undefined` value
+ * type-checks against Drizzle's type but not against a bare `?:`. See
+ * `[F-094]` in `AUDIT.md`.
+ */
 export type InferInsertFromColumns<C extends ColumnsMap> = Simplify<
 	& { [K in Exclude<RequiredKeys<C>, GeneratedKeys<C>>]: Out<C[K]> }
-	& { [K in Exclude<Writable<C>, RequiredKeys<C>>]?: Out<C[K]> }
+	& { [K in Exclude<Writable<C>, RequiredKeys<C>>]?: Out<C[K]> | undefined }
 >;
 
 export type InferInsert<T extends Table> = InferInsertFromColumns<Cols<T>>;

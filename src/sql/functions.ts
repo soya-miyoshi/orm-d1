@@ -42,11 +42,28 @@ export const sum = (operand: Column<any> | SQLChunk): DecodedChunk<string | null
 export const avg = (operand: Column<any> | SQLChunk): DecodedChunk<string | null> =>
 	withDecode<string | null>(sql`avg(${operand})`, nullable(String));
 
+// Real drizzle-orm: `.mapWith(is(expression, Column) ? expression : String)`
+// (`drizzle-orm/sql/functions/aggregate.js`) — a Column operand decodes
+// through its own column type, but anything else (a raw `sql<number>`
+// expression, say) decodes through `String`, same as `sum`/`avg` always do.
+// `passthroughDecoder` returning `undefined` for a non-Column operand used
+// to leave the driver value untouched instead, so `min(sql<number>\`…\`)`
+// disagreed with Drizzle's `SQL<string | null>` both in the decoded value
+// and in the type.
+// A Column operand may have no `decode` configured at all — that still has
+// to stay passthrough (identity), not fall back to `String`; only a
+// *non*-Column operand decodes through `String`. So this can't reuse
+// `passthroughDecoder`'s `undefined` as the "use String" signal — that
+// `undefined` is ambiguous between "not a Column" and "a Column with no
+// decode".
+const minMaxDecoder = (operand: Column<any> | SQLChunk) =>
+	isColumn(operand) ? passthroughDecoder(operand) : String;
+
 export const min = <T>(operand: Column<any> | SQLChunk<T>): DecodedChunk<T | null> =>
-	withDecode<T | null>(sql`min(${operand})`, nullable(passthroughDecoder(operand)));
+	withDecode<T | null>(sql`min(${operand})`, nullable(minMaxDecoder(operand)));
 
 export const max = <T>(operand: Column<any> | SQLChunk<T>): DecodedChunk<T | null> =>
-	withDecode<T | null>(sql`max(${operand})`, nullable(passthroughDecoder(operand)));
+	withDecode<T | null>(sql`max(${operand})`, nullable(minMaxDecoder(operand)));
 
 export const coalesce = <T>(...operands: (Column<any> | SQLChunk<T> | T)[]): SQLChunk<T> => {
 	// D1 caps any single SQL function at 32 arguments. `coalesce` is the only

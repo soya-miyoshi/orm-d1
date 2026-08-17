@@ -133,21 +133,20 @@ export function asDrizzleRelations<TRelations extends Record<string, unknown>>(r
 }
 
 /**
- * Guard against two resolved `drizzle-orm` copies — see `[F-095]` in
- * `AUDIT.md`.
+ * Guard against the calling app resolving a different `drizzle-orm` copy
+ * than orm-d1 did — see `[F-095]` in `AUDIT.md`.
  *
  * `asDrizzleRelations` re-prototypes onto the `Many`/`One` classes **this
- * module** resolved. If the adapter reading the result (e.g. Pothos' drizzle
- * plugin) resolves a *different* copy of `drizzle-orm` — a lockfile that
- * hoists two versions, a range bump in any dependency — its own `instanceof
- * Many` is `false` for every relation, and every list field silently
- * resolves as a single object instead of an array. No error, no type
- * failure: the two copies' relation types are mutually unassignable, but
- * adapters already require casts at exactly the seams where that
- * assignability would have been checked.
+ * module** resolved. If the code that calls `assertSameDrizzle` resolves a
+ * *different* copy of `drizzle-orm` — a lockfile that hoists two versions, a
+ * range bump in any dependency — its own `instanceof Many` is `false` for
+ * every relation, and every list field silently resolves as a single object
+ * instead of an array. No error, no type failure: the two copies' relation
+ * types are mutually unassignable, but adapters already require casts at
+ * exactly the seams where that assignability would have been checked.
  *
- * Call this once, in the adopter's own test suite, with the `Many` *the app
- * itself* resolves:
+ * Call this once, in your own app's test suite, with the `Many` *your app*
+ * resolves:
  *
  * ```ts
  * import { Many } from 'drizzle-orm';
@@ -155,9 +154,20 @@ export function asDrizzleRelations<TRelations extends Record<string, unknown>>(r
  * assertSameDrizzle({ Many });
  * ```
  *
- * It throws exactly when the two copies diverge. Pinning `drizzle-orm` to an
- * exact version sidesteps the class of bug; this catches the day someone
- * changes that.
+ * **What this proves, and what it does not.** It proves that the `Many` the
+ * *calling code* resolved is orm-d1's `Many` — nothing more. It does NOT
+ * reach into a third-party adapter (Pothos' drizzle plugin, or any other
+ * package) and check what copy of `drizzle-orm` *that package* resolved
+ * internally: this function has no access to an adapter's private import of
+ * `Many`, only to whatever `Many` its own caller passes in. If your app and
+ * the adapter both happen to resolve the same `node_modules/drizzle-orm`
+ * (the common case with a single top-level dependency and no version range
+ * that lets npm/pnpm hoist a second copy), passing your app's `Many` here
+ * transitively covers the adapter too — but that is a fact about your
+ * dependency tree, not something this call verifies on the adapter's behalf.
+ * Pinning `drizzle-orm` to one exact version across the tree is what
+ * actually prevents the split; this only tells you the day it happens to
+ * your own resolution.
  */
 export function assertSameDrizzle(other: { readonly Many: unknown }): void {
 	if (other.Many !== DrizzleMany) {

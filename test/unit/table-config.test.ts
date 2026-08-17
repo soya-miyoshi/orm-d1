@@ -28,15 +28,20 @@ describe('the v1 field set', () => {
 		const [pk, ...rest] = getTableConfig(postTags).primaryKeys;
 		expect(rest).toEqual([]);
 		expect(names(pk!.columns)).toEqual(['post_id', 'tag']);
-		// `${table}_${cols}_pk`, matching Drizzle's `PrimaryKey.getName()` — not
-		// the bare `${table}_pk` this used to derive. See `[F-052]`.
-		expect(pk!.name).toBe('post_tags_post_id_tag_pk');
+		// Real drizzle-orm's `PrimaryKey.name` is `undefined` for an unnamed PK
+		// — only `.getName()` derives `${table}_${cols}_pk`. See `[F-052]`.
+		expect(pk!.name).toBeUndefined();
+		expect(pk!.isNameExplicit).toBe(false);
+		expect(pk!.getName()).toBe('post_tags_post_id_tag_pk');
 		expect(pk!.table).toBe(postTags);
 	});
 
 	it('reports a table-level unique() constraint', () => {
 		const [uq] = getTableConfig(postTags).uniqueConstraints;
 		expect(uq!.name).toBe('post_tags_tag_unique');
+		// `postTags` names this constraint explicitly (`unique('post_tags_tag_unique')`).
+		expect(uq!.isNameExplicit).toBe(true);
+		expect(uq!.getName()).toBe('post_tags_tag_unique');
 		expect(names(uq!.columns)).toEqual(['tag']);
 	});
 

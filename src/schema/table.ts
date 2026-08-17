@@ -288,16 +288,33 @@ export interface TableCheck {
 	readonly value: SQLChunk;
 }
 
+/**
+ * Matches `drizzle-orm/sqlite-core`'s `PrimaryKey` instance shape: `name` is
+ * `undefined` unless the PK was given an explicit name — only `getName()`
+ * derives `${table}_${cols}_pk` for the unnamed case. Verified against
+ * `drizzle-orm/sqlite-core/primary-keys.ts`. See `[F-052]` in `AUDIT.md`.
+ */
 export interface TablePrimaryKey {
-	readonly name: string;
+	readonly name: string | undefined;
 	readonly table: Table;
 	readonly columns: readonly Column<any>[];
+	readonly isNameExplicit: boolean;
+	readonly getName: () => string;
 }
 
+/**
+ * Matches `drizzle-orm/sqlite-core`'s `UniqueConstraint` instance shape:
+ * `name` is always set (falling back to `${table}_${cols}_unique` when no
+ * name was given), alongside `isNameExplicit` and a `getName()` that just
+ * returns `name`. Verified against
+ * `drizzle-orm/sqlite-core/unique-constraint.ts`. See `[F-052]`.
+ */
 export interface TableUniqueConstraint {
 	readonly name: string;
 	readonly table: Table;
 	readonly columns: readonly Column<any>[];
+	readonly isNameExplicit: boolean;
+	readonly getName: () => string;
 }
 
 /**
@@ -388,26 +405,39 @@ export const getTableConfig = (t: Table): TableConfig => {
 					isNameExplicit: extra.meta.name !== undefined,
 				});
 				break;
-			case 'primaryKey':
-				// Drizzle's `PrimaryKey.getName()` is `${table}_${cols}_pk`, not the
-				// bare `${table}_pk` that `primaryKeyName()` (shared with the actual
-				// DDL emitted for an unnamed composite PK) derives — the same
-				// divergence `[F-015]` records for foreign keys. Reported only
-				// here, on the `getTableConfig` shape, so real migration bytes for
-				// existing unnamed composite-PK tables stay unchanged. See `[F-052]`.
+			case 'primaryKey': {
+				// Real drizzle-orm's `PrimaryKey.name` is `undefined` when the PK
+				// was not given an explicit name — only `.getName()` derives
+				// `${table}_${cols}_pk`. drizzle-kit relies on that: it names an
+				// unnamed PK `${table}_pk` (no columns at all), reached through
+				// `pk.name ?? nameForPk(tableName)`, never through `.getName()`.
+				// So `name` here must stay `undefined`, not the derived string —
+				// getting this wrong here doesn't change real migration bytes
+				// (this is only the `getTableConfig` shape, not orm-d1's own DDL
+				// rendering), but it does change what a drizzle-kit-shaped
+				// consumer computes from it. Verified against
+				// `drizzle-orm/sqlite-core/primary-keys.ts`. See `[F-052]`.
+				const derivedName = `${name}_${extra.meta.columns.map((c) => c.name).join('_')}_pk`;
 				primaryKeys.push({
-					name: extra.meta.name ?? `${name}_${extra.meta.columns.map((c) => c.name).join('_')}_pk`,
+					name: extra.meta.name,
 					table: t,
 					columns: extra.meta.columns,
+					isNameExplicit: extra.meta.name !== undefined,
+					getName: () => extra.meta.name ?? derivedName,
 				});
 				break;
-			case 'unique':
+			}
+			case 'unique': {
+				const uName = uniqueConstraintName(extra.meta, name);
 				uniqueConstraints.push({
-					name: uniqueConstraintName(extra.meta, name),
+					name: uName,
 					table: t,
 					columns: extra.meta.columns,
+					isNameExplicit: extra.meta.name !== undefined,
+					getName: () => uName,
 				});
 				break;
+			}
 			case 'foreignKey':
 				foreignKeys.push(
 					buildForeignKey(
