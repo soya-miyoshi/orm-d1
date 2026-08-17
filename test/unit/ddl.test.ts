@@ -1,7 +1,7 @@
 import { and as dAnd, eq as dEq, gt as dGt, inArray as dInArray, notInArray as dNotInArray, sql as dSql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { asDrizzleTable } from '../../src/drizzle.js';
-import { createIndexes, createSchema, createTable, dropTable, literal } from '../../src/ddl.js';
+import { createIndexes, createSchema, createTable, dropTable, literal, tableOptions } from '../../src/ddl.js';
 import { blob, check, customType, integer, numeric, real, sql, sqliteTable, text, uniqueIndex } from '../../src/index.js';
 import { inArray, notInArray } from '../../src/sql/expressions.js';
 import type { SQLChunk } from '../../src/sql/sql.js';
@@ -425,6 +425,24 @@ describe('ddl generation', () => {
 		expect(statements).toHaveLength(6);
 		expect(statements.slice(0, 3).every((s) => s.startsWith('create table'))).toBe(true);
 		expect(statements.slice(3).every((s) => s.includes('index'))).toBe(true);
+	});
+
+	it('renders a per-column collate from tableOptions, matching the kit\'s snapshot-based DDL', () => {
+		// `TableOptions.collate` (`src/ddl.ts`) had no branch in `createSchema`'s
+		// `optionsFor`, so a column-level `COLLATE` stated through the
+		// `tableOptions()` sidecar rendered here (`create table`) but not through
+		// `createTableFromSnapshot` (`kit/src/core/snapshot.ts`) for the very same
+		// input — the two producers disagreed for identical `TableOptions`.
+		const t = sqliteTable('people', { id: integer('id').primaryKey(), email: text('email') });
+		const [ddl] = createSchema([t], {}, tableOptions([[t, { collate: { email: 'nocase' } }]]));
+		expect(ddl).toContain('"email" text collate nocase');
+
+		// The kit's `TableOptions.collate` doc states `null` retires a carried
+		// collation and any casing/`binary` normalises away to no clause at all —
+		// `createSchema` has to agree on that normalisation too, not just on the
+		// stated-collation case.
+		const [none] = createSchema([t], {}, tableOptions([[t, { collate: { email: 'BINARY' } }]]));
+		expect(none).not.toContain('collate');
 	});
 
 	it('derives an index name when none is given', () => {

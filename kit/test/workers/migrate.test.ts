@@ -1093,3 +1093,48 @@ describe('[Round 4, finding 6] a guarded-column rename with no table rename', ()
 		expect(row[0]!.cents).toBe(5);
 	});
 });
+
+describe('a table rename beside a new append-only column', () => {
+	it('guards the new column too, not just the renamed one', async () => {
+		// `events(id, a, b)`, `appendOnly: ['a', 'b']` -> `audit(id, alpha, b, note)`,
+		// `appendOnly: ['alpha', 'note']`: a table rename, a column rename
+		// (a -> alpha), and a brand-new guarded column (`note`) that does not
+		// exist on the pre-rename live table at all.
+		//
+		// Step 1's guard re-create used to filter `after`'s declared append-only
+		// list down to columns present on the pre-rename snapshot, dropping
+		// `note` entirely — and `carriedAppendOnly` was set to `after`'s FULL
+		// list regardless, so step 4 saw `previousGuard === nextGuard` and never
+		// corrected the narrowed guard. The result: `note` was never guarded, for
+		// good.
+		const before = sqliteTable('events', {
+			id: integer('id').primaryKey(),
+			a: integer('a'),
+			b: integer('b'),
+		});
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['a', 'b'] }]])),
+		);
+		await DB.prepare(`insert into events (id, a, b) values (1, 10, 20)`).run();
+
+		const after = sqliteTable('audit', {
+			id: integer('id').primaryKey(),
+			alpha: integer('alpha'),
+			b: integer('b'),
+			note: text('note'),
+		});
+		await migrateTo(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['a', 'b'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['alpha', 'note'] }]])),
+			{ renamedTables: { events: 'audit' }, renamedColumns: { 'audit.a': 'alpha' } },
+		);
+		const live = await introspect(runner);
+		expect(live.tables.audit?.appendOnly).toEqual(['alpha', 'note']);
+
+		// The new column is guarded.
+		await expect(DB.prepare(`update audit set note = 'x' where id = 1`).run()).rejects.toThrow();
+		// The renamed column is still guarded too.
+		await expect(DB.prepare(`update audit set alpha = 99 where id = 1`).run()).rejects.toThrow();
+	});
+});

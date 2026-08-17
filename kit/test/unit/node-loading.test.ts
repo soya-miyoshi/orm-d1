@@ -13,9 +13,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
 import { describe, expect, it } from 'vitest';
+import { integer, sqliteTable, text } from 'orm-d1';
 import { importModule } from '../../src/node/import.js';
+import { EMPTY_TABLE_OPTIONS_MODULE } from '../../src/node/commands.js';
 import { loadTableOptions, unreadableMigrations } from '../../src/node/store.js';
 import { findLocalDatabase } from '../../src/node/runners.js';
+import { diffSnapshots } from '../../src/core/diff.js';
+import { snapshotFromSchema } from '../../src/core/snapshot.js';
 
 const scratch = (): string => mkdtempSync(join(tmpdir(), 'orm-d1-kit-'));
 
@@ -361,6 +365,38 @@ describe('loadTableOptions', () => {
 
 	it('refuses a module that is not there', async () => {
 		await expect(loadTableOptions(scratch(), './missing.ts')).rejects.toThrow(/not found/);
+	});
+
+	// Companion to `pull-sidecar.test.ts`'s "--force drops a declared
+	// strict/appendOnly the live database no longer backs, and warns", which
+	// asserts only on the emptied file's *content* — it deliberately does not
+	// load the file back or run `generate` against it in the same process,
+	// because Node caches an ES module by URL and every CLI invocation in that
+	// suite runs in one process, so a same-path re-import would silently read
+	// the *stale* module object from an earlier write rather than what pull
+	// just wrote to disk.
+	//
+	// A fresh `mkdtemp` path per test (via `scratch()`) sidesteps that: the
+	// module URL has never been imported before, so there is no stale cache
+	// entry to hit. This proves the content assertion's implicit claim —
+	// that `EMPTY_TABLE_OPTIONS_MODULE` is not just bytes that look right, but
+	// a real ES module `loadTableOptions` can import and that a subsequent
+	// `generate` sees as "nothing declared", not as drift.
+	it('EMPTY_TABLE_OPTIONS_MODULE is actually loadable, not just content that looks right, and yields no diff', async () => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'table-options.ts'), EMPTY_TABLE_OPTIONS_MODULE);
+
+		const map = await loadTableOptions(dir, './table-options.ts');
+		expect(map.byTable).toEqual({});
+
+		// A snapshot built with the loaded (empty) map must diff clean against
+		// one built with no `tableOptions()` sidecar at all — the whole point of
+		// "emptied, not deleted" (`commands.ts`) is that the next `generate`
+		// reconciles nothing because of it.
+		const t = sqliteTable('events', { id: integer('id').primaryKey(), note: text('note') });
+		const withoutSidecar = snapshotFromSchema([t]);
+		const withLoadedSidecar = snapshotFromSchema([t], '', map);
+		expect(diffSnapshots(withoutSidecar, withLoadedSidecar).statements).toEqual([]);
 	});
 });
 

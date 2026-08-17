@@ -178,6 +178,15 @@ export interface DDLOptions {
 	 * its key once instead of once in the table and again in an index.
 	 */
 	readonly withoutRowid?: boolean | undefined;
+	/**
+	 * Per-column `COLLATE`, keyed by column name — the same shape and intent as
+	 * `TableOptions.collate` (`null` states "no collation" explicitly). Threaded
+	 * through so `createSchema`'s `CREATE TABLE` agrees, byte-for-byte, with
+	 * `createTableFromSnapshot` (`kit/src/core/snapshot.ts`) for the same
+	 * `tableOptions()` input — both read `collate` off the same map, they just
+	 * used to reach it through different producers.
+	 */
+	readonly collate?: Readonly<Record<string, string | null>> | undefined;
 }
 
 /**
@@ -508,9 +517,15 @@ const defaultClause = (column: Column<any>): string => {
 };
 
 /** One `column-def`, in SQLite's constraint order. */
-export const columnDDL = (column: Column<any>, inlinePrimaryKey: boolean, tableName: string): string =>
+export const columnDDL = (
+	column: Column<any>,
+	inlinePrimaryKey: boolean,
+	tableName: string,
+	collate?: string | null,
+): string =>
 	withDDLContext(tableName, column.name, () => {
 		let ddl = `${quoteIdentifier(column.name)} ${typeName(column)}`;
+		if (collate) ddl += ` collate ${collate}`;
 
 		if (inlinePrimaryKey && column.config.primaryKey) {
 			ddl += ' primary key';
@@ -605,7 +620,9 @@ export function createTable(t: Table, options: DDLOptions = {}): string {
 	const extras = getTableExtras(t);
 	const compositePk = extras.find((e): e is PrimaryKeyConstraint => e.kind === 'primaryKey');
 
-	const parts: string[] = columns.map((column) => columnDDL(column, compositePk === undefined, name));
+	const parts: string[] = columns.map((column) =>
+		columnDDL(column, compositePk === undefined, name, options.collate?.[column.name])
+	);
 
 	if (compositePk) parts.push(primaryKeyDDL(compositePk.meta, name));
 	for (const extra of extras) {
@@ -644,10 +661,24 @@ export function createSchema(
 	const optionsFor = (t: Table): DDLOptions => {
 		const extra = perTable?.byTable[getTableName(t)];
 		if (!extra) return options;
+		// Normalised the same way the kit's snapshot path treats the identical
+		// sidecar map (`snapshot.ts`'s `collateOptions` loop): lower-cased, and
+		// `null`/`binary` read as "no collation" rather than an emitted clause
+		// — so the two producers agree byte-for-byte for the same `TableOptions`.
+		const collate = extra.collate
+			? Object.fromEntries(
+				Object.entries(extra.collate)
+					.map(([column, value]): [string, string | null] => [
+						column,
+						value === null || value.toLowerCase() === 'binary' ? null : value.toLowerCase(),
+					]),
+			)
+			: options.collate;
 		return {
 			...options,
 			strict: extra.strict ?? options.strict,
 			withoutRowid: extra.withoutRowid ?? options.withoutRowid,
+			collate,
 		};
 	};
 

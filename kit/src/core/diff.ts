@@ -869,9 +869,20 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 						// to `after`'s names is strictly less wrong than handing it
 						// `[]` and blocking writes the schema permits.
 						const finalGuarded = appendOnlyColumns(after.tables[renamed]!.appendOnly);
+						// Not filtered down to columns that already exist on the pre-rename
+						// live table: SQLite resolves a trigger's `UPDATE OF <cols>` by column
+						// NAME at UPDATE time, not at `CREATE TRIGGER` time, so naming a
+						// column that does not exist yet (e.g. one this same diff is about
+						// to `add column`) is accepted silently and simply starts firing once
+						// that column exists -- it is not an error, and it is not inert.
+						// Filtering such names out here used to leave the guard permanently
+						// covering only the columns present *before* this diff ran: below,
+						// `carriedAppendOnly` is set to `after`'s full list regardless of
+						// what was actually emitted here, so step 4 saw
+						// `previousGuard === nextGuard` and never re-stated the guard with
+						// the columns this filter had dropped.
 						const liveGuarded = finalGuarded
-							?.map((column) => preRenameColumnName(renamedColumns, renamed, column))
-							.filter((column) => t.columns[column] !== undefined);
+							?.map((column) => preRenameColumnName(renamedColumns, renamed, column));
 						statements.push({
 							sql: appendOnlyTrigger(
 								renamed,
