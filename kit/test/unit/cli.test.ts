@@ -626,6 +626,64 @@ describe('rendering a schema module from a snapshot', () => {
 			expect(rendered).toContain(`collate: { "email": "nocase" }`);
 		});
 
+		// The sidecar imports `tableOptions` from `orm-d1/ddl` itself, so a table
+		// whose identifier is that exact name cannot be imported unaliased:
+		// `SyntaxError: Identifier 'tableOptions' has already been declared`, from
+		// a command whose whole job is to write a file that loads. The schema
+		// module's own `RESERVED` set knows only the schema module's imports, and
+		// has to keep only knowing them — so the disambiguation is an import alias.
+		it('aliases a table whose binding collides with its own `tableOptions` import', async () => {
+			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
+			const snapshot = {
+				...snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }),
+				tables: {
+					table_options: {
+						name: 'table_options',
+						columns: { id: column('id', 'integer', { primaryKey: true }) },
+						indexes: {},
+						foreignKeys: {},
+						compositePrimaryKeys: {},
+						uniqueConstraints: {},
+						checkConstraints: {},
+						strict: true,
+					},
+				},
+			};
+
+			const rendered = renderTableOptionsModule(snapshot as never, './schema.js')!;
+			expect(rendered).toContain(`import { tableOptions } from 'orm-d1/ddl';`);
+			expect(rendered).toContain('import { tableOptions as tableOptions_ } from "./schema.js";');
+			expect(rendered).toContain('[tableOptions_, { strict: true }],');
+			// The schema module still exports it under its own name, so the import
+			// must name that and only alias the local binding.
+			expect(rendered).not.toMatch(/import \{ tableOptions_ \}/);
+		});
+
+		// `pull --force` overwriting a hand-maintained sidecar dropped every option
+		// introspection cannot reproduce. `collate: null` is the sharpest case: it
+		// exists precisely to say "no collation", which a live database states by
+		// having nothing to introspect.
+		it('carries config-declared options the live database cannot express', async () => {
+			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
+			const snapshot = {
+				...snapshotOf({
+					id: column('id', 'integer', { primaryKey: true }),
+					email: column('email', 'text', { collate: 'nocase' }),
+					legacy_id: column('legacy_id', 'text'),
+				}),
+			};
+
+			const rendered = renderTableOptionsModule(snapshot as never, './schema.js', {
+				things: { collate: { legacy_id: null, email: 'rtrim' }, appendOnly: ['id'] },
+			})!;
+			// Declared and unintrospectable: kept.
+			expect(rendered).toContain('"legacy_id": null');
+			expect(rendered).toContain('appendOnly: ["id"]');
+			// Declared and contradicted by the live column: the live value wins.
+			expect(rendered).toContain('"email": "nocase"');
+			expect(rendered).not.toContain('"rtrim"');
+		});
+
 		it('returns undefined when nothing needs the sidecar', async () => {
 			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
 			const rendered = renderTableOptionsModule(

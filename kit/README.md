@@ -170,7 +170,7 @@ immediately:
 ```ts
 // table-options.ts, written by `pull`
 import { tableOptions } from 'orm-d1/ddl';
-import { reads, users } from './schema';
+import { reads, users } from './schema.js';
 
 export default tableOptions([
   [users, { collate: { email: 'nocase' } }],
@@ -178,11 +178,28 @@ export default tableOptions([
 ]);
 ```
 
-No sidecar is written when nothing in the introspected snapshot needs one. `--force` (the
-same flag that lets `pull` overwrite an existing schema file) also governs overwriting an
-existing table-options file. Point `orm-d1.config.ts`'s `tableOptions` at the written file
-to put it to use — from then on, `generate`/`push`/`check` read it as the schema's stated
-intent instead of guessing from what was last introspected.
+The import says `./schema.js` for a file that is `schema.ts` on disk. That is deliberate:
+it is the only spelling TypeScript accepts under `moduleResolution: 'node16'`/`'nodenext'`
+(a relative import of a `.ts` file is `TS2835`), and the kit's own loader maps it back to
+the `.ts` source, so the sidecar both typechecks and loads.
+
+No sidecar is written when nothing in the introspected snapshot needs one — and in that
+case an existing `table-options.ts` is neither read nor touched. `pull` also prints, for
+every option it found, what the rendered schema module cannot express, and reminds you to
+point `orm-d1.config.ts`'s `tableOptions` at the file it wrote: writing it is only half the
+job. From then on, `generate`/`push`/`check` read it as the schema's stated intent instead
+of guessing from what was last introspected.
+
+**Overwriting a hand-maintained sidecar is lossy.** `--force` (the same flag that lets
+`pull` overwrite an existing schema file) also governs overwriting an existing
+table-options file, and the renderer cannot round-trip everything a person writes there:
+comments, formatting, and any option for a table the live database no longer has are gone.
+What it does preserve, when `config.tableOptions` points at the file being overwritten, is
+every option it can still attribute to a table that exists live — including the ones
+introspection can never produce, `collate: { column: null }` above all. The live database
+wins per key (it is the authority on what is actually there), the config's declaration
+survives everywhere else, and a declared table the live database no longer has is named in
+the output rather than dropped in silence. Keep a copy anyway if the file is hand-written.
 
 ## What it does differently
 

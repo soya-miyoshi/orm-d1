@@ -3,9 +3,11 @@
  * so they are callable from a script as well as from the CLI.
  */
 import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { configureCasing, getTableName, isTable } from 'orm-d1';
 import { validateTableOptions } from 'orm-d1/ddl';
+import type { TableOptions } from 'orm-d1/ddl';
 import {
 	appliedMigrations,
 	applyMigrations,
@@ -394,11 +396,48 @@ export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	await writeJournal(ctx.config.out, appendEntry(journal, tag, ctx.now()));
 
 	const schema = renderSchemaModule(snapshot);
-	const tableOptions = renderTableOptionsModule(snapshot, flags.schemaModuleSpecifier ?? './schema');
+
+	// [F-100 follow-up] Options the *config* already declares are read back and
+	// merged in, because the mechanical renderer below can only state what it
+	// can see in the live database. A hand-maintained sidecar says things
+	// introspection cannot produce — `collate: { legacyId: null }` ("stop
+	// carrying that collation forward"), or an option for a table the live
+	// database no longer has — and `pull --force` used to overwrite all of it
+	// with the live-derived set alone. Live-derived values win per key (the live
+	// database is the authority on what is actually there); everything else the
+	// config declared survives.
+	// Existence-checked rather than let to throw: `config.tableOptions` naming
+	// the file this very `pull` is about to write for the first time is the
+	// normal bootstrapping order, and refusing to introspect over it would make
+	// the config entry impossible to add before the first pull.
+	const declared = ctx.config.tableOptions && existsSync(resolve(ctx.cwd, ctx.config.tableOptions))
+		? (await loadTableOptions(ctx.cwd, ctx.config.tableOptions)).byTable
+		: undefined;
+
+	const tableOptions = renderTableOptionsModule(snapshot, flags.schemaModuleSpecifier ?? './schema', declared);
 	ctx.log(`Introspected ${Object.keys(snapshot.tables).length} tables.`);
-	if (!tableOptions) {
-		for (const warning of unexpressibleTableOptionWarnings(snapshot)) ctx.log(`  ! ${warning}`);
+
+	// Printed whenever there is anything to say, not only when no sidecar was
+	// rendered. The two predicates test the same four conditions with the same
+	// operators, so `warnings.length > 0` iff a sidecar was rendered — guarding
+	// the print on "no sidecar" made it dead code, and the operator learned
+	// nothing about a live option their schema module cannot state. The sidecar
+	// is how it gets stated; these lines are what tell them to wire it up.
+	for (const warning of unexpressibleTableOptionWarnings(snapshot)) ctx.log(`  ! ${warning}`);
+
+	// A declared table the live database does not have cannot be re-stated: the
+	// rendered sidecar imports its bindings from the rendered schema module,
+	// which has no export for a table that is not there. Named rather than
+	// dropped silently.
+	for (const name of Object.keys(declared ?? {})) {
+		if (snapshot.tables[name]) continue;
+		ctx.log(
+			`  ! config.tableOptions declares "${name}", which the live database does not have — it cannot be `
+				+ 'carried into the rendered sidecar (the schema module has no binding for it). Keep a copy before '
+				+ 'overwriting, or restore that entry by hand.',
+		);
 	}
+
 	return { snapshot, schema, tableOptions };
 }
 
@@ -407,12 +446,13 @@ export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promis
  * `snapshotFromIntrospection`, but the rendered schema module (plain
  * `sqliteTable` calls) has no spelling for any of them. `pull` now renders a
  * `tableOptions([...])` sidecar ({@link renderTableOptionsModule}) that states
- * them, so this warning only fires when there is nothing for that sidecar to
- * say — which today means never, since the sidecar covers exactly the four
- * things this function checks. Kept as a defence in depth: a caller of `pull`
- * that discards `result.tableOptions` (or a future option this function
- * checks but the sidecar renderer does not yet) would otherwise fail
- * silently instead of loudly.
+ * them — and these warnings are printed *alongside* it, not instead of it.
+ * They used to be guarded on "no sidecar was rendered", which is dead code:
+ * this predicate and the renderer's test the same four conditions with the
+ * same operators, so there are warnings exactly when there is a sidecar. The
+ * operator still needs to be told, because writing the file is not the same as
+ * putting it to use — `config.tableOptions` has to point at it, and a caller
+ * of `pull` that discards `result.tableOptions` gets no file at all.
  *
  * F-110: the message now names `config.tableOptions` — the kit's actual
  * mechanism for stating this — rather than only describing what is lost.
@@ -693,43 +733,89 @@ export function renderSchemaModule(snapshot: Snapshot): string {
  * Returns `undefined` when no table in the snapshot needs any of the four —
  * so `pull` does not write an empty, pointless module.
  */
-export function renderTableOptionsModule(snapshot: Snapshot, schemaModuleSpecifier: string): string | undefined {
+export function renderTableOptionsModule(
+	snapshot: Snapshot,
+	schemaModuleSpecifier: string,
+	/**
+	 * What `config.tableOptions` already declares, when there is such a file.
+	 * Merged in so a `pull --force` does not silently discard the half of a
+	 * hand-maintained sidecar introspection cannot reproduce — a `collate: null`
+	 * retirement, most of all. The live database wins per key: it is the
+	 * authority on what is actually there, and this file's whole job is to state
+	 * that.
+	 */
+	declared?: Readonly<Record<string, TableOptions>>,
+): string | undefined {
 	const { ordered, tableIds } = orderedTableIdentifiers(snapshot);
-	const entries: string[] = [];
+	const entries: { table: string; text: string }[] = [];
+
+	const renderAppendOnly = (value: boolean | readonly string[]): string =>
+		value === true || value === false ? String(value) : JSON.stringify([...value]);
 
 	for (const table of ordered) {
+		const carried = declared?.[table.name];
 		const optionParts: string[] = [];
-		if (table.strict) optionParts.push('strict: true');
-		if (table.withoutRowid) optionParts.push('withoutRowid: true');
-		if (table.appendOnly) {
-			optionParts.push(
-				`appendOnly: ${table.appendOnly === true ? 'true' : JSON.stringify([...table.appendOnly])}`,
-			);
-		}
+		if (table.strict || carried?.strict) optionParts.push('strict: true');
+		if (table.withoutRowid || carried?.withoutRowid) optionParts.push('withoutRowid: true');
+		const appendOnly = table.appendOnly || carried?.appendOnly;
+		if (appendOnly) optionParts.push(`appendOnly: ${renderAppendOnly(appendOnly)}`);
 
-		const collateEntries = Object.values(table.columns)
-			.filter((c) => c.collate && c.collate.toLowerCase() !== 'binary')
-			.map((c) => `${JSON.stringify(c.name)}: ${JSON.stringify(c.collate)}`);
-		if (collateEntries.length > 0) {
-			optionParts.push(`collate: { ${collateEntries.join(', ')} }`);
+		// Declared first, live second, so a column the live database states a
+		// collation for overwrites whatever the config said about it — and a
+		// column it says nothing about (including a `null` retirement, which is
+		// unintrospectable by construction) keeps the declared entry.
+		const collate = new Map<string, string | null>(Object.entries(carried?.collate ?? {}));
+		for (const c of Object.values(table.columns)) {
+			if (c.collate && c.collate.toLowerCase() !== 'binary') collate.set(c.name, c.collate);
+		}
+		if (collate.size > 0) {
+			const rendered = [...collate].map(([name, value]) => `${JSON.stringify(name)}: ${JSON.stringify(value)}`);
+			optionParts.push(`collate: { ${rendered.join(', ')} }`);
 		}
 
 		if (optionParts.length === 0) continue;
-		const id = tableIds.get(table.name) ?? toIdentifier(table.name);
-		entries.push(`\t[${id}, { ${optionParts.join(', ')} }],`);
+		entries.push({ table: table.name, text: `{ ${optionParts.join(', ')} }` });
 	}
 
 	if (entries.length === 0) return undefined;
 
-	const usedTables = ordered.filter((t) => entries.some((e) => e.startsWith(`\t[${tableIds.get(t.name)},`)));
-	const importedIds = usedTables.map((t) => tableIds.get(t.name) ?? toIdentifier(t.name)).sort();
+	// The binding each table is imported under. A table named `table_options`
+	// maps to `tableOptions` — which is this module's *own* import from
+	// `orm-d1/ddl`, so importing it unaliased is a `SyntaxError: Identifier
+	// 'tableOptions' has already been declared` and the sidecar does not parse
+	// at all. `orderedTableIdentifiers`' `RESERVED` set only knows the *schema*
+	// module's imports, and it has to keep only knowing them (the schema module
+	// must keep exporting the name it already exports) — so the disambiguation
+	// happens here, as an `import { x as x_ }` alias, leaving the schema module
+	// untouched.
+	const taken = new Set(['tableOptions', ...entries.map((e) => tableIds.get(e.table) ?? toIdentifier(e.table))]);
+	const bindings = new Map<string, string>();
+	for (const entry of entries) {
+		const exported = tableIds.get(entry.table) ?? toIdentifier(entry.table);
+		if (exported !== 'tableOptions') {
+			bindings.set(entry.table, exported);
+			continue;
+		}
+		let alias = `${exported}_`;
+		for (let n = 2; taken.has(alias); n++) alias = `${exported}_${n}`;
+		taken.add(alias);
+		bindings.set(entry.table, alias);
+	}
+
+	const imported = entries
+		.map((e) => {
+			const exported = tableIds.get(e.table) ?? toIdentifier(e.table);
+			const binding = bindings.get(e.table)!;
+			return exported === binding ? exported : `${exported} as ${binding}`;
+		})
+		.sort();
 
 	return [
 		`import { tableOptions } from 'orm-d1/ddl';`,
-		`import { ${importedIds.join(', ')} } from ${JSON.stringify(schemaModuleSpecifier)};`,
+		`import { ${imported.join(', ')} } from ${JSON.stringify(schemaModuleSpecifier)};`,
 		'',
 		'export default tableOptions([',
-		...entries,
+		...entries.map((e) => `\t[${bindings.get(e.table)!}, ${e.text}],`),
 		']);',
 		'',
 	].join('\n');

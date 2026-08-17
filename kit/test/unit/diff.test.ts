@@ -2276,6 +2276,31 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 		// state before this fix: the re-create was pushed by a much later,
 		// unrelated per-table pass) would still leave the table unprotected
 		// across a split.
+		// [F-117 follow-up] Moving the `create trigger` into the renamed-table
+		// step took the destination-name collision check out of the *only* step
+		// that ever made it for this shape: setting `carriedAppendOnly` makes
+		// step 4 see `previousGuard === nextGuard`, so its own
+		// `tableGuardCollides` call is never reached. The refusal has to happen
+		// here instead, or the migration ships a `create trigger "audit_no_update"`
+		// that fails on apply with "already exists". Not renaming refuses (the
+		// in-place case above), and neither does becoming append-only across a
+		// rename — this is the "was, and stays, append-only across a rename" case.
+		it('refuses when the destination name collides with a foreign trigger, guard carried across the rename', () => {
+			// A *pure* rename — identical columns, so nothing forces a rebuild and
+			// the renamed-table step is the only place the guard is created.
+			const pureRename = sqliteTable('audit', { id: text('id').primaryKey(), at: integer('at').notNull() });
+			const diff = diffSnapshots(opts(events, true), opts(pureRename, true), {
+				renamedTables: { events: 'audit' },
+				// A trigger orm-d1 did not author, on an unrelated live table, that
+				// happens to be called what the renamed table's guard will be.
+				foreignTriggers: { other: ['audit_no_update'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"audit_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "audit_no_update"/.test(s.sql))).toBe(false);
+		});
+
 		it('emits the rename, the old-name drop and the new-name re-create with nothing between them', () => {
 			const diff = diffSnapshots(opts(events, true), opts(renamed, true), {
 				renamedTables: { events: 'audit' },

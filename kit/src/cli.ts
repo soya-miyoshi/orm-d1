@@ -57,7 +57,11 @@ Options
                           table-options.ts next to --schema-out), when the live
                           database has STRICT, WITHOUT ROWID, appendOnly or a
                           non-BINARY column collation to state
-  --force               let \`pull\` overwrite an existing schema or tableOptions file
+  --force               let \`pull\` overwrite an existing schema or tableOptions
+                          file. Lossy for a hand-maintained tableOptions file:
+                          comments and options for tables the live database no
+                          longer has do not survive. Options config.tableOptions
+                          declares for tables that do exist live are carried over.
 
 Renames — repeatable, and the alternative to dropping the data
   --rename-table old_table=new_table
@@ -206,14 +210,27 @@ export const environmentFlag = (flags: Record<string, FlagValue>): string | unde
 };
 
 /**
- * A relative `import`-style specifier from `fromFile` to `toFile`, extension
- * stripped and with a leading `./` (Node's ESM resolver rejects a bare
- * `schema` as a relative specifier without it).
+ * A relative `import`-style specifier from `fromFile` to `toFile`, with a
+ * leading `./` (Node's ESM resolver rejects a bare `schema` as a relative
+ * specifier without it).
+ *
+ * A TypeScript extension is rewritten to the JavaScript one it compiles to:
+ * `./schema.ts` is emitted as `./schema.js`. It looks wrong and is not — this
+ * is exactly what `moduleResolution: 'node16'`/`'nodenext'` requires (a
+ * relative import of a `.ts` file is `TS2835`: "did you mean './schema.js'?"),
+ * so the sidecar `pull` writes has to say `.js` to typecheck in the project
+ * shape a Workers/D1 codebase most often has. An extension-*less* specifier
+ * (what this used to emit) fails the same rule, and the kit's own resolve hook
+ * maps `./schema.js` back to `schema.ts` on the way in
+ * (`node/import.ts`'s `JS_TO_TS_SUFFIXES`), so both loaders agree.
  */
+const TS_TO_JS_EXTENSION: Record<string, string> = { '.ts': '.js', '.tsx': '.js', '.mts': '.mjs', '.cts': '.cjs' };
+
 const relativeSpecifier = (fromFile: string, toFile: string): string => {
 	const rel = relative(dirname(fromFile), toFile).replaceAll('\\', '/');
-	const withoutExt = rel.slice(0, rel.length - extname(rel).length);
-	return withoutExt.startsWith('.') ? withoutExt : `./${withoutExt}`;
+	const ext = extname(rel);
+	const spelled = TS_TO_JS_EXTENSION[ext] ? rel.slice(0, rel.length - ext.length) + TS_TO_JS_EXTENSION[ext] : rel;
+	return spelled.startsWith('.') ? spelled : `./${spelled}`;
 };
 
 export async function run(argv: readonly string[]): Promise<number> {
@@ -275,26 +292,51 @@ export async function run(argv: readonly string[]): Promise<number> {
 				);
 				return 1;
 			}
-			if (existsSync(tableOptionsPath) && flags['force'] !== true) {
+			// [F-100] The specifier the *sidecar* imports the schema module through
+			// — relative to where the sidecar itself is written, and spelled with
+			// the JavaScript extension `moduleResolution: nodenext` demands (see
+			// `relativeSpecifier`); the kit's own resolve hook (`node/import.ts`)
+			// maps it back to the real `.ts`.
+			const schemaModuleSpecifier = relativeSpecifier(tableOptionsPath, path);
+
+			const result = await pull(ctx, { ...target, schemaModuleSpecifier });
+
+			// The table-options existence check happens *here*, after
+			// introspection, rather than up front with the schema one: whether
+			// there is a sidecar to write at all is not known until the live
+			// database has been read, and checking unconditionally refused a
+			// perfectly ordinary `pull` (skipping `schema.ts` with it) over a file
+			// nothing was going to touch.
+			if (result.tableOptions && existsSync(tableOptionsPath) && flags['force'] !== true) {
 				ctx.log(
 					`${tableOptionsOut} already exists. Re-run with --force to overwrite it, or pass `
-						+ '--table-options-out <file> to write somewhere else.',
+						+ '--table-options-out <file> to write somewhere else. Options this pull could not derive '
+						+ 'from the live database are carried over from config.tableOptions when it points at that '
+						+ 'file; anything else in it (comments, a table the live database no longer has) is lost.',
 				);
 				return 1;
 			}
 
-			// [F-100] The specifier the *sidecar* imports the schema module through
-			// — relative to where the sidecar itself is written, extension-less so
-			// the kit's own resolve hook (`node/import.ts`) picks it up whether the
-			// schema is `.ts`, `.mts` or `.js`.
-			const schemaModuleSpecifier = relativeSpecifier(tableOptionsPath, path);
-
-			const result = await pull(ctx, { ...target, schemaModuleSpecifier });
 			await writeFile(path, result.schema);
 			ctx.log(`Wrote ${out}.`);
 			if (result.tableOptions) {
 				await writeFile(tableOptionsPath, result.tableOptions);
 				ctx.log(`Wrote ${tableOptionsOut}.`);
+				// Wire it up, so the rest of *this* process (and any command run
+				// through `run()` after it) reads the file that was just written
+				// instead of guessing from the last introspection — and say so,
+				// since only an edit to `orm-d1.config.ts` makes it stick for the
+				// next process.
+				const configured = ctx.config.tableOptions
+					&& resolve(cwd, ctx.config.tableOptions) === tableOptionsPath;
+				ctx.config.tableOptions = `./${relative(cwd, tableOptionsPath).replaceAll('\\', '/')}`;
+				if (!configured) {
+					ctx.log(
+						`  ! Add \`tableOptions: '${ctx.config.tableOptions}'\` to orm-d1.config.ts — until it is `
+							+ 'named there, generate/check keep guessing at STRICT, WITHOUT ROWID, appendOnly and '
+							+ 'column collation instead of reading what this pull just wrote.',
+					);
+				}
 			}
 			return 0;
 		}

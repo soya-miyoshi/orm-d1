@@ -552,10 +552,13 @@ export async function checkForeignTriggerConflicts(
  *   database — but a caller relying on "this migration always applies" does
  *   not.
  *
- * This is the intended, permanent contract going forward: `applyMigrations`
- * is the guarded entry point, and the throw is the guard doing its job, not
- * a bug to route around. A caller that must not throw here should catch the
- * specific refusal rather than expect it to go away.
+ * Whether that is the *right* contract for a published function is an open
+ * question, not one this comment settles — `[F-047]` in this repo's `AUDIT.md`
+ * is `needs-human` for exactly it: may `applyMigrations` refuse input it used
+ * to apply, or does the guard belong behind an opt-in parameter (defaulting to
+ * the old behaviour) or in the CLI commands instead? Until that is answered the
+ * behaviour described above is what the code does, and a caller that must not
+ * throw here has to catch the specific refusal.
  *
  * **Inconsistency with the singular {@link applyMigration}**: that function
  * is also exported from `orm-d1-kit/core` and does **not** run this guard —

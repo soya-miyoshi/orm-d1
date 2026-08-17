@@ -774,10 +774,46 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 					}),
 				});
 				if (staysAppendOnly) {
-					statements.push({
-						sql: appendOnlyTrigger(renamed, appendOnlyColumns(after.tables[renamed]!.appendOnly)),
-						destructive: false,
-					});
+					// The same foreign-trigger collision check step 2 and step 4
+					// make, asked here too. Moving the `create trigger` into this
+					// step is what made it necessary: step 4 now sees
+					// `previousGuard === nextGuard` (that is what `carriedAppendOnly`
+					// below arranges) and never reaches its own check, so a rename
+					// whose *destination* name collides with a live trigger orm-d1
+					// did not author used to emit a `create trigger` that fails on
+					// apply with "already exists" — for "was and stays append-only
+					// across a rename", the one case the reordering took out of
+					// step 4's reach.
+					//
+					// `[]` for the dropped-tables argument, not `dropped` (which is
+					// not computed until after this loop): the exemption it enables
+					// only counts a `drop table` already *emitted*, and at this point
+					// in the statement list none have been — so the two arguments
+					// give the same answer here, exactly as at step 2's call site.
+					const guardName = appendOnlyTriggerName(renamed);
+					if (tableGuardCollides(guardName, options.foreignTriggers, [], statements)) {
+						errors.push(
+							`"${name}" is being renamed to "${renamed}" and stays append-only, but a trigger named `
+								+ `"${guardName}" already exists and orm-d1 did not create it. Creating the guard would `
+								+ 'fail on apply because the name is taken. Drop or rename that trigger, or bring it '
+								+ 'into the schema so orm-d1 can carry it across rebuilds.',
+						);
+					} else {
+						// Kept even when the same table is *also* rebuilt later in
+						// this diff, which re-creates the identical guard on the new
+						// table: the two `create trigger` statements look like waste
+						// under D1's per-batch ceiling, but the first one is what keeps
+						// the table guarded across a batch boundary landing between the
+						// rename and the rebuild — the exact window `[F-117]` closed,
+						// and the invariant `kit/test/unit/diff.test.ts`'s "emits the
+						// rename, the old-name drop and the new-name re-create with
+						// nothing between them" pins. De-duplicating to the rebuild's
+						// copy alone would re-open it, so the duplicate stays.
+						statements.push({
+							sql: appendOnlyTrigger(renamed, appendOnlyColumns(after.tables[renamed]!.appendOnly)),
+							destructive: false,
+						});
+					}
 				}
 			}
 			// `appendOnly` on the effective (post-rename) entry is set to match
@@ -1019,6 +1055,7 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			);
 			statements.push(...recreated.statements);
 			errors.push(...recreated.errors);
+
 
 			// The rebuild's own statements only ever *add back* the append-only
 			// guard (when `next.appendOnly`), because `recreateTable` has no
