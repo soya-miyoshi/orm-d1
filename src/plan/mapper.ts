@@ -171,7 +171,10 @@ const readRow = (nodes: readonly Node[], read: (index: number) => unknown): Reco
 		// none — every leaf sits inside a nested group instead, as a joined
 		// subquery's own row produces — falls back to every Column leaf found
 		// anywhere below it, or it would be permanently non-collapsible.
-		const collapseIndexes = group.columnIndexes.length > 0 ? group.columnIndexes : group.descendantColumnIndexes;
+		// `descendantColumnIndexes` *is* `columnIndexes` (same array reference)
+		// whenever the group has direct leaves, so it is the only value needed
+		// here — no per-row branch.
+		const collapseIndexes = group.descendantColumnIndexes;
 		if (
 			group.nullable
 			&& collapseIndexes.length > 0

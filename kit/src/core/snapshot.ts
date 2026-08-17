@@ -318,7 +318,7 @@ export function snapshotFromSchema(
 								: decorateIndexColumn(renderInline(c as never))
 						),
 						isUnique: extra.meta.unique,
-						where: extra.meta.where ? renderInline(extra.meta.where) : undefined,
+						where: extra.meta.where ? renderInline(extra.meta.where, true) : undefined,
 					};
 					break;
 				}
@@ -383,7 +383,12 @@ export function snapshotFromSchema(
 					// `checkDDL` call would normally attach that context, so it is
 					// wrapped here through the same `withDDLContext` helper
 					// `checkDDL` uses, rather than calling `renderInline` bare.
-					const value = withDDLContext(name, extra.meta.name, () => renderInline(extra.meta.value));
+					// `isPredicate: true` matters here and not only in `checkDDL`: this is the
+					// *only* place in the whole kit where a check's `SQLChunk` becomes text
+					// (`generate`/`check`/`push` all render tables from the snapshot via
+					// `createTableFromSnapshot`, which reads this string), so a refusal that
+					// fires only in `checkDDL` never sees a migration.
+					const value = withDDLContext(name, extra.meta.name, () => renderInline(extra.meta.value, true));
 					if (Object.hasOwn(checkConstraints, extra.meta.name)) {
 						throw new Error(
 							`"${name}" declares two check constraints both named "${extra.meta.name}" `

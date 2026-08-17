@@ -1092,6 +1092,14 @@ lacks (`docs/04`); no test weakened to go green. `docs/` may now be edited, sinc
 items are documentation fixes.
 
 
+### [F-119] The predicate-scoped empty-array refusal must be asked for at the *snapshot* call site, not only in `checkDDL` — status: **done** (batch C round 7) — severity: **high** — area: kit/snapshot
+- **Where**: `kit/src/core/snapshot.ts:391` (check value), `:321` (partial-index `where`)
+- **Defect**: `snapshotFromSchema` is the **only** place in the whole kit where a check's `SQLChunk` becomes text — `generate` / `check` / `push` all render tables from the snapshot via `createTableFromSnapshot` — so a refusal that fires only in `checkDDL` never sees a migration. Drizzle collapses `inArray(c, [])` to `sql\`false\`` and `notInArray(c, [])` to `sql\`true\`` *before* orm-d1 sees any array chunk, so those spellings are caught only by the bare-boolean check, and only when this call site asks for it.
+- **Failure scenario**: `check('users_role_ck', drizzleNotInArray(users.role, []))` produced `constraint "users_role_ck" check (true)`; D1 accepted the table and `insert (1,'not-a-real-role')` succeeded. The snapshot, the emitted migration and the live database all agreed on `check (true)`, so `orm-d1-kit check` stayed green forever — bug class #1 verbatim. `inArray` was worse in the other direction: `check (false)` rejects **every** insert. `docs/04`, added in the same batch, asserted the `and`/`eq`/`inArray` form was refused.
+- **Fix**: pass `isPredicate: true` at both call sites. Two tokens.
+- **Prove it**: `kit/test/unit/snapshot-check-errors.test.ts` gained five cases (Drizzle `notInArray`/`inArray` over `[]`, one nested in Drizzle `and()`, one in a partial-index predicate, and a legitimate check + partial index that must still snapshot). Reverting the two tokens turns three of them red; the partial-index one passes either way, because `createIndex()`'s name derivation happens to render first — incidental, not designed, and `[F-028]` already flags that derivation as fragile.
+
+
 ## Audit areas
 
 Unchecked areas, roughly in descending order of what a bug there would cost. One
