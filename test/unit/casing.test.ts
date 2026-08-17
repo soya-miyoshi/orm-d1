@@ -5,9 +5,10 @@
  * SQL that is wrong rather than SQL that fails to build — so both bad orders
  * throw at the point of the mistake.
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { toSnakeCase as drizzleToSnakeCase } from 'drizzle-orm/casing';
-import { applyCasing, configureCasing, getApplyCasingCallCount, isColumn, resetCasing } from '../../src/schema/columns.js';
+import * as columns from '../../src/schema/columns.js';
+import { applyCasing, configureCasing, isColumn, resetCasing } from '../../src/schema/columns.js';
 import { integer, query, sqliteTable, text } from '../../src/index.js';
 
 afterEach(() => resetCasing());
@@ -109,11 +110,16 @@ describe('configureCasing', () => {
 		});
 		const columnCount = Object.values(t).filter(isColumn).length;
 
-		const before = getApplyCasingCallCount();
-		query.select().from(t).compile();
-		const calls = getApplyCasingCallCount() - before;
+		// Reading `.name` once per column first forces every memo to be filled
+		// before the spy starts counting, so the query compilation below is what
+		// gets measured — not the initial resolution this same table needs
+		// regardless of memoization.
+		for (const column of Object.values(t)) if (isColumn(column)) void column.name;
 
-		expect(calls).toBeLessThanOrEqual(columnCount);
-		expect(calls).toBeGreaterThan(0);
+		const spy = vi.spyOn(columns, 'applyCasing');
+		query.select().from(t).compile();
+
+		expect(spy).not.toHaveBeenCalled();
+		spy.mockRestore();
 	});
 });

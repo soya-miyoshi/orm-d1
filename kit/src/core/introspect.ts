@@ -167,7 +167,36 @@ export const hasAutoincrement = (sql: string, columnName: string): boolean =>
  */
 export const parseColumnCollation = (sql: string, columnName: string): string | undefined => {
 	const scan = blankLiterals(sql);
-	const match = new RegExp(`${columnDefinitionStart(columnName)}[^,]*?\\bcollate\\s+(\\w+)`, 'i').exec(scan);
+	const anchor = new RegExp(columnDefinitionStart(columnName), 'i').exec(scan);
+	if (!anchor) return undefined;
+
+	// The column definition's own span: from right after its name to the next
+	// top-level comma (the next column, or a table-level constraint) or the
+	// closing paren of the column list — crossing nested parens rather than
+	// stopping at their first `)`, the same balanced scan `parseGenerated` uses
+	// for its expression. `[^,]*?` here used to stop at the *first* `collate`
+	// found anywhere later in the text, which is also legal inside a
+	// `unique (…)`/`primary key (…)`/`check (…)` clause's indexed-column
+	// grammar (`unique ("email" collate nocase)` is the standard idiom for
+	// case-insensitive uniqueness) — misattributing that constraint's
+	// collation to the column itself. It also stopped scanning at the first
+	// comma even *inside* a call, e.g. `check (substr("email", 1, 1) <> '@')
+	// collate nocase`, missing a collation that genuinely belongs to the
+	// column because a comma inside `substr(...)` looked like the column
+	// definition's end.
+	let depth = 0;
+	let i = anchor.index + anchor[0].length;
+	while (i < scan.length) {
+		const ch = scan[i];
+		if (ch === '(') depth++;
+		else if (ch === ')') {
+			if (depth === 0) break;
+			depth--;
+		} else if (ch === ',' && depth === 0) break;
+		i++;
+	}
+
+	const match = /\bcollate\s+(\w+)/i.exec(scan.slice(anchor.index + anchor[0].length, i));
 	return match?.[1];
 };
 

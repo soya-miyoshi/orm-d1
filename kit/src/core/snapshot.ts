@@ -556,7 +556,16 @@ export interface CanonicalTable {
  * The tuple is compared field by field rather than as a blob so the reason
  * stays as specific as it was before normalisation.
  */
-export const columnDifference = (a: CanonicalColumn, b: CanonicalColumn): string | undefined => {
+export const columnDifference = (
+	a: CanonicalColumn,
+	b: CanonicalColumn,
+	/**
+	 * Whether the snapshot `b` was derived from is schema-authored. Only then
+	 * is `b.collate === undefined` structurally forced rather than a genuine
+	 * statement of BINARY — see the comment below.
+	 */
+	bIsSchemaDerived: boolean,
+): string | undefined => {
 	if (a.type !== b.type && !typeMatchesAcrossUpgrade(a, b) && !typeMatchesAcrossUpgrade(b, a)) return 'changes type';
 	if (a.notNull !== b.notNull) return 'changes nullability';
 	if (a.default !== b.default) return 'changes its default';
@@ -568,12 +577,20 @@ export const columnDifference = (a: CanonicalColumn, b: CanonicalColumn): string
 	// genuinely has one. That is "unexpressible", not "changed to binary" —
 	// forcing a destructive recreate on the very first `generate` after a
 	// `pull` would be a permanent, unfixable false positive. `pull` reports the
-	// live value instead, via `unexpressibleTableOptionWarnings`. A genuine
-	// mismatch between two *stated* values — schema-to-schema, introspection-
-	// to-introspection, or a schema stating one where the live db states
-	// another — still needs to be caught, so only this one direction is
-	// exempted.
-	if (!(a.collate !== undefined && b.collate === undefined) && a.collate !== b.collate) {
+	// live value instead, via `unexpressibleTableOptionWarnings`.
+	//
+	// The exemption is keyed on `b` actually being schema-derived — not merely
+	// on `b.collate` being `undefined` — because an introspected snapshot can
+	// state `undefined` two genuine ways: never mentioned, or explicitly
+	// `collate binary` (folded to `undefined` above). Keying on the value alone
+	// hid introspection-to-introspection drift (a hand-rebuilt production
+	// table gaining a real collation the pulled baseline never had) and made
+	// an explicit `collate binary` on one side permanently unreachable against
+	// a real collation on the other. Only a schema-derived `b` is structurally
+	// incapable of stating one; everything else — schema-to-schema,
+	// introspection-to-introspection, or a schema stating one where the live
+	// db states another — still needs to be caught.
+	if (!(bIsSchemaDerived && a.collate !== undefined && b.collate === undefined) && a.collate !== b.collate) {
 		return 'changes its collation';
 	}
 	return undefined;

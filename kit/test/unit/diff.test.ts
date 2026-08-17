@@ -4,7 +4,7 @@ import type { Column } from 'orm-d1';
 import { describe, expect, it } from 'vitest';
 import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { applicableStatements, splitStatements } from '../../src/core/sql.js';
-import { appendOnlyTriggerGuard, hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
+import { appendOnlyTriggerGuard, hasAutoincrement, isAppendOnlyTrigger, parseChecks, parseColumnCollation, parseGenerated, parseTableOptions } from '../../src/core/introspect.js';
 import { assertRoundTrip, emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
 import type { Snapshot } from '../../src/core/snapshot.js';
 
@@ -34,6 +34,37 @@ describe('parsing a CREATE TABLE', () => {
 		expect(() => hasAutoincrement(sql, 'a(')).not.toThrow();
 		expect(hasAutoincrement(sql, 'a(')).toBe(true);
 		expect(parseGenerated(sql, 'a(')).toBeUndefined();
+	});
+
+	it('does not attribute a table-level UNIQUE clause\'s COLLATE to the column itself', () => {
+		// `unique ("email" collate nocase)` is the standard idiom for
+		// case-insensitive email uniqueness — the indexed-column grammar SQLite
+		// allows `COLLATE` on in a `unique (…)`, `primary key (…)`, or
+		// `check (…)` clause, not just on the column definition. `[^,]*?` used to
+		// keep scanning right past the column definition's own end and pick up
+		// this one instead, reporting a collation the column does not have.
+		const sql = 'create table "u1" ("id" integer primary key, "email" text not null, unique ("email" collate nocase))';
+		expect(parseColumnCollation(sql, 'email')).toBeUndefined();
+	});
+
+	it('does not attribute a table-level CHECK clause\'s COLLATE to the column it names', () => {
+		const sql = 'create table "u2" ("a" text, "b" text, check ("a" = "b" collate nocase))';
+		expect(parseColumnCollation(sql, 'a')).toBeUndefined();
+		expect(parseColumnCollation(sql, 'b')).toBeUndefined();
+	});
+
+	it('still finds a genuine column COLLATE that comes before a comma inside a function call', () => {
+		// The mirror false negative: `[^,]*?` stopped at the first comma it saw
+		// at all, including one nested inside `substr(...)`, so a collation
+		// stated *after* such a call on the column's own definition was missed.
+		const sql = 'create table "u3" ("id" integer primary key, '
+			+ '"email" text check (substr("email", 1, 1) <> \'@\') collate nocase not null)';
+		expect(parseColumnCollation(sql, 'email')).toBe('nocase');
+	});
+
+	it('still finds an ordinary column-level COLLATE', () => {
+		const sql = 'create table "u4" ("id" integer primary key, "email" text collate nocase not null)';
+		expect(parseColumnCollation(sql, 'email')).toBe('nocase');
 	});
 });
 
@@ -232,6 +263,75 @@ describe('diffing snapshots', () => {
 		};
 
 		const { statements } = diffSnapshots(before, after);
+		expect(statements.some((s) => s.reason?.includes('collation'))).toBe(true);
+	});
+
+	it('carries a live collation into a rebuild the schema DSL cannot state, instead of dropping it (F-101 follow-up)', () => {
+		// A rebuild forced for an unrelated reason (here: `id` changes type) must
+		// not read `columnDifference`'s "unstated = unchanged" exemption as
+		// license to render the rebuilt table without the collation: the
+		// rebuild reads `after`, which structurally never carries one, so
+		// rendering `after` as-is silently turned a `uniqueIndex` over a
+		// case-insensitive column into one over a BINARY column — nothing
+		// failed, `alice@x.com` and `Alice@x.com` just both became insertable.
+		const before = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [uniqueIndex('users_email_idx').on(c.email)]);
+		const after = sqliteTable('users', {
+			id: text('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [uniqueIndex('users_email_idx').on(c.email)]);
+
+		const schemaAfter = snapshotOf(after);
+		const liveBefore: Snapshot = {
+			...snapshotOf(before),
+			origin: 'introspection',
+			tables: {
+				users: {
+					...snapshotOf(before).tables['users']!,
+					columns: {
+						...snapshotOf(before).tables['users']!.columns,
+						email: { ...snapshotOf(before).tables['users']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		const { statements, errors } = diffSnapshots(liveBefore, schemaAfter);
+		expect(errors).toEqual([]);
+
+		const createTemp = statements.find((s) => s.sql.includes('create table "__new_users"'));
+		expect(createTemp?.sql).toContain('"email" text collate nocase not null');
+	});
+
+	it('detects introspection-to-introspection collation drift instead of exempting it (F-101 follow-up)', () => {
+		// Right after `pull`, both sides of `check` are `origin: 'introspection'`
+		// — `undefined` there genuinely means BINARY, not "the schema DSL cannot
+		// say". Keying the exemption on `b.collate === undefined` alone (rather
+		// than on `after.origin`) hid a hand-rebuilt production table gaining a
+		// real collation the pulled baseline never had.
+		const t = sqliteTable('people', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		});
+		const base = snapshotOf(t);
+		const pulledBaseline: Snapshot = { ...base, origin: 'introspection' };
+		const liveWithHandAddedCollation: Snapshot = {
+			...base,
+			origin: 'introspection',
+			tables: {
+				people: {
+					...base.tables['people']!,
+					columns: {
+						...base.tables['people']!.columns,
+						email: { ...base.tables['people']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		const { statements } = diffSnapshots(liveWithHandAddedCollation, pulledBaseline);
 		expect(statements.some((s) => s.reason?.includes('collation'))).toBe(true);
 	});
 

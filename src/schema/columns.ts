@@ -2,6 +2,14 @@ import type { D1Param, Query, RenderContext, SQLChunk } from '../sql/sql.js';
 import { Identifier, quoteIdentifier } from '../sql/sql.js';
 import type { DrizzleColumnType, DrizzleDataType, ToDrizzleDataType } from './drizzle-entity.js';
 import { dataTypeOf, entityKind, SQLiteColumnEntity } from './drizzle-entity.js';
+// Self-import, not a cycle: this is how `Column.name` below calls `applyCasing`
+// through the module's own live export binding rather than the local const
+// directly. That indirection is what lets a test spy on `applyCasing`
+// (`vi.spyOn(columnsModule, 'applyCasing')`) and actually observe calls made
+// from inside this file — spying on an export cannot intercept a same-module
+// caller that references the local binding, only one that goes through the
+// exports object the same way an outside caller would.
+import * as self from './columns.js';
 
 /** SQLite's storage classes — the only column types D1 actually has. */
 export type SQLiteType = 'integer' | 'text' | 'real' | 'blob' | 'numeric';
@@ -78,12 +86,17 @@ let casingConfigured = false;
 /** Set the first time a column name is resolved under the current setting. */
 let casingObserved = false;
 /**
- * Test-only instrumentation: how many times `applyCasing` actually ran its
- * tokenising regex, as opposed to how many times `Column.name` was read.
- * `Column.name` memoizes per instance, so this is what proves the memoization
- * actually cuts calls rather than merely changing where the count is paid.
+ * Bumped by `resetCasing` (and never by ordinary `configureCasing` calls,
+ * which only ever take effect before any name is read). `Column.name` below
+ * caches its resolved name alongside the generation it was resolved under, so
+ * a stale memo — one instance's cached name from before a test called
+ * `resetCasing` — is recomputed instead of silently surviving the reset.
+ * Without this, a memo hit never re-enters `applyCasing`, which is also the
+ * only place that latches `casingObserved`, so `resetCasing` between tests
+ * both left stale names in place and silently disarmed the "casing changed
+ * after a name was read" guard.
  */
-let applyCasingCallCount = 0;
+let casingGeneration = 0;
 
 /**
  * Reconfiguring is refused rather than honoured, and so is configuring late.
@@ -125,7 +138,7 @@ export const resetCasing = (): void => {
 	casingMode = 'preserve';
 	casingConfigured = false;
 	casingObserved = false;
-	applyCasingCallCount = 0;
+	casingGeneration++;
 };
 
 export const getCasing = (): 'preserve' | 'snake_case' => casingMode;
@@ -146,12 +159,8 @@ export const applyCasing = (name: string): string => {
 	// Latched here rather than in `Column.name`, so every path that resolves a
 	// name — DDL, snapshots, compilation — counts as having observed it.
 	casingObserved = true;
-	applyCasingCallCount++;
 	return casingMode === 'snake_case' ? toSnakeCase(name) : name;
 };
-
-/** @internal Test-only instrumentation; never call this from application code. */
-export const getApplyCasingCallCount = (): number => applyCasingCallCount;
 
 /**
  * The phantom metadata a column carries. One record, not five type parameters:
@@ -274,12 +283,26 @@ export class Column<M extends ColumnMeta = ColumnMeta> extends SQLiteColumnEntit
 	 * fresh `Column` from the same `config` for an alias, so an alias still
 	 * resolves its own name once, independently, with nothing stale carried
 	 * over from the table it was aliased from.
+	 *
+	 * Versioned by `casingGeneration` rather than a plain nullable cache: the
+	 * memo would otherwise outlive `resetCasing`, the test-only escape hatch
+	 * that flips `casingMode` back for the next test without constructing new
+	 * `Column` instances — `test/schema.ts` builds its tables once at module
+	 * scope, so the first test to read one of its columns across a
+	 * `resetCasing` boundary would get the *previous* test's cached name. A
+	 * stale generation recomputes, which also re-enters `applyCasing` and so
+	 * re-latches `casingObserved`.
 	 */
 	#resolvedName: string | undefined;
+	#resolvedNameGeneration = -1;
 
 	/** The database column name, resolved against the configured casing. */
 	get name(): string {
-		return this.#resolvedName ??= this.config.explicitName ?? applyCasing(this.config.fieldName);
+		if (this.#resolvedName === undefined || this.#resolvedNameGeneration !== casingGeneration) {
+			this.#resolvedNameGeneration = casingGeneration;
+			return this.#resolvedName = this.config.explicitName ?? self.applyCasing(this.config.fieldName);
+		}
+		return this.#resolvedName;
 	}
 
 	get notNull(): boolean {
