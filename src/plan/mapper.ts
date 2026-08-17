@@ -175,8 +175,8 @@ export function buildPositionalMapper<T>(shape: Shape): (rows: unknown[][]) => T
 
 	// The `(index) => row[index]` reader is allocated once here, not once per
 	// row inside `.map()` — `current` is closed over and reassigned each
-	// iteration instead. Measured (see the batch's F-104 note): ~15-20% faster
-	// at 1k-10k rows for this shape, with no behaviour change.
+	// iteration instead. Measured (see the batch's F-104 note): ~5% faster at
+	// 1k-10k rows for this shape, with no behaviour change.
 	return (rows) => {
 		const out: T[] = new Array(rows.length);
 		let current: unknown[];

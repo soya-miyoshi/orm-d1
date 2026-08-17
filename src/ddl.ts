@@ -33,8 +33,31 @@ import { defaultRenderContext, quoteIdentifier, render } from './sql/sql.js';
  */
 const PARAM_TOKEN = '\u0000orm-d1:param\u0000';
 
+/**
+ * An empty array interpolated into a `check()` or a partial index's `where()`
+ * renders `in ()` / `not in ()` — SQLite accepts it, but it is unconditionally
+ * false/true, so the constraint or partial index goes permanently inert
+ * instead of failing loudly. `src/sql/sql.ts` ships to the Worker and cannot
+ * decide what to do about that (no `console`, no throwing on a hot path); this
+ * module is the one place that generates DDL, runs in Node (via `orm-d1-kit`),
+ * and is free to refuse outright.
+ */
+const refuseEmptyArrayPredicate = (): never => {
+	throw new Error(
+		'An empty array was interpolated into a DDL predicate (a check() or a partial '
+			+ 'index\'s where()). This renders "in ()" / "not in ()", which SQLite accepts '
+			+ 'but is unconditionally false/true — the constraint or partial index would '
+			+ 'become permanently inert instead of failing loudly.',
+	);
+};
+
 /** DDL cannot qualify column names with a table, and cannot bind parameters. */
-const ddlContext: RenderContext = { ...defaultRenderContext, bareColumns: true, paramToken: PARAM_TOKEN };
+const ddlContext: RenderContext = {
+	...defaultRenderContext,
+	bareColumns: true,
+	paramToken: PARAM_TOKEN,
+	onEmptyArrayPredicate: refuseEmptyArrayPredicate,
+};
 
 export interface DDLOptions {
 	/** `create table if not exists` — and, for `dropTable`, `if exists`. */

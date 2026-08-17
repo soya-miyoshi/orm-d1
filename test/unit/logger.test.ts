@@ -4,7 +4,8 @@
  * caller who set it and saw no output had every reason to believe no queries
  * were running.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { setDev } from '../../src/dev.js';
 import type { Logger } from '../../src/index.js';
 import { eq, ormD1 } from '../../src/index.js';
 import { users } from '../schema.js';
@@ -23,12 +24,16 @@ const stubClient = (): D1Database => {
 };
 
 describe('logger', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		setDev(false);
+	});
+
 	it('does not call a logger when none is configured', async () => {
+		const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
 		const db = ormD1(stubClient());
 		await db.select().from(users).where(eq(users.id, 1));
-		// Nothing to assert against directly — the absence of a throw/side
-		// effect is the point; covered structurally by the tests below, which
-		// prove the wiring exists and is opt-in.
+		expect(spy).not.toHaveBeenCalled();
 	});
 
 	it('calls a custom logger\'s logQuery with the compiled sql and bound params', async () => {
@@ -59,5 +64,22 @@ describe('logger', () => {
 	it('logger: true uses a default logger without throwing', async () => {
 		const db = ormD1(stubClient(), { logger: true });
 		await expect(db.select().from(users).where(eq(users.id, 1))).resolves.toBeDefined();
+	});
+
+	it('the default logger omits bound params outside dev, but prints them in dev', async () => {
+		const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+		setDev(false);
+		const dbProd = ormD1(stubClient(), { logger: true });
+		await dbProd.select().from(users).where(eq(users.id, 1));
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(spy.mock.calls[0]![0]).not.toContain('params');
+
+		spy.mockClear();
+		setDev(true);
+		const dbDev = ormD1(stubClient(), { logger: true });
+		await dbDev.select().from(users).where(eq(users.id, 1));
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(spy.mock.calls[0]![0]).toContain('params: [1]');
 	});
 });

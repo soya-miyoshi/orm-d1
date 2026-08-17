@@ -354,12 +354,13 @@ with the request, so a prepared statement cannot outlive it and the SQL is built
 every `fetch`. Separating compilation from execution is what makes reuse possible instead:
 `query.select()…compile()` at module scope, then `db.get(compiled, input)`.
 
-**`logger`, and the v0 `schema` option — accepted and ignored, with no warning.** Both are
-accepted so that an options object carried over from Drizzle keeps type-checking during a
-port. `logger` reports the SQL and its parameters; on D1 the numbers that decide what a
-query cost are `rows_read` and `rows_written`, which arrive on the response `meta`, and
-`onQuery` reports those. `schema` took a v0 schema module; the v1 replacement is
-`relations`.
+**`logger` is honored; the v0 `schema` option is accepted and ignored, with no warning.**
+`logger` is Drizzle-shaped — `true` for a default `console.log` logger, or an object with
+`logQuery(sql, params)` — and is called once per executed statement. The default logger
+prints bound parameter values only in dev (`setDev(true)`); a caller-supplied `logQuery`
+still receives the raw params unfiltered. `onQuery` remains the way to get at D1's own
+cost numbers: `rows_read` and `rows_written` arrive on the response `meta`, which
+`logger` never sees. `schema` took a v0 schema module; the v1 replacement is `relations`.
 
 **`drizzle-kit studio` — `orm-d1-kit` has no `studio` command.** There is nothing to
 reimplement: the Drizzle Studio browser extension introspects the live database and never

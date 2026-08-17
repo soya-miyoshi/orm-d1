@@ -557,8 +557,12 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 		// anything, and a fragment like `sql`${a} || ${b}`` can bind more than
 		// one. Rendered rather than guessed, the same way `countOnConflictParams`
 		// counts the conflict clause — see [F-055], [F-058].
-		const rowParams = group.rows.map((row) => countRowParams(row, group.fields, cols, ctx));
-		const maxRowParams = Math.max(...rowParams);
+		const rowParams = group.rows.map((row) => rowParamCount(row, group.fields, cols, ctx));
+		// Not `Math.max(...rowParams)`: spreading one call argument per row
+		// overflows the call stack around ~125k rows (`RangeError: Maximum call
+		// stack size exceeded`).
+		let maxRowParams = 0;
+		for (const n of rowParams) if (n > maxRowParams) maxRowParams = n;
 		if (maxRowParams + reservedParams > ctx.maxParams) {
 			throw new CompileError(
 				`A row binds ${maxRowParams} parameter(s) plus ${reservedParams} bound parameter(s) from `
@@ -568,18 +572,30 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 			);
 		}
 		const budget = ctx.maxParams - reservedParams;
+		// A row built entirely from `sql\`...\`` fragments (or all-default values)
+		// can bind zero parameters, so `sum + rowParams[end] <= budget` never trips
+		// and every row would land in one chunk regardless of `maxParams` — a
+		// statement that can exceed D1's 100KB text limit no matter how low
+		// `maxParams` is set. `rowsPerChunk` is the row-count cap main had before
+		// param counts were rendered exactly: a fallback bound derived from column
+		// count, independent of how many of those columns actually bind a param.
+		const rowsPerChunk = Math.max(1, Math.floor(budget / cols.length));
 
 		let start = 0;
 		while (start < group.rows.length) {
 			let sum = 0;
 			let end = start;
-			while (end < group.rows.length && sum + rowParams[end]! <= budget) {
+			while (
+				end < group.rows.length
+				&& sum + rowParams[end]! <= budget
+				&& end - start < rowsPerChunk
+			) {
 				sum += rowParams[end]!;
 				end++;
 			}
 			// `maxRowParams + reservedParams <= ctx.maxParams` above guarantees
-			// every individual row fits the budget alone, so `end` always
-			// advances past `start` here.
+			// every individual row fits the budget alone, and `rowsPerChunk >= 1`,
+			// so `end` always advances past `start` here.
 			const chunkRows = group.rows.slice(start, end);
 			start = end;
 			const writer = new Writer(ctx);
@@ -690,6 +706,44 @@ const countRowParams = (
 		scratch.chunk(value === undefined ? defaultChunk(column) : valueChunk(column, value));
 	}
 	return scratch.toQuery().params.length;
+};
+
+/**
+ * A value that can only ever render to exactly one bound parameter: not a
+ * `sql\`...\`` fragment (zero, one, or many params), not a `Placeholder`
+ * (deferred, but still exactly one — excluded anyway to keep this check a
+ * cheap syntactic one rather than one that has to reason about *why* a shape
+ * is safe), and not an array (never valid as a single column's value, but not
+ * this function's job to reject it).
+ */
+const isDynamicRowValue = (value: unknown): boolean => isSQLChunk(value) || isPlaceholder(value) || Array.isArray(value);
+
+/**
+ * How many bound parameters one row of `VALUES` will add.
+ *
+ * The common case — every value a plain scalar (or `undefined`, using a
+ * column default) — binds exactly one parameter per column with no rendering
+ * needed to know that: `valueChunk`/`defaultChunk` always emit a single `?`
+ * for those. Only when a row actually contains a `sql` fragment, a
+ * `Placeholder`, or an array does `countRowParams` need to render the row
+ * against a scratch `Writer` to find out — that path re-runs every column's
+ * `encode`, which the real render pass runs again anyway, so skipping it in
+ * the common case avoids double-encoding every value in a bulk insert.
+ */
+const rowParamCount = (
+	row: Record<string, unknown>,
+	fields: readonly string[],
+	cols: readonly Column<any>[],
+	ctx: RenderContext,
+): number => {
+	let dynamic = false;
+	for (const field of fields) {
+		if (isDynamicRowValue(row[field])) {
+			dynamic = true;
+			break;
+		}
+	}
+	return dynamic ? countRowParams(row, fields, cols, ctx) : cols.length;
 };
 
 /**

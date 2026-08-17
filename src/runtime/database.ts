@@ -34,9 +34,21 @@ export interface Logger {
 	logQuery(query: string, params: unknown[]): void;
 }
 
-/** Matches `drizzle-orm`'s `DefaultLogger`: one line per query, to `console.log`. */
+/**
+ * Matches `drizzle-orm`'s `DefaultLogger`: one line per query, to `console.log`.
+ *
+ * Bound params routinely contain PII (see `errors.ts`'s `OrmD1QueryError.params`
+ * and `result.ts`'s event building, both gated the same way) — this is *our*
+ * default logger choosing what to print, not a caller's. A caller who passes
+ * their own `logger:` function still gets raw params handed to it unfiltered;
+ * this gate only applies to the built-in implementation.
+ */
 class DefaultLogger implements Logger {
 	logQuery(query: string, params: unknown[]): void {
+		if (!isDev()) {
+			console.log(`Query: ${query}`);
+			return;
+		}
 		const stringifiedParams = params.map((p) => {
 			try {
 				return JSON.stringify(p);

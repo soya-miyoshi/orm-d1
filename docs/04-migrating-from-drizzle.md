@@ -60,7 +60,8 @@ you can read:
 | `db.transaction(cb)` | Throws `NoTransactionsError`, whose message names `db.batch([...])`. Nothing else of the transaction machinery is present. |
 | `.prepare()` on a builder | Not a method; `query.select()…compile()` replaces it. |
 | `relations()` (v0), and the `where` / `orderBy` callback forms | Not exported. `defineRelations()` and the v1 object DSL are the interface. |
-| The v0 `schema` option, and `logger` | Accepted and ignored, with no warning. Use `relations` and `onQuery`. |
+| The v0 `schema` option | Accepted and ignored, with no warning. Use `relations`. |
+| `logger` | Honored — Drizzle-shaped, `true` for a default logger. Its default logger prints bound params only in dev; a custom `logQuery` still gets raw params. It doesn't see `rows_read` / `rows_written` — use `onQuery` for that. |
 | Views (`sqliteView`), CTEs, `union` / `intersect` / `except` | Not exported, so a schema or query using them does not compile. `db.execute(sql, params)` is the escape hatch. |
 
 Drizzle's execution plan for relational queries is not adopted either, only its interface;

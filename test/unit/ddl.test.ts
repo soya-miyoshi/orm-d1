@@ -1,6 +1,5 @@
 import { gt as dGt } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { setDev, setWarn } from '../../src/dev.js';
 import { asDrizzleTable } from '../../src/drizzle.js';
 import { createIndexes, createSchema, createTable, dropTable, literal } from '../../src/ddl.js';
 import { blob, check, customType, integer, numeric, real, sql, sqliteTable, text, uniqueIndex } from '../../src/index.js';
@@ -130,46 +129,28 @@ describe('ddl generation', () => {
 	// which SQLite accepts — `not in ()` is unconditionally true, `in ()` is
 	// unconditionally false, so the constraint goes permanently inert with no
 	// error. Matching `drizzle-orm`'s own `()` rendering is correct (the
-	// `docs/08` reverse-alias invariant), so the fix is a `__DEV__` warning,
-	// not a rendering divergence.
-	it('warns in dev when an empty array is interpolated into a check', () => {
-		setDev(true);
-		const warnings: string[] = [];
-		setWarn((message) => warnings.push(message));
-		try {
-			const ROLES: string[] = [];
-			const t = sqliteTable('t', {
-				role: text('role'),
-			}, (c) => [
-				check('t_role_check', sql`${c.role} not in ${ROLES}`),
-			]);
+	// `docs/08` reverse-alias invariant), so `createTable` refuses outright
+	// rather than silently emitting an inert constraint — DDL generation runs
+	// in Node (via `orm-d1-kit`), so it is free to throw.
+	it('refuses to generate DDL for a check built from an empty interpolated array', () => {
+		const ROLES: string[] = [];
+		const t = sqliteTable('t', {
+			role: text('role'),
+		}, (c) => [
+			check('t_role_check', sql`${c.role} not in ${ROLES}`),
+		]);
 
-			const ddl = createTable(t);
-			expect(ddl).toContain('check ("role" not in ())');
-			expect(warnings.some((m) => m.includes('empty array'))).toBe(true);
-		} finally {
-			setDev(false);
-			setWarn(() => {});
-		}
+		expect(() => createTable(t)).toThrow(/empty array/);
 	});
 
-	it('does not warn for a non-empty interpolated array in a check', () => {
-		setDev(true);
-		const warnings: string[] = [];
-		setWarn((message) => warnings.push(message));
-		try {
-			const t = sqliteTable('t', {
-				role: text('role'),
-			}, (c) => [
-				check('t_role_check', sql`${c.role} in ${['admin', 'member']}`),
-			]);
+	it('does not refuse a non-empty interpolated array in a check', () => {
+		const t = sqliteTable('t', {
+			role: text('role'),
+		}, (c) => [
+			check('t_role_check', sql`${c.role} in ${['admin', 'member']}`),
+		]);
 
-			createTable(t);
-			expect(warnings).toEqual([]);
-		} finally {
-			setDev(false);
-			setWarn(() => {});
-		}
+		expect(() => createTable(t)).not.toThrow();
 	});
 
 	it('renders sql defaults inline and value defaults as literals', () => {
