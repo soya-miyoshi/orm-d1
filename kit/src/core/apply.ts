@@ -14,6 +14,7 @@ import type { Snapshot } from './snapshot.js';
 import {
 	applicableStatements,
 	createMigrationsTable,
+	foldAsciiCase,
 	IDENTIFIER_SOURCE,
 	lookupCaseInsensitive,
 	MIGRATIONS_TABLE,
@@ -475,8 +476,28 @@ export async function checkForeignTriggerConflicts(
 		// Fold this migration's renames into the running map before moving to
 		// the next migration, so a rename here is visible to a rebuild in any
 		// later pending migration.
+		//
+		// Both sides of this fold used to be raw, case-sensitive
+		// `Record<string, string>` lookups/writes. `accumulated[from]` missed a
+		// seam where one migration's rename target and the next migration's
+		// rename source differ only in case (`orders -> Sales` then
+		// `sales -> sales_v2`): the chain back to the true live name silently
+		// broke, and a rebuild several migrations later became invisible to
+		// the guard. [Finding 9]
+		//
+		// The write side has to be case-insensitive too, and consistently so:
+		// if an earlier iteration (of this same loop, or the within-file walk
+		// above) already recorded the live table under some case spelling of
+		// `to`, reuse that exact key rather than adding a second, differently
+		// cased key for the same table — two keys for one table would let
+		// later folds see one and miss the other, drifting apart across
+		// further renames.
 		for (const [to, from] of Object.entries(migration.renames)) {
-			accumulated[to] = accumulated[from] ?? from;
+			const resolved = lookupCaseInsensitive(accumulated, from) ?? from;
+			const existingKey = Object.keys(accumulated).find(
+				(key) => foldAsciiCase(key) === foldAsciiCase(to),
+			);
+			accumulated[existingKey ?? to] = resolved;
 		}
 	}
 }

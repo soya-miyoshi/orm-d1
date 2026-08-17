@@ -343,3 +343,62 @@ describe('finding 5: lookupCaseInsensitive', () => {
 		expect(new Set(result)).toEqual(new Set(['a', 'b']));
 	});
 });
+
+describe('finding 8: the tail-extension matcher does not mis-capture a later "on" in the statement', () => {
+	it('keeps a partial index whose `where` clause contains a `JOIN ... ON` in the rebuild group', () => {
+		// `CREATE_ON_PATTERN`'s old capture-then-compare approach used a greedy
+		// `[\s\S]*` before the capture group; `.exec()` backtracks to the LAST
+		// "on <ident>" that still lets the rest of the pattern match, not the
+		// first. A trailing `create index` whose `where` clause contains a
+		// second "on" (here, a `JOIN ... ON` inside a subquery) then captures
+		// that subquery's join identifier instead of the table this index is
+		// actually on, `!== finalName` becomes true, and the loop breaks early
+		// — splitting the index create out of the atomic rebuild group.
+		const statements = [
+			...rebuildGroup('orders'),
+			'create index "orders_active_idx" on "orders" ("status") '
+				+ 'where "region_id" in (select "a"."id" from "regions" "a" join "zones" "b" on "a"."zone_id" = "b"."id")',
+		];
+		const groups = statementGroups(statements);
+		expect(new Set(groups).size).toBe(1);
+	});
+
+	it('keeps a trigger body containing ON CONFLICT in the rebuild group', () => {
+		const statements = [
+			...rebuildGroup('orders'),
+			'create trigger "orders_audit" after insert on "orders" '
+				+ 'begin insert into "audit_log" ("table_name") values (\'orders\') on conflict do nothing; end',
+		];
+		const groups = statementGroups(statements);
+		expect(new Set(groups).size).toBe(1);
+	});
+
+	it('still stops at a statement that is not on the rebuilt table\'s final name', () => {
+		const statements = [
+			...rebuildGroup('orders'),
+			'create index "other_idx" on "other" ("id")',
+		];
+		const groups = statementGroups(statements);
+		expect(groups[groups.length - 1]).not.toBe(groups[0]);
+	});
+});
+
+describe('finding 9: the cross-file rename fold is case-insensitive', () => {
+	it('follows a rename chain across migration files whose case spelling changes at the seam', async () => {
+		// m1: orders -> Sales. m2: sales -> sales_v2 (lowercase "sales" at the
+		// seam, where m1's target was spelled "Sales"). m3 rebuilds sales_v2.
+		// The old fold did `accumulated[from]` as a raw, case-sensitive object
+		// lookup, so `accumulated['sales']` (m2's `from`) missed the entry
+		// written as `accumulated['Sales']` (m1's fold), and the chain back to
+		// "orders" — the table the live trigger actually sits on — was lost.
+		const runner = triggerRunner([
+			{ name: 'orders_audit', tbl_name: 'orders', sql: 'create trigger "orders_audit" after insert on "orders" begin select 1; end' },
+		]);
+		const m1 = { tag: 'm1', sql: 'alter table orders rename to Sales;' };
+		const m2 = { tag: 'm2', sql: 'alter table sales rename to sales_v2;' };
+		const m3 = { tag: 'm3', sql: `${rebuildGroup('sales_v2').join(';\n')};` };
+
+		await expect(checkForeignTriggerConflicts(runner, [m1, m2, m3]))
+			.rejects.toThrow(/"orders_audit"/);
+	});
+});

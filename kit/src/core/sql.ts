@@ -197,10 +197,36 @@ const RENAME_TO_PATTERN = new RegExp(
 	`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+to\\s+(${IDENTIFIER_SOURCE})\\s*$`,
 	'i',
 );
-const CREATE_ON_PATTERN = new RegExp(
-	`^\\s*create\\s+(?:unique\\s+index|index|trigger)\\b[\\s\\S]*\\son\\s(${IDENTIFIER_SOURCE})`,
-	'i',
-);
+// A generic capture-then-compare pattern here would be wrong: `.exec()`
+// against a greedy `[\s\S]*` backtracks to the LAST "on <ident>" that still
+// lets the rest of the pattern match, not the first — so a trailing
+// statement whose SQL contains a second "on" after the table-defining one
+// (a partial index's `where` clause with a `JOIN ... ON`, or a trigger body
+// with `ON CONFLICT`/a join) captures the wrong identifier and the group
+// splits early, exactly the data-loss shape this function exists to
+// prevent. Instead, build a pattern per candidate `finalName`, the same
+// technique `tablesRebuiltIn`'s callers use to test a *specific* name rather
+// than capture-and-compare generically: bake the escaped name into an
+// alternation of the four quoting spellings, anchored right after
+// `create ... on`, so only an "on" whose identifier is exactly the rebuilt
+// table's final name — in the table-clause position — can match. [Finding 8]
+const escapeRegExpForOnPattern = (value: string): string =>
+	value.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function buildCreateOnPattern(finalName: string): RegExp {
+	const escaped = escapeRegExpForOnPattern(finalName);
+	const escapedForBrackets = escapeRegExpForOnPattern(finalName.replaceAll(']', ']]'));
+	const spellings = [
+		`"${escapeRegExpForOnPattern(finalName.replaceAll('"', '""'))}"`,
+		`\`${escapeRegExpForOnPattern(finalName.replaceAll('`', '``'))}\``,
+		`\\[${escapedForBrackets}\\]`,
+		`\\b${escaped}\\b`,
+	];
+	return new RegExp(
+		`^\\s*create\\s+(?:unique\\s+index|index|trigger)\\b[\\s\\S]*?\\bon\\s+(?:${spellings.join('|')})`,
+		'i',
+	);
+}
 
 export function statementGroups(statements: readonly string[]): number[] {
 	const groups: number[] = new Array(statements.length);
@@ -251,10 +277,10 @@ export function statementGroups(statements: readonly string[]): number[] {
 		// rebuilt table's final name — the exact shape `recreateTable` emits —
 		// and stop at the first statement that is not one of those.
 		if (finalName !== undefined) {
+			const createOnPattern = buildCreateOnPattern(finalName);
 			let k = end + 1;
 			while (k < statements.length) {
-				const tailMatch = CREATE_ON_PATTERN.exec(statements[k]!);
-				if (!tailMatch || normalizeIdentifierToken(tailMatch[1]!) !== finalName) break;
+				if (!createOnPattern.test(statements[k]!)) break;
 				end = k;
 				k++;
 			}
@@ -416,7 +442,7 @@ export function packStatementsWithTrailer(
  * caller of {@link lookupCaseInsensitive} on trigger-owning table names — could
  * misfile which live table a trigger lookup resolves to. [Finding 5]
  */
-const foldAsciiCase = (value: string): string => value.replace(/[A-Za-z]/g, (c) => c.toLowerCase());
+export const foldAsciiCase = (value: string): string => value.replace(/[A-Za-z]/g, (c) => c.toLowerCase());
 
 /**
  * Look a key up in a map the way SQLite compares identifiers: case-sensitively
