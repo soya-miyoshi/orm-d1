@@ -179,6 +179,13 @@ the response carried no `meta`. Present only when D1 returned them, and therefor
 optional: `d1DurationMs` and `sqlDurationMs` (D1's own, server-side), `servedByPrimary`,
 `servedByRegion` and `attempts`. `durationMs - sqlDurationMs` is the network share.
 
+`drizzle()`'s `logger` option — Drizzle-shaped, `true` for a default logger or an object
+with `logQuery(sql, params)` — is also honored, for a port that already relies on it. It
+does not see `rows_read` / `rows_written`, which is what still makes `onQuery` the way to
+get at what a query cost. The default logger prints bound parameter values only when
+`isDev()`, since params routinely carry PII; a caller-supplied `logQuery` function is
+handed the raw params unfiltered.
+
 Installing `onQuery` costs two things. `.raw()` carries no metadata, so it switches selects
 to the keyed read path, which allocates one object per row — which is why it is opt-in per
 database. And bound parameters are included only in development builds, since they contain

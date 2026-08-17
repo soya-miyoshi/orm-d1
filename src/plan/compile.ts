@@ -77,6 +77,13 @@ class Writer {
 		return this;
 	}
 
+	/** Splice in an already-rendered `Query` verbatim — no re-rendering. */
+	query(rendered: Query): this {
+		this.sql += rendered.sql;
+		this.params.push(...rendered.params);
+		return this;
+	}
+
 	toQuery(): Query {
 		return { sql: this.sql, params: this.params };
 	}
@@ -223,11 +230,14 @@ const explicitNullableGroups = (plan: SelectPlan): Set<string> => {
 	if (nullable.size === 0) return groups;
 	for (const [key, entry] of Object.entries(plan.selection)) {
 		if (!isSelectionObject(entry)) continue;
-		const leaves = flattenSelection(entry, [key]);
-		if (leaves.length === 0) continue;
+		const allLeaves = flattenSelection(entry, [key]);
+		if (allLeaves.length === 0) continue;
 		// Only this group's own depth is eligible — a leaf that sits deeper
-		// belongs to a nested group of its own, not to this one.
-		if (leaves.some((leaf) => leaf.path.length !== 2)) continue;
+		// belongs to a nested group of its own, not to this one. Drizzle applies
+		// `path.length === 2` per leaf (`drizzle-orm/utils.js:136`): a deeper
+		// leaf is simply skipped, it does not veto the whole group.
+		const leaves = allLeaves.filter((leaf) => leaf.path.length === 2);
+		if (leaves.length === 0) continue;
 		const tableNames = new Set<string>();
 		for (const leaf of leaves) {
 			if (!leaf.column) continue;
@@ -512,6 +522,18 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 	// different field lists can never produce the same key. Written as an escape
 	// rather than a literal so tools do not read this file as binary.
 	const FIELD_SEPARATOR = '\u0000';
+	// Whether a column is eligible for a row's field list depends only on the
+	// column's own static config — never on which row is being looked at — so
+	// it is decided once per column here rather than re-read (several
+	// `.config.*` property chases through every column, every row) inside the
+	// per-row loop below. Only `row[field] !== undefined` genuinely varies per
+	// row and stays there.
+	const columnEntries = Object.entries(columns).map(([field, column]) => ({
+		field,
+		notGenerated: !column.config.generated,
+		alwaysIncluded: column.config.defaultFn !== undefined
+			|| (column.config.onUpdateFn !== undefined && column.config.default === undefined),
+	}));
 	const groups: { fields: string[]; rows: Record<string, unknown>[] }[] = [];
 	for (const row of plan.values) {
 		// A generated column can never be written: SQLite rejects the statement.
@@ -523,13 +545,10 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 				throw new CompileError(`"${field}" is a generated column and cannot be inserted into.`);
 			}
 		}
-		const fields = Object.keys(columns).filter(
-			(field) =>
-				!columns[field]!.config.generated
-				&& (row[field] !== undefined
-					|| columns[field]!.config.defaultFn !== undefined
-					|| (columns[field]!.config.onUpdateFn !== undefined && columns[field]!.config.default === undefined)),
-		);
+		const fields: string[] = [];
+		for (const entry of columnEntries) {
+			if (entry.notGenerated && (row[entry.field] !== undefined || entry.alwaysIncluded)) fields.push(entry.field);
+		}
 		if (fields.length === 0) throw new CompileError('An inserted row has no values and no defaults.');
 		const key = fields.join(FIELD_SEPARATOR);
 		const last = groups.at(-1);
@@ -544,34 +563,91 @@ export function compileInsert<TRow>(plan: InsertPlan, ctx: RenderContext): Compi
 	};
 
 	const conflictParams = plan.onConflict ? countOnConflictParams(plan.onConflict, columns, ctx) : 0;
+	const returningParams = countReturningParams(plan.table, plan.returning, ctx);
+	const reservedParams = conflictParams + returningParams;
 
 	for (const group of groups) {
 		const cols = group.fields.map((field) => columns[field]!);
-		if (cols.length > ctx.maxParams) {
+		// Actual bound parameters per row, not `cols.length`: a value supplied
+		// as a zero-parameter `sql` fragment occupies a column without binding
+		// anything, and a fragment like `sql`${a} || ${b}`` can bind more than
+		// one. Rendered rather than guessed, the same way `countOnConflictParams`
+		// counts the conflict clause — see [F-055], [F-058]. Where that render
+		// was needed, it is kept (`.rendered`) rather than thrown away, so the
+		// write pass below splices it in instead of rendering the row again —
+		// see `rowParamCount`.
+		// Two pre-sized parallel arrays rather than `group.rows.map(row =>
+		// rowParamCount(...))`: `rowParamCount` still allocates one `{ count,
+		// rendered }` wrapper object per row either way — the arrays avoid
+		// *storing* that wrapper (a `{ count, rendered }[]` array of boxed
+		// objects), not allocating it, since each wrapper is read once, right
+		// here, and then discarded. `rowCounts` is a typed array — every count is
+		// a small non-negative integer, so this is a flat unboxed buffer rather
+		// than a holey/boxed `number[]`, cheaper both to allocate and to scan in
+		// the `maxRowParams` loop below.
+		const rowCounts = new Int32Array(group.rows.length);
+		const rowRendered: (Query | undefined)[] = new Array(group.rows.length);
+		for (let i = 0; i < group.rows.length; i++) {
+			const result = rowParamCount(group.rows[i]!, group.fields, cols, ctx);
+			rowCounts[i] = result.count;
+			rowRendered[i] = result.rendered;
+		}
+		// Not `Math.max(...rowCounts)`: spreading one call argument per row
+		// overflows the call stack around ~125k rows (`RangeError: Maximum call
+		// stack size exceeded`).
+		let maxRowParams = 0;
+		for (const count of rowCounts) if (count > maxRowParams) maxRowParams = count;
+		if (maxRowParams + reservedParams > ctx.maxParams) {
 			throw new CompileError(
-				`A row of ${cols.length} columns exceeds the bound-parameter limit of ${ctx.maxParams}; `
-					+ 'no chunking can satisfy it. Insert fewer columns per statement.',
+				`A row binds ${maxRowParams} parameter(s) plus ${reservedParams} bound parameter(s) from `
+					+ '"on conflict"/"returning" exceed the bound-parameter limit of '
+					+ `${ctx.maxParams}; no chunking can satisfy it. Insert fewer columns, bind fewer `
+					+ 'parameters per row, or bind fewer parameters in the conflict/returning clauses.',
 			);
 		}
-		if (cols.length + conflictParams > ctx.maxParams) {
-			throw new CompileError(
-				`A row of ${cols.length} columns plus ${conflictParams} bound parameter(s) from `
-					+ `"on conflict" exceed the bound-parameter limit of ${ctx.maxParams}; no chunking can `
-					+ 'satisfy it. Insert fewer columns, or bind fewer parameters in the conflict clause.',
-			);
-		}
-		const rowsPerChunk = Math.max(1, Math.floor((ctx.maxParams - conflictParams) / cols.length));
+		const budget = ctx.maxParams - reservedParams;
+		// A row built entirely from `sql\`...\`` fragments (or all-default values)
+		// can bind zero parameters, so `sum + rowParams[end] <= budget` never trips
+		// and every row would land in one chunk regardless of `maxParams` — a
+		// statement that can exceed D1's 100KB text limit no matter how low
+		// `maxParams` is set. `rowsPerChunk` is the row-count cap main had before
+		// param counts were rendered exactly: a fallback bound derived from column
+		// count, independent of how many of those columns actually bind a param.
+		const rowsPerChunk = Math.max(1, Math.floor(budget / cols.length));
 
-		for (let start = 0; start < group.rows.length; start += rowsPerChunk) {
-			const chunkRows = group.rows.slice(start, start + rowsPerChunk);
+		let start = 0;
+		while (start < group.rows.length) {
+			let sum = 0;
+			let end = start;
+			while (
+				end < group.rows.length
+				&& sum + rowCounts[end]! <= budget
+				&& end - start < rowsPerChunk
+			) {
+				sum += rowCounts[end]!;
+				end++;
+			}
+			// `maxRowParams + reservedParams <= ctx.maxParams` above guarantees
+			// every individual row fits the budget alone, and `rowsPerChunk >= 1`,
+			// so `end` always advances past `start` here.
+			const chunkStart = start;
+			start = end;
 			const writer = new Writer(ctx);
 			writer
 				.text(`insert into ${quoteIdentifier(getTableName(plan.table))} (`)
 				.text(cols.map((c) => quoteIdentifier(c.name)).join(', '))
 				.text(') values ');
 
-			for (const [r, row] of chunkRows.entries()) {
-				if (r > 0) writer.text(', ');
+			for (let i = chunkStart; i < end; i++) {
+				if (i > chunkStart) writer.text(', ');
+				const rendered = rowRendered[i];
+				// Already rendered once while counting its params — splice it in
+				// verbatim rather than rendering this row's columns again.
+				if (rendered) {
+					writer.query(rendered);
+					continue;
+				}
+				const row = group.rows[i]!;
 				writer.text('(');
 				for (const [c, column] of cols.entries()) {
 					if (c > 0) writer.text(', ');
@@ -653,6 +729,99 @@ const withOnUpdate = (
  * one, or many parameters — counting must match what `writeOnConflict` will
  * actually emit, not guess "one param per assignment".
  */
+/**
+ * Render one row's `(col1, col2, …)` text exactly as the real `VALUES` writer
+ * would, against a scratch writer — not assumed to be one param per column, a
+ * value supplied as a `sql` fragment can bind zero, one, or many parameters.
+ * See `countOnConflictParams` below, which the same reasoning is lifted from.
+ */
+const renderRow = (
+	row: Record<string, unknown>,
+	fields: readonly string[],
+	cols: readonly Column<any>[],
+	ctx: RenderContext,
+): Query => {
+	const scratch = new Writer(ctx);
+	scratch.text('(');
+	for (const [c, column] of cols.entries()) {
+		if (c > 0) scratch.text(', ');
+		const field = fields[c]!;
+		const value = row[field];
+		scratch.chunk(value === undefined ? defaultChunk(column) : valueChunk(column, value));
+	}
+	scratch.text(')');
+	return scratch.toQuery();
+};
+
+/**
+ * A value that can only ever render to exactly one bound parameter: not a
+ * `sql\`...\`` fragment (zero, one, or many params), not a `Placeholder`
+ * (deferred, but still exactly one — excluded anyway to keep this check a
+ * cheap syntactic one rather than one that has to reason about *why* a shape
+ * is safe), and not an array (never valid as a single column's value, but not
+ * this function's job to reject it).
+ */
+const isDynamicRowValue = (value: unknown): boolean => {
+	// The overwhelming common case — a plain scalar (string, number, boolean,
+	// bigint, null, undefined) — is not an object at all, so this single
+	// `typeof` check discards it without ever calling `isSQLChunk`/
+	// `isPlaceholder`/`Array.isArray`, each of which is its own function call
+	// (and `isSQLChunk` repeats this same `typeof`/`null` check internally).
+	// At 5000 rows × 8 columns that is up to 120,000 calls avoided for the
+	// common shape; only an actual object pays for the three checks below.
+	if (typeof value !== 'object' || value === null) return false;
+	return Array.isArray(value) || isPlaceholder(value) || isSQLChunk(value);
+};
+
+/**
+ * How many bound parameters one row of `VALUES` will add, plus — when it had
+ * to render to find out — the rendered `(col1, col2, …)` text so the later
+ * write pass can splice it in with `Writer.query()` instead of re-rendering.
+ *
+ * The common case — every value a plain scalar (or `undefined`, using a
+ * column default) — binds exactly one parameter per column with no rendering
+ * needed to know that: `valueChunk`/`defaultChunk` always emit a single `?`
+ * for those, so `rendered` stays `undefined` and the write pass renders once,
+ * there. Only when a row actually contains a `sql` fragment, a `Placeholder`,
+ * or an array does this need to render the row against a scratch `Writer` to
+ * count its params — previously that render was thrown away and the row
+ * rendered *again* at write time, re-running every column's `encode` twice.
+ * Memoizing it here means every row is rendered exactly once either way.
+ */
+const rowParamCount = (
+	row: Record<string, unknown>,
+	fields: readonly string[],
+	cols: readonly Column<any>[],
+	ctx: RenderContext,
+): { readonly count: number; readonly rendered: Query | undefined } => {
+	let dynamic = false;
+	for (const field of fields) {
+		if (isDynamicRowValue(row[field])) {
+			dynamic = true;
+			break;
+		}
+	}
+	if (!dynamic) return { count: cols.length, rendered: undefined };
+	const rendered = renderRow(row, fields, cols, ctx);
+	return { count: rendered.params.length, rendered };
+};
+
+/**
+ * How many bound parameters `writeReturning` will add to *every* statement in
+ * the insert, outside the `VALUES` list — zero unless `returning()` was given
+ * a `Selection` containing a `sql` expression that itself binds parameters.
+ */
+const countReturningParams = (
+	t: Table,
+	returning: Selection | true | undefined,
+	ctx: RenderContext,
+): number => {
+	if (!returning) return 0;
+	const scratch = new Writer(ctx);
+	writeReturning(scratch, t, returning, ctx);
+	return scratch.toQuery().params.length;
+};
+
 const countOnConflictParams = (
 	conflict: NonNullable<InsertPlan['onConflict']>,
 	columns: Record<string, Column<any>>,

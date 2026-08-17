@@ -35,14 +35,27 @@ interface GroupSpec {
 	 * nulls.
 	 */
 	readonly nullable: boolean;
-	readonly indexes: readonly number[];
 	/**
-	 * Subset of `indexes` that back a plain Column (not a `sql` leaf). The
-	 * null check for collapsing the group reads only these — a `sql` leaf
-	 * riding along in the group must not veto (or force) the collapse merely
-	 * by being non-null.
+	 * Indexes of this group's *direct* depth-2 Column leaves — not `sql`
+	 * leaves, and not leaves belonging to a nested group further down. The
+	 * null check for collapsing the group reads only these, matching Drizzle
+	 * (`path.length === 2`, applied per leaf): a `sql` leaf riding along must
+	 * not veto (or force) the collapse merely by being non-null, and a leaf
+	 * that sits deeper belongs to a nested group of its own.
 	 */
 	readonly columnIndexes: readonly number[];
+	/**
+	 * Fallback used ONLY when `columnIndexes` is empty: every Column leaf
+	 * found anywhere below this group, at any depth. A group produced by
+	 * joining to a nested subquery (what `.as()` over a join produces) has no
+	 * *direct* depth-2 Column leaf of its own — every leaf sits inside a
+	 * nested group instead — which left it permanently ineligible to collapse
+	 * even though every leaf under it is a real Column and all of them are
+	 * null. This does not change collapse eligibility for a group that does
+	 * have direct leaves (per-leaf rule above still governs those); it only
+	 * gives a group with none something to key the decision off of.
+	 */
+	readonly descendantColumnIndexes: readonly number[];
 }
 
 interface LeafSpec {
@@ -75,16 +88,17 @@ export function buildShape(fields: readonly FieldPlan[], nullableGroups: Readonl
 		key: string;
 		children: Draft[];
 		leaf?: LeafSpec;
-		indexes: number[];
+		/** Set on a leaf draft only: whether that leaf is a plain Column. */
+		isColumn?: boolean;
 		columnIndexes: number[];
 		path: string;
 	}
 
-	const root: Draft = { key: '', children: [], indexes: [], columnIndexes: [], path: '' };
+	const root: Draft = { key: '', children: [], columnIndexes: [], path: '' };
 	const find = (parent: Draft, key: string, path: string): Draft => {
 		let node = parent.children.find((c) => c.key === key && !c.leaf);
 		if (!node) {
-			node = { key, children: [], indexes: [], columnIndexes: [], path };
+			node = { key, children: [], columnIndexes: [], path };
 			parent.children.push(node);
 		}
 		return node;
@@ -95,18 +109,29 @@ export function buildShape(fields: readonly FieldPlan[], nullableGroups: Readonl
 		for (let i = 0; i < field.path.length - 1; i++) {
 			const segment = field.path[i]!;
 			parent = find(parent, segment, parent.path ? `${parent.path}.${segment}` : segment);
-			parent.indexes.push(field.index);
-			if (field.isColumn) parent.columnIndexes.push(field.index);
+			// Only the *direct* parent (the last iteration, i.e. the group this
+			// leaf is an immediate child of) collects it into `columnIndexes` —
+			// matching Drizzle's per-leaf `path.length === 2` rule: a deeper
+			// ancestor group does not see leaves nested further below it.
+			if (field.isColumn && i === field.path.length - 2) parent.columnIndexes.push(field.index);
 		}
 		parent.children.push({
 			key: field.path.at(-1)!,
 			children: [],
-			indexes: [],
 			columnIndexes: [],
 			path: '',
+			isColumn: field.isColumn,
 			leaf: { key: field.path.at(-1)!, index: field.index, decode: field.decode },
 		});
 	}
+
+	// Descendant Column indexes at any depth below a draft — used only as the
+	// collapse-decision fallback for a group whose own `columnIndexes` (direct
+	// depth-2 leaves) is empty. See `GroupSpec.descendantColumnIndexes`.
+	const collectDescendantColumnIndexes = (draft: Draft): number[] =>
+		draft.leaf
+			? draft.isColumn ? [draft.leaf.index] : []
+			: draft.children.flatMap(collectDescendantColumnIndexes);
 
 	const toNode = (draft: Draft): Node =>
 		draft.leaf
@@ -117,8 +142,10 @@ export function buildShape(fields: readonly FieldPlan[], nullableGroups: Readonl
 					key: draft.key,
 					children: draft.children.map(toNode),
 					nullable: nullableGroups.has(draft.path),
-					indexes: draft.indexes,
 					columnIndexes: draft.columnIndexes,
+					descendantColumnIndexes: draft.columnIndexes.length > 0
+						? draft.columnIndexes
+						: draft.children.flatMap(collectDescendantColumnIndexes),
 				},
 			};
 
@@ -139,10 +166,19 @@ const readRow = (nodes: readonly Node[], read: (index: number) => unknown): Reco
 			continue;
 		}
 		const group = node.group;
+		// A group with its own direct depth-2 Column leaves decides collapse
+		// from those alone (matching Drizzle's per-leaf rule). A group with
+		// none — every leaf sits inside a nested group instead, as a joined
+		// subquery's own row produces — falls back to every Column leaf found
+		// anywhere below it, or it would be permanently non-collapsible.
+		// `descendantColumnIndexes` *is* `columnIndexes` (same array reference)
+		// whenever the group has direct leaves, so it is the only value needed
+		// here — no per-row branch.
+		const collapseIndexes = group.descendantColumnIndexes;
 		if (
 			group.nullable
-			&& group.columnIndexes.length > 0
-			&& group.columnIndexes.every((index) => read(index) === null || read(index) === undefined)
+			&& collapseIndexes.length > 0
+			&& collapseIndexes.every((index) => read(index) === null || read(index) === undefined)
 		) {
 			obj[group.key] = null;
 			continue;
@@ -172,7 +208,20 @@ export function buildPositionalMapper<T>(shape: Shape): (rows: unknown[][]) => T
 		};
 	}
 
-	return (rows) => rows.map((row) => readRow(shape.nodes, (index) => row[index]) as T);
+	// The `(index) => row[index]` reader is allocated once here, not once per
+	// row inside `.map()` — `current` is closed over and reassigned each
+	// iteration instead. Measured (see the batch's F-104 note): ~5% faster at
+	// 1k-10k rows for this shape, with no behaviour change.
+	return (rows) => {
+		const out: T[] = new Array(rows.length);
+		let current: unknown[];
+		const read = (index: number): unknown => current[index];
+		for (let r = 0; r < rows.length; r++) {
+			current = rows[r]!;
+			out[r] = readRow(shape.nodes, read) as T;
+		}
+		return out;
+	};
 }
 
 /** Keyed mapper — used inside `batch()`, where `.raw()` is unavailable. */
@@ -183,6 +232,14 @@ export function buildKeyedMapper<T>(
 	const keyByIndex: string[] = [];
 	for (const field of fields) keyByIndex[field.index] = field.key;
 
-	return (rows) =>
-		rows.map((row) => readRow(shape.nodes, (index) => row[keyByIndex[index]!]) as T);
+	return (rows) => {
+		const out: T[] = new Array(rows.length);
+		let current: Record<string, unknown>;
+		const read = (index: number): unknown => current[keyByIndex[index]!];
+		for (let r = 0; r < rows.length; r++) {
+			current = rows[r]!;
+			out[r] = readRow(shape.nodes, read) as T;
+		}
+		return out;
+	};
 }

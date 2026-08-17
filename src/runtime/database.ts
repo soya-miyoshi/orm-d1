@@ -24,6 +24,47 @@ import { Executor } from './session.js';
  */
 export type RelationalStrategy = 'split' | 'joined';
 
+/**
+ * Subset of `drizzle-orm`'s `Logger` interface (`interface Logger {
+ * logQuery(query: string, params: unknown[]): void }`) — kept identical so a
+ * caller's existing Drizzle logger (custom or `DefaultLogger`) can be handed
+ * to `logger:` unchanged.
+ */
+export interface Logger {
+	logQuery(query: string, params: unknown[]): void;
+}
+
+/**
+ * Matches `drizzle-orm`'s `DefaultLogger`: one line per query, to `console.log`.
+ *
+ * Bound params routinely contain PII (see `errors.ts`'s `OrmD1QueryError.params`
+ * and `result.ts`'s event building, both gated the same way) — this is *our*
+ * default logger choosing what to print, not a caller's. A caller who passes
+ * their own `logger:` function still gets raw params handed to it unfiltered;
+ * this gate only applies to the built-in implementation.
+ */
+class DefaultLogger implements Logger {
+	logQuery(query: string, params: unknown[]): void {
+		if (!isDev() || params.length === 0) {
+			console.log(`Query: ${query}`);
+			return;
+		}
+		const strs = params.map((p) => {
+			try {
+				return JSON.stringify(p);
+			} catch {
+				return String(p);
+			}
+		});
+		console.log(`Query: ${query} -- params: [${strs.join(', ')}]`);
+	}
+}
+
+const resolveLogger = (logger: boolean | Logger | undefined): Logger | undefined => {
+	if (!logger) return undefined;
+	return logger === true ? new DefaultLogger() : logger;
+};
+
 export interface OrmD1Options {
 	/** Applied to column names that don't specify one explicitly. */
 	casing?: 'preserve' | 'snake_case';
@@ -56,8 +97,17 @@ export interface OrmD1Options {
 	 * of `defineRelations` as `relations`, which the root `drizzle()` reads.
 	 */
 	schema?: unknown;
-	/** Accepted and ignored — see `onQuery` instead. */
-	logger?: unknown;
+	/**
+	 * Drizzle-shaped query logging: `true` for a default `console.log` logger,
+	 * an object implementing `Logger` to receive `logQuery(sql, params)` for
+	 * every statement actually run (each chunk of a chunked write, each member
+	 * of a batch), or omitted/`false` for none. Distinct from `onQuery` — which
+	 * this project added and which also carries timing and D1's own row-count
+	 * metadata — kept because `logger: true` is the single most common Drizzle
+	 * debugging switch, and silently discarding it (as this used to) reads as
+	 * "no queries are running".
+	 */
+	logger?: boolean | Logger;
 	/**
 	 * Which Workers plan this database is on.
 	 *
@@ -151,10 +201,14 @@ export class OrmD1Database {
 	 * way out of the builder is a reason for better diagnostics, not worse.
 	 */
 	async execute(sql: string, params: unknown[] = []): Promise<D1Result> {
-		const stmt = this.$client.prepare(sql);
+		// Routed through `Executor#prepare` (via `prepareRaw`) rather than
+		// `this.$client.prepare()` directly, so `logger`/`onQuery` observe this
+		// statement the same way they observe every built one — see the comment
+		// on `Executor#prepare` in `runtime/session.ts`.
+		const stmt = this.executor.prepareRaw(sql, params as D1Param[]);
 		const started = Date.now();
 		try {
-			const result = await (params.length > 0 ? stmt.bind(...params) : stmt).run();
+			const result = await stmt.run();
 			// Counts like any other statement: D1 does not care that we did not
 			// build this one.
 			this.options.budget?.record(result.meta?.size_after);
@@ -234,6 +288,7 @@ export function ormD1(binding: D1Database, options: OrmD1Options = {}): OrmD1Dat
 			...(options.jsonEachThreshold !== undefined ? { jsonEachThreshold: options.jsonEachThreshold } : {}),
 		},
 		onQuery: options.onQuery,
+		logger: resolveLogger(options.logger),
 		// Created here rather than per Executor so that the databases
 		// `withSession()` derives share the count — they are the same invocation.
 		budget: options.plan ? new InvocationBudget(options.plan, PLAN_LIMITS[options.plan]) : undefined,

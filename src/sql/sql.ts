@@ -52,6 +52,24 @@ export interface RenderContext {
 	 * inlined.
 	 */
 	readonly paramToken?: string;
+	/**
+	 * Called when an empty array is interpolated into a DDL predicate (a
+	 * `check()` or a partial index's `where()`), which renders `in ()` / `not in
+	 * ()` — SQLite accepts it, but it is unconditionally false/true, so the
+	 * constraint or partial index goes permanently inert. This module ships to
+	 * the Worker and must not decide what to do about that; `src/ddl.ts`
+	 * supplies this hook only while generating DDL and throws from it.
+	 */
+	readonly onEmptyArrayPredicate?: () => void;
+	/**
+	 * Called with a foreign (Drizzle) `SQL` fragment's own `queryChunks` when
+	 * one is rendered under `bareColumns`, so the tree walk that looks for an
+	 * interpolated empty array nested inside it (`and`/`eq`/`inArray` built
+	 * with Drizzle's own `sql` tag) can live in `src/ddl.ts` — Node, DDL-only —
+	 * instead of the core runtime bundle. A no-op when absent, so production
+	 * pays nothing beyond the field check itself.
+	 */
+	readonly onForeignFragment?: (queryChunks: readonly unknown[]) => void;
 }
 
 export const defaultRenderContext: RenderContext = {
@@ -196,6 +214,18 @@ class SQL<T = unknown> implements SQLChunk<T> {
 				text += nested.sql;
 				params.push(...nested.params);
 			} else if (Array.isArray(value)) {
+				// An empty array renders `()`, matching `drizzle-orm` exactly (see
+				// `docs/04`'s reverse-alias invariant — diverging here would break
+				// it). In a DDL predicate that is not safe the way it is at
+				// runtime: `x not in ()` is unconditionally true and `x in ()` is
+				// unconditionally false, so a CHECK or partial-index `where` built
+				// from an empty array goes permanently inert instead of failing
+				// loudly. `orm-d1-kit generate` is where that can actually be
+				// refused (`src/ddl.ts`, Node, free to throw); this module ships to
+				// the Worker and stays silent — `ctx.onEmptyArrayPredicate` is an
+				// optional structural hook the DDL path supplies, a no-op call when
+				// absent, so production pays nothing.
+				if (value.length === 0 && ctx.bareColumns) ctx.onEmptyArrayPredicate?.();
 				text += '(';
 				for (const [j, item] of value.entries()) {
 					if (j > 0) text += ', ';

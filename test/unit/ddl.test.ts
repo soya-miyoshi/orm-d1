@@ -1,6 +1,10 @@
+import { and as dAnd, eq as dEq, gt as dGt, inArray as dInArray, notInArray as dNotInArray, sql as dSql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
+import { asDrizzleTable } from '../../src/drizzle.js';
 import { createIndexes, createSchema, createTable, dropTable, literal } from '../../src/ddl.js';
 import { blob, check, customType, integer, numeric, real, sql, sqliteTable, text, uniqueIndex } from '../../src/index.js';
+import { inArray, notInArray } from '../../src/sql/expressions.js';
+import type { SQLChunk } from '../../src/sql/sql.js';
 import { allTables, postTags, posts, users } from '../schema.js';
 
 describe('ddl generation', () => {
@@ -120,6 +124,257 @@ describe('ddl generation', () => {
 		expect(ddl).toContain('check ("role" in (\'admin\', , \'member\'))');
 		expect(ddl).not.toContain("'admin', null");
 		expect(ddl).not.toContain('null, ');
+	});
+
+	// [F-087]: an empty interpolated array in a DDL predicate renders `()`,
+	// which SQLite accepts — `not in ()` is unconditionally true, `in ()` is
+	// unconditionally false, so the constraint goes permanently inert with no
+	// error. Matching `drizzle-orm`'s own `()` rendering is correct (the
+	// `docs/04` reverse-alias invariant), so `createTable` refuses outright
+	// rather than silently emitting an inert constraint — DDL generation runs
+	// in Node (via `orm-d1-kit`), so it is free to throw.
+	it('refuses to generate DDL for a check built from an empty interpolated array', () => {
+		const ROLES: string[] = [];
+		const t = sqliteTable('t', {
+			role: text('role'),
+		}, (c) => [
+			check('t_role_check', sql`${c.role} not in ${ROLES}`),
+		]);
+
+		expect(() => createTable(t)).toThrow(/empty array/);
+	});
+
+	it('does not refuse a non-empty interpolated array in a check', () => {
+		const t = sqliteTable('t', {
+			role: text('role'),
+		}, (c) => [
+			check('t_role_check', sql`${c.role} in ${['admin', 'member']}`),
+		]);
+
+		expect(() => createTable(t)).not.toThrow();
+	});
+
+	// The `RenderContext` hook that throws has no access to which table or
+	// constraint it is rendering for — the raw error was anonymous. The DDL
+	// call sites (`checkDDL`, `createIndex`, `columnDDL`) all have that
+	// context, so it is attached on the way back out.
+	it('names the table and constraint in the empty-array refusal', () => {
+		const ROLES: string[] = [];
+		const t = sqliteTable('t', {
+			role: text('role'),
+		}, (c) => [
+			check('t_role_check', sql`${c.role} not in ${ROLES}`),
+		]);
+
+		expect(() => createTable(t)).toThrow(/table "t"/);
+		expect(() => createTable(t)).toThrow(/constraint "t_role_check"/);
+	});
+
+	it('also refuses a check built with a Drizzle sql fragment interpolating an empty array', () => {
+		// Closes the gap `fromDrizzleSQL` left: a check() written with
+		// Drizzle's own `sql` tag rendered `not in ()` silently because
+		// `ctx.onEmptyArrayPredicate` was only ever consulted from orm-d1's
+		// own template tag.
+		const roles: string[] = [];
+		const t = sqliteTable('t', { role: text('role') });
+		const dRole = asDrizzleTable(t).role;
+		const withCheck = sqliteTable('t', {
+			role: text('role'),
+		}, () => [
+			check('t_role_check', dSql`${dRole} not in ${roles}` as unknown as SQLChunk),
+		]);
+
+		expect(() => createTable(withCheck)).toThrow(/empty array/);
+	});
+
+	// [F-1] orm-d1's own `inArray()`/`notInArray()` (src/sql/expressions.ts)
+	// short-circuit an empty array to a bare `'1 = 1'`/`'1 = 0'` string for
+	// query correctness/performance — but that short-circuit used to bypass
+	// the DDL empty-array refusal entirely, since it never went through
+	// `sql.ts`'s own array-interpolation path that `ctx.onEmptyArrayPredicate`
+	// hooks into. A `check()`/partial-index `where()` built with `inArray`/
+	// `notInArray` over an empty array therefore rendered a permanently
+	// true/false constraint with no error, the exact hazard [F-087] closed for
+	// a hand-written `sql` template and for Drizzle's own fragments.
+	it('refuses a check built with notInArray() over an empty array', () => {
+		const t = sqliteTable('t1', {
+			role: text('role'),
+		}, (c) => [
+			check('t1_role_check', notInArray(c.role, [])),
+		]);
+
+		expect(() => createTable(t)).toThrow(/empty array/);
+		expect(() => createTable(t)).toThrow(/table "t1"/);
+		expect(() => createTable(t)).toThrow(/constraint "t1_role_check"/);
+	});
+
+	it('refuses a partial index built with inArray() over an empty array', () => {
+		const t = sqliteTable('t2', {
+			role: text('role'),
+		}, (c) => [
+			uniqueIndex('t2_role_idx').on(c.role).where(inArray(c.role, [])),
+		]);
+
+		expect(() => createIndexes(t)).toThrow(/empty array/);
+	});
+
+	it('does not refuse inArray()/notInArray() with a non-empty array in a check', () => {
+		const t = sqliteTable('t3', {
+			role: text('role'),
+		}, (c) => [
+			check('t3_role_check', notInArray(c.role, ['admin', 'member'])),
+		]);
+
+		expect(() => createTable(t)).not.toThrow();
+	});
+
+	// Drizzle's own `inArray`/`notInArray` (as opposed to orm-d1's) short-circuit
+	// an empty array *before* building any array chunk at all —
+	// `drizzle-orm/sql/expressions/conditions.js` returns `sql\`false\`` /
+	// `sql\`true\`` outright. That is a whole fragment whose `queryChunks` is one
+	// bare `StringChunk`, a shape distinct from — and, before this fix, invisible
+	// to — the bare-`[]` scan that already caught a hand-written `sql` template
+	// and orm-d1's own `InArray`. Verified for both the bare form and nested
+	// inside `and()`/`eq()`, since `and()` wraps the collapsed fragment as a
+	// nested `SQL` rather than flattening it.
+	it('refuses a check built with Drizzle\'s own inArray() over an empty array', () => {
+		const t = sqliteTable('t4', { role: text('role') });
+		const dRole = asDrizzleTable(t).role;
+		const withCheck = sqliteTable('t4', {
+			role: text('role'),
+		}, () => [
+			check('t4_role_check', dInArray(dRole, []) as unknown as SQLChunk),
+		]);
+
+		expect(() => createTable(withCheck)).toThrow(/empty array/);
+	});
+
+	it('refuses a check built with Drizzle\'s own notInArray() over an empty array', () => {
+		const t = sqliteTable('t5', { role: text('role') });
+		const dRole = asDrizzleTable(t).role;
+		const withCheck = sqliteTable('t5', {
+			role: text('role'),
+		}, () => [
+			check('t5_role_check', dNotInArray(dRole, []) as unknown as SQLChunk),
+		]);
+
+		expect(() => createTable(withCheck)).toThrow(/empty array/);
+	});
+
+	it('refuses Drizzle\'s own inArray() over an empty array nested inside and()/eq()', () => {
+		const t = sqliteTable('t6', { id: integer('id'), role: text('role') });
+		const dt = asDrizzleTable(t);
+		const withCheck = sqliteTable('t6', {
+			id: integer('id'),
+			role: text('role'),
+		}, () => [
+			check('t6_role_check', dAnd(dEq(dt.id, 1), dInArray(dt.role, [])) as unknown as SQLChunk),
+		]);
+
+		expect(() => createTable(withCheck)).toThrow(/empty array/);
+	});
+
+	it('refuses a partial index built with Drizzle\'s own notInArray() over an empty array', () => {
+		const bare = sqliteTable('t7', { role: text('role') });
+		const dRole = asDrizzleTable(bare).role;
+		const t7 = sqliteTable('t7', {
+			role: text('role'),
+		}, (c) => [
+			uniqueIndex('t7_role_idx').on(c.role).where(dNotInArray(dRole, []) as unknown as SQLChunk),
+		]);
+
+		expect(() => createIndexes(t7)).toThrow(/empty array/);
+	});
+
+	// Regression: `isBareBooleanFragment` is only meaningful for a predicate
+	// (`check()`/partial-index `where()`) — it must NOT be consulted from
+	// `ddlContext`, which every `renderInline` call shares, including
+	// `defaultClause` and the generated-column expression in `columnDDL`. A
+	// Drizzle-tagged `default(sql\`true\`)` collapses to the exact same
+	// one-`StringChunk` shape as Drizzle's own `inArray([])`/`notInArray([])`
+	// short-circuit, but it is an ordinary, meaningful default — not an
+	// empty-array predicate — and must render, not throw.
+	it('does not refuse a Drizzle-tagged default(sql`true`)', () => {
+		const t = sqliteTable('members', {
+			active: integer('active', { mode: 'boolean' }).notNull().default(dSql`true` as unknown as SQLChunk),
+		});
+
+		let ddl = '';
+		expect(() => (ddl = createTable(t))).not.toThrow();
+		expect(ddl).toContain('"active" integer not null default true');
+	});
+
+	it('does not refuse a Drizzle-tagged generatedAlwaysAs(sql`true`)', () => {
+		const t = sqliteTable('t11', {
+			flag: integer('flag', { mode: 'boolean' }).generatedAlwaysAs(dSql`true` as unknown as SQLChunk),
+		});
+
+		let ddl = '';
+		expect(() => (ddl = createTable(t))).not.toThrow();
+		expect(ddl).toContain('generated always as (true)');
+	});
+
+	// The predicate positions must still refuse a bare `sql\`true\`` — this is
+	// the accepted false positive the long comment on `isBareBooleanFragment`
+	// documents: structurally indistinguishable from Drizzle's own
+	// `inArray([])`/`notInArray([])` collapse, and a `check` that is
+	// unconditionally satisfied has no reason to exist.
+	it('still refuses a check() built directly with Drizzle\'s sql`true`', () => {
+		const t = sqliteTable('t12', {
+			role: text('role'),
+		}, () => [
+			check('t12_always_check', dSql`true` as unknown as SQLChunk),
+		]);
+
+		expect(() => createTable(t)).toThrow(/empty array/);
+	});
+
+	// DDL binds nothing — every value is inlined as a literal (`renderInline`)
+	// — so the real D1 bound-parameter limits (`jsonEachThreshold: 30`,
+	// `maxParams: 100`) do not apply here. Left at their query-path defaults, a
+	// `check()`/partial-index built from a long `inArray()` would either
+	// render a `json_each(...)` subquery — which D1 rejects outright inside a
+	// CHECK constraint — or throw the bound-parameter `CompileError` even
+	// though nothing is bound.
+	it('renders inArray() with >= 30 values in a check as a literal list, not json_each', () => {
+		const roles = Array.from({ length: 30 }, (_, i) => `role${i}`);
+		const t = sqliteTable('t8', {
+			role: text('role'),
+		}, (c) => [
+			check('t8_role_check', inArray(c.role, roles)),
+		]);
+
+		const ddl = createTable(t);
+		expect(ddl).not.toContain('json_each');
+		expect(ddl).toContain(`in ('role0', 'role1'`);
+	});
+
+	it('renders inArray() with > 100 values in a check without throwing, as a literal list', () => {
+		const roles = Array.from({ length: 150 }, (_, i) => `role${i}`);
+		const t = sqliteTable('t9', {
+			role: text('role'),
+		}, (c) => [
+			check('t9_role_check', inArray(c.role, roles)),
+		]);
+
+		let ddl = '';
+		expect(() => (ddl = createTable(t))).not.toThrow();
+		expect(ddl).not.toContain('json_each');
+		expect(ddl).toContain(`in ('role0', 'role1'`);
+		expect(ddl).toContain(`'role149'`);
+	});
+
+	it('renders inArray() with >= 30 values in a partial index where as a literal list, not json_each', () => {
+		const roles = Array.from({ length: 30 }, (_, i) => `role${i}`);
+		const t = sqliteTable('t10', {
+			role: text('role'),
+		}, (c) => [
+			uniqueIndex('t10_role_idx').on(c.role).where(inArray(c.role, roles)),
+		]);
+
+		const [ddl] = createIndexes(t);
+		expect(ddl).not.toContain('json_each');
+		expect(ddl).toContain(`in ('role0', 'role1'`);
 	});
 
 	it('renders sql defaults inline and value defaults as literals', () => {
@@ -304,5 +559,27 @@ describe('blob defaults', () => {
 		}, (table) => [check('payload_check', sql`${table.payload} <> ${new Uint8Array([0x00, 0xff])}`)]);
 
 		expect(createTable(t)).toContain(`check ("payload" <> x'00ff')`);
+	});
+
+	// [F-067]: a Drizzle fragment inside DDL ignored `ctx.bareColumns`, so
+	// `check('c', drizzleSql\`${col} > 0\`)` rendered a table-qualified column.
+	// A table-qualified column is actually fine inside a CHECK constraint on
+	// D1 — the restriction SQLite enforces is narrower, and applies only to a
+	// *generated* column's expression (`the "." operator prohibited in
+	// generated columns`). This assertion is kept because bare-columns
+	// rendering is still the intended, more natural spelling for `check`/
+	// `where` — not because the qualified form would otherwise fail.
+	it('renders a Drizzle fragment in a check constraint with a bare column, not table-qualified', () => {
+		const t = sqliteTable('t', {
+			score: integer('score'),
+		});
+		const dt = asDrizzleTable(t);
+		const withCheck = sqliteTable('t', {
+			score: integer('score'),
+		}, () => [check('t_score_check', dGt(dt.score, 0) as unknown as SQLChunk)]);
+
+		const ddl = createTable(withCheck);
+		expect(ddl).toContain('check ("score" > 0)');
+		expect(ddl).not.toContain('"t"."score"');
 	});
 });

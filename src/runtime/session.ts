@@ -21,6 +21,8 @@ export interface D1Target {
 export interface ResolvedOptions {
 	readonly compileOptions: CompileOptions;
 	readonly onQuery: ((event: QueryEvent) => void) | undefined;
+	/** See `Logger` in `runtime/database.ts` — `undefined` means no logging. */
+	readonly logger: { logQuery(query: string, params: unknown[]): void } | undefined;
 	/**
 	 * Present only when `plan` was supplied. Shared by every database derived
 	 * from the one that was opened — `withSession()` reuses these options — so
@@ -30,6 +32,35 @@ export interface ResolvedOptions {
 }
 
 const now = (): number => Date.now();
+
+/**
+ * Summarise a chunked statement's parts for `wrapQueryError`, instead of
+ * joining every part's SQL. D1's `batch()` gives no indication of which
+ * member failed, so the earlier approach reported every part — measured at
+ * 62KB+ for a 3000-row insert failing on its last chunk (~1KB baseline). The
+ * first and last part plus the total count is almost always enough to place
+ * the failure (an insert's parts are otherwise identical text with different
+ * bound values) without scaling with the number of chunks. See [F-064].
+ */
+const summarizeParts = (sqls: readonly string[]): string => {
+	if (sqls.length === 1) return sqls[0]!;
+	const first = sqls[0]!;
+	const last = sqls.at(-1)!;
+	return `${sqls.length} parts; first: ${first}${first === last ? '' : `; last: ${last}`}`;
+};
+
+/**
+ * Parameters to attach to a chunked-statement error — `__DEV__` only, same as
+ * `OrmD1QueryError.params`, so the potentially-large `bound.flat()` allocation
+ * is skipped entirely outside dev rather than computed and then discarded by
+ * the constructor. Bounded to the first and last part's params, matching
+ * `summarizeParts`.
+ */
+const summarizedParams = (bound: readonly (readonly D1Param[])[]): D1Param[] | undefined => {
+	if (!isDev()) return undefined;
+	if (bound.length <= 2) return bound.flat();
+	return [...bound[0]!, ...bound.at(-1)!];
+};
 
 /**
  * Fold the results of a statement that compiled to several parts back into one.
@@ -94,8 +125,23 @@ export class Executor implements QueryExecutor {
 	}
 
 	#prepare(sql: string, params: readonly D1Param[]): D1PreparedStatement {
+		// Every statement actually sent to D1 passes through here — each chunk
+		// of a chunked write, each member of a `batch()`, and `db.execute()`'s
+		// raw escape hatch via `prepareRaw` below — which is what makes this
+		// the one place to log rather than the call sites above it.
+		this.options.logger?.logQuery(sql, [...params]);
 		const stmt = this.target.prepare(sql);
 		return params.length > 0 ? stmt.bind(...params) : stmt;
+	}
+
+	/**
+	 * The public seam for `db.execute()` — Database's raw escape hatch — so
+	 * that path observes `logger`/`onQuery` the same as every built statement,
+	 * instead of calling `$client.prepare()` directly and skipping this class
+	 * entirely.
+	 */
+	prepareRaw(sql: string, params: readonly D1Param[]): D1PreparedStatement {
+		return this.#prepare(sql, params);
 	}
 
 	async executeRows<T>(query: CompiledQuery<T>, input: Record<string, unknown> = {}): Promise<T[]> {
@@ -158,7 +204,17 @@ export class Executor implements QueryExecutor {
 			}
 			return results as D1Result[];
 		} catch (cause) {
-			throw wrapQueryError(cause, query.sql);
+			// `query.sql` is always `parts[0].sql` — reporting only it named the
+			// wrong statement for anything but a failure in the first chunk. D1's
+			// `batch()` gives no indication of which member failed, so the first
+			// and last part's SQL and bound parameters are reported rather than
+			// guessing which one to blame (or joining every part unbounded — see
+			// `summarizeParts`). See [F-064].
+			throw wrapQueryError(
+				cause,
+				summarizeParts(query.parts.map((part) => part.sql)),
+				summarizedParams(bound),
+			);
 		}
 	}
 
@@ -185,6 +241,8 @@ export class Executor implements QueryExecutor {
 
 		/** Parallel to `statements`, so `onQuery` can report what was bound. */
 		const bound: (readonly D1Param[])[] = [];
+		/** Parallel to `statements` too — every part's SQL, not just each item's first. */
+		const sqls: string[] = [];
 
 		for (const { query, input } of compiled) {
 			const span: number[] = [];
@@ -192,6 +250,7 @@ export class Executor implements QueryExecutor {
 				span.push(statements.length);
 				const params = bindParams(part.params, input);
 				bound.push(params);
+				sqls.push(part.sql);
 				statements.push(this.#prepare(part.sql, params));
 			}
 			spans.push(span);
@@ -202,7 +261,13 @@ export class Executor implements QueryExecutor {
 		try {
 			results = await this.target.batch<Record<string, unknown>>(statements);
 		} catch (cause) {
-			throw wrapQueryError(cause, compiled.map((c) => c.query.sql).join('; '));
+			// `compiled.map((c) => c.query.sql)` joined only each item's *first*
+			// part — an item that itself compiled to several chunked statements
+			// (a wide insert inside `batch()`) lost every part but the first.
+			// D1 gives no indication of which statement in the batch failed, so
+			// the first and last statement actually sent are reported (not every
+			// part unbounded — see `summarizeParts`). See [F-064].
+			throw wrapQueryError(cause, summarizeParts(sqls), summarizedParams(bound));
 		}
 
 		return compiled.map(({ query }, i) => {

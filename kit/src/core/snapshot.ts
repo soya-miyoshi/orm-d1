@@ -6,7 +6,7 @@
  * drizzle-kit's shape — it is a reasonable design, and matching it is what
  * makes importing an existing migration history possible.
  */
-import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName } from 'orm-d1/ddl';
+import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName, withDDLContext } from 'orm-d1/ddl';
 import type { TableOptionsMap } from 'orm-d1/ddl';
 import { appendOnlyKey, assertAppendOnlyColumns } from 'orm-d1/ddl';
 import type { Column, Table } from 'orm-d1';
@@ -318,7 +318,7 @@ export function snapshotFromSchema(
 								: decorateIndexColumn(renderInline(c as never))
 						),
 						isUnique: extra.meta.unique,
-						where: extra.meta.where ? renderInline(extra.meta.where) : undefined,
+						where: extra.meta.where ? renderInline(extra.meta.where, true) : undefined,
 					};
 					break;
 				}
@@ -376,8 +376,20 @@ export function snapshotFromSchema(
 					break;
 				}
 				case 'check': {
+					// `renderInline` can throw the empty-array DDL refusal
+					// (`src/ddl.ts`'s `onEmptyArrayPredicate`/`onForeignFragment`),
+					// which comes back anonymous — no table or constraint name.
+					// Snapshot generation runs before the diff engine's own
+					// `checkDDL` call would normally attach that context, so it is
+					// wrapped here through the same `withDDLContext` helper
+					// `checkDDL` uses, rather than calling `renderInline` bare.
+					// `isPredicate: true` matters here and not only in `checkDDL`: this is the
+					// *only* place in the whole kit where a check's `SQLChunk` becomes text
+					// (`generate`/`check`/`push` all render tables from the snapshot via
+					// `createTableFromSnapshot`, which reads this string), so a refusal that
+					// fires only in `checkDDL` never sees a migration.
+					const value = withDDLContext(name, extra.meta.name, () => renderInline(extra.meta.value, true));
 					if (Object.hasOwn(checkConstraints, extra.meta.name)) {
-						const value = renderInline(extra.meta.value);
 						throw new Error(
 							`"${name}" declares two check constraints both named "${extra.meta.name}" `
 								+ `(the second is "${value}"). `
@@ -386,7 +398,7 @@ export function snapshotFromSchema(
 					}
 					checkConstraints[extra.meta.name] = {
 						name: extra.meta.name,
-						value: renderInline(extra.meta.value),
+						value,
 					};
 					break;
 				}

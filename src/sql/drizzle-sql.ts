@@ -36,6 +36,21 @@ export const isDrizzleSQL = (value: unknown): boolean =>
 	typeof value === 'object' && value !== null && hasEntityKind(value, 'SQL');
 
 /**
+ * A Drizzle `StringChunk` — a literal fragment of SQL text, as opposed to a
+ * bound value or a nested `SQL`. Exported for `src/ddl.ts`'s DDL-only
+ * empty-array detection: Drizzle's `inArray`/`notInArray` helpers
+ * short-circuit an empty array to `sql\`true\`` / `sql\`false\`` *before*
+ * building any array chunk, which renders as a whole fragment whose
+ * `queryChunks` is exactly one `StringChunk(["true"])` / `StringChunk(["false"])`
+ * — structurally different from (and not caught by) a scan for a bare `[]`.
+ */
+export const isStringChunk = (value: unknown): value is { readonly value: readonly string[] } =>
+	typeof value === 'object' && value !== null && hasEntityKind(value, 'StringChunk');
+
+/** The text a Drizzle `StringChunk` carries — its `value` array, joined. */
+export const stringChunkText = (chunk: { readonly value: readonly string[] }): string => chunk.value.join('');
+
+/**
  * Anything Drizzle can turn into a fragment: a `SQL`, or a `SQLWrapper` such as
  * a Drizzle column, table or aggregate.
  *
@@ -111,6 +126,18 @@ export const fromDrizzleSQL = (value: unknown, ctx?: RenderContext): Query => {
 		? value as { toQuery: (config: unknown) => { sql: string; params: unknown[] } }
 		: (value as { getSQL: () => { toQuery: (config: unknown) => { sql: string; params: unknown[] } } }).getSQL();
 
+	// Whether one of this fragment's own `queryChunks` is a bare `[]` — the
+	// empty-array-predicate hazard `src/sql/sql.ts`'s own `toQuery` refuses via
+	// `ctx.onEmptyArrayPredicate` for our own template tag — is DDL-only
+	// detection logic. Scanning `queryChunks` here would ship a Drizzle-specific
+	// tree walk in the core runtime bundle for a check that can only ever fire
+	// under `ctx.bareColumns` (set only by `src/ddl.ts`, which never reaches a
+	// deployed Worker). So this only hands the fragment's own chunk list to
+	// whatever the caller supplied; the walk itself lives in `src/ddl.ts`.
+	if (ctx?.bareColumns && isDrizzleSQL(fragment)) {
+		ctx.onForeignFragment?.((fragment as unknown as { queryChunks: readonly unknown[] }).queryChunks);
+	}
+
 	const token = ctx?.paramToken ?? '?';
 	const { sql, params } = fragment.toQuery({
 		escapeName: quote,
@@ -118,6 +145,24 @@ export const fromDrizzleSQL = (value: unknown, ctx?: RenderContext): Query => {
 		escapeString: (str: string): string => `'${str.replaceAll("'", "''")}'`,
 		casing: { getColumnCasing: (column: { name: string }): string => column.name },
 		inlineParams: false,
+		// `check('c', drizzleSql\`${col} > 0\`)` must not render "t"."c" > 0 —
+		// a table-qualified column is fine in a CHECK constraint on D1 (`check
+		// ("t"."c" <> 'bad')` and `where "t"."c" = 'x'` are both accepted); the
+		// real restriction is narrower and applies only to a *generated*
+		// column's expression, where the `.` operator is rejected outright
+		// (`the "." operator prohibited in generated columns`). Bare-columns
+		// rendering here still strips the qualifier regardless — it reads more
+		// naturally and avoids relying on a table alias the DDL context never
+		// declares — it just is not a correctness requirement for `check`/
+		// `where`. Drizzle itself special-cases this: `SQL.toQuery`
+		// (drizzle-orm/sql/sql.js) checks `_config.invokeSource === 'indexes'`
+		// at the `Column` chunk and, if so, renders just `escapeName(columnName)`
+		// with no table qualifier — the flag propagates through nested
+		// fragments automatically. Asking for it structurally here means only
+		// actual column-reference nodes are affected; text inside string
+		// literals (e.g. a JSON path like '$."a"."b"') is untouched, unlike a
+		// text-level regex over the rendered SQL. See [F-067].
+		...(ctx?.bareColumns ? { invokeSource: 'indexes' } : {}),
 	});
 
 	return { sql, params: params.map(toSlot) };

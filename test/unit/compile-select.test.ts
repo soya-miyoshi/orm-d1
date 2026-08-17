@@ -204,6 +204,20 @@ describe('select compilation', () => {
 		);
 	});
 
+	// [F-085]: `alias()` ran `buildTable`, which did not copy the `TableSource`
+	// symbol a subquery carries — so re-aliasing a subquery lost the inner
+	// statement and compiled to `select "x"."id" from "sq" "x"` (a table that
+	// does not exist) instead of inlining `(select …) "x"`.
+	it('aliases a subquery, inlining the inner statement rather than referencing it by name', () => {
+		const sq = query.select({ id: posts.id, views: posts.views }).from(posts).limit(10).as('sq');
+		const x = alias(sq, 'x');
+		const compiled = query.select({ id: x.id }).from(x).compile();
+
+		expect(compiled.sql).toBe(
+			'select "x"."id" from (select "posts"."id", "posts"."views" from "posts" limit 10) "x"',
+		);
+	});
+
 	/**
 	 * A subquery's declared columns have to name what the statement inside it
 	 * actually emits.
@@ -343,6 +357,24 @@ describe('the surface a subquery exposes', () => {
 		expect(mapped!.users).not.toBeNull();
 	});
 
+	it('collapses a joined nested subquery whose own leaves have no direct depth-2 Column of their own', () => {
+		// `s` is itself a join wrapped in `.as()`, so every leaf under the `s`
+		// group sits at depth 3 (`s.users.id`, `s.posts.id`, …) — `s` has no
+		// *direct* depth-2 Column leaf of its own. Gating collapse on
+		// `columnIndexes.length > 0` alone made `s` permanently non-collapsible:
+		// a row where every column under `s` is null rendered as
+		// `{ users: {...}, posts: null }` (a live object) instead of `null`.
+		const s = query.select().from(users).leftJoin(posts, on).as('s');
+		const compiled = query.select().from(users).leftJoin(s, eq(users.id, users.id)).compile();
+
+		const userColumns = Object.keys(getTableColumns(users)).length;
+		const row = compiled.columnNames.map((_, i) => (i < userColumns ? 1 : null));
+		const [mapped] = compiled.map([row]);
+
+		expect(mapped!.users).not.toBeNull();
+		expect(mapped!.s).toBeNull();
+	});
+
 	it('treats an untyped sql fragment as one column, not a group', () => {
 		// `SubqueryLeaf` enumerates scalars, so `unknown` — what a bare
 		// `sql\`…\`` produces — fell to the group branch and expanded the
@@ -432,6 +464,19 @@ describe('explicit selections over an outer join', () => {
 		}).from(users).leftJoin(posts, on).compile();
 
 		expect(c.map([[7]])[0]!.p).toEqual({ one: 7 });
+	});
+
+	// [F-056]: a group mixing a depth-2 leaf with a deeper leaf used to veto
+	// the whole group from collapsing. Drizzle applies `path.length === 2` per
+	// leaf, not per group: the deeper leaf is simply skipped, and the group's
+	// own depth-2 Column leaves still decide the collapse.
+	it('collapses a group whose direct leaf is null, skipping a deeper leaf rather than vetoing the group', () => {
+		const c = query.select({
+			postId: posts.id,
+			author: { id: users.id, contact: { email: users.email } },
+		}).from(posts).leftJoin(users, eq(posts.authorId, users.id)).compile();
+
+		expect(c.map([[7, null, null]])[0]).toEqual({ postId: 7, author: null });
 	});
 
 	it('does not collapse a group from the non-nullable side of the join', () => {

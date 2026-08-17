@@ -121,7 +121,7 @@ export type { LatestPerGroupConfig } from './builders/window.js';
 export { latestPerGroup } from './builders/window.js';
 
 // runtime
-export type { OrmD1Options, OrmD1Session } from './runtime/database.js';
+export type { Logger, OrmD1Options, OrmD1Session } from './runtime/database.js';
 export { OrmD1Database, ormD1 } from './runtime/database.js';
 export type { QueryEvent } from './runtime/result.js';
 export { OrmD1QueryError, NoTransactionsError } from './errors.js';

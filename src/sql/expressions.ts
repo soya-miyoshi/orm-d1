@@ -134,7 +134,17 @@ class InArray implements SQLChunk<boolean> {
 		}
 
 		if (this.values.length === 0) {
-			// `x in ()` is a syntax error; an empty set is simply never/always true.
+			// `x in ()` is a syntax error; an empty set is simply never/always true
+			// for an ordinary query, so this still short-circuits for correctness
+			// and performance there. Under DDL rendering (`ctx.bareColumns`) that
+			// same rewrite would make a check()/partial-index predicate
+			// permanently inert, so it goes through the same refusal hook
+			// `src/sql/sql.ts`'s own empty-array handling uses instead of
+			// returning a bare literal that the DDL scan can never see —
+			// `src/ddl.ts` supplies the hook only while generating DDL and
+			// throws from it; this module ships to the Worker and stays a
+			// no-op call in production.
+			if (ctx.bareColumns) ctx.onEmptyArrayPredicate?.();
 			return { sql: this.negated ? '1 = 1' : '1 = 0', params: [] };
 		}
 

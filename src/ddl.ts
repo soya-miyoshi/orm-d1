@@ -22,6 +22,7 @@ import { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from 
 export { foreignKeyName, indexName, primaryKeyName, uniqueConstraintName } from './schema/constraints.js';
 import type { Table } from './schema/table.js';
 import { getTableColumns, getTableExtras, getTableName } from './schema/table.js';
+import { isDrizzleSQL, isStringChunk, stringChunkText } from './sql/drizzle-sql.js';
 import type { RenderContext, SQLChunk } from './sql/sql.js';
 import { defaultRenderContext, quoteIdentifier, render } from './sql/sql.js';
 
@@ -33,8 +34,135 @@ import { defaultRenderContext, quoteIdentifier, render } from './sql/sql.js';
  */
 const PARAM_TOKEN = '\u0000orm-d1:param\u0000';
 
-/** DDL cannot qualify column names with a table, and cannot bind parameters. */
-const ddlContext: RenderContext = { ...defaultRenderContext, bareColumns: true, paramToken: PARAM_TOKEN };
+/**
+ * An empty array interpolated into a `check()` or a partial index's `where()`
+ * renders `in ()` / `not in ()` — SQLite accepts it, but it is unconditionally
+ * false/true, so the constraint or partial index goes permanently inert
+ * instead of failing loudly. `src/sql/sql.ts` ships to the Worker and cannot
+ * decide what to do about that (no `console`, no throwing on a hot path); this
+ * module is the one place that generates DDL, runs in Node (via `orm-d1-kit`),
+ * and is free to refuse outright.
+ */
+const refuseEmptyArrayPredicate = (): never => {
+	throw new Error(
+		'An empty array was interpolated into a DDL predicate (a check() or a partial '
+			+ 'index\'s where()). This renders "in ()" / "not in ()", which SQLite accepts '
+			+ 'but is unconditionally false/true — the constraint or partial index would '
+			+ 'become permanently inert instead of failing loudly.',
+	);
+};
+
+/**
+ * Structurally walk a Drizzle `SQL` fragment's own `queryChunks`, looking for
+ * a bare `[]` interpolated directly into the template (`sql\`... in
+ * ${arr}\``) — Drizzle's `SQL.toQuery` renders that as `()`, which is exactly
+ * the empty-array-predicate hazard above. That hook is only ever consulted
+ * from our own template tag, so a DDL predicate written with Drizzle's `sql`
+ * tag (`and`/`eq`/`inArray` included — they nest as `SQL` chunks inside
+ * `queryChunks` rather than flattening) would otherwise sail straight past it
+ * and render `check("role" not in ())` — a permanently inert constraint D1
+ * accepts silently. No text/string heuristics: this only inspects the chunk
+ * array Drizzle itself builds, recursing into nested `SQL` fragments
+ * (`and()` etc.) the same way `toQuery` does when it flattens them.
+ *
+ * This is DDL-only detection logic (it only ever runs under `bareColumns`,
+ * set only here), so it lives in this module rather than in
+ * `src/sql/drizzle-sql.ts` — which ships to the Worker — even though it is
+ * invoked *from* that module's `fromDrizzleSQL` via `onForeignFragment`.
+ *
+ * Drizzle's own `inArray`/`notInArray` helpers (`drizzle-orm/sql/expressions/
+ * conditions.js`) do not go through the array-chunk path at all for an empty
+ * array: they short-circuit *before* building any fragment, returning
+ * `sql\`true\`` (notInArray) or `sql\`false\`` (inArray) — a whole `SQL`
+ * fragment whose `queryChunks` is exactly one `StringChunk(["true"])` /
+ * `StringChunk(["false"])`. `and()`/`eq()` compositions nest that fragment as
+ * a `chunk` here the same way they nest any other `SQL`, so the existing
+ * recursion already reaches it — `isBareBooleanFragment` below is what
+ * recognises the shape once it does.
+ *
+ * A bare single-`StringChunk` fragment of `true`/`false` is, on its own,
+ * structurally indistinguishable from a deliberate `check(sql\`true\`)`
+ * sentinel written directly with Drizzle's `sql` tag — there is nothing left
+ * in `queryChunks` at that point to tell "Drizzle collapsed an empty array"
+ * from "the user wrote the literal". That spelling is a vanishingly rare way
+ * to write a DDL predicate (a `check` that is unconditionally satisfied has
+ * no reason to exist), so this accepts the false positive there in exchange
+ * for closing the silent-inert-DDL hole: refusing a deliberate `sql\`true\``
+ * is a loud, fixable error; silently emitting a permanently-inert constraint
+ * is not.
+ */
+const isBareBooleanFragment = (queryChunks: readonly unknown[]): boolean => {
+	if (queryChunks.length !== 1) return false;
+	const [chunk] = queryChunks;
+	if (!isStringChunk(chunk)) return false;
+	const text = stringChunkText(chunk).trim().toLowerCase();
+	return text === 'true' || text === 'false';
+};
+
+const hasEmptyArrayChunk = (queryChunks: readonly unknown[], checkBareBoolean: boolean): boolean => {
+	if (checkBareBoolean && isBareBooleanFragment(queryChunks)) return true;
+	for (const chunk of queryChunks) {
+		if (Array.isArray(chunk) && chunk.length === 0) return true;
+		if (typeof chunk === 'object' && chunk !== null && isDrizzleSQL(chunk)) {
+			if (hasEmptyArrayChunk((chunk as { queryChunks: readonly unknown[] }).queryChunks, checkBareBoolean)) return true;
+		}
+	}
+	return false;
+};
+
+/**
+ * DDL cannot qualify column names with a table, and cannot bind parameters —
+ * every value is inlined as a literal (see `renderInline`).
+ *
+ * `jsonEachThreshold`/`maxParams` are the real D1 platform limits on *bound*
+ * queries (`src/sql/sql.ts`'s `defaultRenderContext`), and DDL binds nothing,
+ * so neither applies here. Left at their defaults, an `inArray`/`notInArray`
+ * of >= 30 values inside a `check()` or partial-index `where()` would render
+ * as a `json_each(...)` subquery — which D1 rejects outright inside a CHECK
+ * constraint ("subqueries prohibited") — and one of > 100 values would throw
+ * the bound-parameter-limit `CompileError` from `src/sql/expressions.ts` even
+ * though nothing is bound. Both are set to effectively infinite so DDL
+ * rendering always takes the literal `in (...)` list branch.
+ */
+/**
+ * Base DDL render context. `onForeignFragment` here only refuses a genuine
+ * empty-array chunk (`in ()` / `not in ()`) — it does NOT consult
+ * `isBareBooleanFragment`. That heuristic is meaningful only for a predicate
+ * (a `check`/partial-index `where` that would go permanently inert), and this
+ * context is shared by every `renderInline` call, including `defaultClause`
+ * and the generated-column expression in `columnDDL` — neither of which is a
+ * predicate. A `default(sql\`true\`)` or `.generatedAlwaysAs(sql\`true\`)` is
+ * a perfectly ordinary, meaningful expression there; refusing it because it
+ * happens to collapse to the same one-`StringChunk` shape Drizzle's
+ * `inArray([])`/`notInArray([])` produce was a false positive with no
+ * predicate anywhere nearby. See `predicateDdlContext` below for the
+ * predicate-only variant that layers the bare-boolean check back on.
+ */
+const ddlContext: RenderContext = {
+	...defaultRenderContext,
+	bareColumns: true,
+	paramToken: PARAM_TOKEN,
+	jsonEachThreshold: Number.POSITIVE_INFINITY,
+	maxParams: Number.POSITIVE_INFINITY,
+	onEmptyArrayPredicate: refuseEmptyArrayPredicate,
+	onForeignFragment: (queryChunks): void => {
+		if (hasEmptyArrayChunk(queryChunks, false)) refuseEmptyArrayPredicate();
+	},
+};
+
+/**
+ * Used only by `checkDDL` and `createIndex`'s `where()` — the two DDL
+ * positions that are actually predicates, and so the only positions where
+ * Drizzle's `inArray([])`/`notInArray([])` collapsing to a bare
+ * `sql\`true\`\`/`sql\`false\`` fragment is a real hazard (see the long
+ * comment on `isBareBooleanFragment` above).
+ */
+const predicateDdlContext: RenderContext = {
+	...ddlContext,
+	onForeignFragment: (queryChunks): void => {
+		if (hasEmptyArrayChunk(queryChunks, true)) refuseEmptyArrayPredicate();
+	},
+};
 
 export interface DDLOptions {
 	/** `create table if not exists` — and, for `dropTable`, `if exists`. */
@@ -255,9 +383,9 @@ export function validateTableOptions(t: Table, options: TableOptions): string | 
  * value never compared equal to itself and `check` and `push` re-emitted it on
  * every run.
  */
-export const renderInline = (chunk: SQLChunk | string): string => {
+export const renderInline = (chunk: SQLChunk | string, isPredicate = false): string => {
 	if (typeof chunk === 'string') return chunk;
-	const { sql, params } = render(chunk, ddlContext);
+	const { sql, params } = render(chunk, isPredicate ? predicateDdlContext : ddlContext);
 	let index = 0;
 	return sql.replaceAll(PARAM_TOKEN, () => {
 		const slot = params[index++];
@@ -351,23 +479,24 @@ const defaultClause = (column: Column<any>): string => {
 };
 
 /** One `column-def`, in SQLite's constraint order. */
-export const columnDDL = (column: Column<any>, inlinePrimaryKey: boolean): string => {
-	let ddl = `${quoteIdentifier(column.name)} ${typeName(column)}`;
+export const columnDDL = (column: Column<any>, inlinePrimaryKey: boolean, tableName: string): string =>
+	withDDLContext(tableName, column.name, () => {
+		let ddl = `${quoteIdentifier(column.name)} ${typeName(column)}`;
 
-	if (inlinePrimaryKey && column.config.primaryKey) {
-		ddl += ' primary key';
-		if (column.config.autoIncrement) ddl += ' autoincrement';
-	}
-	if (column.config.notNull) ddl += ' not null';
-	if (column.config.unique) ddl += ' unique';
-	if (column.config.generated) {
-		ddl += ` generated always as (${renderInline(column.config.generated.as)}) ${column.config.generated.mode}`;
-	}
-	ddl += defaultClause(column);
-	ddl += referenceClause(column);
+		if (inlinePrimaryKey && column.config.primaryKey) {
+			ddl += ' primary key';
+			if (column.config.autoIncrement) ddl += ' autoincrement';
+		}
+		if (column.config.notNull) ddl += ' not null';
+		if (column.config.unique) ddl += ' unique';
+		if (column.config.generated) {
+			ddl += ` generated always as (${renderInline(column.config.generated.as)}) ${column.config.generated.mode}`;
+		}
+		ddl += defaultClause(column);
+		ddl += referenceClause(column);
 
-	return ddl;
-};
+		return ddl;
+	});
 
 const constraintName = (name: string): string => `constraint ${quoteIdentifier(name)} `;
 
@@ -394,17 +523,51 @@ export const foreignKeyDDL = (meta: ForeignKeyMeta, tableName: string): string =
 	return ddl;
 };
 
-export const checkDDL = (meta: CheckMeta): string =>
-	`${constraintName(meta.name)}check (${renderInline(meta.value)})`;
-
-export const createIndex = (meta: IndexMeta, tableName: string, options: DDLOptions = {}): string => {
-	const columns = meta.columns.map((c) => (isColumn(c) ? quoteIdentifier(c.name) : renderInline(c))).join(', ');
-	let ddl = `create ${meta.unique ? 'unique ' : ''}index ${options.ifNotExists ? 'if not exists ' : ''}${
-		quoteIdentifier(indexName(meta, tableName))
-	} on ${quoteIdentifier(tableName)} (${columns})`;
-	if (meta.where) ddl += ` where ${renderInline(meta.where)}`;
-	return ddl;
+/**
+ * `renderInline` throws through `ddlContext.onEmptyArrayPredicate`, which is a
+ * `RenderContext` hook with no access to which table/constraint it is
+ * rendering for — the error it throws is anonymous. Every call site here
+ * *does* have that context, so it is added on the way back out rather than
+ * threaded down into the render.
+ */
+export const withDDLContext = <T>(tableName: string, constraint: string, render: () => T): T => {
+	try {
+		return render();
+	} catch (error) {
+		if (
+			error instanceof Error
+			&& error.message.startsWith('An empty array was interpolated')
+			// Already wrapped by an outer `withDDLContext` call (e.g. `checkDDL`
+			// calling `renderInline` on a value that was already rendered once
+			// through this same helper elsewhere) — appending a second `(table
+			// "…", constraint "…")` suffix would misname or double up the
+			// context rather than add anything true.
+			&& !error.message.includes('(table "')
+		) {
+			// `{ cause }` keeps the original throw site (and its stack) reachable
+			// for debugging instead of discarding it for a fresh, contextless one.
+			throw new Error(`${error.message} (table "${tableName}", constraint "${constraint}")`, { cause: error });
+		}
+		throw error;
+	}
 };
+
+export const checkDDL = (meta: CheckMeta, tableName: string): string =>
+	withDDLContext(
+		tableName,
+		meta.name,
+		() => `${constraintName(meta.name)}check (${renderInline(meta.value, true)})`,
+	);
+
+export const createIndex = (meta: IndexMeta, tableName: string, options: DDLOptions = {}): string =>
+	withDDLContext(tableName, indexName(meta, tableName), () => {
+		const columns = meta.columns.map((c) => (isColumn(c) ? quoteIdentifier(c.name) : renderInline(c))).join(', ');
+		let ddl = `create ${meta.unique ? 'unique ' : ''}index ${options.ifNotExists ? 'if not exists ' : ''}${
+			quoteIdentifier(indexName(meta, tableName))
+		} on ${quoteIdentifier(tableName)} (${columns})`;
+		if (meta.where) ddl += ` where ${renderInline(meta.where, true)}`;
+		return ddl;
+	});
 
 /** `CREATE TABLE` for one table, excluding its indexes. */
 export function createTable(t: Table, options: DDLOptions = {}): string {
@@ -413,13 +576,13 @@ export function createTable(t: Table, options: DDLOptions = {}): string {
 	const extras = getTableExtras(t);
 	const compositePk = extras.find((e): e is PrimaryKeyConstraint => e.kind === 'primaryKey');
 
-	const parts: string[] = columns.map((column) => columnDDL(column, compositePk === undefined));
+	const parts: string[] = columns.map((column) => columnDDL(column, compositePk === undefined, name));
 
 	if (compositePk) parts.push(primaryKeyDDL(compositePk.meta, name));
 	for (const extra of extras) {
 		if (extra.kind === 'unique') parts.push(uniqueDDL(extra.meta, name));
 		if (extra.kind === 'foreignKey') parts.push(foreignKeyDDL(extra.meta, name));
-		if (extra.kind === 'check') parts.push(checkDDL(extra.meta));
+		if (extra.kind === 'check') parts.push(checkDDL(extra.meta, name));
 	}
 
 	const body = parts.map((p) => `\t${p}`).join(',\n');
