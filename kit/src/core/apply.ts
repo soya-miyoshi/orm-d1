@@ -287,8 +287,16 @@ export async function applyMigration(
 function renamesInMigration(statements: readonly string[]): Record<string, string> {
 	const renames: Record<string, string> = {};
 	// Kit's own `recreateTable` always emits `create table "__new_X"` with the
-	// double-quoted spelling, so this pattern only needs to recognise that one.
-	const createPattern = /^\s*create\s+table\s+"(__new_(?:[^"]|"")+)"/i;
+	// double-quoted spelling, but `renames` below already has to recognise a
+	// hand-written rename in any of the four spellings — and a hand-written
+	// `create table` (or a rebuild produced by some other tool feeding this
+	// same applier) is under no obligation to match kit's own spelling either.
+	// Recognising only `"…"` here left `createdAt` unpopulated for any other
+	// spelling, which made `isRebuildsOwnClose` below always false and caused
+	// the rebuild's own closing rename to be misfiled as a genuine live-table
+	// rename — corrupting `accumulated` in `checkForeignTriggerConflicts`
+	// silently rather than merely missing a guard. [Finding 1]
+	const createPattern = new RegExp(`^\\s*create\\s+table\\s+(${IDENTIFIER_SOURCE})`, 'i');
 	// A hand-written or `--rename-table` rename is under no obligation to use
 	// the kit's own double-quoted spelling — `alter table orders rename to
 	// sales;` (bare, no quotes) is completely ordinary SQL, and used to be
@@ -321,7 +329,12 @@ function renamesInMigration(statements: readonly string[]): Record<string, strin
 	statements.forEach((statement, index) => {
 		const created = createPattern.exec(statement);
 		if (!created) return;
-		const name = created[1]!.replaceAll('""', '"');
+		// Normalized the same way `pattern`'s matches are below, not with the
+		// double-quote-specific unescape this used to do — a bare or
+		// backtick-/bracket-quoted `create table __new_x` produced a name that
+		// never matched `from`'s normalized form, for the same reason.
+		const name = normalizeIdentifierToken(created[1]!);
+		if (!name.startsWith('__new_')) return;
 		if (!createdAt.has(name)) createdAt.set(name, index);
 	});
 
@@ -397,8 +410,53 @@ export async function checkForeignTriggerConflicts(
 
 	for (const migration of parsed) {
 		for (const table of migration.tables) {
-			const preMigrationName = migration.renames[table] ?? table;
-			const liveName = accumulated[preMigrationName] ?? preMigrationName;
+			// Both hops below used to be exact-match/case-sensitive lookups while
+			// only the final `foreignTriggers` lookup was case-insensitive, and the
+			// within-file hop only ever followed one rename, not a chain — two
+			// independent ways a real trigger went unguarded. [Finding 4]
+			//
+			// (a) `alter table orders rename to Sales;` then a rebuild of `sales`
+			// (lowercase) in the same file: `migration.renames` is keyed exactly as
+			// written (`Sales`), so a case-sensitive `renames[table]` with
+			// `table === 'sales'` misses it entirely.
+			//
+			// (b) A two-hop chain within one migration file — `orders` -> `tmp` ->
+			// `sales` — followed by a rebuild of `sales` in that same file.
+			// `migration.renames` maps each post-rename name to its immediately
+			// preceding name (`renames['sales'] === 'tmp'`, `renames['tmp'] ===
+			// 'orders'`); a single lookup stops at `tmp` and never reaches `orders`,
+			// the table's actual live identity before this migration ran.
+			// `accumulated`'s cross-file fold (below) already walks a chain, but
+			// only across *previous* migrations — this walks the chain *within*
+			// the current one before handing off to `accumulated`.
+			// Both hops below used to be exact-match/case-sensitive lookups while
+			// only the final `foreignTriggers` lookup was case-insensitive, and the
+			// within-file hop only ever followed one rename, not a chain — two
+			// independent ways a real trigger went unguarded. [Finding 4]
+			//
+			// (a) `alter table orders rename to Sales;` then a rebuild of `sales`
+			// (lowercase) in the same file: `migration.renames` is keyed exactly as
+			// written (`Sales`), so a case-sensitive `renames[table]` with
+			// `table === 'sales'` misses it entirely.
+			//
+			// (b) A two-hop chain within one migration file — `orders` -> `tmp` ->
+			// `sales` — followed by a rebuild of `sales` in that same file.
+			// `migration.renames` maps each post-rename name to its immediately
+			// preceding name (`renames['sales'] === 'tmp'`, `renames['tmp'] ===
+			// 'orders'`); a single lookup stops at `tmp` and never reaches `orders`,
+			// the table's actual live identity before this migration ran.
+			// `accumulated`'s cross-file fold (below) already walks a chain, but
+			// only across *previous* migrations — this walks the chain *within*
+			// the current one before handing off to `accumulated`.
+			let preMigrationName = table;
+			const visited = new Set<string>([preMigrationName]);
+			for (;;) {
+				const next = lookupCaseInsensitive(migration.renames, preMigrationName);
+				if (next === undefined || visited.has(next)) break;
+				preMigrationName = next;
+				visited.add(next);
+			}
+			const liveName = lookupCaseInsensitive(accumulated, preMigrationName) ?? preMigrationName;
 			// Case-insensitive: `sqlite_master.tbl_name` is stored exactly as the
 			// hand-written trigger spelled it, and identifiers are
 			// case-insensitive, so a trigger on `Orders` still guards the schema's

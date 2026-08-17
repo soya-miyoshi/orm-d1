@@ -317,8 +317,10 @@ export const carryForwardCollations = (before: Snapshot, after: Snapshot, option
  * diff, removes the collider before the create ever runs.
  *
  * @param droppedTables Tables this diff drops outright (`diffSnapshots`'s
- * `dropped`). A collider on one of these cannot collide — it is gone by the
- * time `create trigger` would run.
+ * `dropped`). A collider on one of these only stops colliding once its
+ * `drop table` statement has actually been emitted into `statementsSoFar` —
+ * membership in this list alone does not mean the drop has run yet at the
+ * call site currently checking (see the emission-order check below).
  * @param statementsSoFar Everything this diff has decided to emit before the
  * check point. A `drop trigger if exists "<name>"` in here (from `dropped
  * AppendOnlyTrigger`, via a rename or an in-place `appendOnly` transition
@@ -342,9 +344,32 @@ const tableGuardCollides = (
 	);
 	if (droppedTriggerNames.has(lowerGuard)) return false;
 
+	// `droppedTables` is *membership* — every table this diff will eventually
+	// drop — not *order*. `diffSnapshots` emits created tables (step 2, this
+	// function's caller for a brand-new append-only table) before dropped
+	// tables (step 3): at that call site none of `droppedTables`' `drop table`
+	// statements have been emitted yet, so exempting on membership alone waves
+	// through a `create trigger` that collides with a live trigger which is
+	// still there when the create actually runs. Requiring the `drop table`
+	// to already be *in* `statementsSoFar` — the same emission-order test
+	// `droppedTriggerNames` above already applies to a dropped trigger — makes
+	// the exemption sound at every call site: it is false at step 2 (nothing
+	// dropped yet) and true from step 4 onward (step 3 already ran). The
+	// in-place-rebuild call site's own premise (recreateTable drops the very
+	// table it is rebuilding before creating its own guard) never depended on
+	// `droppedTables` at all — that table is excluded via `foreignTriggers`
+	// instead, checked separately in `recreateTable`. [Finding 2]
 	const droppedTablesLower = new Set(droppedTables.map((t) => t.toLowerCase()));
+	const alreadyDroppedLower = new Set(
+		statementsSoFar
+			.map((s) => /^drop\s+table\s+"((?:[^"]|"")+)"/i.exec(s.sql)?.[1])
+			.filter((n): n is string => n !== undefined)
+			.map((n) => n.replaceAll('""', '"').toLowerCase())
+			.filter((n) => droppedTablesLower.has(n)),
+	);
+
 	return Object.entries(foreignTriggers).some(([table, triggers]) => {
-		if (droppedTablesLower.has(table.toLowerCase())) return false;
+		if (alreadyDroppedLower.has(table.toLowerCase())) return false;
 		return triggers.some((t) => t.toLowerCase() === lowerGuard);
 	});
 };
@@ -490,6 +515,15 @@ const recreateTable = (
 				+ 'name is taken. Drop or rename that trigger, or bring it into the schema so orm-d1 can carry it '
 				+ 'across rebuilds.',
 		);
+		// Same contract as the two refusals above (`return { statements: [],
+		// errors }`): this used to fall through and return the `statements`
+		// array already built above — the full destructive rebuild (create
+		// "__new_X", the data copy, `drop table`, the rename) — alongside the
+		// error, so a rebuild refused for a guard collision still shipped
+		// unapplyable SQL. `check`/`push`/`generate` all trust "an error means
+		// no statements"; this branch was the one place that trust was wrong.
+		// [Finding 6]
+		return { statements: [], errors };
 	} else if (after.appendOnly) {
 		statements.push({
 			sql: appendOnlyTrigger(after.name, appendOnlyColumns(after.appendOnly)),

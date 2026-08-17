@@ -7,9 +7,9 @@
  * in one batch and fail the rename in the next, leaving the table gone.
  */
 import { describe, expect, it } from 'vitest';
-import { applyMigration, MAX_STATEMENTS_PER_BATCH } from '../../src/core/apply.js';
+import { applyMigration, checkForeignTriggerConflicts, MAX_STATEMENTS_PER_BATCH } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
-import { packIntoBatches, statementGroups } from '../../src/core/sql.js';
+import { lookupCaseInsensitive, packIntoBatches, statementGroups, tablesRebuiltIn } from '../../src/core/sql.js';
 
 const recordingRunner = (): { runner: SqlRunner; batches: string[][] } => {
 	const batches: string[][] = [];
@@ -219,5 +219,127 @@ describe('applyMigration batching', () => {
 			'create table "t" ("id" integer)',
 			`insert into "d1_migrations" (name) values ('m_small')`,
 		]);
+	});
+});
+
+/** A rebuild spelled with backticks throughout, instead of kit's own `"…"`. */
+const backtickRebuildGroup = (table: string): string[] => [
+	'PRAGMA defer_foreign_keys = ON',
+	`create table \`__new_${table}\` (\`id\` integer)`,
+	`insert into \`__new_${table}\` (\`id\`) select \`id\` from \`${table}\``,
+	`drop table \`${table}\``,
+	`alter table \`__new_${table}\` rename to \`${table}\``,
+];
+
+/** A rebuild spelled with brackets throughout. */
+const bracketRebuildGroup = (table: string): string[] => [
+	'PRAGMA defer_foreign_keys = ON',
+	`create table [__new_${table}] ([id] integer)`,
+	`insert into [__new_${table}] ([id]) select [id] from [${table}]`,
+	`drop table [${table}]`,
+	`alter table [__new_${table}] rename to [${table}]`,
+];
+
+const triggerRunner = (rows: { name: string; tbl_name: string; sql: string }[]): SqlRunner => ({
+	all: async () => rows.map((r) => ({ type: 'trigger', ...r })) as never,
+	batch: async () => {},
+});
+
+describe('finding 1 / finding 3: non-double-quoted rebuilds are recognized', () => {
+	it('tablesRebuiltIn recognizes a backtick-quoted rebuild', () => {
+		expect(tablesRebuiltIn(backtickRebuildGroup('orders'))).toEqual(['orders']);
+	});
+
+	it('tablesRebuiltIn recognizes a bracket-quoted rebuild', () => {
+		expect(tablesRebuiltIn(bracketRebuildGroup('orders'))).toEqual(['orders']);
+	});
+
+	it('statementGroups treats a bracket-quoted rebuild as one atomic group, not five singletons', () => {
+		const groups = statementGroups(bracketRebuildGroup('orders'));
+		expect(new Set(groups).size).toBe(1);
+	});
+
+	it('statementGroups treats a backtick-quoted rebuild as one atomic group, not five singletons', () => {
+		const groups = statementGroups(backtickRebuildGroup('orders'));
+		expect(new Set(groups).size).toBe(1);
+	});
+
+	// [Finding 1]: `renamesInMigration`'s own `create table "__new_X"`
+	// recognizer used to be double-quote-only, while the *rename* recognizer
+	// right next to it already accepted all four spellings. A backtick- (or
+	// bracket-, or bare-) spelled rebuild's own closing rename then went
+	// unrecognized as "the rebuild's own close" and was misfiled as a genuine
+	// live-table rename instead — which is worse than not checking at all:
+	// the guard below would resolve "orders" through a bogus rename to
+	// "__new_orders" and then find no trigger recorded under that name, so it
+	// silently misses a real foreign trigger on "orders" rather than firing.
+	it('still catches a foreign trigger on a table rebuilt with backtick-quoted SQL', async () => {
+		const runner = triggerRunner([
+			{ name: 'orders_audit', tbl_name: 'orders', sql: 'create trigger "orders_audit" after insert on "orders" begin select 1; end' },
+		]);
+		const sql = `${backtickRebuildGroup('orders').join(';\n')};`;
+
+		await expect(checkForeignTriggerConflicts(runner, [{ tag: 'm1', sql }]))
+			.rejects.toThrow(/"orders_audit"/);
+	});
+});
+
+describe('finding 4: within-file rename resolution is transitive and case-insensitive', () => {
+	it('follows a bare-identifier two-hop rename chain within one migration file back to the live name', async () => {
+		// orders -> tmp -> sales, all bare (no quotes at all), then a rebuild of
+		// "sales" in the very same migration file. A single-hop lookup only
+		// resolves "sales" back to "tmp", never reaching "orders" — the table's
+		// actual live identity, and the one `foreignTriggers` is keyed by.
+		const runner = triggerRunner([
+			{ name: 'orders_audit', tbl_name: 'orders', sql: 'create trigger "orders_audit" after insert on "orders" begin select 1; end' },
+		]);
+		const sql = [
+			'alter table orders rename to tmp',
+			'alter table tmp rename to sales',
+			...rebuildGroup('sales'),
+		].join(';\n') + ';';
+
+		await expect(checkForeignTriggerConflicts(runner, [{ tag: 'm1', sql }]))
+			.rejects.toThrow(/"orders_audit"/);
+	});
+
+	it('resolves a within-file rename whose recorded target case does not match the rebuild\'s spelling', async () => {
+		// [Finding 4a]: `alter table orders rename to Sales;` records
+		// `renames['Sales'] = 'orders'` — keyed exactly as the migration spelled
+		// the target. The rebuild in the same file targets "sales" (lowercase),
+		// so a case-sensitive `renames[table]` lookup with `table === 'sales'`
+		// misses the entry entirely and never resolves back to "orders", the
+		// table the live trigger actually sits on.
+		const runner = triggerRunner([
+			{ name: 'orders_audit', tbl_name: 'orders', sql: 'create trigger "orders_audit" after insert on "orders" begin select 1; end' },
+		]);
+		const sql = [
+			'alter table orders rename to Sales',
+			...rebuildGroup('sales'),
+		].join(';\n') + ';';
+
+		await expect(checkForeignTriggerConflicts(runner, [{ tag: 'm1', sql }]))
+			.rejects.toThrow(/"orders_audit"/);
+	});
+});
+
+describe('finding 5: lookupCaseInsensitive', () => {
+	it('folds only ASCII letters — the Kelvin sign does not fold to "k"', () => {
+		// `.toLowerCase()` maps U+212A KELVIN SIGN to ordinary ASCII "k", which
+		// would make an unrelated identifier spelled with it collide with one
+		// spelled with a real "K" — SQLite's own identifier comparison is
+		// ASCII-only and treats them as different names entirely.
+		const map: Record<string, string[]> = { amountK: ['ascii-k'] };
+		const kelvinSign = String.fromCharCode(0x212a);
+		expect(lookupCaseInsensitive(map, `amount${kelvinSign}`)).toBeUndefined();
+		// A genuine ASCII-only case difference still matches.
+		expect(lookupCaseInsensitive(map, 'AMOUNTK')).toEqual(['ascii-k']);
+	});
+
+	it('unions every case-insensitively matching key\'s array, rather than only the first found', () => {
+		const map: Record<string, string[]> = { Orders: ['a'], ORDERS: ['b'] };
+		const result = lookupCaseInsensitive(map, 'orders');
+		expect(result).toBeDefined();
+		expect(new Set(result)).toEqual(new Set(['a', 'b']));
 	});
 });

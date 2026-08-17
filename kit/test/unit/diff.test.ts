@@ -1871,6 +1871,33 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
 		});
 
+		// [Finding 7c]: SQLite trigger names are database-global, not scoped to
+		// the table gaining the guard, so the collision check has to scan every
+		// table's foreign triggers — not just look up `foreignTriggers[name]` for
+		// the table becoming append-only. Reverting to that per-table
+		// `.includes(guardName)` shape (main's old check) left every existing
+		// test in this file green, because they all happen to put the collider
+		// on the table gaining the guard, or on a table this same diff drops.
+		// This one puts it on a *different* table that neither is rebuilt nor
+		// dropped — untouched by this diff except for being where the colliding
+		// trigger happens to live.
+		it('refuses when the colliding trigger lives on a different table entirely, which survives untouched', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, events);
+			const after = snapshotFromSchema([audit, events], '', tableOptions([[events, { appendOnly: true }]]));
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"events_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
+			// "audit" itself is untouched by this diff — it is neither rebuilt nor
+			// dropped, just the table the collider happens to live on.
+			expect(diff.statements.some((s) => s.sql.includes('"audit"'))).toBe(false);
+		});
+
 		it('still creates the guard normally when no foreign trigger occupies the name', () => {
 			const before = withOptions(events, {});
 			const after = withOptions(events, { appendOnly: true });
@@ -1897,6 +1924,33 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			expect(diff.errors).toEqual([]);
 			expect(diff.statements.some((s) => s.sql === 'drop table "audit"')).toBe(true);
 			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(true);
+		});
+
+		// [Finding 2]: `tableGuardCollides`'s `droppedTables` exemption used to be
+		// pure membership — "this diff drops that table eventually" — not order.
+		// `diffSnapshots` emits created tables (step 2) *before* dropped tables
+		// (step 3), so a brand-new append-only table whose guard collides with a
+		// trigger on a table this same diff also drops used to be exempted here
+		// even though, in the emitted SQL, the colliding `create trigger` runs
+		// before the `drop table` that was supposed to clear the name — the
+		// create fails on apply (or, worse, silently attaches to whichever table
+		// SQLite still has under that name). Both "audit" and "log" are dropped
+		// (neither survives into `after`), so nothing in the emitted statements
+		// removes the collider before the new "events" guard would try to claim
+		// its name.
+		it('refuses a brand-new append-only table whose guard collides with a live trigger on a table dropped later in the same diff', () => {
+			const audit = sqliteTable('audit', { id: text('id').primaryKey() });
+			const log = sqliteTable('log', { id: text('id').primaryKey() });
+			const before = snapshotOf(audit, log);
+			const after = snapshotFromSchema([events], '', tableOptions([[events, { appendOnly: true }]]));
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { audit: ['events_no_update'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"events_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
 		});
 
 		// [F-079], narrowness half: the created-table path never checked at all.
@@ -1933,10 +1987,15 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 				foreignTriggers: { audit: ['events_no_update'] },
 			});
 
-			expect(diff.statements.some((s) => /create table "__new_events"/.test(s.sql))).toBe(true);
+			// [Finding 6]: a guard-collision refusal here used to fall through and
+			// still return the full destructive rebuild alongside the error — the
+			// `create table "__new_events"`, the data copy, the `drop table`, the
+			// rename — unapplyable SQL sitting next to an error that says the
+			// rebuild cannot happen. It must refuse the same way the other two
+			// `recreateTable` refusals do: an error, and no statements at all.
 			expect(diff.errors).toHaveLength(1);
 			expect(diff.errors[0]).toMatch(/"events_no_update"/);
-			expect(diff.statements.some((s) => /create trigger "events_no_update"/.test(s.sql))).toBe(false);
+			expect(diff.statements).toEqual([]);
 		});
 	});
 

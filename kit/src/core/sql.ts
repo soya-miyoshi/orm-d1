@@ -139,8 +139,6 @@ export const isPragma = (statement: string): boolean =>
 
 export const applicableStatements = (sql: string): string[] => splitStatements(sql).filter((s) => !isPragma(s));
 
-const escapeRegExpChars = (value: string): string => value.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
 /**
  * Any of SQLite's four identifier spellings, as a regex alternation source —
  * for splicing into a larger pattern, not for standalone use. A hand-written
@@ -187,6 +185,23 @@ export function normalizeIdentifierToken(token: string): string {
  * Everything outside a recognised rebuild is its own singleton group, so it
  * is always safe to split between any two of them.
  */
+// Any spelling of `create table <name>` — a hand-written or non-kit-generated
+// rebuild is under no obligation to use kit's own double-quoted spelling, the
+// same reason `IDENTIFIER_SOURCE` exists. Matching `"…"` only used to split a
+// backtick- or bracket-quoted (or bare) rebuild into singleton groups instead
+// of recognising it as one atomic unit — the exact data-loss shape this
+// function exists to prevent, just for a spelling `tablesRebuiltIn` already
+// handled correctly elsewhere in this file. [Finding 3]
+const CREATE_TABLE_PATTERN = new RegExp(`^\\s*create\\s+table\\s+(${IDENTIFIER_SOURCE})`, 'i');
+const RENAME_TO_PATTERN = new RegExp(
+	`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+to\\s+(${IDENTIFIER_SOURCE})\\s*$`,
+	'i',
+);
+const CREATE_ON_PATTERN = new RegExp(
+	`^\\s*create\\s+(?:unique\\s+index|index|trigger)\\b[\\s\\S]*\\son\\s(${IDENTIFIER_SOURCE})`,
+	'i',
+);
+
 export function statementGroups(statements: readonly string[]): number[] {
 	const groups: number[] = new Array(statements.length);
 	let nextGroup = 0;
@@ -199,28 +214,25 @@ export function statementGroups(statements: readonly string[]): number[] {
 		const isPragmaLead = /^\s*pragma\s+defer_foreign_keys\b/i.test(statements[i]!);
 		const createIndex = isPragmaLead ? i + 1 : i;
 		const createMatch = createIndex < statements.length
-			? /^\s*create\s+table\s+"(__new_(?:[^"]|"")+)"/i.exec(statements[createIndex]!)
+			? CREATE_TABLE_PATTERN.exec(statements[createIndex]!)
 			: null;
+		const createdName = createMatch ? normalizeIdentifierToken(createMatch[1]!) : undefined;
 
-		if (!createMatch) {
+		if (!createdName || !createdName.startsWith('__new_')) {
 			groups[i] = nextGroup++;
 			i++;
 			continue;
 		}
 
-		const tempName = createMatch[1]!;
-		const renamePattern = new RegExp(
-			`^\\s*alter\\s+table\\s+"${escapeRegExpChars(tempName)}"\\s+rename\\s+to\\s+"((?:[^"]|"")+)"`,
-			'i',
-		);
+		const tempName = createdName;
 
 		let end = createIndex;
 		let finalName: string | undefined;
 		for (let j = createIndex + 1; j < statements.length; j++) {
-			const renameMatch = renamePattern.exec(statements[j]!);
-			if (renameMatch) {
+			const renameMatch = RENAME_TO_PATTERN.exec(statements[j]!);
+			if (renameMatch && normalizeIdentifierToken(renameMatch[1]!) === tempName) {
 				end = j;
-				finalName = renameMatch[1]!;
+				finalName = normalizeIdentifierToken(renameMatch[2]!);
 				break;
 			}
 		}
@@ -239,14 +251,10 @@ export function statementGroups(statements: readonly string[]): number[] {
 		// rebuilt table's final name — the exact shape `recreateTable` emits —
 		// and stop at the first statement that is not one of those.
 		if (finalName !== undefined) {
-			const tailPattern = new RegExp(
-				`^\\s*create\\s+(?:unique\\s+index|index|trigger)\\b[\\s\\S]*\\son\\s"${
-					escapeRegExpChars(finalName)
-				}"`,
-				'i',
-			);
 			let k = end + 1;
-			while (k < statements.length && tailPattern.test(statements[k]!)) {
+			while (k < statements.length) {
+				const tailMatch = CREATE_ON_PATTERN.exec(statements[k]!);
+				if (!tailMatch || normalizeIdentifierToken(tailMatch[1]!) !== finalName) break;
 				end = k;
 				k++;
 			}
@@ -400,22 +408,53 @@ export function packStatementsWithTrailer(
 }
 
 /**
+ * Fold only the ASCII letters `A`-`Z`/`a`-`z` to lowercase — SQLite's own
+ * identifier case-folding is ASCII-only, unlike `String.prototype.toLowerCase`,
+ * which also folds non-ASCII letters (Turkish İ/ı, Kelvin sign, and more) that
+ * SQLite treats as distinct identifiers. Using `.toLowerCase()` here matched
+ * two identifiers SQLite itself considers different, which — for the one
+ * caller of {@link lookupCaseInsensitive} on trigger-owning table names — could
+ * misfile which live table a trigger lookup resolves to. [Finding 5]
+ */
+const foldAsciiCase = (value: string): string => value.replace(/[A-Za-z]/g, (c) => c.toLowerCase());
+
+/**
  * Look a key up in a map the way SQLite compares identifiers: case-sensitively
- * first (the common, cheap case), falling back to a case-insensitive scan.
- * `sqlite_master.tbl_name` is stored exactly as `CREATE TRIGGER` spelled it,
- * and identifiers are case-insensitive — so a hand-written trigger can be
- * attached to a table under a different spelling than the schema uses
- * (`Orders` in the trigger, `orders` in the schema). A plain `map[key]` lookup
- * makes that trigger invisible to the foreign-trigger guard.
+ * first (the common, cheap case), falling back to an ASCII-only
+ * case-insensitive scan. `sqlite_master.tbl_name` is stored exactly as
+ * `CREATE TRIGGER` spelled it, and identifiers are case-insensitive — so a
+ * hand-written trigger can be attached to a table under a different spelling
+ * than the schema uses (`Orders` in the trigger, `orders` in the schema). A
+ * plain `map[key]` lookup makes that trigger invisible to the foreign-trigger
+ * guard.
+ *
+ * More than one distinct key can case-insensitively match (`"Orders"` and
+ * `"ORDERS"` both recorded as literal `tbl_name` spellings on different
+ * triggers) — when every matching value is an array (the only shape any
+ * caller stores under an ambiguous key: `foreignTriggers`' trigger-name
+ * lists), the union of all matches is returned rather than whichever key
+ * `Object.keys` happens to visit first, so a trigger recorded under a second
+ * spelling is never silently dropped from the guard. [Finding 5]
  */
 export function lookupCaseInsensitive<T>(map: Record<string, T> | undefined, key: string): T | undefined {
 	if (!map) return undefined;
 	if (Object.hasOwn(map, key)) return map[key];
-	const lower = key.toLowerCase();
+	const lower = foldAsciiCase(key);
+	let result: T | undefined;
+	let found = false;
 	for (const k of Object.keys(map)) {
-		if (k.toLowerCase() === lower) return map[k];
+		if (foldAsciiCase(k) !== lower) continue;
+		const value = map[k]!;
+		if (!found) {
+			result = value;
+			found = true;
+			continue;
+		}
+		if (Array.isArray(result) && Array.isArray(value)) {
+			result = [...result, ...value] as T;
+		}
 	}
-	return undefined;
+	return result;
 }
 
 /** Wrangler's own migration bookkeeping table, reused so both appliers agree. */

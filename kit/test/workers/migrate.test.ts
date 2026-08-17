@@ -292,10 +292,12 @@ describe('batching a large migration cannot cut a table rebuild in half (finding
 		// state (`age` still the text `'30'`), never reaching the split this
 		// test is named for. `calls === 3` is the actual second real batch.
 		let calls = 0;
+		const seenBatches: string[][] = [];
 		const throwingRunner: SqlRunner = {
 			...runner,
 			batch: async (statements) => {
 				calls++;
+				seenBatches.push([...statements]);
 				if (calls === 3) throw new Error('simulated failure on the second batch');
 				await runner.batch(statements);
 			},
@@ -304,6 +306,32 @@ describe('batching a large migration cannot cut a table rebuild in half (finding
 		await expect(
 			applyMigrations(throwingRunner, [{ tag: 'm_rebuild_split', sql }]),
 		).rejects.toThrow(/simulated failure/);
+
+		// [Finding 7a]: `calls === 3` alone only pins *how many* `batch()` calls
+		// happened before the throw, not *which* statements were in the batch
+		// that failed — so reverting to `calls === 2` (the `ensureMigrationsTable`
+		// call this comment already explains was the wrong target) still passed
+		// every assertion below unchanged, and so did reverting the grouping fix
+		// that keeps the rebuild's tail (its restored index) attached through the
+		// rename (`[F-041]`/finding 3): under the old off-by-one grouping, with
+		// exactly 95 fillers, the drop-and-rename half of the rebuild happens to
+		// land in the batch *before* the one that fails, and the index-create
+		// half lands in the one that fails — still "batch 2 fails" by count,
+		// even though the rebuild group was split. Pinning the actual contents
+		// of the batch at the moment of failure — the *whole* rebuild group,
+		// landing together, and *no* part of it in the batch before — closes
+		// both gaps: a `calls === 2` revert leaves `seenBatches` with only two
+		// entries (`ensureMigrationsTable` and the failing first real batch),
+		// so indexing the third fails outright; a broken grouping either splits
+		// the rebuild across the two batches asserted below or shifts which one
+		// it lands in, and either way fails one of these assertions.
+		const firstRealBatch = seenBatches[1]!;
+		const failingBatch = seenBatches[2]!;
+		expect(firstRealBatch.some((s) => s.includes('rebuilt'))).toBe(false);
+		expect(failingBatch.some((s) => s.includes('create table "__new_rebuilt"'))).toBe(true);
+		expect(failingBatch.some((s) => s === 'drop table "rebuilt"')).toBe(true);
+		expect(failingBatch.some((s) => s === 'alter table "__new_rebuilt" rename to "rebuilt"')).toBe(true);
+		expect(failingBatch.some((s) => s.includes('create unique index "rebuilt_code_idx"'))).toBe(true);
 
 		// The rebuild group is 6 statements — far short of the 100-statement
 		// cap — so with correct grouping it always lands whole in one batch,
