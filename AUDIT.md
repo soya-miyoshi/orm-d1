@@ -21,7 +21,7 @@ Advanced in every terminal case, including blocked and nothing-found, so a lens 
 failing cannot starve the other two.
 
 - Next lens: **security**
-- Last ran: efficiency + bugs — 2026-08-17, merged `<MERGE_SHA>` **over an unresolved round-2
+- Last ran: efficiency + bugs — 2026-08-17, merged `df50b65` **over an unresolved round-2
   rejection**. Five findings batched; `[F-098]` (rename FK repointing), `[F-099]` (right/full
   join nullability, runtime + type), `[F-100]` (the `pull` warning half) and `[F-102]`
   (`Column.name` memoization, 18.13 → 9.26 µs/op) all confirmed closed against real
