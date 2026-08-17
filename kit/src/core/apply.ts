@@ -119,15 +119,22 @@ export async function introspect(runner: SqlRunner, foreignTriggers?: Record<str
 	);
 
 	if (foreignTriggers) {
-		// `foreignTriggers` is caller-supplied (an out-param); callers are
-		// expected to pass a null-prototype object for the same `[F-078]`
-		// reason documented on `checkForeignTriggerConflicts`'s own
-		// `foreignTriggers` below — a live table named `constructor` must not
-		// resolve to `Object.prototype`'s member instead of `undefined`.
+		// `foreignTriggers` is caller-supplied (an out-param) and documented as
+		// a plain `Record<string, string[]>` — every real caller in this repo
+		// passes an ordinary `{}` literal, which inherits `Object.prototype`.
+		// `??=` only initializes on `undefined`, so a live table literally
+		// named `constructor`/`toString`/`valueOf`/etc. resolves
+		// `foreignTriggers[row.tbl_name]` to the *inherited* prototype member
+		// (a function) instead of `undefined`, and `.push` on it throws
+		// `TypeError`. `Object.hasOwn` checks *own*-property presence, which is
+		// unaffected by what the prototype carries, so this works for any
+		// caller-supplied object shape without requiring a null-prototype
+		// object from the caller.
 		for (const row of master) {
 			if (row.type !== 'trigger' || !row.sql) continue;
 			if (isAppendOnlyTrigger(row.sql, row.tbl_name)) continue;
-			(foreignTriggers[row.tbl_name] ??= []).push(row.name);
+			if (!Object.hasOwn(foreignTriggers, row.tbl_name)) foreignTriggers[row.tbl_name] = [];
+			foreignTriggers[row.tbl_name]!.push(row.name);
 		}
 	}
 

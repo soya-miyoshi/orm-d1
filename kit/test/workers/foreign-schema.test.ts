@@ -334,3 +334,27 @@ describe('introspecting a database orm-d1 did not write', () => {
 		expect(rendered.toLowerCase()).toContain('collate');
 	});
 });
+
+describe('introspect: foreignTriggers out-param is prototype-safe', () => {
+	it('records a foreign trigger on a live table literally named "constructor" without throwing', async () => {
+		// `introspect(runner, {})` — every real caller passes a plain object
+		// literal, which inherits `Object.prototype.constructor` (a function,
+		// not `undefined`). If the out-param is populated with
+		// `(foreignTriggers[row.tbl_name] ??= []).push(...)`, a live table named
+		// "constructor" resolves that lookup to the inherited member instead of
+		// `undefined`, and `.push` throws `TypeError: ... .push is not a
+		// function` — instead of recording the trigger.
+		await DB.prepare('drop table if exists "constructor"').run();
+		await DB.prepare('create table "constructor" ("id" integer primary key)').run();
+		await DB.prepare(
+			'create trigger "constructor_audit" after insert on "constructor" begin select 1; end',
+		).run();
+
+		const foreignTriggers: Record<string, string[]> = {};
+		await expect(introspect(runner, foreignTriggers)).resolves.toBeDefined();
+		expect(foreignTriggers['constructor']).toEqual(['constructor_audit']);
+
+		await DB.prepare('drop trigger "constructor_audit"').run();
+		await DB.prepare('drop table "constructor"').run();
+	});
+});

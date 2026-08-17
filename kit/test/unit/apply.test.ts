@@ -91,6 +91,13 @@ describe('packIntoBatches', () => {
 		// emit a migration that can leave the table dropped and never renamed.
 		expect(() => packIntoBatches(rebuildGroup('orders'), 3)).toThrow(/exceeds the per-batch limit/);
 	});
+
+	it('names the table whose rebuild is too large to fit in one batch', () => {
+		// The refusal above proves the throw; this proves the message says
+		// *which* table -- otherwise an operator staring at a schema with
+		// dozens of tables has to bisect their own migration to find it.
+		expect(() => packIntoBatches(rebuildGroup('orders'), 3)).toThrow(/"orders"/);
+	});
 });
 
 describe('applyMigration batching', () => {
@@ -470,6 +477,49 @@ describe('round 3, finding 1: __new_ matching is case-insensitive, like SQLite i
 	});
 });
 
+/**
+ * A rebuild whose `create table` statement itself uses the uppercase
+ * `__NEW_` marker (not just the closing rename) — pins `sql.ts`'s create-side
+ * `foldAsciiCase(createdName).startsWith('__new_')` check specifically.
+ * `mixedCaseRebuildGroup` above only spells the *rename* half in uppercase,
+ * so it exercises the rename-side comparison (sql.ts ~259-262) but leaves
+ * the create-side check (sql.ts ~247) uncovered — a case-sensitive
+ * `createdName.startsWith('__new_')` there would fail to recognize this
+ * `create table` as a rebuild at all, and `statementGroups` would never even
+ * look for a matching rename, splitting every statement into its own group.
+ */
+const upperCreateRebuildGroup = (table: string): string[] => [
+	'PRAGMA defer_foreign_keys = ON',
+	`create table "__NEW_${table}" ("id" integer)`,
+	`insert into "__NEW_${table}" ("id") select "id" from "${table}"`,
+	`drop table "${table}"`,
+	`alter table "__NEW_${table}" rename to "${table}"`,
+];
+
+describe('round 3, finding 1b: __new_ matching on the CREATE side is case-insensitive too', () => {
+	it('statementGroups treats a create-side-uppercase __NEW_ rebuild as one atomic group', () => {
+		const statements = upperCreateRebuildGroup('orders');
+		const groups = statementGroups(statements);
+		expect(new Set(groups).size).toBe(1);
+	});
+
+	it('packIntoBatches never splits a create-side-uppercase rebuild across two batches', () => {
+		const statements = [
+			...Array.from({ length: MAX_STATEMENTS_PER_BATCH - 2 }, (_, i) => `create table "t${i}" ("id" integer)`),
+			...upperCreateRebuildGroup('orders'),
+		];
+		const batches = packIntoBatches(statements, MAX_STATEMENTS_PER_BATCH);
+		for (const batch of batches) {
+			const hasDrop = batch.some((s) => s === 'drop table "orders"');
+			const hasRename = batch.some((s) => s === 'alter table "__NEW_orders" rename to "orders"');
+			expect(hasDrop).toBe(hasRename);
+		}
+		const groupBatch = batches.find((b) => b.includes('drop table "orders"'));
+		expect(groupBatch).toBeDefined();
+		expect(groupBatch).toEqual(expect.arrayContaining(upperCreateRebuildGroup('orders')));
+	});
+});
+
 describe('round 3, finding 2: lookupCaseInsensitive unions the exact key with case-insensitive matches', () => {
 	it('includes the exact-key value in the union rather than short-circuiting on it', () => {
 		// The exact-case key ("orders") is present *and* a differently-cased key
@@ -479,6 +529,78 @@ describe('round 3, finding 2: lookupCaseInsensitive unions the exact key with ca
 		const map: Record<string, string[]> = { orders: ['a'], Orders: ['b'] };
 		const result = lookupCaseInsensitive(map, 'orders');
 		expect(new Set(result)).toEqual(new Set(['a', 'b']));
+	});
+});
+
+describe('apply.ts:485 checkForeignTriggerConflicts looks up foreignTriggers case-insensitively', () => {
+	it('catches a foreign trigger recorded under a differently-cased live table name', async () => {
+		// The live table is "ORDERS" (as sqlite_master literally spells it via
+		// `tbl_name`), but the migration's own rebuild marker resolves to
+		// "orders" (lowercase) — a direct `foreignTriggers[liveName]` lookup at
+		// apply.ts:485 would miss the "ORDERS"-keyed entry entirely.
+		const runner = triggerRunner([
+			{ name: 'orders_audit', tbl_name: 'ORDERS', sql: 'create trigger "orders_audit" after insert on "ORDERS" begin select 1; end' },
+		]);
+		const sql = `${rebuildGroup('orders').join(';\n')};`;
+
+		await expect(checkForeignTriggerConflicts(runner, [{ tag: 'm1', sql }]))
+			.rejects.toThrow(/"orders_audit"/);
+	});
+});
+
+describe('apply.ts: the within-file rename walk terminates on a rename cycle', () => {
+	it('terminates instead of looping forever when a migration renames tables in a cycle', async () => {
+		// "a" -> "tmp" -> "b" -> "a": walking `renames` back from "b" (the table
+		// being rebuilt) visits tmp, then a, then loops back to b. Without the
+		// `visited.has(next)` guard at apply.ts ~483 this walk never terminates.
+		// A short per-test timeout (rather than relying on vitest's default) is
+		// the "hangs" assertion: this test fails by timing out if the guard is
+		// removed, and resolves promptly when it is present.
+		// `checkForeignTriggerConflicts` returns immediately, before ever
+		// reaching the walk, when `foreignTriggers` (read from the live
+		// database) is empty — so an unrelated foreign trigger, on a table this
+		// migration never touches, is needed to reach the loop at all.
+		const runner = triggerRunner([
+			{ name: 'unrelated_audit', tbl_name: 'unrelated', sql: 'create trigger "unrelated_audit" after insert on "unrelated" begin select 1; end' },
+		]);
+		const sql = [
+			'alter table a rename to tmp',
+			'alter table b rename to a',
+			'alter table tmp rename to b',
+			...rebuildGroup('b'),
+		].join(';\n') + ';';
+
+		await expect(checkForeignTriggerConflicts(runner, [{ tag: 'm1', sql }])).resolves.toBeUndefined();
+	}, 2000);
+});
+
+describe('apply.ts: the accumulated fold reuses an existing case-insensitive key rather than adding a second one', () => {
+	it('does not leave a stale duplicate key that a later rebuild resolves through instead of the live one', async () => {
+		// m1: orders -> Sales.                 accumulated: { Sales: 'orders' }
+		// m2: sales -> Tmp (frees "sales").     accumulated: { Sales: 'orders', Tmp: 'orders' }
+		// m3: widget -> sales (reuses the name freed by m2, now pointing at the
+		//     table that is actually live as "widget"). The write side has to
+		//     reuse the existing "Sales" key (case-insensitively equal to the
+		//     "sales" this rename targets) rather than adding a second,
+		//     differently-cased "sales" key — otherwise "Sales" -> 'orders'
+		//     survives stale alongside a new "sales" -> 'widget', and which one
+		//     a later lookup finds depends on the exact case spelled at the
+		//     call site rather than which is current.
+		// m4: rebuilds "Sales" (capital S, matching m1's own spelling) — must
+		//     resolve through the live chain to "widget", the table the
+		//     foreign trigger actually sits on, not the stale "orders" a
+		//     duplicate key would return.
+		const runner = triggerRunner([
+			{ name: 'widget_audit', tbl_name: 'widget', sql: 'create trigger "widget_audit" after insert on "widget" begin select 1; end' },
+		]);
+		const migrations = [
+			{ tag: 'm1', sql: 'alter table orders rename to Sales;' },
+			{ tag: 'm2', sql: 'alter table sales rename to Tmp;' },
+			{ tag: 'm3', sql: 'alter table widget rename to sales;' },
+			{ tag: 'm4', sql: `${rebuildGroup('Sales').join(';\n')};` },
+		];
+
+		await expect(checkForeignTriggerConflicts(runner, migrations)).rejects.toThrow(/"widget_audit"/);
 	});
 });
 

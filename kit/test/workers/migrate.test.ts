@@ -7,7 +7,7 @@
  * seeded before a migration survives it.
  */
 import { env } from 'cloudflare:test';
-import { createSchema, tableOptions } from 'orm-d1/ddl';
+import { appendOnlyTrigger, createSchema, tableOptions } from 'orm-d1/ddl';
 import { integer, real, sql, sqliteTable, text, uniqueIndex } from 'orm-d1';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { applyMigrations, appliedMigrations, checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
@@ -718,5 +718,23 @@ describe('drift detection', () => {
 		await migrateTo(emptySnapshot(), snapshotFromSchema([t]));
 
 		expect(diffSnapshots(await introspect(runner), snapshotFromSchema([t])).statements).toEqual([]);
+	});
+});
+
+describe('append-only guard offsets survive a length-changing case fold', () => {
+	it('recovers the exact appendOnly column list for a table whose name contains Turkish İ', async () => {
+		// `appendOnlyTriggerGuard` used to match against `.toLowerCase()`, which
+		// (unlike SQLite's own ASCII-only identifier folding) maps Turkish İ
+		// (U+0130) to TWO UTF-16 units ('i' + combining dot above, U+0307) —
+		// growing the string by one code unit at that point. The column list is
+		// then sliced out of the case-preserving `source` at offsets computed
+		// against the *folded* text, so every offset past the İ lands one
+		// character short, corrupting the recovered column name.
+		const table = 'İslem';
+		await DB.prepare(`create table "${table}" ("id" integer primary key, "tutar" integer)`).run();
+		await DB.prepare(appendOnlyTrigger(table, ['tutar'])).run();
+
+		const live = await introspect(runner);
+		expect(live.tables[table]?.appendOnly).toEqual(['tutar']);
 	});
 });

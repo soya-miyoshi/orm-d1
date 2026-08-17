@@ -129,6 +129,16 @@ the split point is printed, because atomicity is lost across it; a remote migrat
 100 statements is instead routed through the file-import endpoint, which Cloudflare rolls
 back as a unit.
 
+**A single table rebuild that will not fit in one batch is refused outright, not split.**
+A rebuild — `create table "__new_X"` … copy the data … `drop table "X"` … `alter table
+"__new_X" rename to "X"`, plus every index and trigger `X` carries, recreated right after
+the rename — has to land in one `batch()` or not run at all: splitting it risks leaving the
+database mid-rebuild (the old table dropped, the new one never renamed into place) if a
+later batch fails. If that whole group is longer than the per-batch limit (100 statements by
+default) — which only happens for a table with enough indexes and triggers that the rebuild
+plus their re-creation exceeds it — `push`/`migrate` refuse to emit the migration rather than
+split the group unsafely. The error names the table.
+
 **Compound statements do not go through D1's `/query` endpoint.** `/query` re-splits the
 posted string on semicolons, and the splitter does not model compound statements:
 
@@ -193,6 +203,11 @@ const sql = renderMigration(diffSnapshots(previousSnapshot, snapshotFromSchema(s
 
 `orm-d1-kit/core` has no Node dependencies, so it also runs inside workerd — which is where
 the migration engine is tested against a real D1 database.
+
+`introspect(runner, foreignTriggers?)` takes an optional out-param, populated (keyed by live
+table name) with the name of every trigger found that orm-d1 did not create — pass a plain
+`{}`; it does not need to be a null-prototype object, even for a live table literally named
+`constructor` or another `Object.prototype` member.
 
 ## License
 

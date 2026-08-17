@@ -333,11 +333,37 @@ function statementRuns(statements: readonly string[]): string[][] {
 	return runs;
 }
 
+/**
+ * Best-effort table name for an error message, read straight off the run's own
+ * statements rather than threaded in from the group-building logic in
+ * {@link statementGroups} — a run is a `readonly string[]`, not a richer
+ * structure carrying its own table name, so recovering it here (from whichever
+ * of the run's statements happens to be the `create table "__new_X"` or the
+ * closing rename) is cheaper than reshaping every caller to carry one
+ * alongside. Falls back to `undefined` for a run this pattern does not
+ * recognise, so the message degrades to "a table" rather than throwing a
+ * second, unrelated error out of an error path.
+ */
+function runTableName(run: readonly string[]): string | undefined {
+	for (const statement of run) {
+		const created = CREATE_TABLE_PATTERN.exec(statement);
+		if (created) {
+			const name = normalizeIdentifierToken(created[1]!);
+			if (foldAsciiCase(name).startsWith('__new_')) return name.slice('__new_'.length);
+		}
+		const renamed = RENAME_TO_PATTERN.exec(statement);
+		if (renamed) return normalizeIdentifierToken(renamed[2]!);
+	}
+	return undefined;
+}
+
 function assertRunsFit(runs: readonly (readonly string[])[], maxPerBatch: number): void {
 	for (const run of runs) {
 		if (run.length > maxPerBatch) {
+			const table = runTableName(run);
+			const subject = table !== undefined ? `a table rebuild of "${table}"` : 'a table rebuild';
 			throw new Error(
-				`A group of ${run.length} statements that must be applied together (a table rebuild) exceeds the `
+				`A group of ${run.length} statements that must be applied together (${subject}) exceeds the `
 					+ `per-batch limit of ${maxPerBatch}. Splitting it across batches risks leaving the database `
 					+ 'mid-rebuild — the old table dropped and the new one never renamed into place — if a later '
 					+ 'batch fails. Refusing rather than emitting that migration.',

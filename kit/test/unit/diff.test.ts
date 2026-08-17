@@ -1770,6 +1770,27 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			expect(diff.errors[0]).toMatch(/"users_audit"/);
 		});
 
+		it('refuses when the live foreign trigger is recorded under a differently-cased table name (diff.ts:808)', () => {
+			// `options.foreignTriggers` is keyed the way `introspect()` populates
+			// it — exactly as `sqlite_master.tbl_name` spelled it, "USERS" here —
+			// while the diff's own table name is "users" (lowercase). A direct
+			// `options.foreignTriggers[liveTableNames[name] ?? name]` lookup would
+			// miss the "USERS"-keyed entry.
+			const before = withOptions(users, {});
+			const after = withOptions(
+				sqliteTable('users', { id: text('id').primaryKey(), email: text('email') }),
+				{},
+			);
+
+			const diff = diffSnapshots(before, after, {
+				foreignTriggers: { USERS: ['users_audit'] },
+			});
+
+			expect(diff.statements).toEqual([]);
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"users_audit"/);
+		});
+
 		it('does not refuse when the only trigger present is the append-only guard itself', () => {
 			const before = withOptions(users, { appendOnly: true });
 			const after = withOptions(
@@ -1896,6 +1917,41 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			// "audit" itself is untouched by this diff — it is neither rebuilt nor
 			// dropped, just the table the collider happens to live on.
 			expect(diff.statements.some((s) => s.sql.includes('"audit"'))).toBe(false);
+		});
+
+		// `tableGuardCollides`'s `droppedTriggerNames` exemption: a rename of an
+		// append-only table drops its OLD guard under the OLD name (step 1, see
+		// the comment at diff.ts ~569-593 on why SQLite does not rename a
+		// trigger along with its table). If this same diff also creates a
+		// brand-new table that happens to reuse that freed-up name — legal,
+		// since the old name no longer appears in `after` once the rename takes
+		// it — the new table's own derived guard name is identical to the one
+		// just dropped. `options.foreignTriggers` (a pre-diff snapshot) has no
+		// way to know that literal name is about to be vacated by this diff's
+		// own rename, so a naive scan over it would refuse a guard creation
+		// this diff's own earlier statement already made safe.
+		it('does not refuse a new table\'s guard whose name was already vacated by an earlier rename in the same diff', () => {
+			const legacyBefore = sqliteTable('legacy', { id: text('id').primaryKey() });
+			const before = snapshotFromSchema([legacyBefore], '', tableOptions([[legacyBefore, { appendOnly: true }]]));
+
+			const ordersAfter = sqliteTable('orders', { id: text('id').primaryKey() });
+			const legacyNew = sqliteTable('legacy', { id: text('id').primaryKey() });
+			const after = snapshotFromSchema(
+				[ordersAfter, legacyNew],
+				'',
+				tableOptions([[legacyNew, { appendOnly: true }]]),
+			);
+
+			const diff = diffSnapshots(before, after, {
+				renamedTables: { legacy: 'orders' },
+				// A stale pre-diff record of a trigger literally named
+				// "legacy_no_update" — as if it lived on some unrelated table.
+				foreignTriggers: { misc: ['legacy_no_update'] },
+			});
+
+			expect(diff.errors).toEqual([]);
+			expect(diff.statements.some((s) => s.sql === 'drop trigger if exists "legacy_no_update"')).toBe(true);
+			expect(diff.statements.some((s) => /create trigger "legacy_no_update"/.test(s.sql))).toBe(true);
 		});
 
 		it('still creates the guard normally when no foreign trigger occupies the name', () => {
