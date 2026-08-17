@@ -498,9 +498,14 @@ const parseIndexCollations = (sql: string | null): (string | undefined)[] | unde
  * the text is exactly what was written, in the order it was written.
  */
 export const parseTableOptions = (sql: string): { strict: boolean; withoutRowid: boolean } => {
-	const close = blankLiterals(sql).lastIndexOf(')');
+	// Slice the tail out of the *blanked* text, not the raw SQL: blanking removes
+	// comments, so a `)` inside one no longer bounds the column list, and a comment
+	// mentioning `strict` / `without rowid` after that point would otherwise be read
+	// as the option itself — inventing a constraint the table never had.
+	const blanked = blankLiterals(sql);
+	const close = blanked.lastIndexOf(')');
 	if (close < 0) return { strict: false, withoutRowid: false };
-	const tail = sql.slice(close + 1).toLowerCase();
+	const tail = blanked.slice(close + 1).toLowerCase();
 	return {
 		strict: /\bstrict\b/.test(tail),
 		withoutRowid: /\bwithout\s+rowid\b/.test(tail),

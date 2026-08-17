@@ -1906,6 +1906,20 @@ describe('reading table options back out of a CREATE TABLE', () => {
 			.toEqual({ strict: false, withoutRowid: false });
 	});
 
+	it('does not read an option out of a comment', () => {
+		// SQLite keeps a comment that sits *before* a table option, verbatim. Its own
+		// `)` used to bound the tail by accident; now that comments are blanked, the
+		// tail must be taken from the blanked text or the word inside the comment
+		// becomes an option the table never had — and the rebuilt table gets a
+		// constraint that rejects rows the original accepted.
+		expect(parseTableOptions('create table "t" ("id" text primary key, "n" integer) /* strict ) */ without rowid'))
+			.toEqual({ strict: false, withoutRowid: true });
+		expect(parseTableOptions('create table "t" ("id" integer primary key autoincrement) /* without rowid ) */ strict'))
+			.toEqual({ strict: true, withoutRowid: false });
+		expect(parseTableOptions('create table "t" ("a" text) -- strict )\n'))
+			.toEqual({ strict: false, withoutRowid: false });
+	});
+
 	it('recognises the guard by what it does, not by its name', () => {
 		const guard = 'CREATE TRIGGER whatever_i_called_it BEFORE UPDATE ON "events" '
 			+ "BEGIN SELECT RAISE(ABORT, 'nope'); END";
