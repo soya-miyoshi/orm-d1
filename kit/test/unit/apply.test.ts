@@ -45,16 +45,21 @@ describe('statementGroups', () => {
 			'create table "before" ("id" integer)',
 			...rebuildGroup('x'),
 			'create index "x_idx" on "x" ("id")',
+			'create table "after" ("id" integer)',
 		];
 		const groups = statementGroups(statements);
 
-		// The unrelated statement before it, and the index create after it
-		// (outside the 5-statement group `recreateTable` emits), are not
-		// folded in.
+		// The unrelated statement before it is not folded in.
 		expect(groups[0]).not.toBe(groups[1]);
-		expect(groups[6]).not.toBe(groups[1]);
-		// PRAGMA through rename share one id.
-		expect(new Set(groups.slice(1, 6)).size).toBe(1);
+		// The index create after the rename *is* part of the rebuild group:
+		// `recreateTable` (`diff.ts`) emits it after the rename to restore the
+		// constraints the drop just took with it, so a batch boundary landing
+		// between the rename and it is exactly as unsafe as one landing before
+		// the rename — see `[F-041]`. Only the statement after *that* is free.
+		expect(groups[6]).toBe(groups[1]);
+		expect(groups[7]).not.toBe(groups[1]);
+		// PRAGMA through the trailing index create share one id.
+		expect(new Set(groups.slice(1, 7)).size).toBe(1);
 	});
 });
 
@@ -162,25 +167,29 @@ describe('applyMigration batching', () => {
 		}
 	});
 
-	it('does not push the record into its own trailing batch when the real statements fill the last batch exactly (gap 2)', async () => {
+	it('shifts a statement out of an exactly-full last batch so the record does not become its own trailing batch (gap 2)', async () => {
 		const { runner, batches } = recordingRunner();
 		// Exactly MAX_STATEMENTS_PER_BATCH real statements: greedy packing fills
 		// the (only) batch of real statements exactly, with no room left over.
-		// The record must still ride along, spilling into a second batch rather
-		// than becoming its own trailing one-statement batch.
+		// [F-043]: the record must not become its own one-statement trailing
+		// batch here — one real statement is shifted out of the full batch so
+		// the record always rides along with a real statement.
 		const statements = Array.from({ length: MAX_STATEMENTS_PER_BATCH }, (_, i) => `create table "t${i}" ("id" integer)`);
 		await applyMigration(runner, 'm_exact', `${statements.join(';\n')};`);
 
 		expect(batches).toHaveLength(2);
-		expect(batches[0]).toHaveLength(MAX_STATEMENTS_PER_BATCH);
-		expect(batches[1]).toEqual([`insert into "d1_migrations" (name) values ('m_exact')`]);
+		expect(batches[0]).toHaveLength(MAX_STATEMENTS_PER_BATCH - 1);
+		expect(batches[1]).toHaveLength(2);
+		expect(batches[1]).toContain(`insert into "d1_migrations" (name) values ('m_exact')`);
+		expect(batches[1]!.some((s) => s !== `insert into "d1_migrations" (name) values ('m_exact')`)).toBe(true);
 	});
 
-	it('keeps a rebuild group whole when it is what makes the last batch fill exactly (gap 2)', async () => {
+	it('keeps a rebuild group whole when it is what makes the last batch fill exactly, and rides the record along with it (gap 2)', async () => {
 		const { runner, batches } = recordingRunner();
 		// 95 plain creates + a 5-statement rebuild group = exactly 100: the
-		// group must not be split to make room for the record, and the record
-		// must not silently ride into a batch that would then overflow.
+		// group must not be split to make room for the record. [F-043]/[F-041]:
+		// the whole group is shifted into a second batch together with the
+		// record, rather than leaving the record alone in a trailing batch.
 		const statements = [
 			...Array.from({ length: MAX_STATEMENTS_PER_BATCH - 5 }, (_, i) => `create table "t${i}" ("id" integer)`),
 			...rebuildGroup('orders'),
@@ -188,13 +197,17 @@ describe('applyMigration batching', () => {
 		await applyMigration(runner, 'm_rebuild_exact', `${statements.join(';\n')};`);
 
 		expect(batches).toHaveLength(2);
-		expect(batches[0]).toHaveLength(MAX_STATEMENTS_PER_BATCH);
+		expect(batches[0]).toHaveLength(MAX_STATEMENTS_PER_BATCH - 5);
+		expect(batches[1]).toHaveLength(6);
+		expect(batches[1]).toContain(`insert into "d1_migrations" (name) values ('m_rebuild_exact')`);
 		for (const batch of batches) {
 			const hasDrop = batch.some((s) => s === 'drop table "orders"');
 			const hasRename = batch.some((s) => s === 'alter table "__new_orders" rename to "orders"');
 			expect(hasDrop).toBe(hasRename);
 		}
-		expect(batches[1]).toEqual([`insert into "d1_migrations" (name) values ('m_rebuild_exact')`]);
+		// The whole rebuild group landed in the second batch, with the record.
+		expect(batches[1]).toContain('drop table "orders"');
+		expect(batches[1]).toContain('alter table "__new_orders" rename to "orders"');
 	});
 
 	it('keeps the record in the single batch when the migration is small', async () => {

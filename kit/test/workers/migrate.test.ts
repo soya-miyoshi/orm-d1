@@ -262,12 +262,18 @@ describe('batching a large migration cannot cut a table rebuild in half (finding
 		// test is about, rather than accidentally fitting in one batch.
 		expect(sql.split(';').filter((s) => s.trim()).length).toBeGreaterThan(100);
 
+		// [F-044]: `applyMigrations` issues `ensureMigrationsTable` as its own
+		// `batch()` before applying anything, so `calls === 2` was the *first*
+		// real batch, not the second — the migration applied zero statements
+		// and every assertion below passed against the untouched pre-migration
+		// state (`age` still the text `'30'`), never reaching the split this
+		// test is named for. `calls === 3` is the actual second real batch.
 		let calls = 0;
 		const throwingRunner: SqlRunner = {
 			...runner,
 			batch: async (statements) => {
 				calls++;
-				if (calls === 2) throw new Error('simulated failure on the second batch');
+				if (calls === 3) throw new Error('simulated failure on the second batch');
 				await runner.batch(statements);
 			},
 		};

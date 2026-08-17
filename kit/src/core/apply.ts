@@ -15,7 +15,7 @@ import {
 	applicableStatements,
 	createMigrationsTable,
 	MIGRATIONS_TABLE,
-	packIntoBatches,
+	packStatementsWithTrailer,
 	quoteIdentifier,
 	tablesRebuiltIn,
 } from './sql.js';
@@ -234,21 +234,28 @@ export async function applyMigration(
 	// throws outright if a single group cannot fit in one batch, rather than
 	// splitting it.
 	//
-	// The migrations-table insert is packed in together with the real
-	// statements, not appended after batching completes — packing it
-	// separately used to push it into its own trailing one-statement batch
-	// whenever the real statements happened to fill the last batch exactly,
-	// which is a batch boundary indistinguishable from any other and defeats
-	// the whole point of riding along with the migration's own last effect.
-	// Handing it to `packIntoBatches` as one more (singleton-group) statement
-	// lets it spill into a new batch only when there truly is no room.
+	// The migrations-table insert rides along with real statements whenever
+	// there is any way to make that happen, rather than landing in a trailing
+	// batch of its own — a lone `insert into "d1_migrations"` batch is exactly
+	// as fragile as any other split (if it is the one that fails, the schema
+	// change already applied comes back unrecorded, and the retry dies on
+	// "table … already exists" with no way to mark the migration done).
+	// `packStatementsWithTrailer` (`sql.ts`) is the packer that actually
+	// guarantees this: `packIntoBatches([...statements, record], limit)` looks
+	// like it should, since `record` is a singleton run that ought to spill
+	// into the previous batch when there is room, but that packing loop only
+	// ever starts a *new* batch when a run does not fit in the current one —
+	// it never goes back to top up a batch a full-sized run already closed
+	// before `record` is reached. So whenever the real statements exactly
+	// fill a batch, `record` still lands alone in the next one, identical to
+	// always appending it after batching. `packStatementsWithTrailer` shifts
+	// the last batch's last run out to make room instead of accepting that.
 	//
 	// The ceiling comes from the runner, not from a constant here. A migration
 	// that goes through file import — or that runs against local SQLite — has
 	// no ceiling, and splitting it would give away atomicity for nothing.
-	const all = [...statements, record];
-	const limit = runner.atomicLimit?.(all) ?? MAX_STATEMENTS_PER_BATCH;
-	const batches = packIntoBatches(all, limit);
+	const limit = runner.atomicLimit?.([...statements, record]) ?? MAX_STATEMENTS_PER_BATCH;
+	const batches = packStatementsWithTrailer(statements, record, limit);
 
 	if (batches.length > 1) {
 		warnings.push(
@@ -276,17 +283,34 @@ export async function applyMigration(
  */
 function renamesInMigration(statements: readonly string[]): Record<string, string> {
 	const renames: Record<string, string> = {};
+	const createPattern = /^\s*create\s+table\s+"((?:[^"]|"")+)"/i;
 	const pattern = /^\s*alter\s+table\s+"((?:[^"]|"")+)"\s+rename\s+to\s+"((?:[^"]|"")+)"\s*$/i;
+
+	// A rebuild's own closing rename (`"__new_X"` -> `"X"`) is not a live
+	// table's identity change; excluding it keeps this map limited to actual
+	// `--rename-table` renames, which is all `tablesRebuiltIn`'s post-rename
+	// names need resolving through. `from.startsWith('__new_')` used to be the
+	// test for that, but a genuine `--rename-table __new_orders=orders_v2` —
+	// a real table someone named `__new_orders`, the same case `diff.ts:412`
+	// already acknowledges exists — starts with `__new_` too and was wrongly
+	// excluded, silently hiding it from the trigger guard. What actually
+	// distinguishes the rebuild's closing rename is that *this migration
+	// itself* created the temporary table by that exact name moments earlier
+	// (`recreateTable` always emits `create table "__new_X"` before the
+	// matching rename); a hand-authored or `--rename-table` rename never has
+	// a preceding `create table` under the source name in the same file.
+	const createdHere = new Set<string>();
+	for (const statement of statements) {
+		const created = createPattern.exec(statement);
+		if (created) createdHere.add(created[1]!.replaceAll('""', '"'));
+	}
+
 	for (const statement of statements) {
 		const match = pattern.exec(statement);
 		if (!match) continue;
 		const from = match[1]!.replaceAll('""', '"');
 		const to = match[2]!.replaceAll('""', '"');
-		// The rebuild's own closing rename (`"__new_X"` -> `"X"`) is not a live
-		// table's identity change; excluding it keeps this map limited to actual
-		// `--rename-table` renames, which is all `tablesRebuiltIn`'s post-rename
-		// names need resolving through.
-		if (from.startsWith('__new_')) continue;
+		if (from.startsWith('__new_') && createdHere.has(from)) continue;
 		renames[to] = from;
 	}
 	return renames;
@@ -335,9 +359,22 @@ export async function checkForeignTriggerConflicts(
 	}
 	if (Object.keys(foreignTriggers).length === 0) return;
 
+	// `migration.renames` only resolves a rename performed *within that one
+	// migration file*. A table renamed in an earlier pending migration and
+	// then rebuilt in a later one — the ordinary `generate --rename-table`
+	// workflow, split across two runs of `generate` the way any two-step
+	// schema change is — needs its name resolved back through every rename
+	// since the run started, not just the last one. `accumulated` carries
+	// that: it maps a name as it exists going into the migration currently
+	// being checked to the table's true live name in the database (before
+	// this `migrate` run touched anything), and is folded forward after each
+	// migration is considered so the next one inherits it.
+	const accumulated: Record<string, string> = {};
+
 	for (const migration of parsed) {
 		for (const table of migration.tables) {
-			const liveName = migration.renames[table] ?? table;
+			const preMigrationName = migration.renames[table] ?? table;
+			const liveName = accumulated[preMigrationName] ?? preMigrationName;
 			const triggers = foreignTriggers[liveName];
 			if (!triggers || triggers.length === 0) continue;
 			throw new Error(
@@ -347,6 +384,13 @@ export async function checkForeignTriggerConflicts(
 					+ 'orm-d1 does not know the definition of. Drop the trigger, recreate it by hand after this '
 					+ 'migration runs, or bring it into the schema so orm-d1 can carry it across rebuilds.',
 			);
+		}
+
+		// Fold this migration's renames into the running map before moving to
+		// the next migration, so a rename here is visible to a rebuild in any
+		// later pending migration.
+		for (const [to, from] of Object.entries(migration.renames)) {
+			accumulated[to] = accumulated[from] ?? from;
 		}
 	}
 }

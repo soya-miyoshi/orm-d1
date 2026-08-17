@@ -181,15 +181,45 @@ export function statementGroups(statements: readonly string[]): number[] {
 
 		const tempName = createMatch[1]!;
 		const renamePattern = new RegExp(
-			`^\\s*alter\\s+table\\s+"${escapeRegExpChars(tempName)}"\\s+rename\\s+to\\s+"`,
+			`^\\s*alter\\s+table\\s+"${escapeRegExpChars(tempName)}"\\s+rename\\s+to\\s+"((?:[^"]|"")+)"`,
 			'i',
 		);
 
 		let end = createIndex;
+		let finalName: string | undefined;
 		for (let j = createIndex + 1; j < statements.length; j++) {
-			if (renamePattern.test(statements[j]!)) {
+			const renameMatch = renamePattern.exec(statements[j]!);
+			if (renameMatch) {
 				end = j;
+				finalName = renameMatch[1]!;
 				break;
+			}
+		}
+
+		// `recreateTable` (`diff.ts`) does not stop at the rename: it restores
+		// the rebuilt table's indexes and, if the table is append-only, its
+		// guard trigger *after* the rename — that is how the rebuild puts the
+		// constraints back. Those statements are what actually re-create a
+		// `unique()` index dropped along with the old table, so a batch
+		// boundary landing between the rename and them is exactly as unsafe as
+		// one landing before the rename: a `[100, 2]` split can commit the
+		// rename in batch 1 and lose the trailing `create unique index` to a
+		// batch-2 failure, with the table looking rebuilt and the constraint
+		// simply gone. Extend the group through every statement immediately
+		// following the rename that creates an index or trigger "on" the
+		// rebuilt table's final name — the exact shape `recreateTable` emits —
+		// and stop at the first statement that is not one of those.
+		if (finalName !== undefined) {
+			const tailPattern = new RegExp(
+				`^\\s*create\\s+(?:unique\\s+index|index|trigger)\\b[\\s\\S]*\\son\\s"${
+					escapeRegExpChars(finalName)
+				}"`,
+				'i',
+			);
+			let k = end + 1;
+			while (k < statements.length && tailPattern.test(statements[k]!)) {
+				end = k;
+				k++;
 			}
 		}
 
@@ -218,15 +248,9 @@ export function tablesRebuiltIn(statements: readonly string[]): string[] {
 	return names;
 }
 
-/**
- * Split `statements` into batches of at most `maxPerBatch`, without ever
- * splitting a group `statementGroups` says must stay together — a group
- * larger than the limit cannot be packed safely at all, so it is refused
- * outright rather than split.
- */
-export function packIntoBatches(statements: readonly string[], maxPerBatch: number): string[][] {
+/** The atomic runs (rebuild groups, or singleton statements) `statements` breaks into. */
+function statementRuns(statements: readonly string[]): string[][] {
 	const groupIds = statementGroups(statements);
-
 	const runs: string[][] = [];
 	let i = 0;
 	while (i < statements.length) {
@@ -236,7 +260,10 @@ export function packIntoBatches(statements: readonly string[], maxPerBatch: numb
 		runs.push(statements.slice(i, j));
 		i = j;
 	}
+	return runs;
+}
 
+function assertRunsFit(runs: readonly (readonly string[])[], maxPerBatch: number): void {
 	for (const run of runs) {
 		if (run.length > maxPerBatch) {
 			throw new Error(
@@ -247,6 +274,17 @@ export function packIntoBatches(statements: readonly string[], maxPerBatch: numb
 			);
 		}
 	}
+}
+
+/**
+ * Split `statements` into batches of at most `maxPerBatch`, without ever
+ * splitting a group `statementGroups` says must stay together — a group
+ * larger than the limit cannot be packed safely at all, so it is refused
+ * outright rather than split.
+ */
+export function packIntoBatches(statements: readonly string[], maxPerBatch: number): string[][] {
+	const runs = statementRuns(statements);
+	assertRunsFit(runs, maxPerBatch);
 
 	const batches: string[][] = [];
 	let current: string[] = [];
@@ -259,6 +297,73 @@ export function packIntoBatches(statements: readonly string[], maxPerBatch: numb
 	}
 	if (current.length > 0) batches.push(current);
 	return batches;
+}
+
+/**
+ * Same packing as {@link packIntoBatches}, plus one more statement —
+ * `applyMigration`'s `insert into "d1_migrations"` record — that must ride
+ * along with real statements rather than ever becoming a batch of its own
+ * when there is any way to avoid it.
+ *
+ * A record batched separately by appending it *after* `packIntoBatches` has
+ * already closed the last batch only avoids its own trailing batch when that
+ * last batch happens to have a free slot — whenever the real statements
+ * exactly fill it (a batch boundary indistinguishable from any other, and
+ * common at any multiple of `maxPerBatch`), the record still lands alone.
+ * If that lone batch is the one that fails, the schema change it followed
+ * already applied but was never recorded, and the retry dies on `table …
+ * already exists` with no way to mark the migration done.
+ *
+ * So when the last batch is exactly full, its last run is shifted out into a
+ * new batch together with `trailer` instead — moving a run never splits it,
+ * and a run that already fit in one batch plus one more statement fits in
+ * `maxPerBatch` unless that run alone *is* `maxPerBatch`, the one case
+ * nothing can be done about (the trailer is left alone rather than growing
+ * the batch past the ceiling).
+ */
+export function packStatementsWithTrailer(
+	statements: readonly string[],
+	trailer: string,
+	maxPerBatch: number,
+): string[][] {
+	const runs = statementRuns(statements);
+	assertRunsFit(runs, maxPerBatch);
+
+	const batchRuns: string[][][] = [];
+	let current: string[][] = [];
+	let currentLen = 0;
+	for (const run of runs) {
+		if (currentLen > 0 && currentLen + run.length > maxPerBatch) {
+			batchRuns.push(current);
+			current = [];
+			currentLen = 0;
+		}
+		current.push(run);
+		currentLen += run.length;
+	}
+	if (current.length > 0) batchRuns.push(current);
+
+	if (batchRuns.length === 0) {
+		return [[trailer]];
+	}
+
+	const last = batchRuns[batchRuns.length - 1]!;
+	const lastLen = last.reduce((sum, run) => sum + run.length, 0);
+	if (lastLen + 1 <= maxPerBatch) {
+		last.push([trailer]);
+	} else {
+		const shifted = last.pop()!;
+		if (shifted.length + 1 <= maxPerBatch) {
+			batchRuns.push([shifted, [trailer]]);
+		} else {
+			// The shifted run alone already fills a batch — nothing to gain by
+			// moving it, so restore it and give the trailer its own batch.
+			last.push(shifted);
+			batchRuns.push([[trailer]]);
+		}
+	}
+
+	return batchRuns.map((runsInBatch) => runsInBatch.flat());
 }
 
 /** Wrangler's own migration bookkeeping table, reused so both appliers agree. */

@@ -430,38 +430,38 @@ bug under a name claiming the fix is worse than no test, and it is the same
 "both artifacts agree so CI stays green" shape `docs/09` describes. Fix those two first,
 before the defects they were supposed to cover.
 
-### [F-041] The rebuild group stops at the rename, so a `UNIQUE` index can still be split off and silently lost — status: todo — severity: **high** — area: kit/apply
+### [F-041] The rebuild group stops at the rename, so a `UNIQUE` index can still be split off and silently lost — status: done — severity: **high** — area: kit/apply
 - **Where**: `kit/src/core/sql.ts:161-203` (`statementGroups`), against `kit/src/core/diff.ts:311-321`
 - **Defect**: `statementGroups` closes the group at `alter table "__new_X" rename to "X"`, but `recreateTable` emits the table's indexes and its append-only trigger *after* that rename — that is where the rebuild restores its constraints. Those become singleton groups, so `packIntoBatches` will put the boundary immediately after the rename.
 - **Failure scenario** (95 filler creates + a rebuild of a table carrying `uniqueIndex('orders_code')`, batch 2 failing on a D1 500 / 429 / dropped `--remote` connection): batches are `[100, 2]` with batch 2 = `create unique index "orders_code" …` + the `d1_migrations` insert. On real D1: `indexes on orders after the failed migration: []`, two rows now share `code='A'` — the UNIQUE constraint is gone — the migration is unrecorded, and the retry dies on `table "f0" already exists`. `push` self-heals on re-run; `migrate` does not.
 - **Why it matters more than it looks**: this is `docs/09`'s reason-for-existence failure — a `unique()` constraint gone with nothing reporting it — reproduced *through the code path this batch rewrote*. It is not a new hole (fixed-stride slicing could cut here too), but the fix redefines "what must stay in one batch" and leaves the constraint-restoring tail of the rebuild outside that definition.
 - **Fix**: extend the group through the index and trigger statements `recreateTable` emits after the rename, so the whole rebuild — including constraint restoration — is indivisible.
 
-### [F-042] A rename in an *earlier pending migration* still bypasses the trigger guard — status: todo — severity: high — area: kit/apply
+### [F-042] A rename in an *earlier pending migration* still bypasses the trigger guard — status: done — severity: high — area: kit/apply
 - **Where**: `kit/src/core/apply.ts:284-304`
 - **Defect**: `parsed` computes `renames` per migration and the lookup is `migration.renames[table] ?? table`, so only a rename inside the *same file* is resolved. Renames from earlier pending migrations in the same `migrate` run are not accumulated, while the live `foreignTriggers` map is keyed by the pre-run `tbl_name`.
 - **Failure scenario** (proven on real D1): `0001_rename` = `alter table "orders" rename to "sales"`, `0002_retype` = a type change forcing a rebuild of `sales`, with trigger `orders_audit` live on `orders`. `applyMigrations(runner, [m1, m2])` issues no refusal; triggers after migrate: `[]`. Generating a rename migration, then a schema change, then deploying and running `migrate` once is the ordinary workflow. The same hole swallows the error message's own recommended remedy: a `create trigger` hand-added to migration N and a rebuild in migration N+1, both pending, applies with no refusal.
 - **Fix**: fold each migration's renames into a running name→live map *before* checking that migration's rebuilt tables, instead of resetting per file.
 - **Secondary**: the scanner only recognises the kit's own double-quoted spelling — a hand-written `alter table orders rename to sales;` is not seen.
 
-### [F-043] The gap-2 fix is a no-op, and its test asserts the opposite of its own title — status: todo — severity: **high** — area: kit/apply + test-integrity
+### [F-043] The gap-2 fix is a no-op, and its test asserts the opposite of its own title — status: done — severity: **high** — area: kit/apply + test-integrity
 - **Where**: `kit/src/core/apply.ts:215`; test at `kit/test/unit/apply.test.ts:122-133`
 - **Defect**: replacing the explicit "append record to last batch if room" with `packIntoBatches([...statements, record], MAX)` is byte-for-byte identical in every case. Measured side by side: 99 → `[100]`, 100 → `[100, 1]`, 101 → `[100, 2]`, 200 → `[100, 100, 1]` — identical for both implementations. At any exact fill the record is still alone in its own trailing batch.
 - **Failure scenario**: a 100-statement migration commits batch 1, batch 2 (the record alone) fails, the schema change is applied but unrecorded, and the next `migrate` dies on `table … already exists` — permanently stuck.
 - **The test integrity problem**: `kit/test/unit/apply.test.ts:122-133` is titled `does not push the record into its own trailing batch when the real statements fill the last batch exactly (gap 2)` and **asserts** `expect(batches[1]).toEqual([insert into "d1_migrations" …])` — i.e. it pins the behaviour its own name says is fixed.
 - **Fix**: either do the real work (shift the last singleton run into the trailing batch with the record, or reserve a slot) or withdraw the claim and rename the test to describe what it actually pins. It cannot stay as it is.
 
-### [F-044] The flagship regression test for the batch-split finding exercises nothing — status: todo — severity: **high** — area: test-integrity
+### [F-044] The flagship regression test for the batch-split finding exercises nothing — status: done — severity: **high** — area: test-integrity
 - **Where**: `kit/test/workers/migrate.test.ts:238-247`
 - **Defect**: `applyMigrations` issues `ensureMigrationsTable` as its own `batch()` first, so `calls === 2` is the *first real batch*, not the second. The migration applies zero statements, and the assertions (`rebuilt` present, one row, `Number(age) === 30`) pass against the untouched pre-migration state — `age` is still the text `'30'`. The split-across-batches failure the test is named for is never reached.
 - **Fix**: correct the off-by-one to `calls === 3`. The reviewer notes that doing so is exactly what exposed `[F-041]`, so expect this test to go red until `[F-041]` is fixed too.
 
-### [F-045] `from.startsWith('__new_')` excludes real renames, giving a third guard bypass — status: todo — severity: med — area: kit/apply
+### [F-045] `from.startsWith('__new_')` excludes real renames, giving a third guard bypass — status: done — severity: med — area: kit/apply
 - **Where**: `kit/src/core/apply.ts:253`
 - **Defect**: the exclusion rule cannot distinguish a rebuild's closing rename from a genuine `--rename-table` whose *source* table is named `__new_*` — a table the codebase itself acknowledges exists (`diff.ts:412`, "a real table someone genuinely named `__new_orders`").
 - **Failure scenario** (verified): for live table `__new_orders` with trigger `nn_audit`, `generate --rename-table __new_orders=orders_v2` plus a type change produces a migration where `checkForeignTriggerConflicts` does not throw, and `drop table "orders_v2"` takes the trigger. Narrow precondition, same silent-loss outcome. The non-renamed rebuild of a `__new_*` table is handled correctly — the temp name becomes `__new___new_stuff` and the guard fires.
 
-### [F-046] A *refused* rebuild now emits a statement — status: todo — severity: low — area: kit/diff
+### [F-046] A *refused* rebuild now emits a statement — status: done — severity: low — area: kit/diff
 - **Where**: `kit/src/core/diff.ts:553-559`
 - **Defect**: `recreateTable`'s contract is "no statements alongside the refusal" (`diff.ts:237-240`), but the new append-only block runs after the `recreateTable` call regardless of whether it refused, so both refusal paths emit a lone destructive `drop trigger if exists …`. Also reproduces for the pre-existing dependents refusal.
 - **Not reachable as a bad outcome** — `generate` and `push` throw on `errors` before reading `statements` — but `check` now prints a `Drift:` line for a table it simultaneously reports as blocked.
@@ -717,7 +717,7 @@ introspected-vs-stored (plain-vs-plain), so no null-prototype object reaches a d
 - **Failure scenario B — the flagship `docs/09` shape, via `pull`**: given a live `create unique index "__proto__" on users(email)`, `snapshotFromIntrospection` produces `Object.keys(tables.users.indexes) === []`. The index is invisible to every `Object.values` consumer, so `pull` writes a schema module without it, and the next rebuild of `users` re-creates the table from `Object.values(after.indexes)` and drops the UNIQUE constraint permanently — with `check` green throughout, because both sides share the blindness.
 - **Pre-existing**, but it is the flagship bug class, it sits inside the function this commit edits, and it is exactly the reasoning this commit wrote down.
 
-### [F-079] The guard-collision refusal is narrower than SQLite's trigger namespace — status: todo — severity: low — area: kit/diff
+### [F-079] The guard-collision refusal is narrower than SQLite's trigger namespace — status: done — severity: low — area: kit/diff
 - **Where**: `kit/src/core/diff.ts:617-619`
 - **Defect**: `foreignTriggersForTable.includes(guardName)` is keyed per table and compared case-sensitively, but SQLite trigger names are **database-global and case-insensitive**. Verified with `node:sqlite`: `create trigger "events_no_update" … on "audit"` succeeds, and a second `… on "events"` then fails with `trigger "events_no_update" already exists`.
 - **Failure scenario**: a hand-written trigger named `events_no_update` attached to `audit` — or an orm-d1 guard left behind on a table renamed outside the kit, which keeps its name — then `events` gains `appendOnly: true`. `diffSnapshots` finds nothing under `foreignTriggers['events']` and emits the `create trigger` with `errors: []`, which fails on apply with precisely the "already exists" error this refusal exists to prevent. Same for a live `EVENTS_NO_UPDATE`.

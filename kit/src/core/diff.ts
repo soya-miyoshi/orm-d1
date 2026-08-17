@@ -713,7 +713,16 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			// so re-stating it here (the trigger is already gone with the old
 			// table by this point) is inert; it exists only to carry the
 			// destructive reason into `--accept-data-loss` prompts and logs.
-			if ((previous.appendOnly ?? false) && !(next.appendOnly ?? false)) {
+			//
+			// Only when the rebuild actually happened: `recreateTable`'s
+			// contract is "no statements alongside a refusal" (the dependents
+			// and foreign-trigger checks both return `{ statements: [], errors
+			// }` deliberately, see the comment at their `return`), but this
+			// block ran unconditionally after it, so a refused rebuild still
+			// emitted a lone destructive `drop trigger` — `check` printing a
+			// `Drift:` line for a table it was simultaneously reporting as
+			// blocked. Skip it whenever the rebuild refused.
+			if (recreated.errors.length === 0 && (previous.appendOnly ?? false) && !(next.appendOnly ?? false)) {
 				statements.push({
 					sql: dropAppendOnlyTrigger(name),
 					destructive: true,
@@ -792,9 +801,16 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 				// foreign trigger does, which is the bug class this guard exists to
 				// prevent. Refuse instead, matching the rebuild-path foreign-trigger
 				// refusal above.
-				const foreignTriggersForTable = options.foreignTriggers?.[liveTableNames[name] ?? name] ?? [];
 				const guardName = appendOnlyTriggerName(name);
-				if (!previousGuard && foreignTriggersForTable.includes(guardName)) {
+				// SQLite trigger names are database-global and case-insensitive
+				// (verified: a trigger on one table collides with the same name
+				// aimed at another), not scoped to the table gaining the guard —
+				// so the collision check has to look across every live trigger
+				// `options.foreignTriggers` knows about, not just the ones already
+				// keyed under this table's own (possibly renamed) live name.
+				const collides = Object.values(options.foreignTriggers ?? {})
+					.some((triggers) => triggers.some((t) => t.toLowerCase() === guardName.toLowerCase()));
+				if (!previousGuard && collides) {
 					errors.push(
 						`"${name}" is becoming append-only, but a trigger named "${guardName}" already exists and `
 							+ 'orm-d1 did not create it. Creating the guard would fail on apply because the name is '
