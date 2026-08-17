@@ -11,7 +11,18 @@ import { dirname, extname, join, relative, resolve } from 'node:path';
 import type { DiffOptions } from './core/diff.js';
 import { loadConfig } from './node/config.js';
 import type { CommandContext, TargetFlags } from './node/commands.js';
-import { backfillCommand, check, generate, impact, migrate, pull, push, up, verify } from './node/commands.js';
+import {
+	backfillCommand,
+	check,
+	generate,
+	impact,
+	journalPulledBaseline,
+	migrate,
+	pullSnapshot,
+	push,
+	up,
+	verify,
+} from './node/commands.js';
 
 const USAGE = `orm-d1-kit — migrations for orm-d1 on Cloudflare D1
 
@@ -279,6 +290,19 @@ export async function run(argv: readonly string[]): Promise<number> {
 				: join(dirname(out), 'table-options.ts');
 			const tableOptionsPath = resolve(cwd, tableOptionsOut);
 
+			// `--table-options-out` pointed at the same file as `--schema-out`
+			// would otherwise write the schema module, then immediately overwrite
+			// it with the sidecar — which self-imports and is not valid schema
+			// module syntax — printing "Wrote …" twice while quietly destroying
+			// the schema module it just wrote.
+			if (tableOptionsPath === path) {
+				ctx.log(
+					`--schema-out and --table-options-out both resolve to ${out} — they have to be different `
+						+ 'files; the sidecar imports the schema module by path and cannot also replace it.',
+				);
+				return 1;
+			}
+
 			// The default path is very likely to be the hand-written schema this
 			// project already has, and the rendered module is not a substitute
 			// for it — comments, `$type<…>()`, relations and `$defaultFn`s are
@@ -299,14 +323,21 @@ export async function run(argv: readonly string[]): Promise<number> {
 			// maps it back to the real `.ts`.
 			const schemaModuleSpecifier = relativeSpecifier(tableOptionsPath, path);
 
-			const result = await pull(ctx, { ...target, schemaModuleSpecifier });
+			// [F-097 cont'd] Computed but not journalled yet — `pullSnapshot` only
+			// introspects, renders and warns. Every precondition (this check, and
+			// the table-options one right below) has to pass before anything
+			// touches disk, or a refusal here still leaves a pulled baseline
+			// behind, and following the refusal's own "re-run with --force" advice
+			// produces a second, redundant one.
+			const result = await pullSnapshot(ctx, { ...target, schemaModuleSpecifier });
 
 			// The table-options existence check happens *here*, after
 			// introspection, rather than up front with the schema one: whether
 			// there is a sidecar to write at all is not known until the live
 			// database has been read, and checking unconditionally refused a
 			// perfectly ordinary `pull` (skipping `schema.ts` with it) over a file
-			// nothing was going to touch.
+			// nothing was going to touch. Still before any write: `pullSnapshot`
+			// above is read-only, so a refusal here leaves nothing on disk either.
 			if (result.tableOptions && existsSync(tableOptionsPath) && flags['force'] !== true) {
 				ctx.log(
 					`${tableOptionsOut} already exists. Re-run with --force to overwrite it, or pass `
@@ -338,6 +369,10 @@ export async function run(argv: readonly string[]): Promise<number> {
 					);
 				}
 			}
+
+			// Journalled last, once every write above has actually succeeded —
+			// see `pullSnapshot`'s doc comment for why the ordering matters.
+			await journalPulledBaseline(ctx, result.snapshot, { ...target, schemaModuleSpecifier });
 			return 0;
 		}
 		case 'check': {

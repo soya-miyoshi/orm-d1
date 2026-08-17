@@ -163,7 +163,7 @@ export default tableOptions([
   [users, { collate: { email: 'nocase' } }],
   // `null` is the opposite — "no collation, and stop carrying one forward" — the
   // only way to retire a collation the kit once recorded.
-  [accounts, { collate: { legacyId: null } }],
+  [accounts, { collate: { legacy_id: null } }],
 ]);
 ```
 

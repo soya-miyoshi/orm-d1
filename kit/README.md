@@ -60,7 +60,7 @@ export default tableOptions([
   [users, { collate: { email: 'nocase' } }],
   // `null` states the opposite: "no collation, and stop carrying one forward" — the
   // only way to retire a collation the kit once carried.
-  [accounts, { collate: { legacyId: null } }],
+  [accounts, { collate: { legacy_id: null } }],
 ]);
 ```
 
@@ -193,13 +193,25 @@ of guessing from what was last introspected.
 **Overwriting a hand-maintained sidecar is lossy.** `--force` (the same flag that lets
 `pull` overwrite an existing schema file) also governs overwriting an existing
 table-options file, and the renderer cannot round-trip everything a person writes there:
-comments, formatting, and any option for a table the live database no longer has are gone.
-What it does preserve, when `config.tableOptions` points at the file being overwritten, is
-every option it can still attribute to a table that exists live — including the ones
-introspection can never produce, `collate: { column: null }` above all. The live database
-wins per key (it is the authority on what is actually there), the config's declaration
-survives everywhere else, and a declared table the live database no longer has is named in
-the output rather than dropped in silence. Keep a copy anyway if the file is hand-written.
+comments and formatting are gone, and so — deliberately — is anything the config declares
+that the live database no longer backs.
+
+The merge rule is one rule for all four keys: **the live database wins whenever it is
+capable of stating the option at all.** `strict`, `withoutRowid` and `appendOnly` are fully
+introspected — a live "no" is exactly as real as a live "yes" — so a declared `true` the
+live database no longer has is stale and does not survive `--force`; it is dropped, with a
+warning, rather than resurrected. A column's `collate` is different in exactly the one
+direction introspection cannot cover: it can state that a column *has* a non-`BINARY`
+collation, but it has no way to state "stop carrying one forward" — `BINARY` (no entry) and
+"never had one" look identical from the live database. `collate: { column: null }` exists
+solely to say that un-introspectable thing, so it is the one declared value that survives
+even when the live database still shows a real collation for that column — the retirement
+just hasn't been applied there yet — again with a warning rather than silently. A declared
+*non-null* `collate` follows the boolean rule: live wins, a stale value is dropped.
+
+A declared table the live database no longer has at all is named in the output rather than
+dropped in silence — see above. Keep a copy of a hand-written sidecar anyway before
+`--force`ing over it.
 
 ## What it does differently
 

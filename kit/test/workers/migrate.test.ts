@@ -910,3 +910,74 @@ describe('[F-115] unique constraint member collation carry-forward, against real
 		).rejects.toThrow();
 	});
 });
+
+describe('[F-117 cont\'d] a table rename that also renames the guarded column stays atomic', () => {
+	it('folds the column rename into the same statement group as the trigger swap, and the guard holds throughout', async () => {
+		// `events(id, at)`, `appendOnly: ['at']` -> `audit(id, occurred_at)`,
+		// `appendOnly: ['occurred_at']`, with both a table rename and a rename of
+		// the very column the guard watches. The trigger `diffSnapshots` emits is
+		// built from `after`'s column list — `UPDATE OF "occurred_at"` — so if the
+		// column rename were left to land in a different statement group (the
+		// one a batch boundary is free to split from this one), applying only
+		// the first group would leave a trigger that names a column ("occurred_at")
+		// which does not exist yet on a table still actually holding "at" under
+		// that name — SQLite does not validate `UPDATE OF <column>` against real
+		// columns at CREATE time, so the trigger would sit there silently inert,
+		// and `update audit set "at" = … ` would succeed with the guard doing
+		// nothing.
+		const before = sqliteTable('events', { id: text('id').primaryKey(), at: integer('at') });
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['at'] }]])),
+		);
+		await DB.prepare(`insert into events (id, at) values ('a', 1)`).run();
+
+		const after = sqliteTable('audit', { id: text('id').primaryKey(), occurred_at: integer('occurred_at') });
+		const diff = diffSnapshots(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['at'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['occurred_at'] }]])),
+			{ renamedTables: { events: 'audit' }, renamedColumns: { 'audit.at': 'occurred_at' } },
+		);
+		expect(diff.errors).toEqual([]);
+
+		const { statementGroups } = await import('../../src/core/sql.js');
+		const sqls = diff.statements.map((s) => s.sql);
+		const groups = statementGroups(sqls);
+
+		// The rename, the column rename, the drop and the re-create of the guard
+		// are all one group — no other statement (a rebuild of some other table,
+		// say) can land between any of them.
+		const renameIndex = sqls.findIndex((s) => /rename to "audit"/.test(s));
+		const columnRenameIndex = sqls.findIndex((s) => /rename column "at" to "occurred_at"/.test(s));
+		const dropTriggerIndex = sqls.findIndex((s) => /drop trigger.*events_no_update/i.test(s));
+		const createTriggerIndex = sqls.findIndex((s) => /create trigger "audit_no_update"/.test(s));
+		expect([renameIndex, columnRenameIndex, dropTriggerIndex, createTriggerIndex].every((i) => i >= 0)).toBe(true);
+		// The column rename lands *before* the trigger is dropped/re-created —
+		// not after — so there is no statement in between where the trigger, if
+		// it already existed under the final name, would be naming a column that
+		// is not there yet.
+		expect(columnRenameIndex).toBeLessThan(dropTriggerIndex);
+		expect(columnRenameIndex).toBeLessThan(createTriggerIndex);
+		const groupIds = new Set([renameIndex, columnRenameIndex, dropTriggerIndex, createTriggerIndex].map((i) => groups[i]));
+		expect(groupIds.size).toBe(1);
+
+		// Apply only that one group — simulating a batch boundary landing right
+		// after it, the worst case `[F-117]` exists to close — and confirm the
+		// guard is already fully in force: the live table is "audit", the live
+		// column is "occurred_at", and an UPDATE of it is blocked immediately,
+		// with no window where it was not.
+		const groupId = groups[renameIndex];
+		const firstGroup = sqls.filter((_, i) => groups[i] === groupId);
+		await runner.batch(firstGroup);
+
+		const tables = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'table' and name in ('events', 'audit')",
+		);
+		expect(tables.map((t) => t.name)).toEqual(['audit']);
+
+		await expect(DB.prepare(`update audit set "occurred_at" = 2 where id = 'a'`).run())
+			.rejects.toThrow();
+		const row = await runner.all<{ occurred_at: number }>(`select occurred_at from audit where id = 'a'`);
+		expect(row[0]!.occurred_at).toBe(1);
+	});
+});

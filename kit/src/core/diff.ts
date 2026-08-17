@@ -734,6 +734,13 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 	const beforeNames = Object.keys(before.tables);
 	const afterNames = Object.keys(after.tables);
 
+	// [F-117 cont'd]: a column rename that lands on an append-only table's
+	// guarded column, tracked here so step 4 below does not re-emit the
+	// `alter table … rename column` this step already folded into the atomic
+	// rename+trigger run. Keyed the same way `renamedColumns` is: `"<after
+	// table name>.<pre-rename column name>"`.
+	const consumedColumnRenames = new Set<string>();
+
 	// 1. Renamed tables first, so later steps see matching names.
 	const effectiveBefore: Record<string, TableSnapshot> = {};
 	for (const name of beforeNames) {
@@ -766,6 +773,38 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 				// `statementGroups` (extended below) treat them as one unit, the
 				// same way it already does for a rebuild's rename-then-restore.
 				const staysAppendOnly = Boolean(after.tables[renamed]?.appendOnly);
+
+				// [F-117 cont'd]: when the guard survives, the trigger recreated a
+				// few lines below is built from `after`'s (i.e. the *final*) column
+				// list — `UPDATE OF "occurred_at"`, say. SQLite does not validate a
+				// trigger's `UPDATE OF <column>` against the table's actual columns
+				// at CREATE time, so if the rename of that very column were left to
+				// the later per-table pass (a *different* statement group
+				// `statementGroups` can split a batch between), the trigger would
+				// sit there — created, no error — naming a column that does not
+				// exist yet, and an UPDATE of the column under its *old* name would
+				// not fire it at all: the append-only guard would be silently inert
+				// for the entire window between this group and the rename. Folding
+				// the rename in here, before the drop/create pair, closes that
+				// window the same way the original three-statement grouping closed
+				// the drop→re-create one. `statementGroups` is extended below to
+				// keep them adjacent.
+				if (staysAppendOnly) {
+					const staysAppendOnlyColumnRenames: Record<string, string> = {};
+					for (const [key, value] of Object.entries(renamedColumns)) {
+						const [tbl, col] = key.split('.');
+						if (tbl === renamed && col) staysAppendOnlyColumnRenames[col] = value;
+					}
+					for (const [from, to] of Object.entries(staysAppendOnlyColumnRenames)) {
+						if (!t.columns[from] || !after.tables[renamed]!.columns[to]) continue;
+						statements.push({
+							sql: `alter table ${quote(renamed)} rename column ${quote(from)} to ${quote(to)}`,
+							destructive: false,
+						});
+						consumedColumnRenames.add(`${renamed}.${from}`);
+					}
+				}
+
 				statements.push({
 					sql: dropAppendOnlyTrigger(name),
 					destructive: !staysAppendOnly,
@@ -1091,6 +1130,12 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		// are expressed against the new names.
 		for (const [from, to] of Object.entries(columnRenames)) {
 			if (!previous.columns[from] || !next.columns[to]) continue;
+			// Already emitted, adjacent to the table rename and trigger
+			// re-create in step 1 — see `consumedColumnRenames` there. Emitting
+			// it again here would fail on apply ("no such column", the source
+			// name is already gone) and, worse, would put the whole point of
+			// folding it forward back out of reach of a batch split.
+			if (consumedColumnRenames.has(`${name}.${from}`)) continue;
 			statements.push({
 				sql: `alter table ${quote(name)} rename column ${quote(from)} to ${quote(to)}`,
 				destructive: false,

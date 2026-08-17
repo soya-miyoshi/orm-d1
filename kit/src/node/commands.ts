@@ -375,9 +375,95 @@ export interface PullResult {
 	readonly tableOptions: string | undefined;
 }
 
-export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promise<PullResult> {
+/**
+ * The read-only half of `pull`: introspect, render, and warn — no writes at
+ * all. Split out from {@link pull} (which still does the whole thing, for
+ * library callers) so the CLI can run every precondition check — does
+ * `schema.ts` exist, does `table-options.ts` exist, can a declared sidecar
+ * even be loaded — *before* anything touches disk.
+ *
+ * [F-097 cont'd] `pull` used to journal the baseline (migration + snapshot +
+ * meta entry) before the CLI's table-options existence check ran, so a
+ * refused overwrite still left a baseline behind — following the refusal's
+ * own advice (re-run with `--force`) produced a second, redundant baseline.
+ * Worse, loading a stale `config.tableOptions` sidecar that imports a
+ * binding the *previous* schema module no longer exports used to fail
+ * *after* that baseline was written, repeatedly, with no schema module and
+ * no sidecar ever produced — `pull` became unusable in exactly the situation
+ * it exists to recover from. Both are fixed the same way: nothing here
+ * writes anything, so a thrown error (a missing export, an unparsable
+ * sidecar) or a refusal decided from the result leaves nothing on disk.
+ */
+export async function pullSnapshot(
+	ctx: CommandContext,
+	flags: TargetFlags = {},
+): Promise<PullResult & { readonly snapshot: Snapshot }> {
 	const runner = await resolveRunner(ctx, flags);
 	const snapshot = await introspect(runner);
+	const schema = renderSchemaModule(snapshot);
+
+	// [F-100 follow-up] Options the *config* already declares are read back and
+	// merged in, because the mechanical renderer below can only state what it
+	// can see in the live database. A hand-maintained sidecar says one thing
+	// introspection structurally cannot — `collate: { legacyId: null }` ("stop
+	// carrying that collation forward") — and `renderTableOptionsModule`'s
+	// merge rule keeps exactly that one spelling; everything else declared
+	// here is stale the moment the live database disagrees (see that
+	// function's doc comment and `sidecarDisagreementWarnings`).
+	// Existence-checked rather than let to throw: `config.tableOptions` naming
+	// the file this very `pull` is about to write for the first time is the
+	// normal bootstrapping order, and refusing to introspect over it would make
+	// the config entry impossible to add before the first pull. A file that
+	// *does* exist but fails to load (a stale import) throws here, before this
+	// function or its caller has written anything.
+	const declared = ctx.config.tableOptions && existsSync(resolve(ctx.cwd, ctx.config.tableOptions))
+		? (await loadTableOptions(ctx.cwd, ctx.config.tableOptions)).byTable
+		: undefined;
+
+	const tableOptions = renderTableOptionsModule(snapshot, flags.schemaModuleSpecifier ?? './schema', declared);
+	ctx.log(`Introspected ${Object.keys(snapshot.tables).length} tables.`);
+
+	// Printed whenever there is anything to say, not only when no sidecar was
+	// rendered. The two predicates test the same four conditions with the same
+	// operators, so `warnings.length > 0` iff a sidecar was rendered — guarding
+	// the print on "no sidecar" made it dead code, and the operator learned
+	// nothing about a live option their schema module cannot state. The sidecar
+	// is how it gets stated; these lines are what tell them to wire it up.
+	for (const warning of unexpressibleTableOptionWarnings(snapshot)) ctx.log(`  ! ${warning}`);
+
+	// [F-115 cont'd] Where the merge rule above kept a declared value or
+	// dropped one, said out loud rather than left for the operator to notice
+	// only by diffing the rendered file.
+	for (const warning of sidecarDisagreementWarnings(snapshot, declared)) ctx.log(`  ! ${warning}`);
+
+	// A declared table the live database does not have cannot be re-stated: the
+	// rendered sidecar imports its bindings from the rendered schema module,
+	// which has no export for a table that is not there. Named rather than
+	// dropped silently.
+	for (const name of Object.keys(declared ?? {})) {
+		if (snapshot.tables[name]) continue;
+		ctx.log(
+			`  ! config.tableOptions declares "${name}", which the live database does not have — it cannot be `
+				+ 'carried into the rendered sidecar (the schema module has no binding for it). Keep a copy before '
+				+ 'overwriting, or restore that entry by hand.',
+		);
+	}
+
+	return { snapshot, schema, tableOptions };
+}
+
+/**
+ * Journal a pulled baseline: an empty migration recording that the live
+ * database is already in this state, plus the snapshot and journal entry that
+ * make it the new "previous" for `generate`. Split out from {@link pull} so
+ * the CLI can defer it until after every precondition check has passed — see
+ * {@link pullSnapshot}'s doc comment for why that ordering matters.
+ */
+export async function journalPulledBaseline(
+	ctx: CommandContext,
+	snapshot: Snapshot,
+	flags: TargetFlags = {},
+): Promise<void> {
 	const journal = await readJournal(ctx.config.out);
 	const index = nextIndex(journal);
 	const tag = migrationTag(index, flags.name ?? migrationName(index));
@@ -394,51 +480,17 @@ export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	await writeMigration(ctx.config.out, tag, `-- Baseline introspected by orm-d1-kit pull; nothing to apply.`);
 	await writeSnapshot(ctx.config.out, index, { ...snapshot, id: tag, prevId: previous.id });
 	await writeJournal(ctx.config.out, appendEntry(journal, tag, ctx.now()));
+}
 
-	const schema = renderSchemaModule(snapshot);
-
-	// [F-100 follow-up] Options the *config* already declares are read back and
-	// merged in, because the mechanical renderer below can only state what it
-	// can see in the live database. A hand-maintained sidecar says things
-	// introspection cannot produce — `collate: { legacyId: null }` ("stop
-	// carrying that collation forward"), or an option for a table the live
-	// database no longer has — and `pull --force` used to overwrite all of it
-	// with the live-derived set alone. Live-derived values win per key (the live
-	// database is the authority on what is actually there); everything else the
-	// config declared survives.
-	// Existence-checked rather than let to throw: `config.tableOptions` naming
-	// the file this very `pull` is about to write for the first time is the
-	// normal bootstrapping order, and refusing to introspect over it would make
-	// the config entry impossible to add before the first pull.
-	const declared = ctx.config.tableOptions && existsSync(resolve(ctx.cwd, ctx.config.tableOptions))
-		? (await loadTableOptions(ctx.cwd, ctx.config.tableOptions)).byTable
-		: undefined;
-
-	const tableOptions = renderTableOptionsModule(snapshot, flags.schemaModuleSpecifier ?? './schema', declared);
-	ctx.log(`Introspected ${Object.keys(snapshot.tables).length} tables.`);
-
-	// Printed whenever there is anything to say, not only when no sidecar was
-	// rendered. The two predicates test the same four conditions with the same
-	// operators, so `warnings.length > 0` iff a sidecar was rendered — guarding
-	// the print on "no sidecar" made it dead code, and the operator learned
-	// nothing about a live option their schema module cannot state. The sidecar
-	// is how it gets stated; these lines are what tell them to wire it up.
-	for (const warning of unexpressibleTableOptionWarnings(snapshot)) ctx.log(`  ! ${warning}`);
-
-	// A declared table the live database does not have cannot be re-stated: the
-	// rendered sidecar imports its bindings from the rendered schema module,
-	// which has no export for a table that is not there. Named rather than
-	// dropped silently.
-	for (const name of Object.keys(declared ?? {})) {
-		if (snapshot.tables[name]) continue;
-		ctx.log(
-			`  ! config.tableOptions declares "${name}", which the live database does not have — it cannot be `
-				+ 'carried into the rendered sidecar (the schema module has no binding for it). Keep a copy before '
-				+ 'overwriting, or restore that entry by hand.',
-		);
-	}
-
-	return { snapshot, schema, tableOptions };
+/**
+ * The whole of `pull` for a library caller: compute, then journal
+ * unconditionally. The CLI does not call this directly — see
+ * {@link pullSnapshot} and {@link journalPulledBaseline}.
+ */
+export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promise<PullResult> {
+	const result = await pullSnapshot(ctx, flags);
+	await journalPulledBaseline(ctx, result.snapshot, flags);
+	return result;
 }
 
 /**
@@ -518,6 +570,71 @@ export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
 			}
 		}
 	}
+	return warnings;
+}
+
+/**
+ * [F-115 cont'd] Where `config.tableOptions` and the live database disagree,
+ * on the four keys {@link renderTableOptionsModule} renders.
+ *
+ * `renderTableOptionsModule`'s merge rule is "live wins whenever live can
+ * state the option at all", with one deliberate exception — an explicit
+ * `collate: { column: null }` retirement survives even over a live column
+ * that still shows a real collation, because introspection has no way to
+ * state the retirement itself. Both halves of that rule are silent by
+ * construction (that is the point: the rendered sidecar states one outcome).
+ * This function is what tells the operator the *other* outcome existed —
+ * that config declared something the rendered file does not carry over
+ * (stale `strict`/`withoutRowid`/`appendOnly`, or a stale non-null
+ * `collate`), or that a kept `null` retirement is still contradicted by the
+ * live database (the migration to actually drop the collation has not been
+ * applied there yet).
+ */
+export function sidecarDisagreementWarnings(
+	snapshot: Snapshot,
+	declared: Readonly<Record<string, TableOptions>> | undefined,
+): string[] {
+	const warnings: string[] = [];
+	if (!declared) return warnings;
+
+	for (const [name, carried] of Object.entries(declared)) {
+		const table = snapshot.tables[name];
+		if (!table) continue; // Reported separately — see the caller.
+
+		const stale: string[] = [];
+		if (carried.strict && !table.strict) stale.push('strict');
+		if (carried.withoutRowid && !table.withoutRowid) stale.push('withoutRowid');
+		if (carried.appendOnly && !table.appendOnly) stale.push('appendOnly');
+		if (stale.length > 0) {
+			warnings.push(
+				`config.tableOptions declares ${stale.join(', ')} for "${name}", but the live database does not have `
+					+ `${stale.length > 1 ? 'any of them' : 'it'} — the rendered sidecar drops ${
+						stale.length > 1 ? 'them' : 'it'
+					} rather than resurrecting a setting nothing live backs.`,
+			);
+		}
+
+		for (const [column, value] of Object.entries(carried.collate ?? {})) {
+			const live = table.columns[column]?.collate;
+			const liveNonBinary = live && live.toLowerCase() !== 'binary' ? live : undefined;
+			if (value === null) {
+				if (liveNonBinary) {
+					warnings.push(
+						`config.tableOptions retires collate for "${name}"."${column}" (collate: null), but the live `
+							+ `database still has collate ${liveNonBinary} — kept the retirement in the rendered `
+							+ 'sidecar; it takes effect once the migration that drops the collation is applied.',
+					);
+				}
+			} else if (!liveNonBinary) {
+				warnings.push(
+					`config.tableOptions declares collate ${value} for "${name}"."${column}", but the live database `
+						+ 'does not have it — the rendered sidecar drops it rather than resurrecting a collation '
+						+ 'nothing live backs.',
+				);
+			}
+		}
+	}
+
 	return warnings;
 }
 
@@ -730,6 +847,24 @@ export function renderSchemaModule(snapshot: Snapshot): string {
  * `tableOptions()`), rather than leaving it to a warning the operator has to
  * act on by hand before the loss becomes permanent.
  *
+ * The merge rule, single and coherent for every key this function renders:
+ * **the live database wins whenever it is capable of stating the option at
+ * all.** `strict`, `withoutRowid` and `appendOnly` are all fully introspected
+ * — a live "no" is exactly as real as a live "yes" — so a config-declared
+ * `true` that the live database no longer has is stale and does not survive;
+ * it is dropped, with a warning ({@link sidecarDisagreementWarnings}) rather
+ * than silently. A column `collate` is different in exactly one direction:
+ * introspection can state *that* a column has a non-BINARY collation, but it
+ * has no way to state "stop carrying a collation forward" — a live column
+ * either has one or doesn't, and BINARY (no entry) is indistinguishable from
+ * "never had one". `collate: { column: null }` is the one spelling that
+ * exists solely to say the un-introspectable thing, so it is the one entry
+ * that survives even when the live database still shows a real collation for
+ * that column (the retirement just hasn't been applied there yet) — again
+ * with a warning, not silently. A declared non-null `collate` value, by
+ * contrast, is exactly as introspectable as the boolean options and follows
+ * the same rule: live wins, stale entries are dropped.
+ *
  * Returns `undefined` when no table in the snapshot needs any of the four —
  * so `pull` does not write an empty, pointless module.
  */
@@ -738,11 +873,9 @@ export function renderTableOptionsModule(
 	schemaModuleSpecifier: string,
 	/**
 	 * What `config.tableOptions` already declares, when there is such a file.
-	 * Merged in so a `pull --force` does not silently discard the half of a
-	 * hand-maintained sidecar introspection cannot reproduce — a `collate: null`
-	 * retirement, most of all. The live database wins per key: it is the
-	 * authority on what is actually there, and this file's whole job is to state
-	 * that.
+	 * Consulted only for the one thing live introspection structurally cannot
+	 * state — a `collate: null` retirement (see the rule above). Everything
+	 * else declared here is stale the moment the live database disagrees.
 	 */
 	declared?: Readonly<Record<string, TableOptions>>,
 ): string | undefined {
@@ -753,20 +886,26 @@ export function renderTableOptionsModule(
 		value === true || value === false ? String(value) : JSON.stringify([...value]);
 
 	for (const table of ordered) {
-		const carried = declared?.[table.name];
 		const optionParts: string[] = [];
-		if (table.strict || carried?.strict) optionParts.push('strict: true');
-		if (table.withoutRowid || carried?.withoutRowid) optionParts.push('withoutRowid: true');
-		const appendOnly = table.appendOnly || carried?.appendOnly;
-		if (appendOnly) optionParts.push(`appendOnly: ${renderAppendOnly(appendOnly)}`);
+		// Live is authoritative: a declared `true` the live database no longer
+		// backs is stale and does not survive `pull` (see the doc comment above
+		// and `sidecarDisagreementWarnings`, which tells the operator when this
+		// happens).
+		if (table.strict) optionParts.push('strict: true');
+		if (table.withoutRowid) optionParts.push('withoutRowid: true');
+		if (table.appendOnly) optionParts.push(`appendOnly: ${renderAppendOnly(table.appendOnly)}`);
 
-		// Declared first, live second, so a column the live database states a
-		// collation for overwrites whatever the config said about it — and a
-		// column it says nothing about (including a `null` retirement, which is
-		// unintrospectable by construction) keeps the declared entry.
-		const collate = new Map<string, string | null>(Object.entries(carried?.collate ?? {}));
+		// Live-derived values first, then the one declared spelling live cannot
+		// produce: an explicit `null` retirement. It overwrites a live entry for
+		// the same column on purpose — that is the whole point of stating it —
+		// but a declared *non-null* value that live no longer backs is stale,
+		// same as the three booleans above, and is not carried forward.
+		const collate = new Map<string, string | null>();
 		for (const c of Object.values(table.columns)) {
 			if (c.collate && c.collate.toLowerCase() !== 'binary') collate.set(c.name, c.collate);
+		}
+		for (const [column, value] of Object.entries(declared?.[table.name]?.collate ?? {})) {
+			if (value === null) collate.set(column, null);
 		}
 		if (collate.size > 0) {
 			const rendered = [...collate].map(([name, value]) => `${JSON.stringify(name)}: ${JSON.stringify(value)}`);

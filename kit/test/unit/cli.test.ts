@@ -659,11 +659,15 @@ describe('rendering a schema module from a snapshot', () => {
 			expect(rendered).not.toMatch(/import \{ tableOptions_ \}/);
 		});
 
-		// `pull --force` overwriting a hand-maintained sidecar dropped every option
-		// introspection cannot reproduce. `collate: null` is the sharpest case: it
-		// exists precisely to say "no collation", which a live database states by
-		// having nothing to introspect.
-		it('carries config-declared options the live database cannot express', async () => {
+		// `pull --force` overwriting a hand-maintained sidecar used to drop every
+		// option introspection cannot reproduce. The merge rule this pins: live
+		// wins whenever it is capable of stating the option at all — `collate:
+		// null` is the one deliberate exception, because "stop carrying a
+		// collation forward" is the one thing introspection structurally cannot
+		// say. A declared `appendOnly` (or `strict`/`withoutRowid`) the live
+		// table no longer has is exactly as introspectable as a `true` would be,
+		// so it does not get the same exception — it is dropped, not kept.
+		it('keeps a declared collate: null retirement, but drops other stale declared options', async () => {
 			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
 			const snapshot = {
 				...snapshotOf({
@@ -676,12 +680,33 @@ describe('rendering a schema module from a snapshot', () => {
 			const rendered = renderTableOptionsModule(snapshot as never, './schema.js', {
 				things: { collate: { legacy_id: null, email: 'rtrim' }, appendOnly: ['id'] },
 			})!;
-			// Declared and unintrospectable: kept.
+			// Declared and unintrospectable: the one spelling that survives even
+			// though the live database has no way to back it.
 			expect(rendered).toContain('"legacy_id": null');
-			expect(rendered).toContain('appendOnly: ["id"]');
+			// Declared, live-introspectable, and the live table does not have it:
+			// stale, dropped rather than resurrected.
+			expect(rendered).not.toContain('appendOnly');
 			// Declared and contradicted by the live column: the live value wins.
 			expect(rendered).toContain('"email": "nocase"');
 			expect(rendered).not.toContain('"rtrim"');
+		});
+
+		// The mirror case: a live `collate: null` retirement that the live
+		// database still actively contradicts (the migration to drop it hasn't
+		// been applied to *this* database yet) still keeps the declared `null` —
+		// the whole point of the spelling is to survive exactly that window.
+		it('keeps collate: null even when the live column still has a real collation', async () => {
+			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
+			const snapshot = snapshotOf({
+				id: column('id', 'integer', { primaryKey: true }),
+				email: column('email', 'text', { collate: 'nocase' }),
+			});
+
+			const rendered = renderTableOptionsModule(snapshot as never, './schema.js', {
+				things: { collate: { email: null } },
+			})!;
+			expect(rendered).toContain('"email": null');
+			expect(rendered).not.toContain('"nocase"');
 		});
 
 		it('returns undefined when nothing needs the sidecar', async () => {

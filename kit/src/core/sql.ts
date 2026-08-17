@@ -197,6 +197,10 @@ const RENAME_TO_PATTERN = new RegExp(
 	`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+to\\s+(${IDENTIFIER_SOURCE})\\s*$`,
 	'i',
 );
+const RENAME_COLUMN_PATTERN = new RegExp(
+	`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+column\\s+${IDENTIFIER_SOURCE}\\s+to\\s+${IDENTIFIER_SOURCE}\\s*$`,
+	'i',
+);
 // A generic capture-then-compare pattern here would be wrong: `.exec()`
 // against a greedy `[\s\S]*` backtracks to the LAST "on <ident>" that still
 // lets the rest of the pattern match, not the first — so a trailing
@@ -283,6 +287,24 @@ export function statementGroups(statements: readonly string[]): number[] {
 			const fromName = normalizeIdentifierToken(renameMatch[1]!);
 			const toName = normalizeIdentifierToken(renameMatch[2]!);
 			let end = i;
+			// [F-117 cont'd]: `diffSnapshots` (`diff.ts`) folds any rename of the
+			// guarded column itself into this same run, right here, before the
+			// drop/create-trigger pair — the trigger a few statements below is
+			// built from the *final* column list, and a batch boundary landing
+			// between the rename-table and a column rename left dangling in its
+			// own group would leave that trigger naming a column that does not
+			// exist yet, silently inert, for however long the split lasted. Consume
+			// every adjacent `alter table <toName> rename column …` so they stay in
+			// the same atomic run as the trigger swap they make correct.
+			for (;;) {
+				const columnRename = end + 1 < statements.length
+					? RENAME_COLUMN_PATTERN.exec(statements[end + 1]!)
+					: null;
+				if (!columnRename || foldAsciiCase(normalizeIdentifierToken(columnRename[1]!)) !== foldAsciiCase(toName)) {
+					break;
+				}
+				end += 1;
+			}
 			if (
 				end + 1 < statements.length
 				&& buildDropTriggerIfExistsPattern(`${fromName}_no_update`).test(statements[end + 1]!)

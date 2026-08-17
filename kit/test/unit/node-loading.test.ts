@@ -6,11 +6,12 @@
  * a `tableOptions` sidecar named by config, a migrations folder in the wrong
  * layout — so each gets a test rather than a comment saying it was fixed.
  */
-import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { once } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import { importModule } from '../../src/node/import.js';
 import { loadTableOptions, unreadableMigrations } from '../../src/node/store.js';
@@ -143,18 +144,100 @@ describe('importModule', () => {
 	// a private, unguessable directory instead. Squatting the old fixed path with
 	// a plain *file* is the cheapest observable proxy: the old code cannot
 	// `mkdir` over it and fails outright, the new code never looks there.
-	it('[F-038] does not use a fixed, squattable scratch path', () => {
+	it('[F-038] does not use a fixed, squattable scratch path', (ctx) => {
 		const dir = scratch();
 		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
 		writeFileSync(join(dir, 'schema.ts'), "export const users = 'users-table';\n");
 
+		// On the shared `/tmp` this test is about, `orm-d1-kit-import` can
+		// already exist and be owned by a different user — in which case
+		// neither the cleanup below nor the squat that follows can succeed,
+		// and this test cannot say anything about the *current* run (it would
+		// have failed on setup regardless of which scratch-path strategy
+		// `importModule` uses). Skip rather than let an ownership problem this
+		// test does not exercise report as a failure of the property it does.
 		const squatted = join(tmpdir(), 'orm-d1-kit-import');
-		if (existsSync(squatted)) rmSync(squatted, { recursive: true, force: true });
-		writeFileSync(squatted, 'not a directory\n');
+		try {
+			if (existsSync(squatted)) rmSync(squatted, { recursive: true, force: true });
+			writeFileSync(squatted, 'not a directory\n');
+		} catch {
+			ctx.skip();
+			return;
+		}
 		try {
 			expect(runImportUnderPlainNode(dir, join(dir, 'schema.ts'))).toBe('users-table');
 		} finally {
-			rmSync(squatted, { force: true });
+			try {
+				rmSync(squatted, { force: true });
+			} catch {
+				// Best-effort: see the setup comment above.
+			}
+		}
+	});
+
+	// [F-038 security cont'd] The property `mkdtemp`/`O_EXCL` actually buys —
+	// a private (`0700`), unguessable-named scratch directory that never
+	// reuses a fixed name — pinned directly rather than only through the
+	// squatting proxy above. `TMPDIR` is redirected to a scratch directory of
+	// this test's own so the poll below only ever sees directories this test
+	// created. The schema module blocks on a sentinel file so the scratch
+	// directory is guaranteed to still exist at the moment its mode is
+	// checked — without that, the `finally` in `importModule` can have already
+	// removed it before this test gets to look.
+	it('[F-038 security] the scratch directory is private, unguessable, and cleaned up', async () => {
+		const tmpRoot = scratch();
+		const dir = scratch();
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		const sentinel = join(dir, 'release.sentinel');
+		writeFileSync(
+			join(dir, 'schema.ts'),
+			// Plain `import`/`export` syntax forces the CJS-detection failure that
+			// triggers the shim path, the same way every other `[F-038]` test does
+			// — see `isModuleSyntaxError` in `node/import.ts`.
+			'import { existsSync } from \'node:fs\';\n'
+				+ `while (!existsSync(${JSON.stringify(sentinel)})) { /* poll */ }\n`
+				+ "export const users = 'users-table';\n",
+		);
+
+		const importPath = join(dirname(fileURLToPath(import.meta.url)), '../../src/node/import.ts');
+		const scriptPath = join(dir, '.run-import.mjs');
+		writeFileSync(
+			scriptPath,
+			`import { importModule } from ${JSON.stringify(importPath)};\n`
+				+ `const m = await importModule(${JSON.stringify(join(dir, 'schema.ts'))});\n`
+				+ `console.log(JSON.stringify(m.users));\n`,
+		);
+
+		const child = execFile(
+			process.execPath,
+			[scriptPath],
+			{ encoding: 'utf8', env: { ...process.env, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot } },
+		);
+
+		try {
+			// Poll the parent's view of `tmpRoot` for the scratch directory the
+			// child creates — this is the one property `O_EXCL` genuinely resists
+			// a clean, non-racy test of, so it is polled for rather than assumed.
+			let scratchDir: string | undefined;
+			for (let attempt = 0; attempt < 200 && !scratchDir; attempt++) {
+				const found = existsSync(tmpRoot)
+					? readdirSync(tmpRoot).find((n) => n.startsWith('orm-d1-kit-import-'))
+					: undefined;
+				if (found) scratchDir = join(tmpRoot, found);
+				else await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			expect(scratchDir).toBeDefined();
+			expect(existsSync(join(tmpRoot, 'orm-d1-kit-import'))).toBe(false);
+			const mode = statSync(scratchDir!).mode & 0o777;
+			expect(mode).toBe(0o700);
+
+			writeFileSync(sentinel, 'go\n');
+			const [stdout] = await once(child, 'close');
+			void stdout;
+			expect(existsSync(scratchDir!)).toBe(false);
+		} finally {
+			if (!existsSync(sentinel)) writeFileSync(sentinel, 'go\n');
+			child.kill();
 		}
 	});
 
