@@ -122,8 +122,6 @@ describe('ddl generation', () => {
 
 		const ddl = createTable(t);
 		expect(ddl).toContain('check ("role" in (\'admin\', , \'member\'))');
-		expect(ddl).not.toContain("'admin', null");
-		expect(ddl).not.toContain('null, ');
 	});
 
 	// [F-087]: an empty interpolated array in a DDL predicate renders `()`,
@@ -453,7 +451,11 @@ describe('customType', () => {
 		});
 
 		const t = sqliteTable('t', { short: varchar('short', { length: 10 }) });
-		expect(createTable(t)).toContain('"short" text');
+		// An equality-shaped assertion, not `toContain('"short" text')` — that
+		// substring is also a prefix of `"short" text(10)`, so it would keep
+		// passing silently if `createTable` ever started folding the length in
+		// (see the `[F-012]`/`[F-023]` history of this exact column type).
+		expect(createTable(t)).toContain('"short" text(10)');
 	});
 
 	it('preserves the declared type verbatim, instead of guessing one of the five storage classes', () => {

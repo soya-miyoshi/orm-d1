@@ -194,7 +194,7 @@ No plan awareness. 50 statements per Worker invocation and 500 MB on the free pl
 
 </td><td>
 
-44.1 kB / 15.3 kB for the same Worker, built the same way. None of those layers exist to be tree-shaken.
+54.2 kB / 18.7 kB for the same Worker, built the same way. None of those layers exist to be tree-shaken.
 
 </td></tr>
 </table>
@@ -345,7 +345,7 @@ migrations do not manage. Create one in a migration and query it with
 
 **CTEs, `union` / `intersect` / `except` — not exported.** Each is compiler surface parsed
 on every cold isolate and billed as startup CPU, for statements `db.execute(sql, params)`
-runs with their values still bound. Not shipping them is part of the 44.1 kB under
+runs with their values still bound. Not shipping them is part of the 54.2 kB under
 [Bundle size][d-size].
 
 **`.prepare()` on a query builder — not implemented.** In Drizzle it hangs off a builder

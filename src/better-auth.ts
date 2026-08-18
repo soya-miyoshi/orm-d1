@@ -76,9 +76,10 @@ import {
 } from './sql/expressions.js';
 import { exceedsBytes, MAX_PATTERN_BYTES } from './limits.js';
 import { count } from './sql/functions.js';
-import type { SQLChunk } from './sql/sql.js';
-import { sql } from './sql/sql.js';
+import type { Query, RenderContext, SQLChunk } from './sql/sql.js';
+import { defaultRenderContext, sql } from './sql/sql.js';
 import type { OrmD1Database } from './runtime/database.js';
+import { CompileError } from './errors.js';
 
 /** Raised for a misconfiguration this adapter can detect — a missing model, an
  *  unknown field, an operator used with the wrong value shape. Named so the
@@ -216,14 +217,59 @@ const patternCondition = (
 		: sql<boolean>`${column} like ${pattern} escape '\\'`;
 };
 
-const lowerIn = (column: Column<any>, values: readonly unknown[], negated: boolean): Condition => {
-	// An empty set is a constant, and `in ()` is a syntax error.
-	if (values.length === 0) return sql<boolean>`${negated ? sql.raw('1 = 1') : sql.raw('1 = 0')}`;
-	const lowered = sql.join(values.map((v) => sql`lower(${v})`), ', ');
-	return negated
-		? sql<boolean>`lower(${column}) not in (${lowered})`
-		: sql<boolean>`lower(${column}) in (${lowered})`;
-};
+/**
+ * `lower(column) in (lower(v1), lower(v2), …)`.
+ *
+ * Unlike `inArray` (`src/sql/expressions.ts`), this binds one parameter per
+ * value unconditionally — there is no `json_each` fallback, because the
+ * comparison needs `lower()` applied to each element, not the raw value, and
+ * `json_each` would still cost one call to `lower()` per row per element
+ * either way. So instead of silently overflowing D1's bound-parameter budget
+ * as a bare `too many SQL variables` from SQLite, this names the limit the
+ * same way `InArray` does above the threshold it *can* chunk past.
+ *
+ * **Scope of the guard below**: `this.values.length > ctx.maxParams` counts
+ * only the values bound by *this* `LowerIn` clause, not the bound-parameter
+ * count of the whole statement it ends up in. A `where` combining this
+ * clause with others (another `LowerIn`, an `inArray`, several `eq`s) can
+ * still pass this check individually while the statement as a whole exceeds
+ * D1's limit and fails at execution with SQLite's bare `too many SQL
+ * variables` — the exact failure this guard exists to name in advance. A
+ * true fix would need to be statement-aware (know the running total across
+ * every clause as the query is assembled), which this chunk cannot see in
+ * isolation; making the *docstring* honest about that scope, rather than
+ * silently claiming statement-wide coverage it doesn't have, is deliberately
+ * the fix applied here.
+ */
+class LowerIn implements SQLChunk<boolean> {
+	constructor(
+		private readonly column: Column<any>,
+		private readonly values: readonly unknown[],
+		private readonly negated: boolean,
+	) {}
+
+	toQuery(ctx: RenderContext = defaultRenderContext): Query {
+		// An empty set is a constant, and `in ()` is a syntax error.
+		if (this.values.length === 0) {
+			return { sql: this.negated ? '1 = 1' : '1 = 0', params: [] };
+		}
+		if (this.values.length > ctx.maxParams) {
+			throw new CompileError(
+				`Case-insensitive "in" on "${this.column.name}" was given ${this.values.length} values, which `
+					+ `exceeds the bound-parameter limit of ${ctx.maxParams}. Split the call across multiple `
+					+ 'queries, or match against a subquery instead of a literal array.',
+			);
+		}
+		const lowered = sql.join(this.values.map((v) => sql`lower(${v})`), ', ');
+		return (this.negated
+			? sql<boolean>`lower(${this.column}) not in (${lowered})`
+			: sql<boolean>`lower(${this.column}) in (${lowered})`
+		).toQuery(ctx);
+	}
+}
+
+const lowerIn = (column: Column<any>, values: readonly unknown[], negated: boolean): Condition =>
+	new LowerIn(column, values, negated);
 
 /** Whether this comparison should be folded to lower case. Only strings have a
  *  case to ignore, so a non-string value silently keeps the sensitive path —

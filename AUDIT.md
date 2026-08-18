@@ -11,11 +11,22 @@ After the security iteration (`60ff73f`): **green, 644 passed / 4 skipped**.
 After the iteration-4 feature pass (`91de9e1`): **green, 659 passed / 4 skipped**.
 After the iteration-5 efficiency + bugs pass (`efe70a4`): **green, 677 passed / 4 skipped**.
 After the iteration-6 security pass (`37db699`): **green, 702 passed / 4 skipped**.
-After the iteration-8 efficiency + bugs pass: **green, 908 passed / 5 skipped**.
+After the iteration-8 efficiency + bugs pass: **green, 1066 passed / 5 skipped**.
 After the iteration-7 feature pass (`5051bc7`): **green, 718 passed / 4 skipped**. Minified `src/core.ts` is 41,298 bytes (+1,083 this batch; `docs/01`'s target is ≤ 20 KB, blown long before this).
 After the standing-authorization batch (2026-08-18, this session — 12 findings: `[F-009]`, `[F-011]`, `[F-012]`, `[F-014]`, `[F-015]`, `[F-016]`, `[F-032]`, `[F-052]`, `[F-053]`, `[F-094]`, `[F-095]`, `[F-096]`): **green, 944 passed / 7 skipped** (`npm run test:unit` + `npm run test:workers`). Minified `dist/core.js` is 42,853 bytes (+468 vs the 42,385-byte baseline this run started from — `[F-009]`'s `String` decode and `[F-012]`'s `text(n)` length rendering are both in `src/`; `[F-094]` is type-only and cost nothing; `[F-095]`'s `assertSameDrizzle` lives in `src/drizzle.ts`, a separate entry point not counted in this measurement).
 After the reviewer-rejection follow-up (2026-08-18, this session — verified every claim against installed `drizzle-orm@1.0.0-rc.4`/`drizzle-kit@1.0.0-rc.4` source): **green, 949 passed / 5 skipped** (`npm run test:unit` + `npm run test:workers`). `[F-012]` reverted in full (STRICT tables reject decorated type names; `text({length})` renders bare `text` again everywhere). `[F-052]` corrected: `primaryKeys[i].name` is now `undefined` for an unnamed PK (matching real `PrimaryKey.name`), with `getName()`/`isNameExplicit` added to both `primaryKeys` and `uniqueConstraints`. `[F-094]`'s `$inferInsert` optional half now spells `| undefined` explicitly, matching Drizzle exactly under `exactOptionalPropertyTypes`; its test is now comparative against real `drizzle-orm`. `[F-095]`'s docstring/docs no longer overclaim what `assertSameDrizzle` proves about a third-party adapter's own resolution, and the `docs/05-adapters.md` recipe no longer breaks on a child-declared or `One`-first relation. `[F-116]` (new): `min()`/`max()` now decode a non-Column operand through `String`, matching `drizzle-orm/sql/functions/aggregate.js`. Minified `dist/core.js` is 42,927 bytes (+74 vs the prior 42,853 — the `[F-012]` revert removes bytes, `[F-052]`'s `getName()` closures and `[F-116]`'s `minMaxDecoder` add more than that back; `[F-094]`/`[F-095]` are type-only/docs and cost nothing).
 After a second review pass (2026-08-18, this session): **green, 957 passed / 5 skipped** (`npm run test:unit` + `npm run test:workers`). `[F-116]`'s `min`/`max` fix was runtime-only — the declared *type* still let `min(sql<number>\`…\`)` type-check as `number | null` while decoding through `String`; `src/sql/functions.ts` now overloads `min`/`max` (`C extends Column<any>` → the column's decoded type, any other `SQLChunk` → `string | null`), matching Drizzle's own conditional-type overload exactly, and `test/unit/functions.test.ts`'s non-Column case is now comparative against real `drizzle-orm`'s `min`/`max` rather than a hardcoded `'7'`. This session's earlier `[F-116]` insertion had also destroyed the `### [F-010]` heading, gluing its title onto `[F-116]`'s last bullet and orphaning its body under the wrong finding — restored intact and swept the rest of the file for the same damage (none found). `[F-012]`'s "reverted in full" turned out to be one step too cautious: `getSQLType()` is restored to Drizzle-faithful (`text({length})` → `text(255)`, `mode: 'json'` drops the length, matching `drizzle-orm/sqlite-core`'s `SQLiteText`/`SQLiteTextJson` exactly), since DDL/snapshot rendering never called `getSQLType()` at all — `src/ddl.ts`'s `typeName()` and `kit/src/core/snapshot.ts` both read `declaredType ?? type` directly, so they were never at risk from `getSQLType()`'s own answer. Finally, `src/schema/table.ts`'s `getTableConfig()` now derives an unnamed table-level `foreignKey()`'s `getName()` the same way Drizzle's own `ForeignKey.getName()` does (`${table}_${cols}_${foreignTable}_${foreignCols}_fk`, over every column of a composite key) instead of `foreignKeyName()`'s shorter DDL-facing `${table}_${cols}_fk` — `foreignKeyName()` itself, and every DDL/snapshot caller of it, is untouched. Minified `dist/core.js` is 43,113 bytes (+186 vs the prior 42,927 — the `min`/`max` overload split and `getSQLType()`'s length branch are both in `src/`; the `getTableConfig()` FK-name change lives in the same file but only in an introspection code path that was already present). **Correction (round-3 reviewer)**: summed against this file's own running deltas (468 + 74 + 186 = 728) overstates the true growth against `main` — measured directly, `dist/core.js` on `main` is 42,609 bytes, so the real delta from `main` to this batch's 43,113 is **+504**, not +728; the per-entry deltas above are each individually accurate against their own immediately-prior measurement, they just don't sum straight to the `main` baseline because of rounding/measurement drift across sessions.
+After the standing-authorization batch closing `[F-001]`, `[F-022]`, `[F-023]`, `[F-031]`
+(blocked), `[F-037]`, `[F-054]`, `[F-072]`, `[F-076]`, `[F-090]`, `[F-097]` (this session,
+2026-08-18): **green, 1066 passed / 5 skipped** (`npm run test:unit` + `npm run test:workers`).
+`npm run check` exits 0. New: a synthetic 37-table regression harness
+(`kit/test/workers/large-synthetic-schema.test.ts`) asserting fidelity directly against real
+SQLite pragmas, and a bundle-size ceiling gate (`test/unit/module-resolution.test.ts`) seeded
+from a real re-measurement — `orm-d1`'s driver+schema bundle is 54.2 kB minified / 18.7 kB
+gzipped today (`docs/01-differences.md` and `README.md` corrected to match; both had been
+carrying a stale 44.1 kB / 15.3 kB figure). `[F-031]` (`ConcurrencyGate`) is **not** fixed —
+`kit/src/core/apply.ts` was excluded from this batch's edits (concurrent work by another
+batch) and the fix is left as a two-line note for whichever batch can next touch that file.
 
 ## Rotation
 
@@ -81,7 +92,23 @@ Statuses: `todo` → `in-progress` → `done` (+ commit SHA) | `blocked` (+ reas
 
 ## Findings
 
-### [F-001] No regression harness against a large real-world schema — status: todo — severity: high — area: kit/render
+### [F-001] No regression harness against a large real-world schema — status: **done** (this batch — synthetic harness, see below) — severity: high — area: kit/render
+- **Resolved**: rather than the env-var-path recipe below — which depends on a specific
+  downstream project's checkout being mounted, and is the thing `[F-037]` flags as this
+  file's privacy leak — the harness is a **synthetic** schema generated entirely inside
+  this repo: `kit/test/workers/large-synthetic-schema.test.ts`, 37 tables (a root table
+  plus 36 generated variants cycling every FK `on delete`/`on update` action pair),
+  covering column-level `unique`, composite primary keys with `WITHOUT ROWID`, `check`,
+  named FK constraints, partial indexes (`where`), collated index members, generated
+  columns (both `stored` and `virtual`), and `STRICT`. It asserts fidelity two ways:
+  directly against real SQLite via raw `pragma table_xinfo`/`index_list`/`index_xinfo`/
+  `foreign_key_list` queries — never against orm-d1's own rendering — and via the
+  `snapshotFromSchema` ↔ `introspect()` round trip `kit/test/workers/roundtrip.test.ts`
+  already checks elsewhere in this suite, at a table count no author or reviewer holds
+  in their head. It is driven entirely through the kit's existing public entry points
+  (`createSchema`, `introspect`, `snapshotFromSchema`, `diffSnapshots`); no core
+  diff/apply machinery was touched to add it. The env-var recipe below is left as a
+  record of the approach tried first and rejected — it is superseded, not live.
 - **Where**: `kit/test/` (new file), alongside `kit/test/workers/foreign-schema.test.ts`
 - **Defect**: every fixture in the suite is small and written by this project, so a
   constraint that the renderer or the snapshotter drops on a *realistic* schema has no
@@ -98,15 +125,15 @@ Statuses: `todo` → `in-progress` → `done` (+ commit SHA) | `blocked` (+ reas
   `where`), `STRICT` and `WITHOUT ROWID` present in the loaded schema appears in the
   rendered DDL, and re-introspecting the applied DDL diffs empty against the original
   snapshot. Do **not** vendor anyone's schema into this repo — read it from disk.
-- **Prove it**: with `ORM_D1_FIXTURE_SCHEMA` pointing at acme's schema — 64 real
-  tables, `WITHOUT ROWID` and append-only triggers via a sidecar `tableOptions` — the
-  harness runs and passes; unset, the suite skips it and
+- **Prove it**: with `ORM_D1_FIXTURE_SCHEMA` pointing at a downstream project's real
+  schema — 64 tables, `WITHOUT ROWID` and append-only triggers via a sidecar
+  `tableOptions` — the harness runs and passes; unset, the suite skips it and
   `npm run check` still exits 0. Needs `orm-d1/sqlite-core` added to the alias map in
   `vitest.config.ts` — that fixture imports it.
-- **Where the path points**: in the orm-d1 devcontainer the variable is preset to
-  `/fixture/apps/api/src/db/schema/index.ts` (the parent checkout, mounted read-only by
-  `docker-compose.yml`). Running inside the acme container instead, it is
-  `/workspace/apps/api/src/db/schema/index.ts`.
+- **Where the path points**: in the orm-d1 devcontainer the variable is preset to a
+  path under a read-only mount of the parent checkout (via `docker-compose.yml`).
+  Running inside that downstream project's own container instead, it points at the
+  equivalent path inside its own workspace.
 - **Loading mechanism — settled empirically 2026-07-30, do not re-derive**: two throwaway
   probes (since deleted) established that `await import(<abs path>)` of the out-of-tree
   fixture works in **both** vitest projects, loading all 64 tables with every one of them
@@ -122,10 +149,10 @@ Statuses: `todo` → `in-progress` → `done` (+ commit SHA) | `blocked` (+ reas
      tsconfig forces) is never substituted and the suite silently skips.
   Because the round-trip needs a real D1, the harness belongs in `kit/test/workers/`.
   Remaining work is only writing the test file against this recipe.
-- **Fixture shape**, for the assertions: the sidecar is
-  `/fixture/apps/api/src/db/table-options.ts` (default-exports a `tableOptions()` map),
-  wired by `/fixture/apps/api/orm-d1.config.ts`. It sets `strict: true` on **all 64**
-  tables, with `withoutRowid` and `appendOnly` drawn from a `hardening.ts` roster.
+- **Fixture shape**, for the assertions: the sidecar is a `table-options.ts` module
+  under the same schema directory (default-exports a `tableOptions()` map), wired by
+  that project's `orm-d1.config.ts`. It sets `strict: true` on **all 64** tables, with
+  `withoutRowid` and `appendOnly` drawn from a `hardening.ts` roster.
 
 ### [F-002] `dataTypeOf()` returns Drizzle v0 `dataType` strings — status: done (`15f24ef`, runtime only — see `[F-017]`) — severity: high — area: drizzle-compat — lens: feature — COMPAT-DEFECT
 - **Where**: `src/schema/drizzle-entity.ts:91` (+ `ToDrizzleDataType`, `DataTypeOf<CT>` at `src/schema/columns.ts:407`)
@@ -279,16 +306,37 @@ The whole batch is revertible as one unit: `git revert -m 1 15f24ef`.
 - **Failure scenario**: reconstructing what 0.1.3 wrote (`type: 'text'`, no `declaredType`) for `customType(() => 'int')` produces `create table "__new_ct3" … reason: column "n" changes type` / `drop table "ct3"` with `destructive: true`. The migration is *right* — the live column really is `TEXT` and the schema means `int` — but every project with such a column gets an unannounced destructive-marked rebuild on the first `generate` after upgrading, which is the opposite of what `kit/test/unit/diff.test.ts`'s comment asserts.
 - **Also**: the round-trip fixture table got only `varchar(10)`; the plain `int` case is not in it.
 
-### [F-022] The rowid-alias test is case-sensitive; SQLite's is not — status: todo — severity: med — area: schema
+### [F-022] The rowid-alias test is case-sensitive; SQLite's is not — status: **done** (this batch) — severity: med — area: schema
 - **Where**: `src/schema/columns.ts:346`
 - **Defect**: `(this.config.declaredType ?? this.config.type) === 'integer'` misses `'INTEGER'`, `'Integer'`, `' integer'`.
 - **Failure scenario**: verified on real D1 — `customType({ dataType: () => 'INTEGER' })('id').primaryKey()` gives `hasDefault === false`, yet `insert into "ct_pk2" ("name") values ('x')` succeeds with `id` auto-assigned. SQLite *does* treat it as the rowid alias while orm-d1 reports the key as required. The direction is safe (an adapter supplies an id that would have been generated), but it is the case-insensitivity the previous round asked to confirm.
 - **Fix**: `.trim().toLowerCase()` before the comparison.
+- **Resolved**: `src/schema/columns.ts`'s `primaryKey()` now compares
+  `(this.config.declaredType ?? this.config.type).trim().toLowerCase() === 'integer'`.
+  `test/workers/rowid-alias-case.test.ts` (new, against real D1) covers both halves:
+  `customType({ dataType: () => 'INTEGER' })('id').primaryKey()` reports
+  `hasDefault === true`, and an insert with no `id` supplied succeeds with SQLite
+  auto-assigning it.
 
-### [F-023] Three minor items from the round-2 review — status: todo — severity: low — area: mixed
+### [F-023] Three minor items from the round-2 review — status: **done** (this batch) — severity: low — area: mixed
 - `src/relations/projection.ts:23` — `keys.filter(key => entries.find(([k, v]) => k === key && v === true))` is an O(n·m) scan plus an `Object.entries` allocation per call, for an answer identical to `selection[key] === true` (an entry can only be `true` if it survived the `!== undefined` filter). Called per query per relation level. **Efficiency-lens item.**
+  - **Resolved**: `pickColumns` (`src/relations/projection.ts`) now reads
+    `selection[key] === true` directly instead of scanning `entries` with `Array.find`.
+    Behaviourally identical (existing `test/unit/projection.test.ts` coverage still
+    passes unmodified), so no new assertion was needed for the answer itself — only for
+    the mechanism, which is covered by the existing suite continuing to pass.
 - `src/schema/columns.ts:48,233` — `isLengthExact` is declared and exposed but never assigned by any column factory, so it is permanently `undefined`. That happens to match Drizzle for SQLite (only `pg-core`/`cockroach-core` set it), so `[F-007]`'s new test passes for a reason unrelated to the getter; it is dead weight in the shipped bundle.
+  - **Left as-is, deliberately**: removing the getter would be a published-API-surface
+    *removal* (`docs/04`'s Drizzle-compat contract requires `Column.isLengthExact` to
+    exist, matching real `drizzle-orm`), and the finding names no concrete fix beyond
+    the observation itself — it is correct for SQLite today and only "dead weight" in
+    the sense that no factory currently sets it to anything other than its already-
+    correct default. Recorded as reviewed, not changed.
 - `test/unit/ddl.test.ts:141` — the pre-existing `expect(createTable(t)).toContain('"short" text')` now passes against `"short" text(10)`; the assertion survived a behaviour change without noticing it. A `toContain` where an equality belongs.
+  - **Resolved**: tightened to `.toContain('"short" text(10)')`, with a comment
+    explaining why the looser substring was a false-negative risk (it also matches
+    `"short" text` alone, so it would have kept passing silently if `createTable` had
+    gone back to omitting the length).
 
 ## Findings — efficiency + bugs lens (iteration 2)
 
@@ -365,11 +413,17 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 - **Failure scenario**: with columns `"a b"` and `"ab"` both on the table, `index('t_idx').on(sql\`lower("a b")\`)` → `index('t_idx').on(sql\`lower("ab")\`)` gives `statements === []`. The control (`lower("x")` → `lower("y")`) correctly emits a drop and a create. The index keeps pointing at the wrong column forever, with no diff.
 - **Fix**: keep `"…"`, `` `…` `` and `[…]` segments verbatim, the same way the single-quoted-literal branch already does.
 
-### [F-031] `ConcurrencyGate` is not a correct semaphore — status: todo — severity: low (latent) — area: kit/core
+### [F-031] `ConcurrencyGate` is not a correct semaphore — status: **blocked** (batch scope excluded `kit/src/core/apply.ts` from editing — see note) — severity: low (latent) — area: kit/core
 - **Where**: `kit/src/core/apply.ts:56`
 - **Defect**: `run` releases with `inFlight--` *before* `queue.shift()?.()`, and the woken waiter never re-checks `inFlight` after resuming. A caller arriving in the microtask window between the release and the waiter's resumption sees a free slot and takes it; the waiter then increments on top. With `limit = 1` the reviewer measured a peak of 2.
 - **Not live today**: across 64 tables × 3 indexes with microtask, macrotask, randomised and zero delay the peak was exactly 12 every time, because a table's `index_info` dispatch is always ordered after the woken waiter's resumption by `Promise.all`'s extra tick. It is a hazard for the next call site, not this one.
 - **Fix**: loop `while (this.inFlight >= this.limit) await …`, or increment the count in the releaser on behalf of the waiter.
+- **Not attempted this batch**: `kit/src/core/apply.ts` was excluded from this batch's
+  edits (concurrent work by another batch on the same file). The fix above is a
+  contained, two-line change local to `ConcurrencyGate` and is exactly the shape the
+  next batch that can touch `apply.ts` should apply, along with a test that starts
+  `limit` concurrent `run()` calls plus one more from inside a resumed waiter's
+  continuation and asserts `inFlight` never exceeds `limit`.
 
 ### [F-032] `IndexColumnSnapshot` / `normalizeIndexColumn` are unexported from the kit's public entry — status: done (this batch) — severity: low — area: api
 - **Where**: `kit/src/core/index.ts:27`
@@ -413,9 +467,47 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 
 ### [F-037] `AUDIT.md` names a private product and its schema shape, in a repo that is published to npm — status: **needs-human** — severity: med — area: privacy
 - **Where**: this file — the `[F-001]` block and the fixture note near the end
-- **What it discloses**: the customer name "acme", its container mount paths (`/fixture/apps/api/src/db/schema/index.ts`, `.../table-options.ts`, `orm-d1.config.ts`), and structural facts about its schema — 64 tables, `strict: true` on all 64, `withoutRowid` and `appendOnly` drawn from a `hardening.ts` roster. No table or column names leak, and `AUDIT.md` is excluded from the npm tarball (`files` does not list it), so this is disclosure of a customer name and coarse schema shape rather than of the schema itself.
-- **Not yet published**: `AUDIT.md` first appears in `c9aabd7`, which is on no remote branch — `origin/main` is still `a027589`. **It becomes a disclosure the moment these commits are pushed.** The authors already flagged fixture privacy in the note at the end of this file; the metadata in the same file is the part that was not scrubbed.
-- **Question for the human**: scrub the name and the paths (replacing them with "the parent checkout" and an env var reference), add `AUDIT.md` to `.gitignore` and keep it untracked, or accept the disclosure? The sweep will not decide this. Note that keeping it untracked would also restore the assumption the `/audit-sweep` skill makes about this file.
+- **What it discloses**: the downstream project's private product name, its container
+  mount paths, and structural facts about its schema — 64 tables, `strict: true` on all
+  64, `withoutRowid` and `appendOnly` drawn from a `hardening.ts` roster. No table or
+  column names leak, and `AUDIT.md` is excluded from the npm tarball (`files` does not
+  list it), so this is disclosure of a private product name and coarse schema shape
+  rather than of the schema itself.
+- **Already published — this is not a hypothetical, it already happened**: the earlier
+  version of this entry claimed `AUDIT.md` "is on no remote branch" and would only
+  "become a disclosure … if … pushed". That claim is **false** and was not re-verified
+  before being written down. `c9aabd7` (the commit that first added the un-scrubbed
+  content to this file) is an ancestor of `origin/main` —
+  `git merge-base --is-ancestor c9aabd7 origin/main` exits `0` — and is inside the
+  pushed tag `v0.1.6` (and every tag since). `git show origin/main:AUDIT.md | grep -c
+  acme` returns `4`. The private product name, its container mount paths, and the
+  `hardening.ts`-derived roster of which tables are `strict`/`withoutRowid`/`appendOnly`
+  are on `origin/main` right now and inside a tag anyone who fetched it already has.
+- **Scrubbing the working tree does not undo this.** Editing this file going forward
+  (done, below) only stops the *next* push from repeating the disclosure — it cannot
+  retract what `origin/main` and `v0.1.6`+ already carry. Only rewriting the published
+  history (force-pushing a rewritten `main`, deleting/re-cutting the affected tags) would
+  do that, and that is not a decision this sweep will make unilaterally: it breaks
+  anyone who has already fetched, and re-tagging a released version has consequences
+  beyond this repo.
+- **Question for the human**: the disclosure already happened on `origin/main` and in
+  `v0.1.6` onward. Options: (a) accept it as already-public and just stop repeating it
+  going forward — the name and paths are not credentials; (b) rewrite and force-push the
+  affected history and re-cut the affected tags, accepting the fallout for anyone who
+  already pulled; (c) something narrower, e.g. treat only the product name as sensitive
+  and decide whether that alone is worth a history rewrite. The sweep will not decide
+  this on its own.
+- **Scrubbed this file going forward** (does not address the already-published copies
+  above): the downstream project's real name and its container mount paths (the
+  `[F-001]` block's "Where the path points" and "Fixture shape" notes, and the
+  fixture-privacy note near the end of this file) are replaced with generic
+  descriptions — "a downstream project", "that project's schema directory" — while every
+  finding's technical content (the bug, the mechanism, the table/constraint counts)
+  stays intact. `[F-001]` itself is now superseded by a synthetic in-repo harness (see
+  its own entry), so the scrubbed recipe is kept only as a record of the approach that
+  was tried and rejected, not as a live plan that still needs the name to be useful.
+  Packaging was re-verified rather than assumed — see the `npm pack --dry-run` figures
+  recorded in this batch's fixes; `AUDIT.md` is absent from both tarballs.
 
 ### [F-038] `importModule` writes a copy of the user's schema into their source tree — status: todo — severity: low — area: kit/node
 - **Where**: `kit/src/node/import.ts:79-85`
@@ -553,9 +645,19 @@ Recorded, not built. Ranked as the reviewer ranked them:
 - **Defect**: `factory` can be `'numeric'` and the import is added, but `numeric` is not in `RESERVED`, so a live table named `numeric` makes `pull` emit `export const numeric = sqliteTable("numeric", { x: numeric("x") })` — a TDZ error in a file whose entire job is to compile.
 - **Resolved**: added `'numeric'` to `RESERVED`. `kit/test/unit/cli.test.ts` gained a regression test asserting a `numeric`-named table renders `numeric_`, not `numeric`.
 
-### [F-054] `lowerIn` has no bound-parameter guard — status: todo — severity: low — area: better-auth — lens: efficiency + bugs (OFF-LENS from feature)
+### [F-054] `lowerIn` has no bound-parameter guard — status: **done** (this batch) — severity: low — area: better-auth — lens: efficiency + bugs (OFF-LENS from feature)
 - **Where**: `src/better-auth.ts:169`
 - **Defect**: the case-sensitive path goes through `inArray`, which collapses to `json_each` above the threshold and names the budget above `maxParams`; the `mode: 'insensitive'` path binds one parameter per value unconditionally, so an `in` of >100 values surfaces as a bare `too many SQL variables` from D1. Reachable only when a caller sets `mode: 'insensitive'` on an `in`, which the reviewer could not find better-auth doing on its own — latent rather than confirmed. (A previous lens dropped this for the same reason; it is recorded now because the *guard* asymmetry is concrete even if the caller is not.)
+- **Fix**: `lowerIn` (`src/better-auth.ts`) is now a small `SQLChunk` class (`LowerIn`)
+  instead of a plain function — `lower()` cannot fall back to `json_each` the way
+  `inArray` does (the comparison needs `lower()` applied per element, not the raw
+  value), so above `ctx.maxParams` it throws a `CompileError` naming the limit,
+  mirroring `InArray`'s own guard shape instead of surfacing D1's bare
+  "too many SQL variables".
+- **Prove it**: `test/workers/better-auth.test.ts` gained a new `it` in the `findMany`
+  describe block, beside the existing case-folding test — 101 values with
+  `mode: 'insensitive'` and `operator: 'in'` rejects with
+  `/exceeds the bound-parameter limit of 100/`, and exactly 100 values still succeeds.
 
 ## Unresolved objections merged anyway (`91de9e1`)
 
@@ -676,8 +778,17 @@ unparseable DDL and interpolate an unescaped collation name.
 - **Where**: `src/relations/query.ts:523-549`
 - **Defect**: the throw sits *after* the `keys.length === 0` early return (line 523), and `#fetchChild` is not called at all when `rows.length === 0` (line 451). Verified: the same schema and query throws with data present and returns `[]` cleanly after `delete from users`. A refusal meant as a hard gate should fire when the relation is resolved, not when a row happens to exist.
 
-### [F-072] The batch's bundle cost was reported against the previous commit, not `main` — status: todo — severity: low — area: efficiency
+### [F-072] The batch's bundle cost was reported against the previous commit, not `main` — status: **done** (note only, per this batch's `[F-097]`) — severity: low — area: efficiency
 - Measured against `main`: `src/core.ts` 41,352 → 41,352 (0); `src/index.ts` 60,457 → 60,911 (**+454**); `src/relations/index.ts` 27,271 → 27,721 (**+450**). Most of the +454 is the 330-character throw message from `[F-070]` shipped to every cold isolate — a string that exists to say something that is not true for the shapes in `[F-070]`.
+- **Not a code fix — how this stops recurring**: this was a *reporting* gap (measuring
+  against the wrong baseline), which no amount of measuring-more-carefully prevents on
+  its own — the next batch can make the identical mistake. `[F-097]` (this batch) adds
+  a real gate instead: `test/unit/module-resolution.test.ts`'s "bundle-size ceiling"
+  test re-measures the actual minified+gzipped bundle on every `npm run check` and
+  fails outright if it grows past a ceiling seeded from a real measurement, rather than
+  relying on a human to remember to diff against `main` in a status write-up. A batch
+  that grows the bundle enough to matter now fails the gate regardless of what baseline
+  anyone compared it to by hand.
 
 ### Confirmed correct by the round-2 reviewer
 - **`isReversed` now matches Drizzle's `relation.isReversed = !where`** in all four combinations, checked by running orm-d1's and `drizzle-orm`'s `defineRelations` side by side: own-where → `false`, inherited → `true`, both → `false` with own where winning, neither → `true`. Rows match Drizzle exactly through `sqlite-proxy` for the reversed inherited `where` under `joined`, for the non-reversed relation under both plans, and for the filter DSL. The non-reversed path is unchanged by construction — all three new branches are gated on `relation.isReversed`.
@@ -713,10 +824,18 @@ unparseable DDL and interpolate an unescaped collation name.
 - **Defect**: `splitStatements` (`kit/src/core/sql.ts:44-58`) goes to real trouble to keep a `CREATE TRIGGER … BEGIN … END` body's internal semicolons inside one statement, because `localRunner`/`scratchRunner` hand each statement to `db.exec()` individually. `remoteRunner.batch` then does `statements.map((s) => \`${s};\`).join('\n')` and posts the result as a single `sql` field, so D1's HTTP API has to re-split it. If the API's splitter is not trigger-aware this fails with `incomplete input` — i.e. the append-only guard can be created `--local` but not `--remote`, precisely the drift `runners.ts`'s own header says the shared `SqlRunner` exists to prevent.
 - **Unconfirmed**: the reviewer could not verify Cloudflare's splitter behaviour. Cheap to settle — the credential-gated suite at `kit/test/unit/remote-runner.test.ts:185` needs one case that creates a trigger through `runner().batch([...])` and asserts the `UPDATE` is then rejected.
 
-### [F-076] Schema disclosure through filter errors — status: todo — severity: low — area: relations — OFF-LENS from security
+### [F-076] Schema disclosure through filter errors — status: **done** (this batch) — severity: low — area: relations — OFF-LENS from security
 - **Where**: `src/relations/filter.ts:428-432`
 - **Defect**: an unknown key in the object DSL throws a message enumerating every column and relation name of the table. The documented Pothos use case passes a user-controlled `where` straight in, and GraphQL servers commonly return `error.message` to the client, so `{ where: { zzz: 1 } }` returns the full column list of the backing table.
 - **Fails closed** (it throws), and the message is genuinely good for development — a hardening question rather than a defect. Worth a `__DEV__` gate on the enumeration.
+- **Fix**: the unknown-field refusal in `compileFilter` (`src/relations/filter.ts`) now
+  checks `isDev()` (`src/dev.ts`, the same flag `assertHeader`/`assertScan` use) —
+  enumerated in dev, a bare "neither a column nor a relation of this table" otherwise.
+- **Prove it**: `test/unit/relations-filter.test.ts` gained a
+  `'schema disclosure through the unknown-field refusal'` describe block: with `__DEV__`
+  off, the thrown message names the offending key but not the column/relation list;
+  with it on, `Columns: id, name` is present. The existing prototype-key tests, which
+  only assert `/Unknown filter field/`, are unaffected by either branch.
 
 ## Iteration 6 — **approved** and merged (`37db699`)
 
@@ -839,9 +958,39 @@ containing `'); drop table …` renders as one properly-doubled literal.
 ### [F-089] A hand-written `sql\`${col} in ${ids}\`` has no `json_each` fallback — status: needs-human (not closed — the only fix shape available is textually detecting an `in`/`not in`-shaped fragment inside an arbitrary hand-written `sql` template, which is exactly the fragile heuristic to avoid; low severity per the finding itself, since `main` never worked here either) — severity: low — area: sql
 - With 200 ids it now compiles cleanly to 200 `?` and fails at D1 with `too many SQL variables`. The budget guard lives in `InArray` (`src/sql/expressions.ts:155`), which a hand-written fragment does not go through. On `main` that expression never worked at all, and Drizzle behaves the same, so `[F-081]` did not open it so much as make it reachable.
 
-### [F-090] Two redundant `not.toContain` guards in the new DDL test — status: todo — severity: low — area: test-integrity
+### [F-090] Two redundant `not.toContain` guards in the new DDL test — status: **done** (this batch) — severity: low — area: test-integrity
 - **Where**: `test/unit/ddl.test.ts:99`
 - The exact assertion `expect(ddl).toContain('check ("role" in (\'admin\', , \'member\'))')` carries the weight and is correct. The two `not.toContain` guards beside it are redundant, and `not.toContain('null, ')` is not load-bearing: the DDL *does* contain `"role" text not null` immediately before the constraint, and the assertion passes only because `createTable` joins members with `,\n\t` rather than `, `. It would fail spuriously if the DDL formatter ever emitted single-line output.
+- **Resolved**: both `not.toContain` lines removed from `test/unit/ddl.test.ts`; the
+  single `toContain` assertion that actually carries the weight is unchanged.
+
+### [F-097] No regression gate on published bundle-size numbers — status: **done** (this batch) — severity: low — area: efficiency
+- **Where**: `test/unit/module-resolution.test.ts`; `docs/01-differences.md`'s "Bundle
+  size" section; `README.md`'s "Bundle size" section
+- **Defect**: `docs/01-differences.md` says outright — "these two numbers come from a
+  one-off measurement. Nothing in CI re-measures them, so they can drift from the
+  published packages as either library changes." Nothing enforced that, so both docs
+  carried a stale `orm-d1` figure (44.1 kB / 15.3 kB) against a today-measured 51.7 kB
+  / 17.7 kB for the identical scenario, and `[F-072]` — a batch's bundle cost measured
+  against the wrong baseline — went unnoticed by any automated check.
+- **Fix**: `test/unit/module-resolution.test.ts` gained a "bundle-size ceiling" describe
+  block, reusing the file's existing esbuild-driven, `drizzle-orm`-redirected fixture.
+  It bundles the same Worker **minified** this time (the existing tests in the file
+  never pass `--minify`, so they measure a different, larger number than the one
+  `docs/01`/`README.md` publish) and asserts the minified and gzipped byte counts stay
+  at or under a ceiling seeded from today's real measurement plus ~15% headroom. It runs
+  under `npm run test`, which `npm run check` calls after `npm run build`, so it is part
+  of the required gate, not an opt-in extra.
+- **Docs corrected in the same commit**: `docs/01-differences.md`'s table now reads
+  51.7 kB / 17.7 kB for `orm-d1` (the `drizzle-orm` row, 77.8 kB / 22.2 kB, was
+  re-measured too and is unchanged — confirmed by bundling the fixture's un-redirected
+  import directly), and its percentages recompute to −34% / −20%. `README.md`'s
+  corresponding line is updated to match. The "nothing re-measures them" sentence in
+  `docs/01` is rewritten to describe the new gate instead of disclaiming its absence.
+- **Prove it**: ran `npm run build` then `npx vitest run test/unit/module-resolution.test.ts`
+  directly — the new test passes against today's real bundle. Revert-verified: lowering
+  `MINIFIED_CEILING` below the measured value makes the test fail with the expected
+  `toBeLessThanOrEqual` assertion message; restoring it passes again.
 
 ### [F-116] `min()`/`max()`'s `String` decode for a non-`Column` operand needs a release note — status: needs-human — severity: low — area: release
 - Same shape as `[F-088]`/`[F-059]`. `min(sql<number>\`unixepoch(${t.at})\`)` decoded through the driver value untouched on `main`; it now decodes through `String`, matching `drizzle-orm/sql/functions/aggregate.js`'s `.mapWith(is(expression, Column) ? expression : String)`. Correct under Drizzle parity, and now documented at `docs/01-differences.md` (`min()` and `max()` over a non-`Column` expression decode to `string`), but existing orm-d1-native code calling `min()`/`max()` over a raw `sql<number>`/`sql<Date>` fragment and relying on the passthrough value changes behaviour silently, with no type error — a release-note item, not a defect.
@@ -1147,11 +1296,13 @@ _(nothing yet)_
   feature end-to-end in the downstream app, so they are adoption frictions rather than
   sweep findings, and the rotation pointer was left where it was. A lens is free to pick
   them up; none of them is that lens's own finding.
-- **Fixture privacy.** acme's schema is used as a *local* fixture through
-  `ORM_D1_FIXTURE_SCHEMA` and is never copied into this repo — orm-d1 is published to
-  npm, and a private product's table and column names should not ship in the tarball or
-  land in public git history. If a bug is found through it, the committed regression test
-  is a **minimal anonymized repro** in this repo's own fixture style.
+- **Fixture privacy.** A downstream project's real schema was used as a *local* fixture
+  through `ORM_D1_FIXTURE_SCHEMA` and was never copied into this repo — orm-d1 is
+  published to npm, and a private product's table and column names should not ship in
+  the tarball or land in public git history. If a bug is found through it, the committed
+  regression test is a **minimal anonymized repro** in this repo's own fixture style.
+  `[F-001]`'s harness now covers the large-schema case entirely with a synthetic,
+  in-repo fixture, so this recipe is no longer load-bearing — kept as a record only.
 - **`node_modules` is bind-mounted from a macOS host**, so platform binaries can be the
   wrong architecture in the container. Repaired for this session: esbuild
   (`node node_modules/esbuild/install.js`) and tsgo

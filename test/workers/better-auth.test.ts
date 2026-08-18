@@ -343,6 +343,38 @@ describe('findMany', () => {
 		});
 		expect(insensitiveIn.map((r) => r.name)).toEqual(['Ada', 'Bob']);
 	});
+
+	/**
+	 * [F-054]: the case-sensitive `in` path (`inArray`, `src/sql/expressions.ts`)
+	 * collapses to `json_each` above `jsonEachThreshold` and only names the
+	 * budget past `maxParams`. The case-insensitive path binds one `lower()`
+	 * parameter per value unconditionally — with no fallback — so it must name
+	 * the same `maxParams` budget with a clear error, instead of letting a
+	 * >100-value list surface as a bare "too many SQL variables" from D1.
+	 */
+	it('names the bound-parameter budget for a case-insensitive "in" past maxParams, instead of a bare D1 error', async () => {
+		const adapter = makeAdapter();
+		await seed(adapter);
+
+		const tooMany = Array.from({ length: 101 }, (_, i) => `name-${i}`);
+		await expect(
+			adapter.findMany({
+				model: 'user',
+				where: [{ field: 'name', operator: 'in', value: tooMany, mode: 'insensitive' }],
+				limit: 10,
+			}),
+		).rejects.toThrow(/exceeds the bound-parameter limit of 100/);
+
+		// Just at the budget still works.
+		const exactly100 = Array.from({ length: 100 }, (_, i) => `name-${i}`);
+		exactly100[0] = 'ADA';
+		const rows = await adapter.findMany<Record<string, unknown>>({
+			model: 'user',
+			where: [{ field: 'name', operator: 'in', value: exactly100, mode: 'insensitive' }],
+			limit: 10,
+		});
+		expect(rows.map((r) => r.name)).toEqual(['Ada']);
+	});
 });
 
 describe('count', () => {

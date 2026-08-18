@@ -85,7 +85,7 @@ on `--local` as well as `--remote`, with the id masked to its last four characte
 Target: remote D1 (HTTP API)
   environment    prd  ← --env
   binding        DB  ← wrangler.toml [env.prd]
-  database_name  acme-db-prd  ← wrangler.toml [env.prd]
+  database_name  your-db-prd  ← wrangler.toml [env.prd]
   database_id    …1234  ← CLOUDFLARE_D1_DATABASE_ID
   account_id     …f00d  ← CLOUDFLARE_ACCOUNT_ID
 ```

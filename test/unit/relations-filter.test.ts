@@ -8,9 +8,10 @@
  * compiler, and a plain `columns[key]` read walks the prototype chain right
  * past it.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { getTableColumns, integer, sqliteTable, text } from '../../src/index.js';
 import { compileFilter } from '../../src/relations/filter.js';
+import { setDev } from '../../src/dev.js';
 
 const users = sqliteTable('users', {
 	id: integer('id').primaryKey(),
@@ -70,5 +71,38 @@ describe('prototype keys in the filter DSL', () => {
 		const query = compileFilter({ constructor: 'x' } as never, shadow, shadowColumns, {}, {})?.toQuery();
 		expect(query?.sql).toBe('"shadow"."constructor" = ?');
 		expect(query?.params).toEqual([{ k: 'const', v: 'x' }]);
+	});
+});
+
+/**
+ * [F-076]: the documented Pothos use case passes a caller-supplied `where`
+ * straight into `compileFilter`, and GraphQL servers commonly return
+ * `error.message` to the client — so an unknown-field refusal that lists
+ * every column and relation name discloses the table's schema outside dev.
+ */
+describe('schema disclosure through the unknown-field refusal', () => {
+	afterEach(() => setDev(false));
+
+	it('does not enumerate columns or relations when __DEV__ is off', () => {
+		setDev(false);
+		expect(() => compile({ zzz: 1 })).toThrow(/Unknown filter field "zzz"/);
+		try {
+			compile({ zzz: 1 });
+			throw new Error('expected compile to throw');
+		} catch (err) {
+			expect((err as Error).message).not.toMatch(/Columns:/);
+			expect((err as Error).message).not.toContain('id');
+			expect((err as Error).message).not.toContain('name');
+		}
+	});
+
+	it('still enumerates columns and relations when __DEV__ is on', () => {
+		setDev(true);
+		try {
+			compile({ zzz: 1 });
+			throw new Error('expected compile to throw');
+		} catch (err) {
+			expect((err as Error).message).toMatch(/Columns: id, name/);
+		}
 	});
 });

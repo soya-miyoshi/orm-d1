@@ -20,7 +20,11 @@ export const pickColumns = (
 	// missing `columns` key at all (handled above) means "select everything".
 	const entries = Object.entries(selection).filter(([, v]) => v !== undefined);
 	if (entries.length === 0) return [];
-	const included = keys.filter((key) => entries.find(([k, v]) => k === key && v === true));
+	// An entry can only be `true` if it survived the `!== undefined` filter
+	// above, so `selection[key] === true` answers the same question as
+	// scanning `entries` for a matching pair — without the O(n·m) `find` (this
+	// runs per query per relation level) or the `Object.entries` allocation.
+	const included = keys.filter((key) => selection[key] === true);
 	if (included.length > 0) return included;
 	const excluded = new Set(entries.filter(([, v]) => v === false).map(([k]) => k));
 	return keys.filter((key) => !excluded.has(key));
