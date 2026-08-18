@@ -1,6 +1,6 @@
 {
 	"name": "orm-d1-kit",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"description": "Migrations, introspection and drift detection for orm-d1 on Cloudflare D1.",
 	"type": "module",
 	"license": "MIT",
@@ -35,7 +35,7 @@
 		"LICENSE"
 	],
 	"peerDependencies": {
-		"orm-d1": "^0.2.1"
+		"orm-d1": "^0.2.2"
 	},
 	"dependencies": {},
 	"devDependencies": {

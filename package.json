@@ -1,6 +1,6 @@
 {
 	"name": "orm-d1",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"description": "A tiny, type-safe ORM built exclusively for Cloudflare D1 and Workers.",
 	"type": "module",
 	"license": "MIT",
