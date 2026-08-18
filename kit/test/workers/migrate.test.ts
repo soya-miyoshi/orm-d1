@@ -1051,17 +1051,39 @@ describe('[Round 4, finding 6] a guarded-column rename with no table rename', ()
 		// end a batch between the drop and the re-create — leaving the table with
 		// no guard at all (UPDATE permitted) until the next batch ran, and for
 		// good if it failed.
-		const before = sqliteTable('ledger', { id: text('id').primaryKey(), amount: integer('amount') });
+		//
+		// [reviewer issue 1 fix] The guard also has to genuinely change for this
+		// scenario to apply: a pure 1:1 rename of the only guarded column
+		// (`amount` -> `cents`, guard `['amount']` -> `['cents']`) needs no
+		// drop+create at all any more — SQLite auto-repoints the live trigger's
+		// `UPDATE OF` list across the rename statement by itself (see the
+		// comment block in `diff.ts` around line 707), and `diffSnapshots` now
+		// forward-maps the previous guard through this diff's renames before
+		// comparing, so it correctly recognises the rename alone already gets
+		// the schema and the live guard into agreement — nothing left to
+		// restate. So the guard here also widens to a second column (`note`)
+		// that is not part of the rename, which the mapped-forward set does not
+		// already satisfy, keeping this test's drop+create (and the batch-atomicity
+		// concern it exists to pin) genuine.
+		const before = sqliteTable('ledger', {
+			id: text('id').primaryKey(),
+			amount: integer('amount'),
+			note: integer('note'),
+		});
 		await migrateTo(
 			emptySnapshot(),
 			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['amount'] }]])),
 		);
-		await DB.prepare(`insert into ledger (id, amount) values ('a', 5)`).run();
+		await DB.prepare(`insert into ledger (id, amount, note) values ('a', 5, 1)`).run();
 
-		const after = sqliteTable('ledger', { id: text('id').primaryKey(), cents: integer('cents') });
+		const after = sqliteTable('ledger', {
+			id: text('id').primaryKey(),
+			cents: integer('cents'),
+			note: integer('note'),
+		});
 		const diff = diffSnapshots(
 			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['amount'] }]])),
-			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['cents'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['cents', 'note'] }]])),
 			{ renamedColumns: { 'ledger.amount': 'cents' } },
 		);
 		expect(diff.errors).toEqual([]);

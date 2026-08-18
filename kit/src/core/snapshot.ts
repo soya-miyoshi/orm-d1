@@ -327,7 +327,14 @@ export function snapshotFromSchema(
 		? (schema as readonly Table[])
 		: Object.values(schema as Record<string, unknown>).filter(isTableLike);
 
-	const result: Record<string, TableSnapshot> = {};
+	// `Object.create(null)`, not `{}` — same hazard as the column/constraint
+	// maps below, one level up: a table literally named `__proto__` (legal SQL)
+	// assigned through a plain object sets the object's *prototype* instead of
+	// adding an entry, so it silently vanishes from `Object.keys(result)` and
+	// everything downstream (diff, generate) never sees it. A table named
+	// `constructor`/`toString`/etc. would also resolve to the built-in instead
+	// of `undefined`, corrupting lookups that use `result[name]`.
+	const result: Record<string, TableSnapshot> = Object.create(null);
 
 	for (const t of tables) {
 		const name = getTableName(t);
