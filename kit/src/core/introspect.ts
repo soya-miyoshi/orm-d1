@@ -113,6 +113,13 @@ const unquote = (name: string): string =>
 		? name.slice(1, -1)
 		: name.startsWith('[') && name.endsWith(']')
 		? name.slice(1, -1)
+		// SQLite's grammar accepts a string literal wherever an `ids` (name) is
+		// expected — `ids ::= ID|STRING` — so `collate 'nocase'` is real and
+		// honoured, not just tolerated. Every `collate`-token reader in this file
+		// (`matchCollateToken`, `parseIndexCollations`) can hand this a `'…'`
+		// span, and this is the one place all of them unquote it.
+		: name.startsWith('\'') && name.endsWith('\'')
+		? name.slice(1, -1).replaceAll('\'\'', '\'')
 		: name;
 
 /**
@@ -217,6 +224,43 @@ const blankComments = (text: string): string =>
 		/'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|--[^\n]*|\/\*[\s\S]*?\*\//g,
 		(span) => (span[0] === '-' || span[0] === '/' ? ' '.repeat(span.length) : span),
 	);
+
+/**
+ * Every spelling SQLite accepts for a `COLLATE` clause's name token: bare,
+ * `"…"`, `` `…` ``, `[…]`, and `'…'`. SQLite's grammar accepts a string
+ * literal wherever a name is expected (`ids ::= ID|STRING`), so `collate
+ * 'nocase'` is real and honoured by SQLite — dropping that spelling used to
+ * turn a live, enforced collation into an omitted one that a rebuild then
+ * fails to reproduce (`[F-111]`/`[F-115]`'s remaining hole).
+ */
+const collateTokenPattern = '\\bcollate(?:\\s+(\\w+)|\\s*("(?:[^"]|"")*"|`[^`]*`|\\[[^\\]]*\\]|\'(?:[^\']|\'\')*\'))';
+
+/**
+ * Find a `COLLATE <name>` clause in `raw` starting no earlier than
+ * `searchStart`, and return the name, unquoted.
+ *
+ * Positions are found in `blankLiterals(raw)`, not `raw` itself — the same
+ * hazard `parseIndexCollations` guards against (`[F-069]`'s class): a string
+ * literal elsewher in the text, e.g. `replace("a", ' collate x ', '')`, must
+ * not be misread as the clause. But the *matched token's own text* is read
+ * back out of `raw`, not the blanked copy: when that token is itself a `'…'`
+ * literal, `blankLiterals` has erased its contents, and only `raw` still
+ * holds the real collation name. `blankLiterals` preserves every span's
+ * length, so the offsets found in the blanked copy still index correctly
+ * into `raw`. The discriminator that keeps this from re-opening `[F-069]`'s
+ * defect is position, not spelling: a token only counts here because it
+ * immediately follows a `collate` keyword that itself survived the blanking
+ * (a keyword can never hide inside a literal, since blanking erases a
+ * literal's entire interior) — not because it merely looks like a name.
+ */
+const matchCollateToken = (raw: string, searchStart = 0): string | undefined => {
+	const blanked = blankLiterals(raw);
+	const match = new RegExp(collateTokenPattern, 'i').exec(blanked.slice(searchStart));
+	if (!match) return undefined;
+	const group = (match[1] ?? match[2])!;
+	const tokenStart = searchStart + match.index + (match[0].length - group.length);
+	return unquote(raw.slice(tokenStart, tokenStart + group.length));
+};
 
 export const parseChecks = (
 	sql: string,
@@ -509,9 +553,10 @@ export const parseColumnCollation = (
 			&& (i === 0 || !/\w/.test(scan[i - 1]!))
 		) {
 			// A bare name or a quoted one — `collate "NOCASE"`, `` collate `NOCASE` ``,
-			// and `collate [NOCASE]` are all legal SQLite and all verified forms D1
-			// stores verbatim; only matching the `"…"` spelling left the other two
-			// invisible, so a rebuild silently dropped the collation (and the
+			// `collate [NOCASE]`, and `collate 'NOCASE'` are all legal SQLite (a
+			// string literal is a valid `ids` per SQLite's grammar) and all verified
+			// forms D1 stores verbatim; only matching the `"…"` spelling left the
+			// others invisible, so a rebuild silently dropped the collation (and the
 			// meaning of any unique index built over the column).
 			//
 			// The separator before the name is optional whitespace when the name is
@@ -520,16 +565,15 @@ export const parseColumnCollation = (
 			// one identifier with no `collate` keyword in it at all, would match as
 			// `collate` + `nocase` (`[F-112]`).
 			const rest = scan.slice(i);
-			const match = /^collate(?:\s+(\w+)|\s*("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]))/i.exec(rest);
+			const match = new RegExp(`^${collateTokenPattern}`, 'i').exec(rest);
 			if (match) {
-				const name = (match[1] ?? match[2])!;
-				collate = name.startsWith('"')
-					? name.slice(1, -1).replaceAll('""', '"')
-					: name.startsWith('`')
-					? name.slice(1, -1)
-					: name.startsWith('[')
-					? name.slice(1, -1)
-					: name;
+				const group = (match[1] ?? match[2])!;
+				// `scan` is `blankLiterals(sql)`: a `'…'` token's contents were
+				// blanked to spaces there, so its real text has to come back out of
+				// `sql` at the same offset — lengths are preserved by
+				// `blankLiterals`, so the offset still lines up.
+				const tokenStart = i + (match[0].length - group.length);
+				collate = unquote(sql.slice(tokenStart, tokenStart + group.length));
 				i += match[0].length;
 				continue;
 			}
@@ -675,26 +719,17 @@ const parseIndexColumns = (sql: string | null): string[] | undefined => {
 const parseIndexCollations = (sql: string | null): (string | undefined)[] | undefined => {
 	const members = parseIndexColumns(sql);
 	if (!members) return undefined;
-	const collateRe = /\bcollate\s+("(?:[^"]|"")+"|`[^`]+`|\[[^\]]+\]|'(?:[^']|'')+'|\w+)/i;
-	const unquote = (token: string): string => {
-		if (
-			(token.startsWith('"') && token.endsWith('"')) || (token.startsWith('\'') && token.endsWith('\''))
-		) {
-			return token.slice(1, -1).replaceAll(token[0]! + token[0]!, token[0]!);
-		}
-		if (token.startsWith('`') && token.endsWith('`')) return token.slice(1, -1).replaceAll('``', '`');
-		if (token.startsWith('[') && token.endsWith(']')) return token.slice(1, -1);
-		return token;
-	};
 	return members.map((member) => {
 		// `member` is sliced from the *original* `sql` (`parseIndexColumns`
 		// deliberately keeps string-literal contents intact), so a literal
 		// containing the word `collate` — `replace("a", ' collate x ', '')` — would
 		// otherwise be read as the member's own collation clause and re-emitted
 		// as an unescaped, uninterpolated `COLLATE x` (`[F-069]`, the same hazard
-		// `blankLiterals` exists to close everywhere else in this file). Blanking
-		// here, not in `parseIndexColumns`, keeps the *stored* member text
-		// literal-faithful for re-rendering while still scanning it safely.
+		// `blankLiterals` exists to close everywhere else in this file).
+		// `matchCollateToken` blanks internally for the position scan, but still
+		// reads the matched token's real text back out of `member` — necessary
+		// for a `collate 'nocase'` member, since SQLite honours a string literal
+		// as a collation name and that is exactly the text that has to survive.
 		// Anchored the same way `parseTableUniqueConstraints` anchors a member:
 		// scan only *after* the leading identifier/name, not the whole member
 		// text. `blankLiterals` blanks string literals but deliberately leaves
@@ -705,8 +740,7 @@ const parseIndexCollations = (sql: string | null): (string | undefined)[] | unde
 		// clause the index member never stated.
 		const blanked = blankLiterals(member);
 		const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)/.exec(blanked);
-		const match = collateRe.exec(blanked.slice(nameMatch ? nameMatch[0].length : 0));
-		return match ? unquote(match[1]!) : undefined;
+		return matchCollateToken(member, nameMatch ? nameMatch[0].length : 0);
 	});
 };
 
@@ -893,17 +927,17 @@ const parseTablePrimaryKeyClause = (sql: string): readonly RawUniqueMember[] | u
 			const blanked = blankLiterals(raw);
 			const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)/.exec(blanked);
 			const rawName = nameMatch ? nameMatch[1]! : blanked.trim();
-			const collateMatch = /\bcollate(?:\s+(\w+)|\s*("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]))/i.exec(
-				blanked.slice(nameMatch ? nameMatch[0].length : 0),
-			);
-			const collateToken = collateMatch ? (collateMatch[1] ?? collateMatch[2]) : undefined;
+			const searchStart = nameMatch ? nameMatch[0].length : 0;
+			// `raw` (not `blanked`) so a `collate 'nocase'` member's real text
+			// survives — see `matchCollateToken`.
+			const collate = matchCollateToken(raw, searchStart);
 			// `[F-1xx]`: a table-level `primary key (col autoincrement)` states
 			// AUTOINCREMENT on the *member*, not on the column definition — see
 			// `hasAutoincrement`'s fallback, which is the only reader of this flag.
-			const autoincrement = /\bautoincrement\b/i.test(blanked.slice(nameMatch ? nameMatch[0].length : 0));
+			const autoincrement = /\bautoincrement\b/i.test(blanked.slice(searchStart));
 			return {
 				name: unquote(rawName),
-				...(collateToken ? { collate: unquote(collateToken) } : {}),
+				...(collate ? { collate } : {}),
 				...(autoincrement ? { autoincrement: true } : {}),
 			};
 		});
@@ -995,30 +1029,17 @@ const parseTableUniqueConstraints = (sql: string): RawUniqueClause[] => {
 			const blanked = blankLiterals(raw);
 			const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)/.exec(blanked);
 			const rawName = nameMatch ? nameMatch[1]! : blanked.trim();
-			const name = rawName.startsWith('"')
-				? rawName.slice(1, -1).replaceAll('""', '"')
-				: rawName.startsWith('`')
-				? rawName.slice(1, -1)
-				: rawName.startsWith('[')
-				? rawName.slice(1, -1)
-				: rawName;
+			const name = unquote(rawName);
 			// Scanned from *after* the matched name, not the whole member: a quoted
 			// identifier that literally contains the word "collate" (e.g. a column
 			// named `"collate nocase"`) is still present, verbatim, in `blanked`
 			// (`blankLiterals` only blanks string literals, not identifiers), and
 			// scanning the whole member misread it as the member's own `COLLATE`
-			// clause — the same false-positive class as `[F-069]`.
-			const collateMatch = /\bcollate(?:\s+(\w+)|\s*("(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]))/i.exec(
-				blanked.slice(nameMatch ? nameMatch[0].length : 0),
-			);
-			const collateToken = collateMatch ? (collateMatch[1] ?? collateMatch[2]) : undefined;
-			const collate = collateToken === undefined ? undefined : collateToken.startsWith('"')
-				? collateToken.slice(1, -1).replaceAll('""', '"')
-				: collateToken.startsWith('`')
-				? collateToken.slice(1, -1)
-				: collateToken.startsWith('[')
-				? collateToken.slice(1, -1)
-				: collateToken;
+			// clause — the same false-positive class as `[F-069]`. `raw` (not
+			// `blanked`) is what `matchCollateToken` reads the token's text back
+			// out of, so a `collate 'nocase'` member's real name survives — see
+			// its own comment.
+			const collate = matchCollateToken(raw, nameMatch ? nameMatch[0].length : 0);
 			return { name, ...(collate ? { collate } : {}) };
 		});
 
@@ -1291,13 +1312,22 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			// `collate`; otherwise leave the column-level rendering (`single &&
 			// column.primaryKey`, `createTableFromSnapshot`) as the faithful,
 			// simpler round-trip it already was.
-			// `collate binary` is SQLite's default and semantically inert — folding
-			// it into an arity-1 entry here would suppress the column-level
-			// `primary key`/`autoincrement` rendering below for no behavioural gain
-			// (and previously dropped `autoincrement` outright, since the PK-clause
-			// render never re-emitted it). Only a genuinely non-default collation
-			// justifies the table-level clause for a single-column PK.
-			if (compositePk || members.some((m) => typeof m !== 'string' && m.collate !== 'binary')) {
+			// `collate binary` on a PK-clause member is *not* inert the way it is on
+			// a plain column: it scopes to the primary key's own automatic index,
+			// so `"a" text collate nocase, constraint … primary key ("a" collate
+			// binary)` builds that index as BINARY even though the column itself
+			// (and every other index over it) is NOCASE — a real override, not a
+			// no-op restating the default. Excluding it here used to fold that
+			// member back into the column-level rendering below, which has no way
+			// to say "the PK's own index overrides the column's collation", and the
+			// rebuilt table silently loosened (or, against a populated table,
+			// failed with `UNIQUE constraint failed` because the rebuild's `insert
+			// … select` now enforces the wrong comparison). Any member that states
+			// a `collate` at all — `binary` included — has to keep the table-level
+			// clause; `createTableFromSnapshot`'s render already emits
+			// `autoincrement` on that clause (round 6), so there is no longer a
+			// rendering reason to prefer the column-level shape for `binary` either.
+			if (compositePk || members.some((m) => typeof m !== 'string')) {
 				compositePrimaryKeys[name] = { name, columns: members };
 			}
 		}

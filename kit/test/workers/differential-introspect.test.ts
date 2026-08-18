@@ -369,13 +369,21 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 		{
 			// The exact shape the differential harness caught (seeds 324, 355,
 			// 472, 865): a table-level PK clause whose lone member states
-			// `collate binary` — the SQLite default, semantically inert — *and*
-			// `autoincrement`. Folding the arity-1 case into `compositePrimaryKeys`
-			// purely because a `collate` was present (even an inert `binary` one)
-			// suppressed the column-level `primary key`/`autoincrement` render
-			// without the PK-clause render ever re-emitting `autoincrement`, so a
-			// rebuild silently dropped AUTOINCREMENT.
-			label: '[Finding 5] a lone PK clause member\'s inert `collate binary` must not swallow AUTOINCREMENT on rebuild',
+			// `collate binary` *and* `autoincrement`. A later, fresher differential
+			// run (real D1, 1200 seeds) found that treating `collate binary` here
+			// as inert and folding it away is itself wrong: unlike a plain
+			// column's `collate binary`, a PK-clause member's own `collate binary`
+			// is *not* a no-op when the column declares a different collation — it
+			// overrides that collation for the primary key's own automatic index
+			// (`"a" text collate nocase, constraint … primary key ("a" collate
+			// binary)` builds a BINARY-collated PK index over a NOCASE column).
+			// Folding it away used to reproduce that as a plain column-level
+			// `primary key`, which silently loosens the rebuilt PK index to the
+			// column's own (possibly non-default) collation. So this member has to
+			// keep the table-level clause like any other stated `collate`, and
+			// `autoincrement` still has to survive on it — the original bug this
+			// case was written for.
+			label: '[Finding 5] a lone PK clause member\'s `collate binary` is not folded away, and AUTOINCREMENT still survives on it',
 			ddl: [
 				'create table "t29" ("id" integer, "v" text, constraint "t29_pkc" primary key ("id" collate binary autoincrement))',
 			],
@@ -384,10 +392,10 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 				const id = s.tables['t29']!.columns['id']!;
 				expect(id.primaryKey).toBe(true);
 				expect(id.autoincrement).toBe(true);
-				// `binary` is inert — it must not force an arity-1 `compositePrimaryKeys`
-				// entry; the column-level render (`single && column.primaryKey`) is the
-				// simpler, faithful round-trip for this case.
-				expect(Object.keys(s.tables['t29']!.compositePrimaryKeys)).toHaveLength(0);
+				const pk = Object.values(s.tables['t29']!.compositePrimaryKeys)[0]!;
+				const member = normalizeUniqueColumn(pk.columns[0]!);
+				expect(member.name).toBe('id');
+				expect(member.collate).toBe('binary');
 			},
 		},
 		{

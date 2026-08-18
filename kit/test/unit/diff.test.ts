@@ -96,6 +96,19 @@ describe('parsing a CREATE TABLE', () => {
 		expect(parseColumnCollation(sql, 'email')).toBe('NOCASE');
 	});
 
+	it('parses a collation name spelled as a string literal — SQLite\'s grammar accepts '
+		+ 'a STRING wherever an ids (name) is expected, so "collate \'nocase\'" is real and enforced', () => {
+		const sql = 'create table "u6" ("id" integer primary key, "email" text collate \'nocase\' not null)';
+		expect(parseColumnCollation(sql, 'email')).toBe('nocase');
+	});
+
+	it('a string literal elsewhere in the column span is not misread as a string-literal collation '
+		+ '([F-069]\'s class: the literal\'s contents can spell the word "collate")', () => {
+		const sql = 'create table "u7" ("id" integer primary key, '
+			+ '"note" text default \' collate nocase \' collate binary not null)';
+		expect(parseColumnCollation(sql, 'note')).toBe('binary');
+	});
+
 	it('does not read a COLLATE mentioned only in a "--" comment as the column\'s own', () => {
 		const sql = 'create table "c1" ("id" integer primary key, '
 			+ '"note" text -- TODO: collate nocase before launch\n\tnot null)';
