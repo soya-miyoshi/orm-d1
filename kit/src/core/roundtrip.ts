@@ -56,7 +56,6 @@ export interface RoundtripPlan {
 	readonly incomplete: boolean;
 }
 
-/** A copy of `snapshot` with every foreign key pointing into `targets` removed. */
 /**
  * `Object.fromEntries` with a null prototype.
  *
@@ -71,6 +70,7 @@ export interface RoundtripPlan {
 const fromEntriesNullProto = <T>(entries: readonly (readonly [string, T])[]): Record<string, T> =>
 	Object.assign(Object.create(null), Object.fromEntries(entries));
 
+/** A copy of `snapshot` with every foreign key pointing into `targets` removed. */
 const withoutReferencesTo = (snapshot: Snapshot, targets: ReadonlySet<string>): Snapshot => {
 	// Keyed by table name, which the database chose — see `reviveSnapshot`.
 	const tables: Record<string, TableSnapshot> = Object.create(null);

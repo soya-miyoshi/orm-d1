@@ -86,8 +86,18 @@ describe('the null prototype survives the copy-on-write paths downstream', () =>
 
 /**
  * Each of these pins one prototype-safety fix that a mutation test showed the
- * suite did not otherwise catch: reverting the map to a plain `{}` left all
- * 1237 tests green, so a one-line regression would have shipped silently.
+ * suite did not otherwise catch: reverting the map to a plain `{}` left the
+ * whole suite green, so a one-line regression would have shipped silently.
+ *
+ * `introspect.ts`'s `indexes` map is pinned in
+ * `kit/test/workers/proto-named-index.test.ts` instead — the defect is in what
+ * introspection records, so it needs a real database to mean anything.
+ *
+ * Two siblings are deliberately *not* pinned, because neither is reachable:
+ * `introspect.ts`'s `foreignKeys` key is synthesised and always ends in `_fk`,
+ * and `diff.ts`'s `dependents` default never fires (its one caller always
+ * passes a map) and is only ever read through `Object.values`. Both are
+ * defensive; there is no scenario to write a test against.
  */
 describe('the remaining prototype-safe maps are pinned', () => {
 	it('does not fabricate a nameless column entry when carrying collations', () => {
@@ -117,13 +127,6 @@ describe('the remaining prototype-safe maps are pinned', () => {
 			expect(column, `column "${name}" must be a real snapshot entry`).toHaveProperty('name');
 			expect(column).toHaveProperty('type');
 		}
-	});
-
-	it('keeps an index named __proto__ in the introspected snapshot', () => {
-		// `indexes['__proto__'] = …` on a plain object adds no own key at all.
-		const indexes: Record<string, { name: string }> = Object.create(null);
-		indexes['__proto__'] = { name: '__proto__' };
-		expect(Object.keys(indexes)).toContain('__proto__');
 	});
 
 	it('does not carry a dropped prototype-named column into a roundtrip rebuild', () => {
