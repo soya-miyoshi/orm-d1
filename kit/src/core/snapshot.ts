@@ -278,11 +278,33 @@ export interface Snapshot {
  * resolving the inherited `Object` function instead of `undefined`. That is
  * truthy, so every `!after.tables[name]` "is this table gone" check silently
  * says no. Every reader of a parsed snapshot must go through this.
+ *
+ * The revive is **deep** for exactly the maps keyed by a database-chosen name:
+ * a snapshot is otherwise plain data, so nothing below those needs it.
  */
-export const reviveSnapshot = (snapshot: Snapshot): Snapshot => ({
-	...snapshot,
-	tables: Object.assign(Object.create(null), snapshot.tables),
-});
+export const reviveSnapshot = (snapshot: Snapshot): Snapshot => {
+	const tables: Record<string, TableSnapshot> = Object.create(null);
+	for (const [name, table] of Object.entries(snapshot.tables)) {
+		// Every one of these is keyed by a name the *database* chose — a column,
+		// index, constraint or primary-key name — and every one is read with
+		// bracket indexing in `diff.ts` (`next.columns[target]`,
+		// `after.indexes[name]`, …). Reviving only `tables` leaves each of them
+		// one level below the fix: `after.indexes['constructor']` still resolves
+		// the inherited `Object`, so `canonicalIndex` reads `.columns.map` off a
+		// function and `check` dies with a `TypeError`, while a live column named
+		// `constructor` that the baseline lacks is reported as no drift at all.
+		tables[name] = {
+			...table,
+			columns: Object.assign(Object.create(null), table.columns),
+			indexes: Object.assign(Object.create(null), table.indexes),
+			foreignKeys: Object.assign(Object.create(null), table.foreignKeys),
+			compositePrimaryKeys: Object.assign(Object.create(null), table.compositePrimaryKeys),
+			uniqueConstraints: Object.assign(Object.create(null), table.uniqueConstraints),
+			checkConstraints: Object.assign(Object.create(null), table.checkConstraints),
+		};
+	}
+	return { ...snapshot, tables };
+};
 
 export const emptySnapshot = (id = '0'.repeat(8), prevId = ''): Snapshot => ({
 	version: SNAPSHOT_VERSION,
