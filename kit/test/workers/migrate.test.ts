@@ -1138,3 +1138,62 @@ describe('a table rename beside a new append-only column', () => {
 		await expect(DB.prepare(`update audit set alpha = 99 where id = 1`).run()).rejects.toThrow();
 	});
 });
+
+describe('a rename that reuses a live column name loses no guard', () => {
+	it('guards both final columns when a rename collides two guarded columns onto one live name', async () => {
+		// `payments(id, amount)`, `appendOnly: ['amount']` -> `ledger(id,
+		// amount_cents, amount)`, `appendOnly: ['amount_cents', 'amount']`, with
+		// `ledger.amount_cents` renamed FROM `payments.amount`.
+		//
+		// Step 1 builds the re-created guard from each guarded column's
+		// PRE-rename (live) name: `amount_cents`'s live name is `amount`
+		// (that's what is being renamed), and the brand-new `amount` column's
+		// live name is also `amount` (nothing renames onto it, so
+		// `preRenameColumnName` returns it unchanged). `appendOnlyTrigger`
+		// de-duplicates its column list by name, so the trigger step 1 created
+		// named `"amount"` only once — covering just one of the two final
+		// columns — and `carriedAppendOnly` used to claim `after`'s full list
+		// regardless, so step 4 never noticed and never restated it. One of the
+		// two columns was permanently unguarded.
+		const before = sqliteTable('payments', {
+			id: integer('id').primaryKey(),
+			amount: integer('amount'),
+		});
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['amount'] }]])),
+		);
+		await DB.prepare(`insert into payments (id, amount) values (1, 500)`).run();
+
+		const after = sqliteTable('ledger', {
+			id: integer('id').primaryKey(),
+			amount_cents: integer('amount_cents'),
+			amount: text('amount'),
+		});
+		const diff = diffSnapshots(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['amount'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['amount_cents', 'amount'] }]])),
+			{ renamedTables: { payments: 'ledger' }, renamedColumns: { 'ledger.amount': 'amount_cents' } },
+		);
+		expect(diff.errors).toEqual([]);
+
+		await applyMigrations(runner, [
+			{ tag: 'm_collision', sql: renderMigration(diff) },
+		]);
+
+		const live = await introspect(runner);
+		const liveAppendOnly = live.tables.ledger?.appendOnly;
+		expect(Array.isArray(liveAppendOnly)).toBe(true);
+		expect(new Set(liveAppendOnly as readonly string[])).toEqual(new Set(['amount_cents', 'amount']));
+
+		// The pre-existing column, now renamed to `amount_cents`, is guarded.
+		await expect(
+			DB.prepare(`update ledger set amount_cents = 999 where id = 1`).run(),
+		).rejects.toThrow();
+		// The brand-new `amount` column (added by this migration) is guarded too.
+		await expect(DB.prepare(`update ledger set amount = 'x' where id = 1`).run()).rejects.toThrow();
+
+		const row = await runner.all<{ amount_cents: number }>(`select amount_cents from ledger where id = 1`);
+		expect(row[0]!.amount_cents).toBe(500);
+	});
+});

@@ -269,7 +269,11 @@ export function tableOptions(entries: readonly (readonly [Table, TableOptions])[
 	const byTable: Record<string, TableOptions> = {};
 	for (const [table, options] of entries) {
 		const name = getTableName(table);
-		if (byTable[name]) throw new Error(`tableOptions: "${name}" is declared twice.`);
+		// `Object.hasOwn`, not a truthiness check on `byTable[name]`: a table
+		// literally named `constructor` (or `toString`, `hasOwnProperty`, …)
+		// otherwise reads an inherited `Object.prototype` member — truthy — and
+		// throws "declared twice" on its very first, legitimate declaration.
+		if (Object.hasOwn(byTable, name)) throw new Error(`tableOptions: "${name}" is declared twice.`);
 		byTable[name] = options;
 	}
 	return { [TableOptionsBrand]: true, byTable };
@@ -621,7 +625,19 @@ export function createTable(t: Table, options: DDLOptions = {}): string {
 	const compositePk = extras.find((e): e is PrimaryKeyConstraint => e.kind === 'primaryKey');
 
 	const parts: string[] = columns.map((column) =>
-		columnDDL(column, compositePk === undefined, name, options.collate?.[column.name])
+		columnDDL(
+			column,
+			compositePk === undefined,
+			name,
+			// `options.collate` is a plain object a caller can pass in directly
+			// (it is public API, not something this module constructs), so a
+			// bracket lookup resolves an inherited `Object.prototype` member for
+			// a column literally named e.g. `constructor` or `toString` — a
+			// function, which is truthy and gets template-stringified straight
+			// into the DDL. `Object.hasOwn` restricts the read to keys the
+			// caller actually set.
+			options.collate && Object.hasOwn(options.collate, column.name) ? options.collate[column.name] : undefined,
+		)
 	);
 
 	if (compositePk) parts.push(primaryKeyDDL(compositePk.meta, name));
@@ -718,7 +734,13 @@ export function assertAppendOnlyColumns(t: Table, columns: readonly string[]): s
 			`tableOptions: "${name}" declares appendOnly columns that do not exist: ${unknown.join(', ')}. `
 			+ `SQLite accepts \`before update of\` on unknown columns without error, and the trigger then `
 			+ `never fires — the table would read as guarded while every UPDATE went through. `
-			+ `Known columns: ${[...known].sort().join(', ')}.`,
+			+ `Known columns: ${[...known].sort().join(', ')}. `
+			+ `If this is a schema typo, fix the column name. If it came from \`pull\` reading a live `
+			+ `"${name}_no_update" trigger that names ${unknown.length > 1 ? 'columns' : 'a column'} the table `
+			+ `does not have yet, a migration that created the guard was probably left unfinished (e.g. a batch `
+			+ `stopped between the guard's \`create trigger\` and the \`add column\` it names) — either finish `
+			+ `applying that migration so the column exists, or drop the trigger `
+			+ `(\`drop trigger "${name}_no_update"\`) and recreate it once the schema is settled.`,
 		);
 	}
 	return normalizeAppendOnlyColumns(columns);

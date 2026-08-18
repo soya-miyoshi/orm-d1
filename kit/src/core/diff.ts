@@ -768,6 +768,18 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			// generated migration can ever clear. Drop it under the name it
 			// actually has, and let the guard be re-created below if it is still
 			// wanted (that is what clearing `appendOnly` here arranges).
+			//
+			// Set inside the `staysAppendOnly` branch below when the guard just
+			// re-created does not actually cover the same column *set* `after`'s
+			// final names describe — see `liveGuarded`, further down, for why
+			// that can happen. Read after this `if (t.appendOnly)` block closes,
+			// when deciding what `carriedAppendOnly` may safely claim.
+			let liveGuardMismatch = false;
+			// The actual (deduplicated) column list the trigger below is created
+			// with, kept so `carriedAppendOnly` can hand step 4 a key that
+			// reflects what really exists right now rather than what `after`
+			// claims, whenever the two differ.
+			let liveGuardedActual: string[] | undefined;
 			if (t.appendOnly) {
 				// Re-creating the guard under the new name happens right here, in
 				// the same three-statement run as the rename and the drop — not
@@ -883,11 +895,23 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 						// the columns this filter had dropped.
 						const liveGuarded = finalGuarded
 							?.map((column) => preRenameColumnName(renamedColumns, renamed, column));
+						// Two distinct `after` column names can resolve to the same
+						// pre-rename/live name (one column renamed onto a name
+						// another guarded column is also being renamed through/to).
+						// `appendOnlyTrigger` de-duplicates its column list, so the
+						// trigger created below ends up naming fewer live columns
+						// than `finalGuarded` has entries — one of the two guarded
+						// columns loses its protection the moment SQLite repoints
+						// the surviving name across the later `RENAME COLUMN`, and
+						// nothing downstream would ever restate it: see
+						// `liveGuardMismatch` below.
+						const emittedGuarded = liveGuarded && liveGuarded.length > 0 ? liveGuarded : finalGuarded;
+						if (liveGuarded && finalGuarded && new Set(liveGuarded).size !== finalGuarded.length) {
+							liveGuardMismatch = true;
+							liveGuardedActual = emittedGuarded && [...new Set(emittedGuarded)];
+						}
 						statements.push({
-							sql: appendOnlyTrigger(
-								renamed,
-								liveGuarded && liveGuarded.length > 0 ? liveGuarded : finalGuarded,
-							),
+							sql: appendOnlyTrigger(renamed, emittedGuarded),
 							destructive: false,
 						});
 					}
@@ -898,8 +922,20 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			// later per-table pass sees no further change to make for it — it
 			// would otherwise treat the freshly-created trigger's presence as
 			// drift it still needs to reconcile.
+			//
+			// Not trusted when `liveGuardMismatch` fired: the trigger actually
+			// created above covers fewer columns (by name-set) than `after`'s
+			// final list, so claiming `after`'s list here would make step 4 see
+			// `previousGuard === nextGuard` and never restate the guard —
+			// leaving one of the two colliding columns permanently unguarded.
+			// Handed `liveGuardedActual` (what the trigger just created above
+			// really guards) instead of `after`'s list in that case, so step 4's
+			// `previousGuard` differs from `nextGuard` and it drops the
+			// mismatched trigger before recreating it with `after`'s final
+			// names — the same drop-then-create it already does for any other
+			// guard narrowing.
 			const carriedAppendOnly = t.appendOnly && after.tables[renamed]?.appendOnly
-				? after.tables[renamed]!.appendOnly
+				? (liveGuardMismatch ? (liveGuardedActual ?? true) : after.tables[renamed]!.appendOnly)
 				: false;
 			effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: carriedAppendOnly };
 		} else {

@@ -14,6 +14,22 @@ const indexOn = (name: string, column: Column<any>) => index(name).on(column);
 const snapshotOf = (...tables: Parameters<typeof snapshotFromSchema>[0] extends infer _ ? any[] : never): Snapshot =>
 	snapshotFromSchema(tables);
 
+describe('snapshotFromSchema collate sidecar', () => {
+	it('does not inject a bogus column for a stated collate name the table does not have', () => {
+		// `options.byTable[name]?.collate` is a plain object the sidecar file
+		// supplies. `columns[columnName]` used to be a plain bracket lookup: a
+		// stated collate for `toString` — a name no column here has — resolved
+		// `Object.prototype.toString` (a function, truthy) instead of `undefined`,
+		// so the `if (!existing) continue` guard never fired and the function got
+		// spread into a "column snapshot", injecting a bogus `toString` entry
+		// with none of `ColumnSnapshot`'s required fields.
+		const t = sqliteTable('people', { id: integer('id').primaryKey(), email: text('email') });
+		const snapshot = snapshotFromSchema([t], '', tableOptions([[t, { collate: { toString: 'nocase' } }]]));
+		expect(Object.keys(snapshot.tables['people']!.columns).sort()).toEqual(['email', 'id']);
+		expect(Object.hasOwn(snapshot.tables['people']!.columns, 'toString')).toBe(false);
+	});
+});
+
 describe('parsing a CREATE TABLE', () => {
 	it('reads a generated expression containing parentheses, and the mode after it', () => {
 		const sql = 'create table "t" ("name" text, "shout" text generated always as (upper("name")) stored)';

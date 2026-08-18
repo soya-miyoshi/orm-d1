@@ -445,6 +445,30 @@ describe('ddl generation', () => {
 		expect(none).not.toContain('collate');
 	});
 
+	it('does not resolve an inherited Object.prototype member for a column named like one', () => {
+		// `options.collate` is a plain `{}` a caller passes in directly. A
+		// bracket lookup (`options.collate?.[column.name]`) on a column literally
+		// named `constructor`, `toString`, `valueOf` or `hasOwnProperty` resolves
+		// an inherited `Object.prototype` function instead of `undefined` — which
+		// is truthy, so it used to get template-stringified straight into the
+		// DDL: `"constructor" text collate function Object() { [native code] }`.
+		const t = sqliteTable('weird', {
+			id: integer('id').primaryKey(),
+			constructor: text('constructor'),
+			toString: text('toString'),
+			valueOf: text('valueOf'),
+			hasOwnProperty: text('hasOwnProperty'),
+		});
+		const ddl = createTable(t, { collate: {} });
+		expect(ddl).toContain('"constructor" text');
+		expect(ddl).toContain('"toString" text');
+		expect(ddl).toContain('"valueOf" text');
+		expect(ddl).toContain('"hasOwnProperty" text');
+		expect(ddl).not.toContain('native code');
+		expect(ddl).not.toContain('function Object');
+		expect(ddl).not.toContain('collate');
+	});
+
 	it('derives an index name when none is given', () => {
 		const t = sqliteTable('t', { a: integer('a') }, (c) => [
 			// eslint-disable-next-line @typescript-eslint/no-unsafe-argument

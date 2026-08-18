@@ -343,6 +343,15 @@ export function snapshotFromSchema(
 		const collateOptions = options?.byTable[name]?.collate;
 		if (collateOptions) {
 			for (const [columnName, value] of Object.entries(collateOptions)) {
+				// `Object.hasOwn`, not a bracket-and-truthiness read: `collateOptions`
+				// is a plain object the sidecar file supplies, so a stated column
+				// name of `toString` (or `constructor`, `valueOf`, …) that the table
+				// does not actually have resolves `columns[columnName]` to an
+				// inherited `Object.prototype` member instead of `undefined` — the
+				// `if (!existing) continue` guard below then never fires, and
+				// spreading that function into a "column snapshot" injects a bogus
+				// entry with none of `ColumnSnapshot`'s required fields.
+				if (!Object.hasOwn(columns, columnName)) continue;
 				const existing = columns[columnName];
 				if (!existing) continue;
 				columns[columnName] = {
