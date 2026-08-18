@@ -1289,6 +1289,51 @@ items are documentation fixes.
 - **Prove it**: `kit/test/unit/snapshot-check-errors.test.ts` gained five cases (Drizzle `notInArray`/`inArray` over `[]`, one nested in Drizzle `and()`, one in a partial-index predicate, and a legitimate check + partial index that must still snapshot). Reverting the two tokens turns three of them red; the partial-index one passes either way, because `createIndex()`'s name derivation happens to render first — incidental, not designed, and `[F-028]` already flags that derivation as fragile.
 
 
+## Findings — iteration-8 batch E's final review (merged `96bcd12`)
+
+The approving review rebuilt the differential corpus from scratch (9 axes over collation
+spelling × name × position × 14 distractors × PK shape × member modifier × constraint-name
+quoting × extras × index shape; 5385 creatable seeds, 11 checks per side against a live D1
+binding, including the production `push` path applied to a populated table): **2653 strictly
+better than `main`, 2732 equal, 0 worse.** It also proved `blankLiterals` / `blankComments` /
+`blankIdentifierContents` span-length-preserving exhaustively over all 111,110 strings of
+length ≤5 from `{' " ` [ ] - / * \n a}`, which is what `matchCollateToken`'s offset trick
+rests on. The items below are gaps it found on the way; **none is a regression** — each
+behaves identically to or better than `main` — and the machinery this batch added makes them
+cheap to close.
+
+### [F-126] A `UNIQUE (…)` member name spelled as a string literal is unmatchable, and the rebuild drops the collation — status: todo — severity: **high** — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:1030`
+- **Defect**: the name reader has no `'…'` branch — the exact grammar rule (`ids ::= ID|STRING`) this batch cites to justify `collate 'nocase'` — and it reads the name out of `blanked`, where a literal's contents are erased, so `rawName` becomes whitespace and `matchUniqueClause` can never line the clause up with its automatic index.
+- **Failure scenario**: `create table "t" ("email" text, "v" text, unique ('email' collate nocase))`. Live rejects `'A@X.com'` after `'a@x.com'`; the snapshot member is `{"name":"email"}` with no collate, the rebuild renders `unique ("email")`, and the rebuilt table **accepts** the duplicate — case-insensitive uniqueness silently downgraded, the founding bug class.
+- **Fix**: add the `'…'` alternation and the same read-from-`raw`-at-the-same-offset trick `matchCollateToken` already uses.
+
+### [F-127] The same hole on the PK clause loses `AUTOINCREMENT` — status: todo — severity: **high** — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:928,937`
+- **Failure scenario**: `create table "t" ("a" integer, "v" text, primary key ('a' autoincrement))` — `sqlite_sequence` exists, so the table really is AUTOINCREMENT, but `hasAutoincrement`'s PK-clause fallback (`:438`) can never match the whitespace name, the snapshot says `autoincrement: false`, and the rebuild drops it, so SQLite starts reusing deleted rowids. The collation on the same clause survives, because the PK path maps collations positionally.
+
+### [F-128] The first `COLLATE` on a column wins in the parser; the last wins in SQLite — status: todo — severity: med — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:547` (`collate === undefined` in the loop guard stops at the first clause)
+- **Failure scenario**: `create table "t" ("a" text collate nocase collate rtrim)` — the live column's effective collation is `RTRIM` (probe index), the snapshot says `nocase`, so any rebuild silently re-collates the column and every index over it.
+
+### [F-129] `hasAutoincrement` truncates the column span at the first *raw* comma, so a nested comma hides the keyword — status: todo — severity: med — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:407`
+- **Defect**: the one anchor this batch did not convert to the depth-aware scan it introduced for the siblings — `parseColumnCollation` (`:519` onward) uses a balanced scan and gets this right.
+- **Failure scenario**: `create table "t" ("id" integer check ("id" in (1, 2)) primary key autoincrement, "v" text)` — live has `sqlite_sequence`, both branches report `autoincrement: false`, the rebuild reuses rowids. `parseGenerated`'s `/^[^,]*?generated\s+always\s+as\s*\(/` (`:597`) has the same shape and is already `[F-120]`. The `depths` array is already computed and passed in, so scanning to the first depth-1 comma is local.
+
+### [F-130] `DESC`/`ASC` on a PK or `UNIQUE` constraint member is parsed past and dropped — status: todo — severity: med — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:938-942`, `:1043`; never re-emitted at `kit/src/core/snapshot.ts:559,577`
+- **Failure scenario**: 495 of 5385 corpus seeds. `primary key ("id" collate NOCASE desc, "n")` — live PK index `id:NOCASE:desc=1`, rebuilt `desc=0`. On `WITHOUT ROWID` it also flips the direction of the PK columns appended to every explicit index, so a query like `order by club_id asc, starts_at desc` that the live PK satisfies index-only needs a temp B-tree sort after an unrelated migration. Uniqueness is unaffected; direction is not.
+
+### [F-131] `[F-119]`'s consequence is worse than recorded — it rewrites data, not metadata — status: todo — severity: **high** (re-graded) — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts:1238`
+- **Confirmed**: `"id" integer primary key desc` is *not* a rowid alias (a `sqlite_autoindex_t_1` exists) and legally holds `NULL`. Both branches snapshot `notNull: true` and render `"id" INTEGER primary key not null`, which also drops the `DESC` and turns the column **into** a rowid alias — so the 12-step rebuild's `insert … select` does not fail, it **silently rewrites the NULL id to an auto-assigned integer**. `[F-119]` graded this "low: forces notNull"; it is a data change.
+
+### [F-132] A comment in `snapshot.ts` describes an ordering the code does not produce — status: todo — severity: low — area: kit/snapshot
+- **Where**: `kit/src/core/snapshot.ts:577,585,593`
+- "an introspected snapshot … falls each group back to its own `Record`'s insertion order, exactly as before" is false: with every `declarationOrder` undefined the fallback is a *per-group* index and the stable sort interleaves the kinds (`u1, fk1, ck1, u2, fk2, ck2`, verified). Relative order within each kind is preserved, so `sqlite_autoindex_<table>_<n>` numbering and semantics are unchanged — no correctness impact, but it will mislead the next reader.
+
+
 ## Audit areas
 
 Unchecked areas, roughly in descending order of what a bug there would cost. One
