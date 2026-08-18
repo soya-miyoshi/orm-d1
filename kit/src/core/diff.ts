@@ -446,7 +446,16 @@ export const carryForwardCollations = (before: Snapshot, after: Snapshot, option
 		const afterTable = tables[targetName];
 		if (!afterTable) continue;
 
-		const columnRenames: Record<string, string> = {};
+		// `Object.create(null)`, not `{}`: keyed by a bare column name built from
+		// this diff's own renames, and a column literally named `__proto__` is
+		// legal SQL — a plain object's `columnRenames['__proto__'] = value`
+		// assignment sets the object's *prototype* instead of adding an entry,
+		// and every subsequent `columnRenames[someName]` READ (elsewhere in this
+		// file, on a plain `{}`) resolves the inherited accessor instead of
+		// `undefined` for that one name — silently corrupting the rename map for
+		// exactly the column this whole fix exists to stop losing. Same hazard,
+		// same fix, as the column/constraint maps in `snapshot.ts`/`introspect.ts`.
+		const columnRenames: Record<string, string> = Object.create(null);
 		for (const [key, value] of Object.entries(renamedColumns)) {
 			const [table, column] = key.split('.');
 			if (table === targetName && column) columnRenames[column] = value;
@@ -906,9 +915,45 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 						// nothing downstream would ever restate it: see
 						// `liveGuardMismatch` below.
 						const emittedGuarded = liveGuarded && liveGuarded.length > 0 ? liveGuarded : finalGuarded;
-						if (liveGuarded && finalGuarded && new Set(liveGuarded).size !== finalGuarded.length) {
-							liveGuardMismatch = true;
-							liveGuardedActual = emittedGuarded && [...new Set(emittedGuarded)];
+						// The check above (do two `after` names collapse onto one live
+						// name) only catches one direction. The other direction is
+						// just as real: an `after`-guarded column's own name can be
+						// the SOURCE of a rename this same diff performs (e.g. the
+						// expand/contract pattern — rename the live column aside,
+						// then add a fresh column back under its old name). SQLite
+						// repoints `UPDATE OF` across `RENAME COLUMN` by column
+						// identity, so the guard created here under that live name
+						// silently follows the rename onto the column being renamed
+						// AWAY, not the one that ends up holding the name in
+						// `finalGuarded`. The only predicate that catches both
+						// directions is: after every rename this diff performs lands,
+						// does the guard's column set still equal `finalGuarded`?
+						// Forward-map each live name this trigger actually guards
+						// through `renamedColumns` (a rename in this same diff moves
+						// it; nothing else does) and compare as sets.
+						if (liveGuarded && finalGuarded) {
+							const guardedAfterRename = new Set(
+								liveGuarded.map((column) => {
+									const key = `${renamed}.${column}`;
+									return Object.hasOwn(renamedColumns, key) ? renamedColumns[key]! : column;
+								}),
+							);
+							const wanted = new Set(finalGuarded);
+							const setsMatch = guardedAfterRename.size === wanted.size
+								&& [...guardedAfterRename].every((column) => wanted.has(column));
+							if (!setsMatch) {
+								liveGuardMismatch = true;
+								// Not `emittedGuarded` (the live names the trigger names
+								// right now, pre-rename): step 4 compares this against
+								// `after`'s own final names to decide whether to restate
+								// the guard, so it needs the columns this trigger will
+								// actually cover once every rename in this diff has landed
+								// — i.e. `guardedAfterRename` — or the SOURCE-collision case
+								// above (where the live guard silently ends up covering the
+								// wrong, renamed-away column) would compare equal to
+								// `after`'s list and never get corrected.
+								liveGuardedActual = [...guardedAfterRename];
+							}
 						}
 						statements.push({
 							sql: appendOnlyTrigger(renamed, emittedGuarded),
@@ -1093,7 +1138,9 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		const next = after.tables[name]!;
 		if (!previous) continue;
 
-		const columnRenames: Record<string, string> = {};
+		// `Object.create(null)` — see the identical comment at this function's
+		// other `columnRenames` construction above.
+		const columnRenames: Record<string, string> = Object.create(null);
 		for (const [key, value] of Object.entries(renamedColumns)) {
 			const [table, column] = key.split('.');
 			if (table === name && column) columnRenames[column] = value;

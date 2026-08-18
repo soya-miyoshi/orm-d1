@@ -266,7 +266,17 @@ export interface TableOptionsMap {
 }
 
 export function tableOptions(entries: readonly (readonly [Table, TableOptions])[]): TableOptionsMap {
-	const byTable: Record<string, TableOptions> = {};
+	// `Object.create(null)`, not `{}` with an `Object.hasOwn` check alone: the
+	// `hasOwn` guard below stops a table named `constructor`/`toString`/… from
+	// reading back a truthy inherited member, but a table literally named
+	// `__proto__` assigned through a plain object sets the object's *prototype*
+	// instead of adding an entry — `byTable['__proto__'] = options` never
+	// becomes an own property at all, so `Object.hasOwn` never sees it and two
+	// declarations for the same `__proto__`-named table never trip "declared
+	// twice". A null-prototype object has no `__proto__` accessor, so the
+	// assignment is just data, the same way the DDL/snapshot column and
+	// constraint maps already are for the identical reason.
+	const byTable: Record<string, TableOptions> = Object.create(null);
 	for (const [table, options] of entries) {
 		const name = getTableName(table);
 		// `Object.hasOwn`, not a truthiness check on `byTable[name]`: a table

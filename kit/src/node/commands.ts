@@ -597,6 +597,33 @@ export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
 				);
 			}
 		}
+
+		// The live guard's own `UPDATE OF <cols>` list, read back verbatim by
+		// `appendOnlyTriggerGuard` (`core/introspect.ts`) with no existence check
+		// against the live table — SQLite accepts (and silently never fires
+		// against) `before update of nosuchcol` without complaint, so a stale
+		// trigger left over from a dropped/renamed column, or one hand-written
+		// outside orm-d1, can name a column the table does not have. Carrying
+		// that straight into the sidecar (as `renderTableOptionsModule` used to)
+		// writes an `appendOnly` list `assertAppendOnlyColumns` (`src/ddl.ts`)
+		// then rejects outright — every later `generate`/`check` throws
+		// uncaught, out of a `pull` that itself reported success. Named here so
+		// the operator sees it while `pull` still has the context to say it,
+		// mirroring `sidecarDisagreementWarnings`' collate-column-does-not-exist
+		// case just above.
+		if (Array.isArray(table.appendOnly)) {
+			const ghosts = table.appendOnly.filter((c) => !table.columns[c]);
+			if (ghosts.length > 0) {
+				warnings.push(
+					`"${table.name}"'s live append-only guard names ${
+						ghosts.map((c) => `"${c}"`).join(', ')
+					} — a column ${ghosts.length > 1 ? 'names' : 'name'} the table does not have. The rendered `
+						+ `sidecar drops ${ghosts.length > 1 ? 'them' : 'it'} rather than writing an appendOnly `
+						+ 'declaration a later generate/check would reject outright; the live trigger itself is stale '
+						+ 'and should be dropped or corrected by hand.',
+				);
+			}
+		}
 	}
 	return warnings;
 }
@@ -1003,7 +1030,24 @@ export function renderTableOptionsModule(
 		// happens).
 		if (table.strict) optionParts.push('strict: true');
 		if (table.withoutRowid) optionParts.push('withoutRowid: true');
-		if (table.appendOnly) optionParts.push(`appendOnly: ${renderAppendOnly(table.appendOnly)}`);
+		if (table.appendOnly) {
+			// The live guard's `UPDATE OF <cols>` list is read back verbatim by
+			// introspection with no existence check (SQLite itself does not
+			// enforce one — see `unexpressibleTableOptionWarnings`'s matching
+			// comment). Writing it into the sidecar as-is produces an
+			// `appendOnly` declaration `assertAppendOnlyColumns` (`src/ddl.ts`)
+			// rejects outright the moment any later command loads it — the same
+			// hazard the `collate` branch below already guards against for a
+			// column the live table lacks. Filtered down here, the same way,
+			// with the drop reported by `unexpressibleTableOptionWarnings`
+			// rather than silently.
+			const guarded = table.appendOnly === true
+				? true
+				: table.appendOnly.filter((c) => table.columns[c]);
+			if (guarded === true || guarded.length > 0) {
+				optionParts.push(`appendOnly: ${renderAppendOnly(guarded)}`);
+			}
+		}
 
 		// Live-derived values first, then the one declared spelling live cannot
 		// produce: an explicit `null` retirement. It overwrites a live entry for

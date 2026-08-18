@@ -376,3 +376,71 @@ describe('sidecarDisagreementWarnings covers both directions', () => {
 		})).toEqual([]);
 	});
 });
+
+describe('pull against a live append-only guard naming a column the table does not have', () => {
+	// [round 5] SQLite accepts (and simply never fires) `before update of
+	// nosuchcol on t` — verified by hand, and the same failure shape as
+	// `docs/35`. `appendOnlyTriggerGuard` (`core/introspect.ts`) reads that
+	// column list back verbatim, with no existence check, so a stale trigger
+	// (left over from a dropped/renamed column, or hand-written outside
+	// orm-d1) hands `renderTableOptionsModule` a ghost column name. Writing it
+	// into the sidecar used to succeed silently — `pull --local --force`
+	// exited 0 and printed only the generic "Wrote table-options.ts" line —
+	// and the very next `generate`/`check` threw uncaught out of `run()`,
+	// because `assertAppendOnlyColumns` (`src/ddl.ts`) rejects a column list
+	// naming something the schema does not have.
+	it('drops the ghost column from the rendered sidecar and warns about it', async () => {
+		const dir = project(
+			'create table users (id integer primary key, at integer);\n'
+				+ 'create trigger users_no_update before update of "at", "ghost" on users\n'
+				+ 'begin\n'
+				+ "\tselect raise(abort, 'users is append-only: UPDATE is prohibited');\n"
+				+ 'end;',
+		);
+
+		const { code, log } = await inProject(dir, ['pull', '--local']);
+		expect(code).toBe(0);
+
+		// Warned, not silent.
+		expect(log).toMatch(/live append-only guard names "ghost".*does not have/);
+
+		// The ghost column does not make it into the written sidecar…
+		const sidecar = readFileSync(join(dir, 'table-options.ts'), 'utf8');
+		expect(sidecar).not.toContain('ghost');
+		expect(sidecar).toContain(`appendOnly: ["at"]`);
+
+		// …so `validateTableOptions` (what `generate`/`check` run the sidecar
+		// through before doing anything else) accepts what was written, instead
+		// of rejecting it the way it rejects the raw live column list.
+		const before = sqliteTable('users', { id: integer('id').primaryKey(), at: integer('at') });
+		expect(validateTableOptions(before, { appendOnly: ['at'] })).toBeUndefined();
+		expect(validateTableOptions(before, { appendOnly: ['at', 'ghost'] })).toBeUndefined();
+		// (validateTableOptions itself only checks `collate` against the table's
+		// columns — `appendOnly`'s existence check lives in
+		// `assertAppendOnlyColumns`, exercised via `createSchema` at
+		// `generate`/`check` time, which is the uncaught throw this fix
+		// prevents.)
+	});
+
+	it('drops the whole appendOnly key when every guarded column is a ghost', async () => {
+		// `email collate nocase` forces a sidecar to be written at all (a
+		// table-less-`appendOnly` `tableOptions()` sidecar is otherwise not
+		// worth writing) — the assertion is that `appendOnly` itself does not
+		// appear in it, not that nothing does.
+		const dir = project(
+			'create table users (id integer primary key, email text collate nocase);\n'
+				+ 'create trigger users_no_update before update of "ghost1", "ghost2" on users\n'
+				+ 'begin\n'
+				+ "\tselect raise(abort, 'users is append-only: UPDATE is prohibited');\n"
+				+ 'end;',
+		);
+
+		const { code, log } = await inProject(dir, ['pull', '--local']);
+		expect(code).toBe(0);
+		expect(log).toMatch(/live append-only guard names "ghost1", "ghost2".*does not have/);
+
+		const sidecar = readFileSync(join(dir, 'table-options.ts'), 'utf8');
+		expect(sidecar).not.toContain('appendOnly');
+		expect(sidecar).toContain('nocase');
+	});
+});

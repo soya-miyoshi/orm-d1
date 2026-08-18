@@ -238,6 +238,20 @@ describe('introspection', () => {
 				.toEqual(Object.keys(declared.tables[name]!.columns));
 		}
 	});
+
+	// [round 5] `__proto__` is a legal column name in real SQLite — verified
+	// here against a real D1 binding, not just Node's `node:sqlite`, since this
+	// whole class of bug is exactly the shape `test/workers/` exists to catch
+	// (a plain `{}` used as a per-table column map drops the entry silently,
+	// with introspection none the wiser). `introspect`'s own column map used to
+	// be one of those plain objects (`kit/src/core/introspect.ts`).
+	it('reads back a live column literally named __proto__', async () => {
+		await DB.prepare('create table "t" ("id" integer primary key, "__proto__" text)').run();
+
+		const snapshot = await introspect(runner);
+		expect(Object.hasOwn(snapshot.tables.t!.columns, '__proto__')).toBe(true);
+		expect(snapshot.tables.t!.columns['__proto__']).toMatchObject({ name: '__proto__', type: 'text' });
+	});
 });
 
 describe('batching a large migration cannot cut a table rebuild in half (finding 1)', () => {
@@ -1195,5 +1209,58 @@ describe('a rename that reuses a live column name loses no guard', () => {
 
 		const row = await runner.all<{ amount_cents: number }>(`select amount_cents from ledger where id = 1`);
 		expect(row[0]!.amount_cents).toBe(500);
+	});
+});
+
+describe('a rename whose after-guarded name is the SOURCE of another rename', () => {
+	it('guards the final column, not the one renamed away from it', async () => {
+		// `t(id, x integer)`, `appendOnly: ['x']` -> `u(id, y integer, x text)`,
+		// `appendOnly: ['x']`, with `u.y` renamed FROM `t.x` (the expand/contract
+		// pattern: rename the old column aside, add a fresh column back under
+		// its original name).
+		//
+		// The collision check in step 1 only caught the OTHER direction (two
+		// `after` names collapsing onto one live name). Here it is the live name
+		// itself that collides with a rename's source: `finalGuarded` is
+		// `['x']`, and `preRenameColumnName` maps it back to the live column
+		// `"x"` unchanged (nothing in `renamedColumns` has `'x'` as its target —
+		// `'u.x'` maps TO `'y'`, not the reverse), so step 1 names the guard
+		// `before update of "x" on "u"` — the column about to be renamed AWAY —
+		// and SQLite's own auto-repointing then carries that guard onto `"y"`
+		// when the rename lands, leaving the fresh `"x"` (which is what
+		// `after`'s `appendOnly: ['x']` actually means) completely unguarded.
+		const before = sqliteTable('t', { id: text('id').primaryKey(), x: integer('x') });
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['x'] }]])),
+		);
+		await DB.prepare(`insert into t (id, x) values ('a', 7)`).run();
+
+		const after = sqliteTable('u', {
+			id: text('id').primaryKey(),
+			y: integer('y'),
+			x: text('x'),
+		});
+		const diff = diffSnapshots(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['x'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['x'] }]])),
+			{ renamedTables: { t: 'u' }, renamedColumns: { 'u.x': 'y' } },
+		);
+		expect(diff.errors).toEqual([]);
+
+		await applyMigrations(runner, [{ tag: 'm_source_collision', sql: renderMigration(diff) }]);
+
+		const live = await introspect(runner);
+		expect(new Set((live.tables.u?.appendOnly ?? []) as readonly string[])).toEqual(new Set(['x']));
+
+		// The fresh `x` column (what the schema actually asks to guard) is
+		// protected.
+		await expect(DB.prepare(`update u set x = 'blocked' where id = 'a'`).run()).rejects.toThrow();
+		// `y` (the renamed-away original column) is NOT guarded by the schema
+		// any more — the migration must not leave it protected instead.
+		await expect(DB.prepare(`update u set y = 99 where id = 'a'`).run()).resolves.toBeDefined();
+
+		const row = await runner.all<{ y: number }>(`select y from u where id = 'a'`);
+		expect(row[0]!.y).toBe(99);
 	});
 });

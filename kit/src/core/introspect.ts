@@ -1099,7 +1099,12 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 		if (row.type !== 'table' || isInternalTable(row.name)) continue;
 		const createSql = row.sql ?? '';
 
-		const columns: Record<string, ColumnSnapshot> = {};
+		// `Object.create(null)`, not `{}` — see `snapshot.ts`'s `snapshotFromSchema`
+		// for the hazard: a live column literally named `__proto__` (SQLite
+		// accepts it as an identifier) assigned through a plain object sets the
+		// prototype instead of adding an entry, and the column silently vanishes
+		// from what introspection reports.
+		const columns: Record<string, ColumnSnapshot> = Object.create(null);
 		const info = input.tableInfo[row.name] ?? [];
 		const pkColumns = info.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk);
 		const compositePk = pkColumns.length > 1;

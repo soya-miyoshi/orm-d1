@@ -2948,6 +2948,25 @@ describe('table options that SQLite would reject', () => {
 		const t = sqliteTable('dup', { id: text('id').primaryKey() });
 		expect(() => tableOptions([[t, { strict: true }], [t, { strict: false }]])).toThrow(/declared twice/);
 	});
+
+	// A plain `{}` byTable map: `byTable['__proto__'] = options` sets the
+	// object's *prototype* instead of adding an own property, so
+	// `Object.hasOwn(byTable, '__proto__')` is false both before AND after the
+	// "first" declaration — the duplicate-detection guard above never fires,
+	// silently accepting a table declared twice (and only the second entry's
+	// options end up anywhere findable, via the prototype chain, not `byTable`
+	// itself). `Object.create(null)` makes the assignment just data.
+	it('rejects a duplicate declaration for a table literally named __proto__', () => {
+		const t = sqliteTable('__proto__', { id: text('id').primaryKey() });
+		expect(() => tableOptions([[t, { strict: true }], [t, { strict: false }]])).toThrow(/declared twice/);
+	});
+
+	it('carries a single __proto__-named table declaration through byTable as an own entry', () => {
+		const t = sqliteTable('__proto__', { id: text('id').primaryKey() });
+		const map = tableOptions([[t, { strict: true }]]);
+		expect(Object.hasOwn(map.byTable, '__proto__')).toBe(true);
+		expect(map.byTable['__proto__']).toEqual({ strict: true });
+	});
 });
 
 describe('splitting a migration that contains a trigger', () => {

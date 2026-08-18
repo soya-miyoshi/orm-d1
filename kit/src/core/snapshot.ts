@@ -331,7 +331,16 @@ export function snapshotFromSchema(
 
 	for (const t of tables) {
 		const name = getTableName(t);
-		const columns: Record<string, ColumnSnapshot> = {};
+		// `Object.create(null)`, not `{}` — same hazard as `indexes`/`foreignKeys`/
+		// etc. below, just for the column name itself instead of a constraint
+		// name. A column literally named `__proto__` (legal SQL, legal in the
+		// schema DSL: `sqliteTable('t', { p: text('__proto__') })`) assigned
+		// through a plain object sets the object's *prototype* instead of adding
+		// an entry — the column silently vanishes from the snapshot, with no
+		// error, and `createTableFromSnapshot`/`diffSnapshots` both read the same
+		// dropped snapshot back, so a rebuild for any unrelated reason silently
+		// drops the column and its data.
+		const columns: Record<string, ColumnSnapshot> = Object.create(null);
 		for (const column of Object.values(getTableColumns(t)) as Column<any>[]) {
 			columns[column.name] = columnSnapshot(column);
 		}
@@ -943,7 +952,12 @@ export const typeAffinity = (declared: string): 'integer' | 'text' | 'blob' | 'r
 };
 
 export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
-	const columns: Record<string, CanonicalColumn> = {};
+	// `Object.create(null)`, not `{}` — same hazard as `snapshotFromSchema`'s
+	// own column map: a column literally named `__proto__` assigned through a
+	// plain object sets the prototype instead of adding an entry, dropping it
+	// from the canonical comparison `requiresRecreate` (`diff.ts`) uses to
+	// decide whether a table needs rebuilding.
+	const columns: Record<string, CanonicalColumn> = Object.create(null);
 	const uniques: (readonly CanonicalUniqueMember[])[] = [];
 	const foreignKeys: string[] = [];
 	// Same member shape `uniques` uses ({ name, collate? }), in declared
