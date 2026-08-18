@@ -56,14 +56,29 @@ export interface RoundtripPlan {
 	readonly incomplete: boolean;
 }
 
+/**
+ * `Object.fromEntries` with a null prototype.
+ *
+ * Every map built here is keyed by a table or column name the *database* chose,
+ * and `diff.ts` bracket-reads them (`after.columns[target]`,
+ * `next.columns[target]`). A plain object resolves `Object.prototype` members
+ * for a column named `constructor`, which makes `recreateTable` carry a column
+ * the new table does not have — `insert into "__new_t" (…, "constructor")
+ * select …` against a table without it — and makes a dropped one silently skip
+ * its `drop column`. See `reviveSnapshot` in `snapshot.ts` for the same fix.
+ */
+const fromEntriesNullProto = <T>(entries: readonly (readonly [string, T])[]): Record<string, T> =>
+	Object.assign(Object.create(null), Object.fromEntries(entries));
+
 /** A copy of `snapshot` with every foreign key pointing into `targets` removed. */
 const withoutReferencesTo = (snapshot: Snapshot, targets: ReadonlySet<string>): Snapshot => {
-	const tables: Record<string, TableSnapshot> = {};
+	// Keyed by table name, which the database chose — see `reviveSnapshot`.
+	const tables: Record<string, TableSnapshot> = Object.create(null);
 	for (const [name, table] of Object.entries(snapshot.tables)) {
-		const foreignKeys = Object.fromEntries(
+		const foreignKeys = fromEntriesNullProto(
 			Object.entries(table.foreignKeys).filter(([, fk]) => !targets.has(fk.tableTo)),
 		);
-		const columns = Object.fromEntries(
+		const columns = fromEntriesNullProto(
 			Object.entries(table.columns).map(([columnName, column]) => {
 				if (!column.references || !targets.has(column.references.tableTo)) return [columnName, column];
 				const { references: _dropped, ...rest } = column;
@@ -187,8 +202,8 @@ export function roundtripPlan(before: Snapshot, after: Snapshot, table: string):
 		// detached so these tables can still be rebuilt.
 		const merged: Snapshot = {
 			...current,
-			tables: Object.fromEntries(
-				Object.entries(current.tables).map(([name, t]) => [
+			tables: fromEntriesNullProto(
+				Object.entries(current.tables).map(([name, t]): [string, TableSnapshot] => [
 					name,
 					restored.has(name) ? after.tables[name]! : t,
 				]),
@@ -212,7 +227,7 @@ export function roundtripPlan(before: Snapshot, after: Snapshot, table: string):
 		// the plan as a spurious (and sometimes destructive) recreate.
 		const scopedBefore: Snapshot = {
 			...before,
-			tables: Object.fromEntries(
+			tables: fromEntriesNullProto(
 				Object.entries(before.tables).filter(([name]) => restored.has(name)),
 			),
 		};

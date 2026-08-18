@@ -4,16 +4,21 @@
  * Node runs TypeScript directly, so no bundler is needed — the schema is a
  * value, not something to parse. One wrinkle: a `.ts` file in a project
  * without `"type": "module"` is loaded as CommonJS, and its `import`
- * statements fail. Copying it to a sibling `.mts` forces the ESM loader while
- * keeping bare and relative specifiers resolving from the project — which is
- * why the copy has to sit next to the original.
+ * statements fail. Copying it to a `.mts` shim forces the ESM loader. The
+ * shim is written under the OS temp directory (`[F-038]`) rather than next to
+ * the original — a copy left inside the user's source tree by a crash between
+ * the write and cleanup becomes an importable duplicate a `**\/*.mts` glob in
+ * a build or test config would pick up — and `shimOrigins` in
+ * `registerResolveHook` below is what still lets the shim's own relative
+ * imports resolve against the original file's directory.
  */
-import { copyFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 // `registerHooks` is Node 22.15+, which is why the package's `engines` says so:
 // a missing named export from a builtin is a link-time SyntaxError, so an older
 // runtime would fail to load the CLI at all rather than fail on first use.
 import { registerHooks } from 'node:module';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -38,6 +43,33 @@ let hooksRegistered = false;
 
 const CANDIDATE_SUFFIXES = ['.ts', '.mts', '.cts', '.js', '.mjs', '/index.ts', '/index.mts', '/index.js'];
 
+/**
+ * [F-038] A `.mts` shim (see {@link importModule}) lives in a scratch
+ * directory outside the user's source tree, so a sibling relative import it
+ * makes (`./helpers`) has to resolve as though the shim were still sitting
+ * next to the file it copies — not against the scratch directory it actually
+ * sits in. Keyed by the shim's own file URL, valued with the *original*
+ * module's path, and set right before importing the shim.
+ */
+const shimOrigins = new Map<string, string>();
+
+/**
+ * A relative import spelled with a JavaScript extension that only exists as
+ * TypeScript on disk — `./schema.js` for `schema.ts`.
+ *
+ * This is what TypeScript's `moduleResolution: nodenext` requires a relative
+ * import to be spelled as (`TS2835`), and what the `tableOptions` sidecar
+ * `pull` writes therefore has to say about the `.ts` schema module next to it
+ * (`cli.ts`'s `relativeSpecifier`). Node's own resolver would reject it: the
+ * `.js` file is not there. Mapped back to the real source extension here, the
+ * same way the extension-less case below is.
+ */
+const JS_TO_TS_SUFFIXES: Record<string, readonly string[]> = {
+	'.js': ['.ts', '.tsx'],
+	'.mjs': ['.mts'],
+	'.cjs': ['.cts'],
+};
+
 const registerResolveHook = (): void => {
 	if (hooksRegistered) return;
 	hooksRegistered = true;
@@ -45,20 +77,68 @@ const registerResolveHook = (): void => {
 	registerHooks({
 		resolve(specifier, context, nextResolve) {
 			const relative = specifier.startsWith('./') || specifier.startsWith('../');
-			// Anything with an extension, and every bare specifier, is left to
-			// Node — rewriting those would shadow real packages.
-			if (!relative || /\.[cm]?[jt]sx?$/.test(specifier)) return nextResolve(specifier, context);
-
 			const parentUrl = context.parentURL;
-			if (!parentUrl?.startsWith('file:')) return nextResolve(specifier, context);
+			const origin = parentUrl ? shimOrigins.get(parentUrl) : undefined;
 
-			const base = join(dirname(fileURLToPath(parentUrl)), specifier);
+			// [F-038 follow-up] A *bare* specifier is still Node's business —
+			// rewriting one would shadow a real package — but when the importer is
+			// a shim sitting in a scratch directory, the node_modules walk Node
+			// starts from that directory never reaches the project's own
+			// node_modules, so every bare import in a schema loaded through the
+			// shim failed with `Cannot find package`. Forward it with the
+			// *original* file as the parent instead, so the walk starts where the
+			// module really lives; Node still does the resolving.
+			if (!relative) {
+				if (origin) return nextResolve(specifier, { ...context, parentURL: pathToFileURL(origin).href });
+				return nextResolve(specifier, context);
+			}
+
+			if (!parentUrl?.startsWith('file:')) return nextResolve(specifier, context);
+			const parentDir = origin ? dirname(origin) : dirname(fileURLToPath(parentUrl));
+
+			// Every remaining branch resolves against `parentDir` — the directory
+			// of the *original* importing file, not of the shim Node thinks is
+			// the parent. Handing `nextResolve` the specifier as written makes
+			// Node resolve it against the scratch directory the shim lives in,
+			// where nothing relative to the real module exists. Only when the
+			// target is actually there: otherwise fall through unchanged, so
+			// Node produces its own (better) error for a genuinely missing file.
+			const againstParent = (spec: string): string | undefined => {
+				const candidate = join(parentDir, spec);
+				return existsSync(candidate) ? pathToFileURL(candidate).href : undefined;
+			};
+
+			// A relative specifier that already names a *TypeScript* extension is
+			// resolvable as written — but still only from the right directory.
+			if (/\.[cm]?tsx?$/.test(specifier)) {
+				return nextResolve(againstParent(specifier) ?? specifier, context);
+			}
+
+			const jsExtension = Object.keys(JS_TO_TS_SUFFIXES).find((ext) => specifier.endsWith(ext));
+			if (jsExtension) {
+				const base = join(parentDir, specifier);
+				// Only when the file it names is genuinely absent: a project with
+				// real emitted `.js` next to its `.ts` must keep resolving to the
+				// `.js` Node would have picked.
+				if (existsSync(base)) return nextResolve(pathToFileURL(base).href, context);
+				const stem = base.slice(0, base.length - jsExtension.length);
+				for (const suffix of JS_TO_TS_SUFFIXES[jsExtension]!) {
+					if (existsSync(stem + suffix)) return nextResolve(pathToFileURL(stem + suffix).href, context);
+				}
+				return nextResolve(againstParent(specifier) ?? specifier, context);
+			}
+
+			const base = join(parentDir, specifier);
 			for (const suffix of CANDIDATE_SUFFIXES) {
 				if (existsSync(base + suffix)) {
 					return nextResolve(pathToFileURL(base + suffix).href, context);
 				}
 			}
-			return nextResolve(specifier, context);
+			// No TypeScript source under any candidate suffix — but the specifier
+			// may name a file that needs no suffix at all (a `.json` imported with
+			// an import attribute, say), which still has to be found next to the
+			// original importer rather than next to the shim.
+			return nextResolve(againstParent(specifier) ?? specifier, context);
 		},
 	});
 };
@@ -76,12 +156,41 @@ export async function importModule<T = Record<string, unknown>>(path: string): P
 	} catch (error) {
 		if (!isModuleSyntaxError(error) || !/\.[cm]?ts$/.test(path)) throw error;
 
-		const shim = join(dirname(path), `.orm-d1-${process.pid}-${shimCounter++}.mts`);
-		await copyFile(path, shim);
+		// [F-038] Written under the OS temp directory, not next to the original —
+		// a copy inside the user's source tree left there by a crash or SIGKILL
+		// between the write and the `finally` below (which never runs) becomes an
+		// importable duplicate of the schema that a `**/*.mts` glob in a build or
+		// test config picks up. `shimOrigins` (above) is what lets a relative
+		// import from *inside* the shim still resolve as though it were sitting
+		// next to the original.
+		// `mkdtemp`, not a fixed `join(tmpdir(), 'orm-d1-kit-import')`: on a shared
+		// `/tmp` a fixed name plus a `<pid>-<counter>` file name is entirely
+		// predictable, and neither `mkdir(recursive)` nor `copyFile` is safe
+		// there — `mkdir` accepts (and does not re-mode) a directory another user
+		// already owns, and `copyFile` follows a symlink planted at the
+		// destination, so an attacker could win the race between the write and
+		// the `import()` on the next line to get arbitrary file write and code
+		// execution. `mkdtemp` creates a fresh, unguessable directory owned by
+		// this process at mode 0700, and the write below is exclusive
+		// (`flag: 'wx'`, which is `O_EXCL|O_NOFOLLOW`-equivalent for this
+		// purpose: it fails rather than following or truncating anything that is
+		// already there). It also removes the availability failure of the fixed
+		// path — an `orm-d1-kit-import` left behind by another user made every
+		// shim import fail with EACCES.
+		const scratchDir = await mkdtemp(join(tmpdir(), 'orm-d1-kit-import-'));
+		// `tmpdir()` is a symlink on macOS (`/var` -> `/private/var`); Node's ESM
+		// loader reports `context.parentURL` against the resolved real path, so
+		// `shimOrigins` has to be keyed the same way or the lookup below misses.
+		const realScratchDir = await realpath(scratchDir);
+		const shim = join(realScratchDir, `shim-${shimCounter++}.mts`);
+		await writeFile(shim, await readFile(path), { flag: 'wx' });
+		const shimUrl = pathToFileURL(shim).href;
+		shimOrigins.set(shimUrl, path);
 		try {
-			return await import(pathToFileURL(shim).href) as T;
+			return await import(shimUrl) as T;
 		} finally {
-			await rm(shim, { force: true });
+			shimOrigins.delete(shimUrl);
+			await rm(scratchDir, { recursive: true, force: true });
 		}
 	}
 }

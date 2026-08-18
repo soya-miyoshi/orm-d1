@@ -7,11 +7,23 @@
  */
 import { existsSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { dirname, extname, join, relative, resolve } from 'node:path';
 import type { DiffOptions } from './core/diff.js';
 import { loadConfig } from './node/config.js';
 import type { CommandContext, TargetFlags } from './node/commands.js';
-import { backfillCommand, check, generate, impact, migrate, pull, push, up, verify } from './node/commands.js';
+import {
+	backfillCommand,
+	check,
+	EMPTY_TABLE_OPTIONS_MODULE,
+	generate,
+	impact,
+	journalPulledBaseline,
+	migrate,
+	pullSnapshot,
+	push,
+	up,
+	verify,
+} from './node/commands.js';
 
 const USAGE = `orm-d1-kit — migrations for orm-d1 on Cloudflare D1
 
@@ -19,7 +31,8 @@ Usage
   orm-d1-kit generate [--name <name>] [--accept-data-loss] [--emit-roundtrip] [renames]
   orm-d1-kit migrate  [--env <name>] [--local | --remote]
   orm-d1-kit push     [--env <name>] [--local | --remote] [--accept-data-loss] [renames]
-  orm-d1-kit pull     [--env <name>] [--local | --remote] [--schema-out <file>] [--force]
+  orm-d1-kit pull     [--env <name>] [--local | --remote] [--schema-out <file>]
+                          [--table-options-out <file>] [--force]
   orm-d1-kit check    [--env <name>] [--local | --remote]
   orm-d1-kit verify
   orm-d1-kit up
@@ -51,7 +64,20 @@ Options
                           three-pass draft to <out>/roundtrip/. Not a migration.
   --name <name>         name for the generated migration
   --schema-out <file>   where \`pull\` writes the schema module
-  --force               let \`pull\` overwrite an existing schema file
+  --table-options-out <file>
+                        where \`pull\` writes the tableOptions() sidecar (default:
+                          table-options.ts next to --schema-out), when the live
+                          database has STRICT, WITHOUT ROWID, appendOnly or a
+                          non-BINARY column collation to state
+  --force               let \`pull\` overwrite an existing schema or tableOptions
+                          file. Lossy for a hand-maintained tableOptions file:
+                          the live database wins on every option it can state, so
+                          comments, options for tables it no longer has, and any
+                          declaration it disagrees with are all dropped. The one
+                          thing carried over is a \`collate: { column: null }\`
+                          retirement — and only for a column that still exists —
+                          because introspection cannot state it; everything else
+                          is re-derived from live.
 
 Renames — repeatable, and the alternative to dropping the data
   --rename-table old_table=new_table
@@ -126,8 +152,14 @@ const asList = (value: FlagValue | undefined): string[] =>
  * also makes a rename reviewable in a shell history and usable from CI.
  */
 const asRenames = (flags: Record<string, FlagValue>): DiffOptions | undefined => {
-	const renamedTables: Record<string, string> = {};
-	const renamedColumns: Record<string, string> = {};
+	// `Object.create(null)`, not `{}` — these flow straight into `diffSnapshots`
+	// as `options.renamedTables`/`renamedColumns`, keyed by a table/column name
+	// an operator can spell as `constructor`, `__proto__`, etc. Passing a plain
+	// object here defeats `diffSnapshots`'s own `?? Object.create(null)`
+	// fallback (a plain `{}` is truthy, so the fallback never fires) and
+	// reintroduces the prototype hazard one call up.
+	const renamedTables: Record<string, string> = Object.create(null);
+	const renamedColumns: Record<string, string> = Object.create(null);
 
 	for (const entry of asList(flags['rename-table'])) {
 		const [from, to] = splitPair(entry, '--rename-table', 'old_table=new_table');
@@ -199,6 +231,30 @@ export const environmentFlag = (flags: Record<string, FlagValue>): string | unde
 	throw new Error('--env expects an environment name, as in `--env stg`.');
 };
 
+/**
+ * A relative `import`-style specifier from `fromFile` to `toFile`, with a
+ * leading `./` (Node's ESM resolver rejects a bare `schema` as a relative
+ * specifier without it).
+ *
+ * A TypeScript extension is rewritten to the JavaScript one it compiles to:
+ * `./schema.ts` is emitted as `./schema.js`. It looks wrong and is not — this
+ * is exactly what `moduleResolution: 'node16'`/`'nodenext'` requires (a
+ * relative import of a `.ts` file is `TS2835`: "did you mean './schema.js'?"),
+ * so the sidecar `pull` writes has to say `.js` to typecheck in the project
+ * shape a Workers/D1 codebase most often has. An extension-*less* specifier
+ * (what this used to emit) fails the same rule, and the kit's own resolve hook
+ * maps `./schema.js` back to `schema.ts` on the way in
+ * (`node/import.ts`'s `JS_TO_TS_SUFFIXES`), so both loaders agree.
+ */
+const TS_TO_JS_EXTENSION: Record<string, string> = { '.ts': '.js', '.tsx': '.js', '.mts': '.mjs', '.cts': '.cjs' };
+
+const relativeSpecifier = (fromFile: string, toFile: string): string => {
+	const rel = relative(dirname(fromFile), toFile).replaceAll('\\', '/');
+	const ext = extname(rel);
+	const spelled = TS_TO_JS_EXTENSION[ext] ? rel.slice(0, rel.length - ext.length) + TS_TO_JS_EXTENSION[ext] : rel;
+	return spelled.startsWith('.') ? spelled : `./${spelled}`;
+};
+
 export async function run(argv: readonly string[]): Promise<number> {
 	const { command, flags } = parseArgs(argv);
 
@@ -240,6 +296,23 @@ export async function run(argv: readonly string[]): Promise<number> {
 		case 'pull': {
 			const out = typeof flags['schema-out'] === 'string' ? flags['schema-out'] : './schema.ts';
 			const path = resolve(cwd, out);
+			const tableOptionsOut = typeof flags['table-options-out'] === 'string'
+				? flags['table-options-out']
+				: join(dirname(out), 'table-options.ts');
+			const tableOptionsPath = resolve(cwd, tableOptionsOut);
+
+			// `--table-options-out` pointed at the same file as `--schema-out`
+			// would otherwise write the schema module, then immediately overwrite
+			// it with the sidecar — which self-imports and is not valid schema
+			// module syntax — printing "Wrote …" twice while quietly destroying
+			// the schema module it just wrote.
+			if (tableOptionsPath === path) {
+				ctx.log(
+					`--schema-out and --table-options-out both resolve to ${out} — they have to be different `
+						+ 'files; the sidecar imports the schema module by path and cannot also replace it.',
+				);
+				return 1;
+			}
 
 			// The default path is very likely to be the hand-written schema this
 			// project already has, and the rendered module is not a substitute
@@ -254,10 +327,91 @@ export async function run(argv: readonly string[]): Promise<number> {
 				);
 				return 1;
 			}
+			// [F-100] The specifier the *sidecar* imports the schema module through
+			// — relative to where the sidecar itself is written, and spelled with
+			// the JavaScript extension `moduleResolution: nodenext` demands (see
+			// `relativeSpecifier`); the kit's own resolve hook (`node/import.ts`)
+			// maps it back to the real `.ts`.
+			const schemaModuleSpecifier = relativeSpecifier(tableOptionsPath, path);
 
-			const result = await pull(ctx, target);
+			// [F-097 cont'd] Computed but not journalled yet — `pullSnapshot` only
+			// introspects, renders and warns. Every precondition (this check, and
+			// the table-options one right below) has to pass before anything
+			// touches disk, or a refusal here still leaves a pulled baseline
+			// behind, and following the refusal's own "re-run with --force" advice
+			// produces a second, redundant one.
+			const result = await pullSnapshot(ctx, { ...target, schemaModuleSpecifier });
+
+			// The table-options existence check happens *here*, after
+			// introspection, rather than up front with the schema one: whether
+			// there is a sidecar to write at all is not known until the live
+			// database has been read, and checking unconditionally refused a
+			// perfectly ordinary `pull` (skipping `schema.ts` with it) over a file
+			// nothing was going to touch. Still before any write: `pullSnapshot`
+			// above is read-only, so a refusal here leaves nothing on disk either.
+			// Nothing live needs a sidecar, but the file on disk declares options
+			// this pull is dropping — and `pullSnapshot` has already printed "the
+			// rendered sidecar drops them". Leaving the file alone would make that
+			// line false in the way that matters: its declarations stay
+			// authoritative for the next `generate`, which keeps proposing the
+			// rebuild the operator was just told had been dropped. So the stale
+			// file is rewritten as an empty `tableOptions([])` — emptied rather
+			// than deleted, because `config.tableOptions` still names it and
+			// `loadTableOptions` throws on a missing file.
+			//
+			// Only for the file the declarations were actually *read* from: if
+			// `--table-options-out` points somewhere else, whatever sits at that
+			// path is not the stale sidecar and emptying it would destroy an
+			// unrelated file.
+			const staleTableOptionsFile = !result.tableOptions
+				&& result.droppedDeclarations.length > 0
+				&& ctx.config.tableOptions !== undefined
+				&& resolve(cwd, ctx.config.tableOptions) === tableOptionsPath
+				&& existsSync(tableOptionsPath);
+
+			if ((result.tableOptions || staleTableOptionsFile) && existsSync(tableOptionsPath) && flags['force'] !== true) {
+				ctx.log(
+					`${tableOptionsOut} already exists. Re-run with --force to overwrite it, or pass `
+						+ '--table-options-out <file> to write somewhere else. The live database wins on every option '
+						+ 'it can state: only a `collate: { column: null }` retirement (for a column that still '
+						+ 'exists) is carried over from config.tableOptions when it points at that file; comments, '
+						+ 'options for tables the live database no longer has, and any declaration it disagrees with '
+						+ 'are lost.',
+				);
+				return 1;
+			}
+
 			await writeFile(path, result.schema);
 			ctx.log(`Wrote ${out}.`);
+			if (result.tableOptions || staleTableOptionsFile) {
+				await writeFile(tableOptionsPath, result.tableOptions ?? EMPTY_TABLE_OPTIONS_MODULE);
+				ctx.log(
+					result.tableOptions
+						? `Wrote ${tableOptionsOut}.`
+						: `Emptied ${tableOptionsOut} — nothing in the live database needs a sidecar, and its `
+							+ `declarations for ${result.droppedDeclarations.map((t) => `"${t}"`).join(', ')} are `
+							+ 'dropped.',
+				);
+				// Wire it up, so the rest of *this* process (and any command run
+				// through `run()` after it) reads the file that was just written
+				// instead of guessing from the last introspection — and say so,
+				// since only an edit to `orm-d1.config.ts` makes it stick for the
+				// next process.
+				const configured = ctx.config.tableOptions
+					&& resolve(cwd, ctx.config.tableOptions) === tableOptionsPath;
+				ctx.config.tableOptions = `./${relative(cwd, tableOptionsPath).replaceAll('\\', '/')}`;
+				if (!configured) {
+					ctx.log(
+						`  ! Add \`tableOptions: '${ctx.config.tableOptions}'\` to orm-d1.config.ts — until it is `
+							+ 'named there, generate/check keep guessing at STRICT, WITHOUT ROWID, appendOnly and '
+							+ 'column collation instead of reading what this pull just wrote.',
+					);
+				}
+			}
+
+			// Journalled last, once every write above has actually succeeded —
+			// see `pullSnapshot`'s doc comment for why the ordering matters.
+			await journalPulledBaseline(ctx, result.snapshot, { ...target, schemaModuleSpecifier });
 			return 0;
 		}
 		case 'check': {

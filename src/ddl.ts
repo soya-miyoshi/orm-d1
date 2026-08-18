@@ -178,6 +178,15 @@ export interface DDLOptions {
 	 * its key once instead of once in the table and again in an index.
 	 */
 	readonly withoutRowid?: boolean | undefined;
+	/**
+	 * Per-column `COLLATE`, keyed by column name — the same shape and intent as
+	 * `TableOptions.collate` (`null` states "no collation" explicitly). Threaded
+	 * through so `createSchema`'s `CREATE TABLE` agrees, byte-for-byte, with
+	 * `createTableFromSnapshot` (`kit/src/core/snapshot.ts`) for the same
+	 * `tableOptions()` input — both read `collate` off the same map, they just
+	 * used to reach it through different producers.
+	 */
+	readonly collate?: Readonly<Record<string, string | null>> | undefined;
 }
 
 /**
@@ -210,6 +219,26 @@ export interface TableOptions {
 	readonly strict?: boolean;
 	readonly withoutRowid?: boolean;
 	/**
+	 * Per-column collation intent, keyed by column name.
+	 *
+	 * The schema DSL has no `.collate()` spelling (`docs/04`), so a live
+	 * column's `COLLATE` was, until this option existed, only ever *read* —
+	 * `orm-d1-kit generate` carried a `before` snapshot's collation forward onto
+	 * `after` unconditionally, because it had no other way to tell "the schema
+	 * cannot say this" from "the operator wants it gone". That carry-forward is
+	 * self-perpetuating: once recorded, a collation can never leave `meta/`,
+	 * even after someone deliberately rebuilds the column as `BINARY` (see
+	 * `[F-115]` in this repo's own audit history).
+	 *
+	 * A string here states the collation the kit should treat as authoritative
+	 * — usually the one already live, so `check`/`generate` stop guessing.
+	 * `null` states the opposite: "no collation, and stop carrying one
+	 * forward" — the only way to retire a collation the kit once carried.
+	 * Omitting a column entirely leaves the old carry-forward behaviour
+	 * unchanged for it.
+	 */
+	readonly collate?: Readonly<Record<string, string | null>>;
+	/**
 	 * Reject `UPDATE` with a `BEFORE UPDATE … RAISE(ABORT)` trigger.
 	 *
 	 * `DELETE` stays allowed: what an append-only table protects is that a
@@ -237,10 +266,24 @@ export interface TableOptionsMap {
 }
 
 export function tableOptions(entries: readonly (readonly [Table, TableOptions])[]): TableOptionsMap {
-	const byTable: Record<string, TableOptions> = {};
+	// `Object.create(null)`, not `{}` with an `Object.hasOwn` check alone: the
+	// `hasOwn` guard below stops a table named `constructor`/`toString`/… from
+	// reading back a truthy inherited member, but a table literally named
+	// `__proto__` assigned through a plain object sets the object's *prototype*
+	// instead of adding an entry — `byTable['__proto__'] = options` never
+	// becomes an own property at all, so `Object.hasOwn` never sees it and two
+	// declarations for the same `__proto__`-named table never trip "declared
+	// twice". A null-prototype object has no `__proto__` accessor, so the
+	// assignment is just data, the same way the DDL/snapshot column and
+	// constraint maps already are for the identical reason.
+	const byTable: Record<string, TableOptions> = Object.create(null);
 	for (const [table, options] of entries) {
 		const name = getTableName(table);
-		if (byTable[name]) throw new Error(`tableOptions: "${name}" is declared twice.`);
+		// `Object.hasOwn`, not a truthiness check on `byTable[name]`: a table
+		// literally named `constructor` (or `toString`, `hasOwnProperty`, …)
+		// otherwise reads an inherited `Object.prototype` member — truthy — and
+		// throws "declared twice" on its very first, legitimate declaration.
+		if (Object.hasOwn(byTable, name)) throw new Error(`tableOptions: "${name}" is declared twice.`);
 		byTable[name] = options;
 	}
 	return { [TableOptionsBrand]: true, byTable };
@@ -352,6 +395,15 @@ export function validateTableOptions(t: Table, options: TableOptions): string | 
 		if (auto) {
 			return `"${name}" is declared WITHOUT ROWID but "${auto.name}" is AUTOINCREMENT; `
 				+ 'AUTOINCREMENT numbers rowids, which a WITHOUT ROWID table does not have.';
+		}
+	}
+
+	if (options.collate) {
+		const known = new Set(columns.map((c) => c.name));
+		const unknown = Object.keys(options.collate).filter((c) => !known.has(c));
+		if (unknown.length > 0) {
+			return `"${name}" declares collate for columns that do not exist: ${unknown.join(', ')}. `
+				+ `Known columns: ${[...known].sort().join(', ')}.`;
 		}
 	}
 
@@ -479,9 +531,15 @@ const defaultClause = (column: Column<any>): string => {
 };
 
 /** One `column-def`, in SQLite's constraint order. */
-export const columnDDL = (column: Column<any>, inlinePrimaryKey: boolean, tableName: string): string =>
+export const columnDDL = (
+	column: Column<any>,
+	inlinePrimaryKey: boolean,
+	tableName: string,
+	collate?: string | null,
+): string =>
 	withDDLContext(tableName, column.name, () => {
 		let ddl = `${quoteIdentifier(column.name)} ${typeName(column)}`;
+		if (collate) ddl += ` collate ${collate}`;
 
 		if (inlinePrimaryKey && column.config.primaryKey) {
 			ddl += ' primary key';
@@ -576,7 +634,21 @@ export function createTable(t: Table, options: DDLOptions = {}): string {
 	const extras = getTableExtras(t);
 	const compositePk = extras.find((e): e is PrimaryKeyConstraint => e.kind === 'primaryKey');
 
-	const parts: string[] = columns.map((column) => columnDDL(column, compositePk === undefined, name));
+	const parts: string[] = columns.map((column) =>
+		columnDDL(
+			column,
+			compositePk === undefined,
+			name,
+			// `options.collate` is a plain object a caller can pass in directly
+			// (it is public API, not something this module constructs), so a
+			// bracket lookup resolves an inherited `Object.prototype` member for
+			// a column literally named e.g. `constructor` or `toString` — a
+			// function, which is truthy and gets template-stringified straight
+			// into the DDL. `Object.hasOwn` restricts the read to keys the
+			// caller actually set.
+			options.collate && Object.hasOwn(options.collate, column.name) ? options.collate[column.name] : undefined,
+		)
+	);
 
 	if (compositePk) parts.push(primaryKeyDDL(compositePk.meta, name));
 	for (const extra of extras) {
@@ -615,10 +687,24 @@ export function createSchema(
 	const optionsFor = (t: Table): DDLOptions => {
 		const extra = perTable?.byTable[getTableName(t)];
 		if (!extra) return options;
+		// Normalised the same way the kit's snapshot path treats the identical
+		// sidecar map (`snapshot.ts`'s `collateOptions` loop): lower-cased, and
+		// `null`/`binary` read as "no collation" rather than an emitted clause
+		// — so the two producers agree byte-for-byte for the same `TableOptions`.
+		const collate = extra.collate
+			? Object.fromEntries(
+				Object.entries(extra.collate)
+					.map(([column, value]): [string, string | null] => [
+						column,
+						value === null || value.toLowerCase() === 'binary' ? null : value.toLowerCase(),
+					]),
+			)
+			: options.collate;
 		return {
 			...options,
 			strict: extra.strict ?? options.strict,
 			withoutRowid: extra.withoutRowid ?? options.withoutRowid,
+			collate,
 		};
 	};
 
@@ -658,7 +744,13 @@ export function assertAppendOnlyColumns(t: Table, columns: readonly string[]): s
 			`tableOptions: "${name}" declares appendOnly columns that do not exist: ${unknown.join(', ')}. `
 			+ `SQLite accepts \`before update of\` on unknown columns without error, and the trigger then `
 			+ `never fires — the table would read as guarded while every UPDATE went through. `
-			+ `Known columns: ${[...known].sort().join(', ')}.`,
+			+ `Known columns: ${[...known].sort().join(', ')}. `
+			+ `If this is a schema typo, fix the column name. If it came from \`pull\` reading a live `
+			+ `"${name}_no_update" trigger that names ${unknown.length > 1 ? 'columns' : 'a column'} the table `
+			+ `does not have yet, a migration that created the guard was probably left unfinished (e.g. a batch `
+			+ `stopped between the guard's \`create trigger\` and the \`add column\` it names) — either finish `
+			+ `applying that migration so the column exists, or drop the trigger `
+			+ `(\`drop trigger "${name}_no_update"\`) and recreate it once the schema is settled.`,
 		);
 	}
 	return normalizeAppendOnlyColumns(columns);

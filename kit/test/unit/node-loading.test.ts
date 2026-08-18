@@ -6,15 +6,43 @@
  * a `tableOptions` sidecar named by config, a migrations folder in the wrong
  * layout — so each gets a test rather than a comment saying it was fixed.
  */
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { once } from 'node:events';
 import { describe, expect, it } from 'vitest';
+import { integer, sqliteTable, text } from 'orm-d1';
 import { importModule } from '../../src/node/import.js';
+import { EMPTY_TABLE_OPTIONS_MODULE } from '../../src/node/commands.js';
 import { loadTableOptions, unreadableMigrations } from '../../src/node/store.js';
 import { findLocalDatabase } from '../../src/node/runners.js';
+import { diffSnapshots } from '../../src/core/diff.js';
+import { snapshotFromSchema } from '../../src/core/snapshot.js';
 
 const scratch = (): string => mkdtempSync(join(tmpdir(), 'orm-d1-kit-'));
+
+/**
+ * `importModule(target)` in a child process running plain Node.
+ *
+ * vitest's own loader (vite-node) transforms every `.ts` it imports before
+ * Node's CommonJS-vs-ESM detection runs, so an in-process call never reaches
+ * the CJS-forcing `.mts` shim at all — `import()` on the original path just
+ * succeeds. Only a child process under plain Node exercises the shim, which is
+ * the code path every test naming `[F-038]` is about.
+ */
+const runImportUnderPlainNode = (dir: string, target: string): unknown => {
+	const importPath = join(dirname(fileURLToPath(import.meta.url)), '../../src/node/import.ts');
+	const scriptPath = join(dir, '.run-import.mjs');
+	writeFileSync(
+		scriptPath,
+		`import { importModule } from ${JSON.stringify(importPath)};\n`
+			+ `const m = await importModule(${JSON.stringify(target)});\n`
+			+ `console.log(JSON.stringify(m.users));\n`,
+	);
+	return JSON.parse(execFileSync(process.execPath, [scriptPath], { encoding: 'utf8' }).trim());
+};
 
 describe('importModule', () => {
 	it('resolves extension-less relative imports', async () => {
@@ -36,6 +64,254 @@ describe('importModule', () => {
 
 		const module = await importModule<{ marker: string }>(join(dir, 'entry.ts'));
 		expect(module.marker).toBe('index');
+	});
+
+	// [F-038]: the CJS-forcing-ESM shim used to be written into the same
+	// directory as the module it copies. A crash between the write and the
+	// `finally` cleanup left an importable duplicate there that a `**/*.mts`
+	// glob in a build or test config would pick up. It now goes under the OS
+	// temp directory instead, so the source directory never gains a file.
+	// vitest's own module loader (vite-node) transforms every `.ts` it imports
+	// before Node's own CommonJS-vs-ESM detection ever runs, so calling
+	// `importModule` in-process here never actually reaches the CJS-forcing
+	// shim fallback — `import()` on the original path just succeeds. The real
+	// CLI runs under plain Node, where a `.ts` file in a project with no
+	// `"type": "module"` genuinely hits it. A child process is what makes this
+	// test exercise the same code path production does.
+	it('[F-038] never writes the ESM shim into the source directory, under plain Node', () => {
+		const dir = scratch();
+		// Node 22+ auto-detects ES module syntax even with no package.json, so
+		// an explicit `"type": "commonjs"` is what actually forces the `export
+		// const` syntax below to fail to parse — the real trigger for the shim
+		// fallback this test is about. Deliberately one self-contained file, not
+		// a schema importing a sibling: a *sibling* `.ts` file under an explicit
+		// `"type": "commonjs"` has its own, unrelated problem (it is not itself
+		// shimmed, so it stays CommonJS-typed and cannot serve a named ESM
+		// export either way) that has nothing to do with where the shim for
+		// *this* file is written, which is the only thing this test is about.
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		writeFileSync(join(dir, 'schema.ts'), "export const users = 'users-table';\n");
+
+		const importPath = join(dirname(fileURLToPath(import.meta.url)), '../../src/node/import.ts');
+		const scriptPath = join(dir, '.run-import.mjs');
+		writeFileSync(
+			scriptPath,
+			`import { importModule } from ${JSON.stringify(importPath)};\n`
+				+ `const m = await importModule(${JSON.stringify(join(dir, 'schema.ts'))});\n`
+				+ `console.log(JSON.stringify(m.users));\n`,
+		);
+
+		// `finally`-block cleanup removes the shim on every ordinary path, so a
+		// before/after directory listing alone would pass whether the shim was
+		// ever written into `dir` or not — the loss `[F-038]` is about only
+		// shows up if the process is killed between the write and that cleanup.
+		// Making `dir` read-only turns "was it written into `dir`?" into a
+		// pass/fail signal directly: a shim written there would fail outright
+		// with EACCES, so a clean run is itself the proof it went to the OS
+		// temp directory instead.
+		try {
+			chmodSync(dir, 0o555);
+			const output = execFileSync(process.execPath, [scriptPath], { encoding: 'utf8' });
+			expect(JSON.parse(output.trim())).toBe('users-table');
+		} finally {
+			chmodSync(dir, 0o755);
+		}
+	});
+
+	// [F-038 follow-up] The shim's whole reason to exist is a project with
+	// `"type": "commonjs"` (Node >= 22.7 auto-detects ESM when `type` is absent,
+	// so a typeless project never reaches the fallback) — and in exactly that
+	// project shape, moving the shim to a scratch directory broke every *bare*
+	// specifier in the schema: Node walks node_modules upward from the importer,
+	// and the importer was now in the OS temp directory. `shimOrigins` restored
+	// relative resolution only.
+	it('[F-038] resolves a bare specifier from the project node_modules, under plain Node', () => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		const pkg = join(dir, 'node_modules', 'marker-pkg');
+		mkdirSync(pkg, { recursive: true });
+		writeFileSync(join(pkg, 'package.json'), '{"name":"marker-pkg","type":"module","main":"index.js"}\n');
+		writeFileSync(join(pkg, 'index.js'), "export const marker = 'from-node-modules';\n");
+		writeFileSync(
+			join(dir, 'schema.ts'),
+			"import { marker } from 'marker-pkg';\nexport const users = marker;\n",
+		);
+
+		expect(runImportUnderPlainNode(dir, join(dir, 'schema.ts'))).toBe('from-node-modules');
+	});
+
+	// [F-038 security] The shim used to be written to a fixed, guessable path
+	// (`<tmp>/orm-d1-kit-import/.orm-d1-<pid>-<counter>.mts`) via
+	// `mkdir(recursive)` + `copyFile`, neither of which is safe on a shared
+	// `/tmp`: another user can own that directory (EACCES for everyone else) or
+	// plant a symlink at the destination that `copyFile` follows. `mkdtemp` gives
+	// a private, unguessable directory instead. Squatting the old fixed path with
+	// a plain *file* is the cheapest observable proxy: the old code cannot
+	// `mkdir` over it and fails outright, the new code never looks there.
+	it('[F-038] does not use a fixed, squattable scratch path', (ctx) => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		writeFileSync(join(dir, 'schema.ts'), "export const users = 'users-table';\n");
+
+		// On the shared `/tmp` this test is about, `orm-d1-kit-import` can
+		// already exist and be owned by a different user — in which case
+		// neither the cleanup below nor the squat that follows can succeed,
+		// and this test cannot say anything about the *current* run (it would
+		// have failed on setup regardless of which scratch-path strategy
+		// `importModule` uses). Skip rather than let an ownership problem this
+		// test does not exercise report as a failure of the property it does.
+		const squatted = join(tmpdir(), 'orm-d1-kit-import');
+		try {
+			if (existsSync(squatted)) rmSync(squatted, { recursive: true, force: true });
+			writeFileSync(squatted, 'not a directory\n');
+		} catch {
+			ctx.skip();
+			return;
+		}
+		try {
+			expect(runImportUnderPlainNode(dir, join(dir, 'schema.ts'))).toBe('users-table');
+		} finally {
+			try {
+				rmSync(squatted, { force: true });
+			} catch {
+				// Best-effort: see the setup comment above.
+			}
+		}
+	});
+
+	// [F-038 security cont'd] The property `mkdtemp`/`O_EXCL` actually buys —
+	// a private (`0700`), unguessable-named scratch directory that never
+	// reuses a fixed name — pinned directly rather than only through the
+	// squatting proxy above. `TMPDIR` is redirected to a scratch directory of
+	// this test's own so the poll below only ever sees directories this test
+	// created. The schema module blocks on a sentinel file so the scratch
+	// directory is guaranteed to still exist at the moment its mode is
+	// checked — without that, the `finally` in `importModule` can have already
+	// removed it before this test gets to look.
+	it('[F-038 security] the scratch directory is private, unguessable, and cleaned up', async () => {
+		const tmpRoot = scratch();
+		const dir = scratch();
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		const sentinel = join(dir, 'release.sentinel');
+		writeFileSync(
+			join(dir, 'schema.ts'),
+			// Plain `import`/`export` syntax forces the CJS-detection failure that
+			// triggers the shim path, the same way every other `[F-038]` test does
+			// — see `isModuleSyntaxError` in `node/import.ts`.
+			'import { existsSync } from \'node:fs\';\n'
+				+ `while (!existsSync(${JSON.stringify(sentinel)})) { /* poll */ }\n`
+				+ "export const users = 'users-table';\n",
+		);
+
+		const importPath = join(dirname(fileURLToPath(import.meta.url)), '../../src/node/import.ts');
+		const scriptPath = join(dir, '.run-import.mjs');
+		writeFileSync(
+			scriptPath,
+			`import { importModule } from ${JSON.stringify(importPath)};\n`
+				+ `const m = await importModule(${JSON.stringify(join(dir, 'schema.ts'))});\n`
+				+ `console.log(JSON.stringify(m.users));\n`,
+		);
+
+		const child = execFile(
+			process.execPath,
+			[scriptPath],
+			{ encoding: 'utf8', env: { ...process.env, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot } },
+		);
+
+		try {
+			// Poll the parent's view of `tmpRoot` for the scratch directory the
+			// child creates — this is the one property `O_EXCL` genuinely resists
+			// a clean, non-racy test of, so it is polled for rather than assumed.
+			let scratchDir: string | undefined;
+			for (let attempt = 0; attempt < 200 && !scratchDir; attempt++) {
+				const found = existsSync(tmpRoot)
+					? readdirSync(tmpRoot).find((n) => n.startsWith('orm-d1-kit-import-'))
+					: undefined;
+				if (found) scratchDir = join(tmpRoot, found);
+				else await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			expect(scratchDir).toBeDefined();
+			expect(existsSync(join(tmpRoot, 'orm-d1-kit-import'))).toBe(false);
+			const mode = statSync(scratchDir!).mode & 0o777;
+			expect(mode).toBe(0o700);
+
+			writeFileSync(sentinel, 'go\n');
+			const [stdout] = await once(child, 'close');
+			void stdout;
+			expect(existsSync(scratchDir!)).toBe(false);
+		} finally {
+			if (!existsSync(sentinel)) writeFileSync(sentinel, 'go\n');
+			child.kill();
+		}
+	});
+
+	// The shim's origin lookup is keyed by a file URL, so anything that needs
+	// percent-encoding on the way in and out is where it breaks.
+	it('[F-038] resolves the shim\'s relative imports through a path with spaces and non-ASCII', () => {
+		const dir = mkdtempSync(join(tmpdir(), 'orm-d1 kit 日本語-'));
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		// `.mts`, not `.ts`: under an explicit `"type": "commonjs"` a sibling
+		// `.ts` is itself CommonJS-typed and cannot serve a named ESM export
+		// (the pre-existing limitation the `[F-038]` test above documents) —
+		// unrelated to the path encoding this test is about.
+		writeFileSync(join(dir, 'users.mts'), "export const users = 'users-table';\n");
+		writeFileSync(join(dir, 'schema.ts'), "export { users } from './users';\n");
+
+		expect(runImportUnderPlainNode(dir, join(dir, 'schema.ts'))).toBe('users-table');
+	});
+
+	// [F-107] `pull`'s sidecar imports the schema module as `./schema.js` — the
+	// only spelling that typechecks under `moduleResolution: nodenext` (TS2835)
+	// — for a file that is `schema.ts` on disk. The resolve hook has to map it
+	// back, or the sidecar the kit writes is a file the kit itself cannot load.
+	// Under plain Node, not in-process: vitest's own resolver maps `./schema.js`
+	// to `schema.ts` itself, so an in-process assertion passes whether the kit's
+	// hook does anything or not — it proves nothing about the CLI.
+	it('resolves a relative .js specifier to the .ts file behind it', () => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'schema.ts'), "export const users = 'users-table';\n");
+		writeFileSync(join(dir, 'options.ts'), "export { users } from './schema.js';\n");
+
+		expect(runImportUnderPlainNode(dir, join(dir, 'options.ts'))).toBe('users-table');
+	});
+
+	// …but never over a real emitted `.js` sitting next to the `.ts`, which is
+	// what Node would have resolved on its own.
+	it('prefers a real .js file over the .ts beside it', () => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'schema.ts'), "export const users = 'from-ts';\n");
+		writeFileSync(join(dir, 'schema.js'), "export const users = 'from-js';\n");
+		writeFileSync(join(dir, 'options.ts'), "export { users } from './schema.js';\n");
+
+		expect(runImportUnderPlainNode(dir, join(dir, 'options.ts'))).toBe('from-js');
+	});
+
+	// [Round 4, finding 5] The two branches that hand `nextResolve` the
+	// specifier as written — an explicit TypeScript extension, and the
+	// fallthrough for a specifier no candidate suffix matched — ignored
+	// `parentDir`, so Node resolved them against the *scratch* directory the
+	// shim lives in. Both worked before the shim moved out of the source
+	// directory and broke silently when it did: nothing relative to the real
+	// module is there.
+	it('resolves a relative specifier with an explicit .mts extension from the importing file\'s directory', () => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		writeFileSync(join(dir, 'helpers.mts'), "export const users = 'from-mts';\n");
+		writeFileSync(join(dir, 'schema.ts'), "export { users } from './helpers.mts';\n");
+
+		expect(runImportUnderPlainNode(dir, join(dir, 'schema.ts'))).toBe('from-mts');
+	});
+
+	it('resolves a relative .json import from the importing file\'s directory', () => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
+		writeFileSync(join(dir, 'fixtures.json'), '{"users":"from-json"}\n');
+		writeFileSync(
+			join(dir, 'schema.ts'),
+			"import data from './fixtures.json' with { type: 'json' };\nexport const users = data.users;\n",
+		);
+
+		expect(runImportUnderPlainNode(dir, join(dir, 'schema.ts'))).toBe('from-json');
 	});
 
 	it('leaves bare specifiers to Node, so a real package is not shadowed', async () => {
@@ -89,6 +365,38 @@ describe('loadTableOptions', () => {
 
 	it('refuses a module that is not there', async () => {
 		await expect(loadTableOptions(scratch(), './missing.ts')).rejects.toThrow(/not found/);
+	});
+
+	// Companion to `pull-sidecar.test.ts`'s "--force drops a declared
+	// strict/appendOnly the live database no longer backs, and warns", which
+	// asserts only on the emptied file's *content* — it deliberately does not
+	// load the file back or run `generate` against it in the same process,
+	// because Node caches an ES module by URL and every CLI invocation in that
+	// suite runs in one process, so a same-path re-import would silently read
+	// the *stale* module object from an earlier write rather than what pull
+	// just wrote to disk.
+	//
+	// A fresh `mkdtemp` path per test (via `scratch()`) sidesteps that: the
+	// module URL has never been imported before, so there is no stale cache
+	// entry to hit. This proves the content assertion's implicit claim —
+	// that `EMPTY_TABLE_OPTIONS_MODULE` is not just bytes that look right, but
+	// a real ES module `loadTableOptions` can import and that a subsequent
+	// `generate` sees as "nothing declared", not as drift.
+	it('EMPTY_TABLE_OPTIONS_MODULE is actually loadable, not just content that looks right, and yields no diff', async () => {
+		const dir = scratch();
+		writeFileSync(join(dir, 'table-options.ts'), EMPTY_TABLE_OPTIONS_MODULE);
+
+		const map = await loadTableOptions(dir, './table-options.ts');
+		expect(map.byTable).toEqual({});
+
+		// A snapshot built with the loaded (empty) map must diff clean against
+		// one built with no `tableOptions()` sidecar at all — the whole point of
+		// "emptied, not deleted" (`commands.ts`) is that the next `generate`
+		// reconciles nothing because of it.
+		const t = sqliteTable('events', { id: integer('id').primaryKey(), note: text('note') });
+		const withoutSidecar = snapshotFromSchema([t]);
+		const withLoadedSidecar = snapshotFromSchema([t], '', map);
+		expect(diffSnapshots(withoutSidecar, withLoadedSidecar).statements).toEqual([]);
 	});
 });
 

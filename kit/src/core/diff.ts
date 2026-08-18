@@ -60,6 +60,25 @@ export interface DiffOptions {
 
 const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
+/**
+ * The name `column` has on the live table right now, given the renames this
+ * diff is about to perform on `table`. `renamedColumns` is keyed
+ * `"<after table name>.<pre-rename column name>"`, so this is its inverse
+ * lookup; `column` itself when nothing renames onto it.
+ */
+const preRenameColumnName = (
+	renamedColumns: Record<string, string>,
+	table: string,
+	column: string,
+): string => {
+	for (const [key, to] of Object.entries(renamedColumns)) {
+		if (to !== column) continue;
+		const separator = key.indexOf('.');
+		if (separator > 0 && key.slice(0, separator) === table) return key.slice(separator + 1);
+	}
+	return column;
+};
+
 const columnDefinition = (column: ColumnSnapshot): string => {
 	let ddl = `${quote(column.name)} ${column.declaredType ?? column.type}`;
 	if (column.collate) ddl += ` collate ${column.collate}`;
@@ -208,6 +227,38 @@ const requiresRecreate = (
 };
 
 /**
+ * Whether `renames` (a single table's `from -> to` column-rename map)
+ * contains a cycle: a chain that, followed through `to` as the next `from`,
+ * revisits its own starting column before running out of renames. Covers a
+ * 2-cycle swap (`x=y, y=x`) as well as longer rotations (`a=b, b=c, c=a`).
+ *
+ * A plain chain (`x=y`, with `y` untouched) is NOT a cycle and is left alone:
+ * SQLite's `RENAME COLUMN` handles that fine when emitted in sequence. Only a
+ * genuine cycle is wrong, because by the time the loop reaches the rename
+ * that would close it, the column it names has already been renamed away (or
+ * — for a 2-cycle — renaming `x` to `y` first, then trying to rename `y` (the
+ * *original* `y`, now gone) to `x` renames the just-moved former-`x` instead,
+ * silently losing the original `y`'s data instead of swapping the two).
+ */
+const hasRenameCycle = (renames: Record<string, string>): boolean => {
+	for (const start of Object.keys(renames)) {
+		const visited = new Set<string>();
+		let current = start;
+		for (;;) {
+			if (visited.has(current)) {
+				if (current === start) return true;
+				break;
+			}
+			visited.add(current);
+			const next = renames[current];
+			if (next === undefined) break;
+			current = next;
+		}
+	}
+	return false;
+};
+
+/**
  * Why a table with *any* dependent cannot be rebuilt on D1.
  *
  * The rebuild drops the old table and renames the new one into its place, and
@@ -277,8 +328,12 @@ const carryForwardCollation = (
 		if (!beforeColumn.collate) continue;
 		const target = columnRenames[beforeName] ?? beforeName;
 		const afterColumn = result[target];
-		if (afterColumn && !afterColumn.collate) {
-			if (result === afterColumns) result = { ...afterColumns };
+		// `[F-115]`: an explicit statement — including an explicit "none" via the
+		// `tableOptions()` sidecar's `collate` map — ends the carry-forward for
+		// this column. Without this check a deliberately-removed collation could
+		// never leave `meta/`: the very next `generate` would just re-carry it.
+		if (afterColumn && !afterColumn.collate && !afterColumn.collateStated) {
+			if (result === afterColumns) result = Object.assign(Object.create(null), afterColumns);
 			result[target] = { ...afterColumn, collate: beforeColumn.collate };
 		}
 	}
@@ -414,8 +469,15 @@ const carryForwardPrimaryKeyCollation = (
  * errors, a real downgrade of the constraint's semantics.
  */
 export const carryForwardCollations = (before: Snapshot, after: Snapshot, options: DiffOptions = {}): Snapshot => {
-	const renamedTables = options.renamedTables ?? {};
-	const renamedColumns = options.renamedColumns ?? {};
+	// `Object.create(null)`, not `{}`: a table literally named `__proto__`
+	// resolved through `renamedTables[beforeName]` on a plain object reads the
+	// inherited `Object.prototype.__proto__` accessor instead of `undefined`,
+	// which is truthy and so is taken as a real target name — corrupting the
+	// carry-forward for exactly the table this fix exists to protect. Same
+	// hazard, same fix, as `columnRenames` just below.
+	const renamedTables: Record<string, string> = Object.create(null);
+	Object.assign(renamedTables, options.renamedTables);
+	const renamedColumns: Record<string, string> = options.renamedColumns ?? Object.create(null);
 	let tables = after.tables;
 
 	for (const [beforeName, beforeTable] of Object.entries(before.tables)) {
@@ -423,7 +485,16 @@ export const carryForwardCollations = (before: Snapshot, after: Snapshot, option
 		const afterTable = tables[targetName];
 		if (!afterTable) continue;
 
-		const columnRenames: Record<string, string> = {};
+		// `Object.create(null)`, not `{}`: keyed by a bare column name built from
+		// this diff's own renames, and a column literally named `__proto__` is
+		// legal SQL — a plain object's `columnRenames['__proto__'] = value`
+		// assignment sets the object's *prototype* instead of adding an entry,
+		// and every subsequent `columnRenames[someName]` READ (elsewhere in this
+		// file, on a plain `{}`) resolves the inherited accessor instead of
+		// `undefined` for that one name — silently corrupting the rename map for
+		// exactly the column this whole fix exists to stop losing. Same hazard,
+		// same fix, as the column/constraint maps in `snapshot.ts`/`introspect.ts`.
+		const columnRenames: Record<string, string> = Object.create(null);
 		for (const [key, value] of Object.entries(renamedColumns)) {
 			const [table, column] = key.split('.');
 			if (table === targetName && column) columnRenames[column] = value;
@@ -453,7 +524,7 @@ export const carryForwardCollations = (before: Snapshot, after: Snapshot, option
 		}
 
 		if (nextAfterTable !== afterTable) {
-			if (tables === after.tables) tables = { ...after.tables };
+			if (tables === after.tables) tables = Object.assign(Object.create(null), after.tables);
 			tables[targetName] = nextAfterTable;
 		}
 	}
@@ -533,7 +604,7 @@ const recreateTable = (
 	after: TableSnapshot,
 	columnRenames: Record<string, string>,
 	reason: string,
-	dependents: Record<string, TableSnapshot> = {},
+	dependents: Record<string, TableSnapshot> = Object.create(null),
 	foreignTriggers: readonly string[] = [],
 	/**
 	 * Whether `after` is schema-derived — the same reading `columnDifference`
@@ -717,21 +788,33 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 	// they are only worth comparing when both sides are one.
 	const comparableNames = before.origin === 'schema' && after.origin === 'schema';
 
-	const renamedTables = options.renamedTables ?? {};
+	// `Object.create(null)`, not `{}` — keyed by table name, and a table
+	// literally named `__proto__`/`constructor`/etc. is legal SQL. See the
+	// identical hazard at `snapshotFromSchema`'s `result` (`snapshot.ts`).
+	const renamedTables: Record<string, string> = options.renamedTables ?? Object.create(null);
 	const renamedColumns = options.renamedColumns ?? {};
 
 	// Reverse of `renamedTables`: post-rename name -> live (pre-rename) name.
 	// `options.foreignTriggers` is populated by `introspect()` keyed by the
 	// live `tbl_name`, before any rename in this diff is applied, so a lookup
 	// keyed by the post-rename identity misses it entirely.
-	const liveTableNames: Record<string, string> = {};
+	// `Object.create(null)`, not `{}` — same hazard as `renamedTables` above,
+	// and it feeds `lookupCaseInsensitive(options.foreignTriggers, liveTableNames[name] ?? name)`
+	// below: a table renamed *to* `constructor` (or `__proto__`, etc.) would
+	// otherwise make `liveTableNames['constructor']` resolve the inherited
+	// `Object` function — truthy, so the `?? name` fallback never fires — and
+	// that gets handed to `foldAsciiCase`, which calls `.replace` on it and
+	// throws `TypeError: value.replace is not a function`.
+	const liveTableNames: Record<string, string> = Object.create(null);
 	for (const [before, after] of Object.entries(renamedTables)) liveTableNames[after] = before;
 
 	const beforeNames = Object.keys(before.tables);
 	const afterNames = Object.keys(after.tables);
 
 	// 1. Renamed tables first, so later steps see matching names.
-	const effectiveBefore: Record<string, TableSnapshot> = {};
+	// `Object.create(null)`, not `{}` — same hazard as `renamedTables` above:
+	// keyed by table name, and a table literally named `__proto__` is legal SQL.
+	const effectiveBefore: Record<string, TableSnapshot> = Object.create(null);
 	for (const name of beforeNames) {
 		const renamed = renamedTables[name];
 		const t = before.tables[name]!;
@@ -745,14 +828,51 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			// generated migration can ever clear. Drop it under the name it
 			// actually has, and let the guard be re-created below if it is still
 			// wanted (that is what clearing `appendOnly` here arranges).
+			//
+			// Set inside the `staysAppendOnly` branch below when the guard just
+			// re-created does not actually cover the same column *set* `after`'s
+			// final names describe — see `liveGuarded`, further down, for why
+			// that can happen. Read after this `if (t.appendOnly)` block closes,
+			// when deciding what `carriedAppendOnly` may safely claim.
+			let liveGuardMismatch = false;
+			// The actual (deduplicated) column list the trigger below is created
+			// with, kept so `carriedAppendOnly` can hand step 4 a key that
+			// reflects what really exists right now rather than what `after`
+			// claims, whenever the two differ.
+			let liveGuardedActual: string[] | undefined;
 			if (t.appendOnly) {
-				// Carrying the guard across the rename is a separate, later step
-				// (re-creating it under the new name when `after` still wants it):
-				// this drop is unconditional. Whether it is *destructive* is not —
-				// dropping it here is safe exactly when it comes back under the new
-				// name in the same diff, which is the same test the in-place
-				// transition below uses (`next.appendOnly`), just against the
-				// renamed identity instead of the unchanged one.
+				// Re-creating the guard under the new name happens right here, in
+				// the same three-statement run as the rename and the drop — not
+				// deferred to the later per-table pass, which used to push the
+				// `create trigger` far away in the statement list (after every
+				// other renamed table's own rename+drop, then every created
+				// table's statements). `statementGroups` (`sql.ts`) only recognises
+				// the rebuild's `create table "__new_X" … rename … create index`
+				// shape as an indivisible run; three statements scattered like that
+				// are three ordinary singleton groups a batch boundary can land
+				// between. A boundary between the drop and a *distant* re-create
+				// left the table genuinely unprotected — UPDATE permitted — for
+				// however long batch 2 took to run, and unprotected for good if
+				// batch 2 then failed. Keeping the three statements adjacent lets
+				// `statementGroups` (extended below) treat them as one unit, the
+				// same way it already does for a rebuild's rename-then-restore.
+				//
+				// A rename of a *guarded column* is deliberately NOT folded into
+				// this run. It was, briefly, on the theory that the guard created
+				// here names `after`'s column list and would be inert until the
+				// later rename caught up — but SQLite (and D1) auto-repoint a
+				// trigger's `UPDATE OF` list across `RENAME COLUMN` (verified:
+				// after `alter table q rename column "a" to "b"`, `sqlite_master`
+				// holds `before update of "b"`), so a guard created here under the
+				// old column name is repointed by the rename itself and is never
+				// inert. Folding it forward, on the other hand, broke the case
+				// where step 4 *also* rebuilds this table: `recreateTable`'s
+				// `insert … select` reads the pre-rename column name, which D1's
+				// double-quoted-string fallback silently degrades to the constant
+				// string — every value in the column replaced by the column's old
+				// name, migration reporting success. Emitting it in step 4 (or
+				// letting the rebuild carry it) keeps that correct; the batch
+				// window is closed by grouping instead, in `statementGroups`.
 				const staysAppendOnly = Boolean(after.tables[renamed]?.appendOnly);
 				statements.push({
 					sql: dropAppendOnlyTrigger(name),
@@ -761,8 +881,159 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 						reason: `"${renamed}" is no longer append-only, so UPDATE is permitted again`,
 					}),
 				});
+				if (staysAppendOnly) {
+					// The same foreign-trigger collision check step 2 and step 4
+					// make, asked here too. Moving the `create trigger` into this
+					// step is what made it necessary: step 4 now sees
+					// `previousGuard === nextGuard` (that is what `carriedAppendOnly`
+					// below arranges) and never reaches its own check, so a rename
+					// whose *destination* name collides with a live trigger orm-d1
+					// did not author used to emit a `create trigger` that fails on
+					// apply with "already exists" — for "was and stays append-only
+					// across a rename", the one case the reordering took out of
+					// step 4's reach.
+					//
+					// `[]` for the dropped-tables argument, not `dropped` (which is
+					// not computed until after this loop): the exemption it enables
+					// only counts a `drop table` already *emitted*, and at this point
+					// in the statement list none have been — so the two arguments
+					// give the same answer here, exactly as at step 2's call site.
+					const guardName = appendOnlyTriggerName(renamed);
+					if (tableGuardCollides(guardName, options.foreignTriggers, [], statements)) {
+						errors.push(
+							`"${name}" is being renamed to "${renamed}" and stays append-only, but a trigger named `
+								+ `"${guardName}" already exists and orm-d1 did not create it. Creating the guard would `
+								+ 'fail on apply because the name is taken. Drop or rename that trigger, or bring it '
+								+ 'into the schema so orm-d1 can carry it across rebuilds.',
+						);
+					} else {
+						// Kept even when the same table is *also* rebuilt later in
+						// this diff, which re-creates the identical guard on the new
+						// table: the two `create trigger` statements look like waste
+						// under D1's per-batch ceiling, but the first one is what keeps
+						// the table guarded across a batch boundary landing between the
+						// rename and the rebuild — the exact window `[F-117]` closed,
+						// and the invariant `kit/test/unit/diff.test.ts`'s "emits the
+						// rename, the old-name drop and the new-name re-create with
+						// nothing between them" pins. De-duplicating to the rebuild's
+						// copy alone would re-open it, so the duplicate stays.
+						// Guarded columns are named here under the names they have
+						// *right now* — pre-rename — not `after`'s final names, even
+						// though `after`'s list is what decides which columns are
+						// guarded at all. The rename of a guarded column lands later
+						// (step 4, or carried by a rebuild), and a trigger whose
+						// `UPDATE OF` names a column that does not exist yet is not
+						// an error at CREATE time: SQLite simply never fires it, so
+						// the guard would be silently inert for the whole window
+						// between here and the rename. Naming the live column keeps
+						// it in force immediately, and SQLite (and D1) auto-repoint
+						// a trigger's `UPDATE OF` list across `RENAME COLUMN`
+						// (verified: after `alter table q rename column "a" to "b"`,
+						// `sqlite_master` holds `before update of "b"`), so the
+						// later rename moves the guard onto the final name by
+						// itself — which is why the rename does *not* need to be
+						// dragged forward into this run (doing that corrupted the
+						// data of any table this diff also rebuilds; see above).
+						//
+						// A whole-table guard (`undefined` column list) needs none of
+						// this, and neither does an empty result: `appendOnlyTrigger`
+						// reads an empty list as "guard every column", so falling back
+						// to `after`'s names is strictly less wrong than handing it
+						// `[]` and blocking writes the schema permits.
+						const finalGuarded = appendOnlyColumns(after.tables[renamed]!.appendOnly);
+						// Not filtered down to columns that already exist on the pre-rename
+						// live table: SQLite resolves a trigger's `UPDATE OF <cols>` by column
+						// NAME at UPDATE time, not at `CREATE TRIGGER` time, so naming a
+						// column that does not exist yet (e.g. one this same diff is about
+						// to `add column`) is accepted silently and simply starts firing once
+						// that column exists -- it is not an error, and it is not inert.
+						// Filtering such names out here used to leave the guard permanently
+						// covering only the columns present *before* this diff ran: below,
+						// `carriedAppendOnly` is set to `after`'s full list regardless of
+						// what was actually emitted here, so step 4 saw
+						// `previousGuard === nextGuard` and never re-stated the guard with
+						// the columns this filter had dropped.
+						const liveGuarded = finalGuarded
+							?.map((column) => preRenameColumnName(renamedColumns, renamed, column));
+						// Two distinct `after` column names can resolve to the same
+						// pre-rename/live name (one column renamed onto a name
+						// another guarded column is also being renamed through/to).
+						// `appendOnlyTrigger` de-duplicates its column list, so the
+						// trigger created below ends up naming fewer live columns
+						// than `finalGuarded` has entries — one of the two guarded
+						// columns loses its protection the moment SQLite repoints
+						// the surviving name across the later `RENAME COLUMN`, and
+						// nothing downstream would ever restate it: see
+						// `liveGuardMismatch` below.
+						const emittedGuarded = liveGuarded && liveGuarded.length > 0 ? liveGuarded : finalGuarded;
+						// The check above (do two `after` names collapse onto one live
+						// name) only catches one direction. The other direction is
+						// just as real: an `after`-guarded column's own name can be
+						// the SOURCE of a rename this same diff performs (e.g. the
+						// expand/contract pattern — rename the live column aside,
+						// then add a fresh column back under its old name). SQLite
+						// repoints `UPDATE OF` across `RENAME COLUMN` by column
+						// identity, so the guard created here under that live name
+						// silently follows the rename onto the column being renamed
+						// AWAY, not the one that ends up holding the name in
+						// `finalGuarded`. The only predicate that catches both
+						// directions is: after every rename this diff performs lands,
+						// does the guard's column set still equal `finalGuarded`?
+						// Forward-map each live name this trigger actually guards
+						// through `renamedColumns` (a rename in this same diff moves
+						// it; nothing else does) and compare as sets.
+						if (liveGuarded && finalGuarded) {
+							const guardedAfterRename = new Set(
+								liveGuarded.map((column) => {
+									const key = `${renamed}.${column}`;
+									return Object.hasOwn(renamedColumns, key) ? renamedColumns[key]! : column;
+								}),
+							);
+							const wanted = new Set(finalGuarded);
+							const setsMatch = guardedAfterRename.size === wanted.size
+								&& [...guardedAfterRename].every((column) => wanted.has(column));
+							if (!setsMatch) {
+								liveGuardMismatch = true;
+								// Not `emittedGuarded` (the live names the trigger names
+								// right now, pre-rename): step 4 compares this against
+								// `after`'s own final names to decide whether to restate
+								// the guard, so it needs the columns this trigger will
+								// actually cover once every rename in this diff has landed
+								// — i.e. `guardedAfterRename` — or the SOURCE-collision case
+								// above (where the live guard silently ends up covering the
+								// wrong, renamed-away column) would compare equal to
+								// `after`'s list and never get corrected.
+								liveGuardedActual = [...guardedAfterRename];
+							}
+						}
+						statements.push({
+							sql: appendOnlyTrigger(renamed, emittedGuarded),
+							destructive: false,
+						});
+					}
+				}
 			}
-			effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: false };
+			// `appendOnly` on the effective (post-rename) entry is set to match
+			// `after` already when the guard was just re-created above, so the
+			// later per-table pass sees no further change to make for it — it
+			// would otherwise treat the freshly-created trigger's presence as
+			// drift it still needs to reconcile.
+			//
+			// Not trusted when `liveGuardMismatch` fired: the trigger actually
+			// created above covers fewer columns (by name-set) than `after`'s
+			// final list, so claiming `after`'s list here would make step 4 see
+			// `previousGuard === nextGuard` and never restate the guard —
+			// leaving one of the two colliding columns permanently unguarded.
+			// Handed `liveGuardedActual` (what the trigger just created above
+			// really guards) instead of `after`'s list in that case, so step 4's
+			// `previousGuard` differs from `nextGuard` and it drops the
+			// mismatched trigger before recreating it with `after`'s final
+			// names — the same drop-then-create it already does for any other
+			// guard narrowing.
+			const carriedAppendOnly = t.appendOnly && after.tables[renamed]?.appendOnly
+				? (liveGuardMismatch ? (liveGuardedActual ?? true) : after.tables[renamed]!.appendOnly)
+				: false;
+			effectiveBefore[renamed] = { ...t, name: renamed, appendOnly: carriedAppendOnly };
 		} else {
 			effectiveBefore[name] = t;
 		}
@@ -783,14 +1054,18 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		for (const name of Object.keys(effectiveBefore)) {
 			const t = effectiveBefore[name]!;
 			let changed = false;
-			const columns: Record<string, ColumnSnapshot> = { ...t.columns };
+			// `Object.assign(Object.create(null), …)`, not a spread: a spread rebuilds a
+			// *plain* object and throws away the null prototype `reviveSnapshot` just
+			// established, so `previous.columns['constructor']` starts resolving the
+			// inherited `Object` again — one `--rename-table` away from every fix below.
+			const columns: Record<string, ColumnSnapshot> = Object.assign(Object.create(null), t.columns);
 			for (const [colName, col] of Object.entries(columns)) {
 				if (col.references && renamedTables[col.references.tableTo]) {
 					columns[colName] = { ...col, references: { ...col.references, tableTo: repoint(col.references.tableTo) } };
 					changed = true;
 				}
 			}
-			const foreignKeys: Record<string, ForeignKeySnapshot> = { ...t.foreignKeys };
+			const foreignKeys: Record<string, ForeignKeySnapshot> = Object.assign(Object.create(null), t.foreignKeys);
 			for (const [fkName, fk] of Object.entries(foreignKeys)) {
 				if (renamedTables[fk.tableTo]) {
 					foreignKeys[fkName] = { ...fk, tableTo: repoint(fk.tableTo) };
@@ -918,7 +1193,9 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		const next = after.tables[name]!;
 		if (!previous) continue;
 
-		const columnRenames: Record<string, string> = {};
+		// `Object.create(null)` — see the identical comment at this function's
+		// other `columnRenames` construction above.
+		const columnRenames: Record<string, string> = Object.create(null);
 		for (const [key, value] of Object.entries(renamedColumns)) {
 			const [table, column] = key.split('.');
 			if (table === name && column) columnRenames[column] = value;
@@ -972,8 +1249,18 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		const unaddable = added.map(([columnName, column]) => ({ columnName, blocker: isAddable(column) }))
 			.find((c) => c.blocker);
 		const afterIsSchemaDerived = after.origin === 'schema';
+		// A cyclic rename (a swap `x<->y`, or a longer rotation) cannot be
+		// expressed as a sequence of in-place `RENAME COLUMN` statements: by the
+		// time the statement that would close the cycle runs, the column it
+		// names has already been renamed away by an earlier statement in the
+		// same loop (see `hasRenameCycle`). Route it through the rebuild path
+		// instead — `recreateTable`'s `INSERT … SELECT` maps old to new columns
+		// directly from `columnRenames`, with no such ordering hazard.
 		const reason = requiresRecreate(previous, next, columnRenames, afterIsSchemaDerived)
-			?? (unaddable && `column "${unaddable.columnName}" cannot be added in place: ${unaddable.blocker}`);
+			?? (unaddable && `column "${unaddable.columnName}" cannot be added in place: ${unaddable.blocker}`)
+			?? (hasRenameCycle(columnRenames)
+				? 'a column rename cycle cannot be expressed as in-place RENAME COLUMN statements'
+				: undefined);
 
 		if (reason) {
 			const foreignTriggersForTable = lookupCaseInsensitive(options.foreignTriggers, liveTableNames[name] ?? name)
@@ -993,6 +1280,7 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			);
 			statements.push(...recreated.statements);
 			errors.push(...recreated.errors);
+
 
 			// The rebuild's own statements only ever *add back* the append-only
 			// guard (when `next.appendOnly`), because `recreateTable` has no
@@ -1026,8 +1314,20 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		// Only reached when the table survives in place; a rebuild carries the
 		// rename itself. Must precede the index and column ALTERs below, which
 		// are expressed against the new names.
+		//
+		// Track which entries actually got a `rename column` statement — the
+		// `guardChanged` check below forward-maps `previous.appendOnly` through
+		// `columnRenames` on the assumption that every entry it names was
+		// emitted here. `columnRenames` can name a rename this loop skips (e.g.
+		// a stale `--rename-column` for a live guard naming a column the table
+		// does not actually have — see `kit/src/node/commands.ts`'s
+		// `sidecarDisagreementWarnings`), and crediting an unemitted rename would
+		// make `guardChanged` conclude the guard is already reconciled when the
+		// live trigger never moved.
+		const emittedColumnRenames: Record<string, string> = Object.create(null);
 		for (const [from, to] of Object.entries(columnRenames)) {
 			if (!previous.columns[from] || !next.columns[to]) continue;
+			emittedColumnRenames[from] = to;
 			statements.push({
 				sql: `alter table ${quote(name)} rename column ${quote(from)} to ${quote(to)}`,
 				destructive: false,
@@ -1068,7 +1368,28 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		// protection, which is worth saying out loud rather than doing quietly.
 		const previousGuard = appendOnlyKey(previous.appendOnly);
 		const nextGuard = appendOnlyKey(next.appendOnly);
-		if (previousGuard !== nextGuard) {
+		// Raw-string comparison (`previousGuard !== nextGuard`) is wrong here for
+		// the same reason step 1's `liveGuardMismatch` check exists: this table
+		// survives in place, so the `columnRenames` loop just above (or about to
+		// run below) applies `alter table … rename column` statements this same
+		// diff emits, and SQLite auto-repoints a live trigger's `UPDATE OF` list
+		// across `RENAME COLUMN` (see the comment block around line 707). If a
+		// guarded column is renamed away and a *new* column is added back under
+		// its old name (`x -> y`, new `x`), `previous.appendOnly` and
+		// `next.appendOnly` can both literally read `['x']` — same raw key, no
+		// drift detected — while the live trigger, after the rename runs, ends up
+		// guarding `y`, not the new `x`. Forward-map the previous guard's columns
+		// through this table's renames and compare as sets against `next`'s,
+		// exactly as step 1 does for the rename-branch case.
+		const guardChanged = (() => {
+			if (previousGuard === '' || nextGuard === '' || previousGuard === '*' || nextGuard === '*') {
+				return previousGuard !== nextGuard;
+			}
+			const mapped = new Set(appendOnlyColumns(previous.appendOnly)!.map((c) => emittedColumnRenames[c] ?? c));
+			const wanted = new Set(appendOnlyColumns(next.appendOnly)!);
+			return mapped.size !== wanted.size || [...mapped].some((c) => !wanted.has(c));
+		})();
+		if (guardChanged) {
 			// A guard that is only being *narrowed* still has to be dropped first:
 			// the trigger's name is derived from the table, so `create trigger`
 			// would fail on apply with "already exists".

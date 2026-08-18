@@ -197,6 +197,15 @@ const RENAME_TO_PATTERN = new RegExp(
 	`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+to\\s+(${IDENTIFIER_SOURCE})\\s*$`,
 	'i',
 );
+const RENAME_COLUMN_PATTERN = new RegExp(
+	// `(?:…)` around every inserted `IDENTIFIER_SOURCE`, not bare: the source is
+	// a top-level alternation of the four spellings, so interpolating it
+	// unwrapped makes the *whole* pattern an alternation — one alternative of
+	// which is a lone bare identifier followed by `\s*$`, matching almost any
+	// statement that ends in a word, with capture group 1 undefined.
+	`^\\s*alter\\s+table\\s+(${IDENTIFIER_SOURCE})\\s+rename\\s+column\\s+(?:${IDENTIFIER_SOURCE})\\s+to\\s+(?:${IDENTIFIER_SOURCE})\\s*$`,
+	'i',
+);
 // A generic capture-then-compare pattern here would be wrong: `.exec()`
 // against a greedy `[\s\S]*` backtracks to the LAST "on <ident>" that still
 // lets the rest of the pattern match, not the first — so a trailing
@@ -213,20 +222,65 @@ const RENAME_TO_PATTERN = new RegExp(
 const escapeRegExpForOnPattern = (value: string): string =>
 	value.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-function buildCreateOnPattern(finalName: string): RegExp {
-	const escaped = escapeRegExpForOnPattern(finalName);
-	const escapedForBrackets = escapeRegExpForOnPattern(finalName.replaceAll(']', ']]'));
-	const spellings = [
-		`"${escapeRegExpForOnPattern(finalName.replaceAll('"', '""'))}"`,
-		`\`${escapeRegExpForOnPattern(finalName.replaceAll('`', '``'))}\``,
+/** Any of SQLite's four quoted spellings of `identifier`, escaped for use in a `RegExp`. */
+function quotedIdentifierAlternation(identifier: string): string {
+	const escaped = escapeRegExpForOnPattern(identifier);
+	const escapedForBrackets = escapeRegExpForOnPattern(identifier.replaceAll(']', ']]'));
+	return [
+		`"${escapeRegExpForOnPattern(identifier.replaceAll('"', '""'))}"`,
+		`\`${escapeRegExpForOnPattern(identifier.replaceAll('`', '``'))}\``,
 		`\\[${escapedForBrackets}\\]`,
 		`\\b${escaped}\\b`,
-	];
+	].join('|');
+}
+
+function buildCreateOnPattern(finalName: string): RegExp {
 	return new RegExp(
-		`^\\s*create\\s+(?:unique\\s+index|index|trigger)\\b[\\s\\S]*?\\bon\\s+(?:${spellings.join('|')})`,
+		`^\\s*create\\s+(?:unique\\s+index|index|trigger)\\b[\\s\\S]*?\\bon\\s+(?:${quotedIdentifierAlternation(finalName)})`,
 		'i',
 	);
 }
+
+/** `drop trigger if exists "<name>_no_update"`, any quoting. */
+function buildDropTriggerIfExistsPattern(triggerName: string): RegExp {
+	return new RegExp(
+		`^\\s*drop\\s+trigger\\s+if\\s+exists\\s+(?:${quotedIdentifierAlternation(triggerName)})\\s*$`,
+		'i',
+	);
+}
+
+/**
+ * `create trigger "<name>_no_update" ...`, any quoting.
+ *
+ * No trailing `\b` after the alternation: `quotedIdentifierAlternation`'s bare
+ * spelling already ends in one, but its quoted/backtick/bracket spellings end
+ * in a punctuation character (`"`, `` ` ``, `]`), and a `\b` right after one of
+ * those requires a word character on both sides of the boundary — which the
+ * statement text right there never has (the identifier is immediately
+ * followed by whitespace or a newline, both non-word). A trailing `\b` here
+ * made the quoted spelling — the one the kit itself always emits — never
+ * match at all.
+ */
+function buildCreateTriggerPattern(triggerName: string): RegExp {
+	return new RegExp(
+		`^\\s*create\\s+trigger\\s+(?:${quotedIdentifierAlternation(triggerName)})`,
+		'i',
+	);
+}
+
+// The generic (name-capturing) spellings of the guard swap, for the case where
+// no table rename precedes it and there is therefore no `fromName`/`toName` to
+// build a name-specific pattern from. `\\s` rather than `\\b` after the
+// captured identifier, for the reason spelled out on
+// `buildCreateTriggerPattern`.
+const DROP_TRIGGER_IF_EXISTS_PATTERN = new RegExp(
+	`^\\s*drop\\s+trigger\\s+if\\s+exists\\s+(${IDENTIFIER_SOURCE})\\s*$`,
+	'i',
+);
+const CREATE_TRIGGER_NAMED_PATTERN = new RegExp(
+	`^\\s*create\\s+trigger\\s+(${IDENTIFIER_SOURCE})\\s`,
+	'i',
+);
 
 export function statementGroups(statements: readonly string[]): number[] {
 	const groups: number[] = new Array(statements.length);
@@ -234,6 +288,107 @@ export function statementGroups(statements: readonly string[]): number[] {
 	let i = 0;
 
 	while (i < statements.length) {
+		// A plain `--rename-table` rename (not the closing rename of a rebuild —
+		// that shape starts at `create table "__new_X"` and is handled by the
+		// branch below, which consumes its own rename before this point in the
+		// loop ever sees it directly). `diffSnapshots` (`diff.ts`) emits the drop
+		// of the append-only guard under its *old* name right after the rename
+		// (SQLite keeps a trigger's name across `RENAME TO`), and — when the
+		// table stays append-only — the guard's re-create under the *new* name
+		// immediately after that, specifically so this scan finds all three
+		// adjacent. Left as three singleton groups, a batch boundary between the
+		// drop and the re-create left the table genuinely unprotected — UPDATE
+		// permitted — for as long as the next batch took, and unprotected for
+		// good if that batch then failed, the same class of hole `[F-041]`
+		// closed for a rebuild's own index/trigger restoration.
+		const renameMatch = RENAME_TO_PATTERN.exec(statements[i]!);
+		if (renameMatch) {
+			const fromName = normalizeIdentifierToken(renameMatch[1]!);
+			const toName = normalizeIdentifierToken(renameMatch[2]!);
+			let end = i;
+			// [F-117 cont'd]: `diffSnapshots` (`diff.ts`) folds any rename of the
+			// guarded column itself into this same run, right here, before the
+			// drop/create-trigger pair — the trigger a few statements below is
+			// built from the *final* column list, and a batch boundary landing
+			// between the rename-table and a column rename left dangling in its
+			// own group would leave that trigger naming a column that does not
+			// exist yet, silently inert, for however long the split lasted. Consume
+			// every adjacent `alter table <toName> rename column …` so they stay in
+			// the same atomic run as the trigger swap they make correct.
+			for (;;) {
+				const columnRename = end + 1 < statements.length
+					? RENAME_COLUMN_PATTERN.exec(statements[end + 1]!)
+					: null;
+				if (!columnRename || foldAsciiCase(normalizeIdentifierToken(columnRename[1]!)) !== foldAsciiCase(toName)) {
+					break;
+				}
+				end += 1;
+			}
+			if (
+				end + 1 < statements.length
+				&& buildDropTriggerIfExistsPattern(`${fromName}_no_update`).test(statements[end + 1]!)
+			) {
+				end += 1;
+				if (
+					end + 1 < statements.length
+					&& buildCreateTriggerPattern(`${toName}_no_update`).test(statements[end + 1]!)
+				) {
+					end += 1;
+				}
+			}
+			if (end > i) {
+				const group = nextGroup++;
+				for (let k = i; k <= end; k++) groups[k] = group;
+				i = end + 1;
+				continue;
+			}
+		}
+
+		// The same guard window, without a table rename in front of it. A rename
+		// of a *guarded* column on a table that keeps its name makes
+		// `diffSnapshots` re-state the guard (its `UPDATE OF` list is keyed on
+		// column names, so narrowing/renaming changes the key): it emits
+		// `alter table X rename column …`, then `drop trigger if exists
+		// "X_no_update"`, then `create trigger "X_no_update"`. The branch above
+		// only starts at a table rename, so these stayed three singleton groups —
+		// and a batch boundary between the drop and the re-create left the table
+		// genuinely unprotected (UPDATE permitted) for as long as the next batch
+		// took, and for good if that batch failed. Exactly the hole the
+		// table-rename case already had closed; close it here too.
+		//
+		// Two entry points, because the guard pair is what actually has to be
+		// atomic: a run of column renames on one table that leads straight into
+		// the pair (grouped from the first rename, so the trigger is never
+		// re-created against a column name that has not landed yet), and the
+		// bare pair on its own (a guard merely being narrowed, with no rename).
+		{
+			let end = i;
+			const columnRenameStart = RENAME_COLUMN_PATTERN.exec(statements[i]!);
+			if (columnRenameStart) {
+				const owner = foldAsciiCase(normalizeIdentifierToken(columnRenameStart[1]!));
+				for (;;) {
+					const next = end + 1 < statements.length ? RENAME_COLUMN_PATTERN.exec(statements[end + 1]!) : null;
+					if (!next || foldAsciiCase(normalizeIdentifierToken(next[1]!)) !== owner) break;
+					end += 1;
+				}
+			}
+			const dropIndex = columnRenameStart ? end + 1 : i;
+			const dropMatch = dropIndex < statements.length
+				? DROP_TRIGGER_IF_EXISTS_PATTERN.exec(statements[dropIndex]!)
+				: null;
+			const droppedTrigger = dropMatch ? normalizeIdentifierToken(dropMatch[1]!) : undefined;
+			if (droppedTrigger !== undefined && dropIndex + 1 < statements.length) {
+				const createMatch = CREATE_TRIGGER_NAMED_PATTERN.exec(statements[dropIndex + 1]!);
+				const createdTrigger = createMatch ? normalizeIdentifierToken(createMatch[1]!) : undefined;
+				if (createdTrigger !== undefined && foldAsciiCase(createdTrigger) === foldAsciiCase(droppedTrigger)) {
+					const group = nextGroup++;
+					for (let k = i; k <= dropIndex + 1; k++) groups[k] = group;
+					i = dropIndex + 2;
+					continue;
+				}
+			}
+		}
+
 		// Looked ahead, not behind: a preceding PRAGMA would otherwise already
 		// have been consumed into its own singleton group by the time this loop
 		// reaches the `create table "__new_X"` that follows it.

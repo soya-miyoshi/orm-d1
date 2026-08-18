@@ -3,9 +3,11 @@
  * so they are callable from a script as well as from the CLI.
  */
 import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { configureCasing, getTableName, isTable } from 'orm-d1';
-import { validateTableOptions } from 'orm-d1/ddl';
+import { appendOnlyKey, validateTableOptions } from 'orm-d1/ddl';
+import type { TableOptions } from 'orm-d1/ddl';
 import {
 	appliedMigrations,
 	applyMigrations,
@@ -24,7 +26,7 @@ import { carryForwardCollations, diffSnapshots, renderMigration } from '../core/
 import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
 import { normalizeIndexColumn, normalizeUniqueColumn, snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
-import type { Snapshot } from '../core/snapshot.js';
+import type { Snapshot, TableSnapshot } from '../core/snapshot.js';
 import { describeResolution } from './config.js';
 import type { Config } from './config.js';
 import { localRunner, remoteRunner, scratchRunner } from './runners.js';
@@ -58,6 +60,14 @@ export interface TargetFlags {
 	readonly renames?: DiffOptions;
 	/** Write the three-pass draft when a rebuild is refused. */
 	readonly emitRoundtrip?: boolean;
+	/**
+	 * [F-100] The specifier `pull`'s rendered `tableOptions([...])` sidecar
+	 * should import the schema module from — i.e. the path from wherever the
+	 * sidecar will be written to wherever `--schema-out` writes the schema.
+	 * Defaults to `'./schema'`, which is right only when both live in the same
+	 * directory; the CLI computes the real relative path.
+	 */
+	readonly schemaModuleSpecifier?: string;
 }
 
 /** Pick the database to act on. Ambiguity here is how the wrong one gets hit. */
@@ -324,8 +334,14 @@ export async function push(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	// Same pragma rule and same batch cap as `applyMigration` — a push that
 	// exceeded D1's per-batch limit used to be sent as one oversized batch.
 	// Packed by whole rebuild groups, never mid-group — see `packIntoBatches`.
+	// [F-116]: the ceiling is asked of the runner, not hardcoded — a remote
+	// runner sending a batch through D1's file-import endpoint may have no
+	// statement ceiling at all, while a stricter `/query` ceiling would be
+	// silently violated by always packing at the constant. Same computation
+	// `applyMigration` (`apply.ts`) already uses.
 	const statements = diff.statements.map((s) => s.sql).filter((s) => !isPragma(s));
-	const batches = packIntoBatches(statements, MAX_STATEMENTS_PER_BATCH);
+	const limit = runner.atomicLimit?.(statements) ?? MAX_STATEMENTS_PER_BATCH;
+	const batches = packIntoBatches(statements, limit);
 
 	// Logged before the first `batch()` call, not after: once a batch has run
 	// there is no undoing it, so the "this will be split, and atomicity is
@@ -333,7 +349,7 @@ export async function push(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	if (batches.length > 1) {
 		ctx.log(
 			`  ! ${statements.length} statements must be split into ${batches.length} batches of up to `
-				+ `${MAX_STATEMENTS_PER_BATCH}. Atomicity is lost at each split; if it fails part-way, the `
+				+ `${limit}. Atomicity is lost at each split; if it fails part-way, the `
 				+ 'database is left between states.',
 		);
 	}
@@ -349,14 +365,140 @@ export async function push(ctx: CommandContext, flags: TargetFlags = {}): Promis
 export interface PullResult {
 	readonly snapshot: Snapshot;
 	readonly schema: string;
+	/**
+	 * [F-100] The `tableOptions([...])` sidecar module text — `STRICT`,
+	 * `WITHOUT ROWID`, `appendOnly` and any non-BINARY column `collate` this
+	 * pull found, in the one shape `config.tableOptions` already reads.
+	 * `undefined` when nothing in the snapshot needs it, so a plain database
+	 * does not get a pointless sidecar file.
+	 */
+	readonly tableOptions: string | undefined;
+	/**
+	 * What an existing `config.tableOptions` sidecar declares that this pull is
+	 * *not* carrying into `tableOptions` above — every declaration for a table
+	 * the live database still has, minus the `collate: null` retirements that do
+	 * survive. Non-empty means the file on disk is now stale, which is what the
+	 * CLI's "the rendered sidecar drops them" lines claim: the caller has to
+	 * rewrite the file for that claim to be true, and when nothing live needs a
+	 * sidecar at all (`tableOptions === undefined`) rewriting it is the *only*
+	 * way — leaving it alone would leave the dropped declarations authoritative
+	 * for the next generate.
+	 */
+	readonly droppedDeclarations: readonly string[];
 }
 
-export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promise<PullResult> {
+/**
+ * The read-only half of `pull`: introspect, render, and warn — no writes at
+ * all. Split out from {@link pull} (which still does the whole thing, for
+ * library callers) so the CLI can run every precondition check — does
+ * `schema.ts` exist, does `table-options.ts` exist, can a declared sidecar
+ * even be loaded — *before* anything touches disk.
+ *
+ * [F-097 cont'd] `pull` used to journal the baseline (migration + snapshot +
+ * meta entry) before the CLI's table-options existence check ran, so a
+ * refused overwrite still left a baseline behind — following the refusal's
+ * own advice (re-run with `--force`) produced a second, redundant baseline.
+ * Worse, loading a stale `config.tableOptions` sidecar that imports a
+ * binding the *previous* schema module no longer exports used to fail
+ * *after* that baseline was written, repeatedly, with no schema module and
+ * no sidecar ever produced — `pull` became unusable in exactly the situation
+ * it exists to recover from. Both are fixed the same way: nothing here
+ * writes anything, so a thrown error (a missing export, an unparsable
+ * sidecar) or a refusal decided from the result leaves nothing on disk.
+ */
+export async function pullSnapshot(
+	ctx: CommandContext,
+	flags: TargetFlags = {},
+): Promise<PullResult & { readonly snapshot: Snapshot }> {
 	const runner = await resolveRunner(ctx, flags);
 	const snapshot = await introspect(runner);
+	const schema = renderSchemaModule(snapshot);
+
+	// [F-100 follow-up] Options the *config* already declares are read back and
+	// merged in, because the mechanical renderer below can only state what it
+	// can see in the live database. A hand-maintained sidecar says one thing
+	// introspection structurally cannot — `collate: { legacyId: null }` ("stop
+	// carrying that collation forward") — and `renderTableOptionsModule`'s
+	// merge rule keeps exactly that one spelling; everything else declared
+	// here is stale the moment the live database disagrees (see that
+	// function's doc comment and `sidecarDisagreementWarnings`).
+	// Existence-checked rather than let to throw: `config.tableOptions` naming
+	// the file this very `pull` is about to write for the first time is the
+	// normal bootstrapping order, and refusing to introspect over it would make
+	// the config entry impossible to add before the first pull. A file that
+	// *does* exist but fails to load (a stale import) throws here, before this
+	// function or its caller has written anything.
+	const declared = ctx.config.tableOptions && existsSync(resolve(ctx.cwd, ctx.config.tableOptions))
+		? (await loadTableOptions(ctx.cwd, ctx.config.tableOptions)).byTable
+		: undefined;
+
+	const tableOptions = renderTableOptionsModule(snapshot, flags.schemaModuleSpecifier ?? './schema', declared);
+	ctx.log(`Introspected ${Object.keys(snapshot.tables).length} tables.`);
+
+	// Printed whenever there is anything to say, not only when no sidecar was
+	// rendered. The two predicates test the same four conditions with the same
+	// operators, so `warnings.length > 0` iff a sidecar was rendered — guarding
+	// the print on "no sidecar" made it dead code, and the operator learned
+	// nothing about a live option their schema module cannot state. The sidecar
+	// is how it gets stated; these lines are what tell them to wire it up.
+	for (const warning of unexpressibleTableOptionWarnings(snapshot)) ctx.log(`  ! ${warning}`);
+
+	// [F-115 cont'd] Where the merge rule above kept a declared value or
+	// dropped one, said out loud rather than left for the operator to notice
+	// only by diffing the rendered file.
+	for (const warning of sidecarDisagreementWarnings(snapshot, declared)) ctx.log(`  ! ${warning}`);
+
+	// A declared table the live database does not have cannot be re-stated: the
+	// rendered sidecar imports its bindings from the rendered schema module,
+	// which has no export for a table that is not there. Named rather than
+	// dropped silently.
+	for (const name of Object.keys(declared ?? {})) {
+		if (snapshot.tables[name]) continue;
+		ctx.log(
+			`  ! config.tableOptions declares "${name}", which the live database does not have — it cannot be `
+				+ 'carried into the rendered sidecar (the schema module has no binding for it). Keep a copy before '
+				+ 'overwriting, or restore that entry by hand.',
+		);
+	}
+
+	// Which declared tables the rendered sidecar does not (or would not) carry:
+	// everything declared for a live table whose only surviving spelling — a
+	// `collate: null` retirement on a column that still exists — is absent.
+	// Tables the live database no longer has are excluded: they are reported
+	// separately just above, and there is nothing this pull could write for
+	// them either way.
+	const droppedDeclarations = Object.entries(declared ?? {})
+		.filter(([name, carried]) => {
+			const table = snapshot.tables[name];
+			if (!table) return false;
+			const retained = Object.entries(carried.collate ?? {})
+				.some(([column, value]) => value === null && table.columns[column]);
+			return !retained && Object.keys(carried).length > 0;
+		})
+		.map(([name]) => name);
+
+	return { snapshot, schema, tableOptions, droppedDeclarations };
+}
+
+/**
+ * Journal a pulled baseline: an empty migration recording that the live
+ * database is already in this state, plus the snapshot and journal entry that
+ * make it the new "previous" for `generate`. Split out from {@link pull} so
+ * the CLI can defer it until after every precondition check has passed — see
+ * {@link pullSnapshot}'s doc comment for why that ordering matters.
+ */
+export async function journalPulledBaseline(
+	ctx: CommandContext,
+	snapshot: Snapshot,
+	flags: TargetFlags = {},
+): Promise<void> {
 	const journal = await readJournal(ctx.config.out);
 	const index = nextIndex(journal);
 	const tag = migrationTag(index, flags.name ?? migrationName(index));
+	// [F-066]: chain the pulled baseline into the snapshot history the same way
+	// `generate` does — otherwise `pull`'s own baseline is the one snapshot in
+	// `meta/` with no `prevId`, breaking the chain for any tooling that walks it.
+	const previous = await readLatestSnapshot(ctx.config.out);
 
 	// The snapshot has to be journalled, or `nextIndex` hands the same index to
 	// the next `generate`, which writes over the pulled baseline and diffs
@@ -364,24 +506,36 @@ export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promis
 	// the live database is already in this state, so applying it is a no-op
 	// that only records the baseline in the migrations table.
 	await writeMigration(ctx.config.out, tag, `-- Baseline introspected by orm-d1-kit pull; nothing to apply.`);
-	await writeSnapshot(ctx.config.out, index, { ...snapshot, id: tag });
+	await writeSnapshot(ctx.config.out, index, { ...snapshot, id: tag, prevId: previous.id });
 	await writeJournal(ctx.config.out, appendEntry(journal, tag, ctx.now()));
+}
 
-	const schema = renderSchemaModule(snapshot);
-	ctx.log(`Introspected ${Object.keys(snapshot.tables).length} tables.`);
-	for (const warning of unexpressibleTableOptionWarnings(snapshot)) ctx.log(`  ! ${warning}`);
-	return { snapshot, schema };
+/**
+ * The whole of `pull` for a library caller: compute, then journal
+ * unconditionally. The CLI does not call this directly — see
+ * {@link pullSnapshot} and {@link journalPulledBaseline}.
+ */
+export async function pull(ctx: CommandContext, flags: TargetFlags = {}): Promise<PullResult> {
+	const result = await pullSnapshot(ctx, flags);
+	await journalPulledBaseline(ctx, result.snapshot, flags);
+	return result;
 }
 
 /**
  * F-100: `strict`, `withoutRowid` and `appendOnly` are captured correctly by
  * `snapshotFromIntrospection`, but the rendered schema module (plain
- * `sqliteTable` calls) has no spelling for any of them — no
- * `tableOptions([...])` sidecar is written. Left silent, the very next
- * `generate` against the rendered module reads all three back as `false` and
- * proposes rebuilding/dropping them with nothing naming what is being lost.
- * This does not block `pull` — it only warns, loudly, naming every affected
- * table and every option it cannot express.
+ * `sqliteTable` calls) has no spelling for any of them. `pull` now renders a
+ * `tableOptions([...])` sidecar ({@link renderTableOptionsModule}) that states
+ * them — and these warnings are printed *alongside* it, not instead of it.
+ * They used to be guarded on "no sidecar was rendered", which is dead code:
+ * this predicate and the renderer's test the same four conditions with the
+ * same operators, so there are warnings exactly when there is a sidecar. The
+ * operator still needs to be told, because writing the file is not the same as
+ * putting it to use — `config.tableOptions` has to point at it, and a caller
+ * of `pull` that discards `result.tableOptions` gets no file at all.
+ *
+ * F-110: the message now names `config.tableOptions` — the kit's actual
+ * mechanism for stating this — rather than only describing what is lost.
  *
  * F-101: the same gap applies per column, to a non-BINARY `COLLATE`. Drizzle
  * (and so this schema DSL) has no `.collate()` spelling, so a live column's
@@ -403,16 +557,17 @@ export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
 			warnings.push(
 				`"${table.name}" is ${lost.join(', ')} in the live database, but the rendered schema module has no way `
 					+ `to express ${lost.length > 1 ? 'any of them' : 'that'} — the next generate against this schema `
-					+ `will propose dropping ${lost.length > 1 ? 'them' : 'it'} unless you account for ${
+					+ `will propose dropping ${lost.length > 1 ? 'them' : 'it'} unless you state ${
 						lost.length > 1 ? 'them' : 'it'
-					} by hand.`,
+					} in a \`config.tableOptions\` sidecar (see kit/README.md).`,
 			);
 		}
 		for (const column of Object.values(table.columns)) {
 			if (!column.collate || column.collate.toLowerCase() === 'binary') continue;
 			warnings.push(
 				`"${table.name}"."${column.name}" is collate ${column.collate} in the live database, but the schema `
-					+ `DSL has no way to express a column collation — the rendered schema module will not state it.`,
+					+ `DSL has no way to express a column collation — state it in a \`config.tableOptions\` sidecar's `
+					+ `\`collate\` map (see kit/README.md), or the rendered schema module will not state it.`,
 			);
 		}
 		// Same gap as a column's own collation (F-101), one level down: a
@@ -442,8 +597,190 @@ export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
 				);
 			}
 		}
+
+		// The live guard's own `UPDATE OF <cols>` list, read back verbatim by
+		// `appendOnlyTriggerGuard` (`core/introspect.ts`) with no existence check
+		// against the live table — SQLite accepts (and silently never fires
+		// against) `before update of nosuchcol` without complaint, so a stale
+		// trigger left over from a dropped/renamed column, or one hand-written
+		// outside orm-d1, can name a column the table does not have. Carrying
+		// that straight into the sidecar (as `renderTableOptionsModule` used to)
+		// writes an `appendOnly` list `assertAppendOnlyColumns` (`src/ddl.ts`)
+		// then rejects outright — every later `generate`/`check` throws
+		// uncaught, out of a `pull` that itself reported success. Named here so
+		// the operator sees it while `pull` still has the context to say it,
+		// mirroring `sidecarDisagreementWarnings`' collate-column-does-not-exist
+		// case just above.
+		if (Array.isArray(table.appendOnly)) {
+			const ghosts = table.appendOnly.filter((c) => !table.columns[c]);
+			if (ghosts.length > 0) {
+				warnings.push(
+					`"${table.name}"'s live append-only guard names ${
+						ghosts.map((c) => `"${c}"`).join(', ')
+					} — a column ${ghosts.length > 1 ? 'names' : 'name'} the table does not have. The rendered `
+						+ `sidecar drops ${ghosts.length > 1 ? 'them' : 'it'} rather than writing an appendOnly `
+						+ 'declaration a later generate/check would reject outright; the live trigger itself is stale '
+						+ 'and should be dropped or corrected by hand.',
+				);
+			}
+		}
 	}
 	return warnings;
+}
+
+/**
+ * [F-115 cont'd] Where `config.tableOptions` and the live database disagree,
+ * on the four keys {@link renderTableOptionsModule} renders.
+ *
+ * `renderTableOptionsModule`'s merge rule is "live wins whenever live can
+ * state the option at all", with one deliberate exception — an explicit
+ * `collate: { column: null }` retirement survives even over a live column
+ * that still shows a real collation, because introspection has no way to
+ * state the retirement itself. Both halves of that rule are silent by
+ * construction (that is the point: the rendered sidecar states one outcome).
+ * This function is what tells the operator the *other* outcome existed —
+ * that config declared something the rendered file does not carry over
+ * (stale `strict`/`withoutRowid`/`appendOnly`, or a stale non-null
+ * `collate`), or that a kept `null` retirement is still contradicted by the
+ * live database (the migration to actually drop the collation has not been
+ * applied there yet).
+ */
+export function sidecarDisagreementWarnings(
+	snapshot: Snapshot,
+	declared: Readonly<Record<string, TableOptions>> | undefined,
+): string[] {
+	const warnings: string[] = [];
+	if (!declared) return warnings;
+
+	for (const [name, carried] of Object.entries(declared)) {
+		const table = snapshot.tables[name];
+		if (!table) continue; // Reported separately — see the caller.
+
+		const stale: string[] = [];
+		if (carried.strict && !table.strict) stale.push('strict');
+		if (carried.withoutRowid && !table.withoutRowid) stale.push('withoutRowid');
+		if (carried.appendOnly && !table.appendOnly) stale.push('appendOnly');
+
+		// The other direction of the same disagreement: config says the option
+		// is *off* (an explicit `false`, not an omission — omitting a key states
+		// nothing and is not a disagreement) while the live database has it on.
+		// The rendered sidecar states the live value, so the declaration is
+		// dropped just as surely as a stale `true` is, and used to be dropped
+		// silently — the operator's "we turned this off" never took effect and
+		// nothing said so.
+		const overridden: string[] = [];
+		if (carried.strict === false && table.strict) overridden.push('strict');
+		if (carried.withoutRowid === false && table.withoutRowid) overridden.push('withoutRowid');
+		if (carried.appendOnly === false && table.appendOnly) overridden.push('appendOnly');
+		if (overridden.length > 0) {
+			warnings.push(
+				`config.tableOptions declares ${overridden.join(', ')} off for "${name}", but the live database has `
+					+ `${overridden.length > 1 ? 'them' : 'it'} — the rendered sidecar states the live setting, so the `
+					+ `declaration is dropped. Migrate the database if you meant to turn ${
+						overridden.length > 1 ? 'them' : 'it'
+					} off.`,
+			);
+		}
+
+		// And the case where both sides state an `appendOnly` guard but not the
+		// same one: a declared column list against a live whole-table guard, or
+		// against a different (usually wider) live list. Neither half is a "stale
+		// true" or a "declared false", so both checks above miss it, and the
+		// rendered sidecar quietly widens the guard back to whatever is live.
+		if (
+			carried.appendOnly && table.appendOnly
+			&& appendOnlyKey(carried.appendOnly) !== appendOnlyKey(table.appendOnly)
+		) {
+			const describe = (value: boolean | readonly string[]): string =>
+				typeof value === 'boolean' ? 'the whole table' : [...value].map((c) => `"${c}"`).join(', ');
+			warnings.push(
+				`config.tableOptions declares appendOnly for "${name}" over ${describe(carried.appendOnly)}, but the `
+					+ `live guard covers ${describe(table.appendOnly)} — the rendered sidecar states the live guard, `
+					+ 'so the declaration is dropped. Migrate the database if you meant to change what is guarded.',
+			);
+		}
+
+		if (stale.length > 0) {
+			warnings.push(
+				`config.tableOptions declares ${stale.join(', ')} for "${name}", but the live database does not have `
+					+ `${stale.length > 1 ? 'any of them' : 'it'} — the rendered sidecar drops ${
+						stale.length > 1 ? 'them' : 'it'
+					} rather than resurrecting a setting nothing live backs.`,
+			);
+		}
+
+		for (const [column, value] of Object.entries(carried.collate ?? {})) {
+			// A declaration for a column the live table no longer has — dropped
+			// (including a `null` retirement, the one spelling that otherwise
+			// survives a live disagreement), because `validateTableOptions`
+			// rejects a `collate` map naming a column that does not exist, so
+			// carrying it would make `pull` write a file no later command can
+			// load.
+			if (!table.columns[column]) {
+				warnings.push(
+					`config.tableOptions declares collate for "${name}"."${column}", which the live table does not `
+						+ 'have — the rendered sidecar drops it (a collate entry for a column that does not exist is '
+						+ 'rejected outright). Restore the entry by hand if the column is coming back under that name.',
+				);
+				continue;
+			}
+			const live = table.columns[column]?.collate;
+			const liveNonBinary = live && live.toLowerCase() !== 'binary' ? live : undefined;
+			if (value === null) {
+				if (liveNonBinary) {
+					warnings.push(
+						`config.tableOptions retires collate for "${name}"."${column}" (collate: null), but the live `
+							+ `database still has collate ${liveNonBinary} — kept the retirement in the rendered `
+							+ 'sidecar; it takes effect once the migration that drops the collation is applied.',
+					);
+				}
+			} else if (!liveNonBinary) {
+				warnings.push(
+					`config.tableOptions declares collate ${value} for "${name}"."${column}", but the live database `
+						+ 'does not have it — the rendered sidecar drops it rather than resurrecting a collation '
+						+ 'nothing live backs.',
+				);
+			} else if (liveNonBinary.toLowerCase() !== value.toLowerCase()) {
+				// Both sides state a collation and they are not the same one. Live
+				// wins (the rule this whole function annotates), so the declared
+				// value is dropped — and used to be dropped in silence, which is
+				// the one shape of this disagreement most likely to be a real
+				// mistake rather than staleness: the operator wrote a collation
+				// down and got a different one back.
+				warnings.push(
+					`config.tableOptions declares collate ${value} for "${name}"."${column}", but the live database `
+						+ `has collate ${liveNonBinary} — the rendered sidecar states the live collation, so the `
+						+ 'declaration is dropped. Migrate the column if you meant to change it.',
+				);
+			}
+		}
+	}
+
+	return warnings;
+}
+
+/**
+ * The bindings a rendered schema module gives its tables, in declaration order.
+ *
+ * Shared between {@link renderSchemaModule} and {@link renderTableOptionsModule}
+ * so a table-options sidecar imports the exact identifiers the schema module
+ * actually exports — recomputing this independently in two places would only
+ * need to disagree once (a duplicate or reserved-word name breaking the
+ * tie-break differently) to import a binding that does not exist.
+ */
+function orderedTableIdentifiers(
+	snapshot: Snapshot,
+): { ordered: TableSnapshot[]; tableIds: Map<string, string> } {
+	// A table-level `foreignKey({ foreignColumns: [other.id] })` reads the other
+	// table eagerly, so a table has to be declared after the ones it points at.
+	// Names are assigned up front, because a foreign key has to refer to the
+	// *binding* another table was given, not to a second lossy conversion of
+	// its name.
+	const ordered = orderByReference(snapshot);
+	const usedNames = new Set<string>();
+	const tableIds = new Map<string, string>();
+	for (const table of ordered) tableIds.set(table.name, uniqueIdentifier(table.name, usedNames));
+	return { ordered, tableIds };
 }
 
 /** Turn an introspected snapshot back into a schema module. */
@@ -454,15 +791,7 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 	const imports = new Set<string>(['sqliteTable']);
 	const lines: string[] = ['', ''];
 
-	// A table-level `foreignKey({ foreignColumns: [other.id] })` reads the other
-	// table eagerly, so a table has to be declared after the ones it points at.
-	// Names are assigned up front, because a foreign key has to refer to the
-	// *binding* another table was given, not to a second lossy conversion of
-	// its name.
-	const ordered = orderByReference(snapshot);
-	const usedNames = new Set<string>();
-	const tableIds = new Map<string, string>();
-	for (const table of ordered) tableIds.set(table.name, uniqueIdentifier(table.name, usedNames));
+	const { ordered, tableIds } = orderedTableIdentifiers(snapshot);
 
 	const idOf = (tableName: string): string => tableIds.get(tableName) ?? toIdentifier(tableName);
 
@@ -625,6 +954,171 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 	lines[0] = `import { ${[...imports].sort().join(', ')} } from 'orm-d1';`;
 
 	return lines.join('\n');
+}
+
+/**
+ * [F-100]/[F-115]: `strict`, `withoutRowid`, `appendOnly` and a non-BINARY
+ * column `collate` are introspected correctly, but the schema DSL — a strict
+ * subset of `drizzle-orm/sqlite-core`, per `docs/04` — has no spelling for any
+ * of them. Left as a warning alone, the very next `generate` against the
+ * rendered module reads all four back as unset and proposes tearing them
+ * down. Rendering this sidecar closes that gap the same way `renderSchemaModule`
+ * closes it for columns and constraints: state what was found, in the one
+ * mechanism the kit has for it (`config.tableOptions`, `orm-d1/ddl`'s
+ * `tableOptions()`), rather than leaving it to a warning the operator has to
+ * act on by hand before the loss becomes permanent.
+ *
+ * The merge rule, single and coherent for every key this function renders:
+ * **the live database wins whenever it is capable of stating the option at
+ * all.** `strict`, `withoutRowid` and `appendOnly` are all fully introspected
+ * — a live "no" is exactly as real as a live "yes" — so a config-declared
+ * `true` that the live database no longer has is stale and does not survive;
+ * it is dropped, with a warning ({@link sidecarDisagreementWarnings}) rather
+ * than silently. A column `collate` is different in exactly one direction:
+ * introspection can state *that* a column has a non-BINARY collation, but it
+ * has no way to state "stop carrying a collation forward" — a live column
+ * either has one or doesn't, and BINARY (no entry) is indistinguishable from
+ * "never had one". `collate: { column: null }` is the one spelling that
+ * exists solely to say the un-introspectable thing, so it is the one entry
+ * that survives even when the live database still shows a real collation for
+ * that column (the retirement just hasn't been applied there yet) — again
+ * with a warning, not silently. A declared non-null `collate` value, by
+ * contrast, is exactly as introspectable as the boolean options and follows
+ * the same rule: live wins, stale entries are dropped.
+ *
+ * Returns `undefined` when no table in the snapshot needs any of the four —
+ * so `pull` does not write an empty, pointless module.
+ */
+/**
+ * The sidecar with nothing in it: what `pull --force` writes over an existing
+ * `config.tableOptions` file whose declarations it is dropping and that the
+ * live database gives it nothing to put back. Emptied rather than deleted —
+ * `config.tableOptions` still names the path and `loadTableOptions` throws on
+ * a missing file — and it still has to parse and export a `tableOptions()`
+ * map, so the rest of the kit reads "nothing declared" instead of failing.
+ */
+export const EMPTY_TABLE_OPTIONS_MODULE = `import { tableOptions } from 'orm-d1/ddl';
+
+// Written by \`orm-d1-kit pull --force\`: nothing in the live database needs a
+// table-options declaration. Add entries here as you add options the schema
+// DSL cannot state.
+export default tableOptions([]);
+`;
+
+export function renderTableOptionsModule(
+	snapshot: Snapshot,
+	schemaModuleSpecifier: string,
+	/**
+	 * What `config.tableOptions` already declares, when there is such a file.
+	 * Consulted only for the one thing live introspection structurally cannot
+	 * state — a `collate: null` retirement (see the rule above). Everything
+	 * else declared here is stale the moment the live database disagrees.
+	 */
+	declared?: Readonly<Record<string, TableOptions>>,
+): string | undefined {
+	const { ordered, tableIds } = orderedTableIdentifiers(snapshot);
+	const entries: { table: string; text: string }[] = [];
+
+	const renderAppendOnly = (value: boolean | readonly string[]): string =>
+		value === true || value === false ? String(value) : JSON.stringify([...value]);
+
+	for (const table of ordered) {
+		const optionParts: string[] = [];
+		// Live is authoritative: a declared `true` the live database no longer
+		// backs is stale and does not survive `pull` (see the doc comment above
+		// and `sidecarDisagreementWarnings`, which tells the operator when this
+		// happens).
+		if (table.strict) optionParts.push('strict: true');
+		if (table.withoutRowid) optionParts.push('withoutRowid: true');
+		if (table.appendOnly) {
+			// The live guard's `UPDATE OF <cols>` list is read back verbatim by
+			// introspection with no existence check (SQLite itself does not
+			// enforce one — see `unexpressibleTableOptionWarnings`'s matching
+			// comment). Writing it into the sidecar as-is produces an
+			// `appendOnly` declaration `assertAppendOnlyColumns` (`src/ddl.ts`)
+			// rejects outright the moment any later command loads it — the same
+			// hazard the `collate` branch below already guards against for a
+			// column the live table lacks. Filtered down here, the same way,
+			// with the drop reported by `unexpressibleTableOptionWarnings`
+			// rather than silently.
+			const guarded = table.appendOnly === true
+				? true
+				: table.appendOnly.filter((c) => table.columns[c]);
+			if (guarded === true || guarded.length > 0) {
+				optionParts.push(`appendOnly: ${renderAppendOnly(guarded)}`);
+			}
+		}
+
+		// Live-derived values first, then the one declared spelling live cannot
+		// produce: an explicit `null` retirement. It overwrites a live entry for
+		// the same column on purpose — that is the whole point of stating it —
+		// but a declared *non-null* value that live no longer backs is stale,
+		// same as the three booleans above, and is not carried forward.
+		const collate = new Map<string, string | null>();
+		for (const c of Object.values(table.columns)) {
+			if (c.collate && c.collate.toLowerCase() !== 'binary') collate.set(c.name, c.collate);
+		}
+		for (const [column, value] of Object.entries(declared?.[table.name]?.collate ?? {})) {
+			// Only for a column the live table actually still has. A retirement
+			// naming a column that has since been dropped or renamed is as stale
+			// as any other declaration — and carrying it forward writes a sidecar
+			// `validateTableOptions` (`src/ddl.ts`) then rejects for naming an
+			// unknown column, i.e. `pull` producing a file that breaks every
+			// later command. Named out loud by the caller, the same way a
+			// declaration for a whole table the live database lacks is.
+			if (value === null && table.columns[column]) collate.set(column, null);
+		}
+		if (collate.size > 0) {
+			const rendered = [...collate].map(([name, value]) => `${JSON.stringify(name)}: ${JSON.stringify(value)}`);
+			optionParts.push(`collate: { ${rendered.join(', ')} }`);
+		}
+
+		if (optionParts.length === 0) continue;
+		entries.push({ table: table.name, text: `{ ${optionParts.join(', ')} }` });
+	}
+
+	if (entries.length === 0) return undefined;
+
+	// The binding each table is imported under. A table named `table_options`
+	// maps to `tableOptions` — which is this module's *own* import from
+	// `orm-d1/ddl`, so importing it unaliased is a `SyntaxError: Identifier
+	// 'tableOptions' has already been declared` and the sidecar does not parse
+	// at all. `orderedTableIdentifiers`' `RESERVED` set only knows the *schema*
+	// module's imports, and it has to keep only knowing them (the schema module
+	// must keep exporting the name it already exports) — so the disambiguation
+	// happens here, as an `import { x as x_ }` alias, leaving the schema module
+	// untouched.
+	const taken = new Set(['tableOptions', ...entries.map((e) => tableIds.get(e.table) ?? toIdentifier(e.table))]);
+	const bindings = new Map<string, string>();
+	for (const entry of entries) {
+		const exported = tableIds.get(entry.table) ?? toIdentifier(entry.table);
+		if (exported !== 'tableOptions') {
+			bindings.set(entry.table, exported);
+			continue;
+		}
+		let alias = `${exported}_`;
+		for (let n = 2; taken.has(alias); n++) alias = `${exported}_${n}`;
+		taken.add(alias);
+		bindings.set(entry.table, alias);
+	}
+
+	const imported = entries
+		.map((e) => {
+			const exported = tableIds.get(e.table) ?? toIdentifier(e.table);
+			const binding = bindings.get(e.table)!;
+			return exported === binding ? exported : `${exported} as ${binding}`;
+		})
+		.sort();
+
+	return [
+		`import { tableOptions } from 'orm-d1/ddl';`,
+		`import { ${imported.join(', ')} } from ${JSON.stringify(schemaModuleSpecifier)};`,
+		'',
+		'export default tableOptions([',
+		...entries.map((e) => `\t[${bindings.get(e.table)!}, ${e.text}],`),
+		']);',
+		'',
+	].join('\n');
 }
 
 /** Referenced tables first; cycles fall back to declaration order. */
@@ -812,11 +1306,18 @@ export async function verify(ctx: CommandContext): Promise<VerifyResult> {
 	const journal = await readJournal(ctx.config.out);
 	const runner = await scratchRunner();
 
-	// In journal order, which is the order a new environment applies them in.
+	// [F-065] Sorted by `idx`, not the array order `_journal.json` happens to be
+	// in on disk — `migrate` (via `pendingMigrations`, `core/journal.ts`) always
+	// replays in `idx` order, the authoritative one; an out-of-order `entries`
+	// array (the ordinary result of resolving a git conflict between two
+	// branches that each generated a migration) used to make `verify` replay in
+	// a different order than `migrate` actually applies in, so a broken history
+	// `migrate` would have caught could pass `verify` clean, or vice versa.
 	// Reading from the journal rather than globbing the folder also means a
 	// migration that exists on disk but was never recorded is caught here.
+	const entries = [...journal.entries].sort((a, b) => a.idx - b.idx);
 	let applied = 0;
-	for (const entry of journal.entries) {
+	for (const entry of entries) {
 		const sql = await readMigration(ctx.config.out, entry.tag);
 		try {
 			await runner.batch(applicableStatements(sql));

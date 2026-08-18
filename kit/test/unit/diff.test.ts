@@ -14,6 +14,22 @@ const indexOn = (name: string, column: Column<any>) => index(name).on(column);
 const snapshotOf = (...tables: Parameters<typeof snapshotFromSchema>[0] extends infer _ ? any[] : never): Snapshot =>
 	snapshotFromSchema(tables);
 
+describe('snapshotFromSchema collate sidecar', () => {
+	it('does not inject a bogus column for a stated collate name the table does not have', () => {
+		// `options.byTable[name]?.collate` is a plain object the sidecar file
+		// supplies. `columns[columnName]` used to be a plain bracket lookup: a
+		// stated collate for `toString` — a name no column here has — resolved
+		// `Object.prototype.toString` (a function, truthy) instead of `undefined`,
+		// so the `if (!existing) continue` guard never fired and the function got
+		// spread into a "column snapshot", injecting a bogus `toString` entry
+		// with none of `ColumnSnapshot`'s required fields.
+		const t = sqliteTable('people', { id: integer('id').primaryKey(), email: text('email') });
+		const snapshot = snapshotFromSchema([t], '', tableOptions([[t, { collate: { toString: 'nocase' } }]]));
+		expect(Object.keys(snapshot.tables['people']!.columns).sort()).toEqual(['email', 'id']);
+		expect(Object.hasOwn(snapshot.tables['people']!.columns, 'toString')).toBe(false);
+	});
+});
+
 describe('parsing a CREATE TABLE', () => {
 	it('reads a generated expression containing parentheses, and the mode after it', () => {
 		const sql = 'create table "t" ("name" text, "shout" text generated always as (upper("name")) stored)';
@@ -848,6 +864,52 @@ describe('diffing snapshots', () => {
 		const createTemp = statements.find((s) => s.sql.includes('create table "__new_u_pair2"'));
 		expect(createTemp?.sql).toContain('constraint "u1" unique ("a" collate nocase)');
 		expect(createTemp?.sql).toContain('constraint "u2" unique ("a" collate rtrim)');
+	});
+
+	it('[F-115] a tableOptions collate statement (including an explicit "none") ends the carry-forward', () => {
+		// Without a stated intent, `carryForwardCollations` has no way to tell
+		// "the schema cannot say this" from "the operator wants it gone" and
+		// carries a collation forward forever. `collateStated` (set by
+		// `snapshotFromSchema` when the `tableOptions()` sidecar names a column)
+		// is the escape hatch: once present, the carry-forward must not
+		// override it, even when the stated value is "no collation".
+		const t = sqliteTable('users', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		});
+
+		const persistedWithCollation: Snapshot = {
+			...snapshotOf(t),
+			tables: {
+				users: {
+					...snapshotOf(t).tables['users']!,
+					columns: {
+						...snapshotOf(t).tables['users']!.columns,
+						email: { ...snapshotOf(t).tables['users']!.columns['email']!, collate: 'nocase' },
+					},
+				},
+			},
+		};
+
+		// The operator states "no collation" via `tableOptions`'s `collate` map —
+		// `snapshotFromSchema` would set `collateStated: true` and `collate:
+		// undefined` for this; simulated directly here since this is a pure
+		// `diff.ts` unit test.
+		const nextWithStatedNone: Snapshot = {
+			...snapshotOf(t),
+			tables: {
+				users: {
+					...snapshotOf(t).tables['users']!,
+					columns: {
+						...snapshotOf(t).tables['users']!.columns,
+						email: { ...snapshotOf(t).tables['users']!.columns['email']!, collateStated: true },
+					},
+				},
+			},
+		};
+
+		const persisted = carryForwardCollations(persistedWithCollation, nextWithStatedNone);
+		expect(persisted.tables['users']!.columns['email']!.collate).toBeUndefined();
 	});
 
 	it('detects introspection-to-introspection collation drift instead of exempting it (F-101 follow-up)', () => {
@@ -2222,6 +2284,49 @@ describe('table options: STRICT, WITHOUT ROWID and the append-only guard', () =>
 			expect(create).toBeDefined();
 			expect(create?.destructive).toBe(false);
 		});
+
+		// A batch boundary can only ever land between two statements a diff
+		// emits *adjacently* — `statementGroups` (`sql.ts`) groups the three by
+		// scanning for the drop and the re-create immediately after the rename.
+		// Correct ordering with something else interleaved between them (the
+		// state before this fix: the re-create was pushed by a much later,
+		// unrelated per-table pass) would still leave the table unprotected
+		// across a split.
+		// [F-117 follow-up] Moving the `create trigger` into the renamed-table
+		// step took the destination-name collision check out of the *only* step
+		// that ever made it for this shape: setting `carriedAppendOnly` makes
+		// step 4 see `previousGuard === nextGuard`, so its own
+		// `tableGuardCollides` call is never reached. The refusal has to happen
+		// here instead, or the migration ships a `create trigger "audit_no_update"`
+		// that fails on apply with "already exists". Not renaming refuses (the
+		// in-place case above), and neither does becoming append-only across a
+		// rename — this is the "was, and stays, append-only across a rename" case.
+		it('refuses when the destination name collides with a foreign trigger, guard carried across the rename', () => {
+			// A *pure* rename — identical columns, so nothing forces a rebuild and
+			// the renamed-table step is the only place the guard is created.
+			const pureRename = sqliteTable('audit', { id: text('id').primaryKey(), at: integer('at').notNull() });
+			const diff = diffSnapshots(opts(events, true), opts(pureRename, true), {
+				renamedTables: { events: 'audit' },
+				// A trigger orm-d1 did not author, on an unrelated live table, that
+				// happens to be called what the renamed table's guard will be.
+				foreignTriggers: { other: ['audit_no_update'] },
+			});
+
+			expect(diff.errors).toHaveLength(1);
+			expect(diff.errors[0]).toMatch(/"audit_no_update"/);
+			expect(diff.statements.some((s) => /create trigger "audit_no_update"/.test(s.sql))).toBe(false);
+		});
+
+		it('emits the rename, the old-name drop and the new-name re-create with nothing between them', () => {
+			const diff = diffSnapshots(opts(events, true), opts(renamed, true), {
+				renamedTables: { events: 'audit' },
+			});
+			const sql = diff.statements.map((s) => s.sql);
+			const renameIndex = sql.indexOf('alter table "events" rename to "audit"');
+			expect(renameIndex).toBeGreaterThanOrEqual(0);
+			expect(sql[renameIndex + 1]).toBe('drop trigger if exists "events_no_update"');
+			expect(sql[renameIndex + 2]).toMatch(/^create trigger "audit_no_update"/);
+		});
 	});
 
 	// Finding 2: a rebuild only ever re-creates the append-only guard it
@@ -2842,6 +2947,25 @@ describe('table options that SQLite would reject', () => {
 	it('rejects a duplicate table in tableOptions rather than letting one win', () => {
 		const t = sqliteTable('dup', { id: text('id').primaryKey() });
 		expect(() => tableOptions([[t, { strict: true }], [t, { strict: false }]])).toThrow(/declared twice/);
+	});
+
+	// A plain `{}` byTable map: `byTable['__proto__'] = options` sets the
+	// object's *prototype* instead of adding an own property, so
+	// `Object.hasOwn(byTable, '__proto__')` is false both before AND after the
+	// "first" declaration — the duplicate-detection guard above never fires,
+	// silently accepting a table declared twice (and only the second entry's
+	// options end up anywhere findable, via the prototype chain, not `byTable`
+	// itself). `Object.create(null)` makes the assignment just data.
+	it('rejects a duplicate declaration for a table literally named __proto__', () => {
+		const t = sqliteTable('__proto__', { id: text('id').primaryKey() });
+		expect(() => tableOptions([[t, { strict: true }], [t, { strict: false }]])).toThrow(/declared twice/);
+	});
+
+	it('carries a single __proto__-named table declaration through byTable as an own entry', () => {
+		const t = sqliteTable('__proto__', { id: text('id').primaryKey() });
+		const map = tableOptions([[t, { strict: true }]]);
+		expect(Object.hasOwn(map.byTable, '__proto__')).toBe(true);
+		expect(map.byTable['__proto__']).toEqual({ strict: true });
 	});
 });
 

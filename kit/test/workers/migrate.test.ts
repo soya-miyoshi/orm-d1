@@ -238,6 +238,20 @@ describe('introspection', () => {
 				.toEqual(Object.keys(declared.tables[name]!.columns));
 		}
 	});
+
+	// [round 5] `__proto__` is a legal column name in real SQLite — verified
+	// here against a real D1 binding, not just Node's `node:sqlite`, since this
+	// whole class of bug is exactly the shape `test/workers/` exists to catch
+	// (a plain `{}` used as a per-table column map drops the entry silently,
+	// with introspection none the wiser). `introspect`'s own column map used to
+	// be one of those plain objects (`kit/src/core/introspect.ts`).
+	it('reads back a live column literally named __proto__', async () => {
+		await DB.prepare('create table "t" ("id" integer primary key, "__proto__" text)').run();
+
+		const snapshot = await introspect(runner);
+		expect(Object.hasOwn(snapshot.tables.t!.columns, '__proto__')).toBe(true);
+		expect(snapshot.tables.t!.columns['__proto__']).toMatchObject({ name: '__proto__', type: 'text' });
+	});
 });
 
 describe('batching a large migration cannot cut a table rebuild in half (finding 1)', () => {
@@ -362,6 +376,24 @@ describe('batching a large migration cannot cut a table rebuild in half (finding
 		await DB.prepare(`insert into rebuilt (id, age, code) values (2, 40, 'B')`).run();
 		await expect(DB.prepare(`insert into rebuilt (id, age, code) values (3, 41, 'B')`).run())
 			.rejects.toThrow();
+	});
+});
+
+describe('[F-047] applyMigrations calls onWarning as each split-batch warning is produced', () => {
+	it('invokes onWarning with the same text collected into ApplyResult.warnings', async () => {
+		// Same >100-statement split-forcing shape as "finding 1" above, without
+		// a throw: this just has to force `applyMigration` to split into more
+		// than one batch, so it emits its split warning.
+		const filler = Array.from({ length: 100 }, (_, i) => sqliteTable(`f_${i}`, { id: integer('id').primaryKey() }));
+		const diff = diffSnapshots(emptySnapshot(), snapshotFromSchema(filler));
+		expect(diff.errors).toEqual([]);
+		const sql = renderMigration(diff);
+
+		const seen: string[] = [];
+		const result = await applyMigrations(runner, [{ tag: 'm_onwarning', sql }], undefined, (w) => seen.push(w));
+
+		expect(result.warnings.length).toBeGreaterThan(0);
+		expect(seen).toEqual([...result.warnings]);
 	});
 });
 
@@ -890,5 +922,367 @@ describe('[F-115] unique constraint member collation carry-forward, against real
 		await expect(
 			DB.prepare('insert into "memberships" ("club_id", "user_id") values (\'c1\', 1)').run(),
 		).rejects.toThrow();
+	});
+});
+
+describe('[F-117 round 4] a table rename beside a guarded-column rename', () => {
+	it('keeps the guard in force across the whole migration without reordering the column rename', async () => {
+		// `events(id, at)`, `appendOnly: ['at']` -> `audit(id, occurred_at)`,
+		// `appendOnly: ['occurred_at']`, with both a table rename and a rename of
+		// the very column the guard watches.
+		//
+		// Round 3 closed the "guard names a column that does not exist yet"
+		// window by dragging the `rename column` forward into step 1, ahead of
+		// everything — which corrupts the data of any table the same diff also
+		// rebuilds (see the next test). Round 4 does it the other way: the guard
+		// re-created next to the table rename names the column as it exists
+		// *right now* (`"at"`), so it is in force immediately, and SQLite's own
+		// auto-repointing of `UPDATE OF` across `RENAME COLUMN` moves it onto
+		// `"occurred_at"` when the rename lands later. No window either way, and
+		// no rename ahead of a rebuild.
+		const before = sqliteTable('events', { id: text('id').primaryKey(), at: integer('at') });
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['at'] }]])),
+		);
+		await DB.prepare(`insert into events (id, at) values ('a', 1)`).run();
+
+		const after = sqliteTable('audit', { id: text('id').primaryKey(), occurred_at: integer('occurred_at') });
+		const diff = diffSnapshots(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['at'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['occurred_at'] }]])),
+			{ renamedTables: { events: 'audit' }, renamedColumns: { 'audit.at': 'occurred_at' } },
+		);
+		expect(diff.errors).toEqual([]);
+
+		const { statementGroups } = await import('../../src/core/sql.js');
+		const sqls = diff.statements.map((s) => s.sql);
+		const groups = statementGroups(sqls);
+
+		const renameIndex = sqls.findIndex((s) => /rename to "audit"/.test(s));
+		const columnRenameIndex = sqls.findIndex((s) => /rename column "at" to "occurred_at"/.test(s));
+		const dropTriggerIndex = sqls.findIndex((s) => /drop trigger.*events_no_update/i.test(s));
+		const createTriggerIndex = sqls.findIndex((s) => /create trigger "audit_no_update"/.test(s));
+		expect([renameIndex, columnRenameIndex, dropTriggerIndex, createTriggerIndex].every((i) => i >= 0)).toBe(true);
+
+		// The column rename is emitted *after* the trigger swap, not before it —
+		// that ordering is what keeps a rebuild's `INSERT … SELECT` reading a
+		// column that still exists.
+		expect(dropTriggerIndex).toBeLessThan(columnRenameIndex);
+		expect(createTriggerIndex).toBeLessThan(columnRenameIndex);
+		// The guard is created under the column's *live* name, so it is not inert.
+		expect(sqls[createTriggerIndex]).toContain('update of "at"');
+		// Rename, drop and re-create are still one indivisible group.
+		expect(new Set([renameIndex, dropTriggerIndex, createTriggerIndex].map((i) => groups[i])).size).toBe(1);
+
+		// Apply only that group — the worst case a batch boundary can produce —
+		// and confirm the guard is already in force on the live column.
+		const groupId = groups[renameIndex];
+		await runner.batch(sqls.filter((_, i) => groups[i] === groupId));
+
+		const tables = await runner.all<{ name: string }>(
+			"select name from sqlite_master where type = 'table' and name in ('events', 'audit')",
+		);
+		expect(tables.map((t) => t.name)).toEqual(['audit']);
+		await expect(DB.prepare(`update audit set "at" = 2 where id = 'a'`).run()).rejects.toThrow();
+
+		// Then the rest, and confirm SQLite repointed `UPDATE OF` onto the new
+		// column name by itself: the guard now blocks "occurred_at".
+		await runner.batch(sqls.filter((_, i) => groups[i] !== groupId));
+		const trigger = await runner.all<{ sql: string }>(
+			`select sql from sqlite_master where type = 'trigger' and name = 'audit_no_update'`,
+		);
+		expect(trigger[0]!.sql.toLowerCase()).toContain('update of "occurred_at"');
+		await expect(DB.prepare(`update audit set "occurred_at" = 2 where id = 'a'`).run()).rejects.toThrow();
+		const row = await runner.all<{ occurred_at: number }>(`select occurred_at from audit where id = 'a'`);
+		expect(row[0]!.occurred_at).toBe(1);
+	});
+
+	it('does not corrupt the renamed column when the same table is also rebuilt', async () => {
+		// [Round 4, finding 1] The regression this pins: with the column rename
+		// hoisted into step 1, step 4's `recreateTable` still emits
+		// `insert into "__new_audit" (…, "occurred_at") select …, "at" from "audit"`
+		// — reading a column that the hoisted rename already renamed away. D1
+		// has double-quoted-string-literal fallback on, so `"at"` degrades to the
+		// *string* `'at'` instead of erroring: the migration reports success and
+		// every value in the column is the old column's name.
+		const before = sqliteTable('events', {
+			id: text('id').primaryKey(),
+			at: integer('at'),
+			note: integer('note'),
+		});
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['at'] }]])),
+		);
+		await DB.prepare(`insert into events (id, at, note) values ('a', 1234, 7)`).run();
+
+		// `note` changes type integer -> text, which forces a rebuild of the same
+		// table that is being renamed and whose guarded column is being renamed.
+		const after = sqliteTable('audit', {
+			id: text('id').primaryKey(),
+			occurred_at: integer('occurred_at'),
+			note: text('note'),
+		});
+		await migrateTo(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['at'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['occurred_at'] }]])),
+			{ renamedTables: { events: 'audit' }, renamedColumns: { 'audit.at': 'occurred_at' } },
+		);
+
+		const rows = await runner.all<{ occurred_at: unknown; note: unknown }>(
+			`select occurred_at, note from audit where id = 'a'`,
+		);
+		// The original value, not the string 'at'.
+		expect(rows[0]!.occurred_at).toBe(1234);
+		expect(rows[0]!.note).toBe('7');
+
+		// And the table is still guarded afterwards, under the final name.
+		await expect(DB.prepare(`update audit set "occurred_at" = 2 where id = 'a'`).run()).rejects.toThrow();
+	});
+});
+
+describe('[Round 4, finding 6] a guarded-column rename with no table rename', () => {
+	it('applies the guard swap as one atomic group, so no batch boundary can land inside it', async () => {
+		// `diffSnapshots` emits `alter table … rename column`, then
+		// `drop trigger if exists "ledger_no_update"`, then the re-create under
+		// the new column list. `statementGroups` only started a group at a *table*
+		// rename, so these were three singletons and `packIntoBatches` was free to
+		// end a batch between the drop and the re-create — leaving the table with
+		// no guard at all (UPDATE permitted) until the next batch ran, and for
+		// good if it failed.
+		//
+		// [reviewer issue 1 fix] The guard also has to genuinely change for this
+		// scenario to apply: a pure 1:1 rename of the only guarded column
+		// (`amount` -> `cents`, guard `['amount']` -> `['cents']`) needs no
+		// drop+create at all any more — SQLite auto-repoints the live trigger's
+		// `UPDATE OF` list across the rename statement by itself (see the
+		// comment block in `diff.ts` around line 707), and `diffSnapshots` now
+		// forward-maps the previous guard through this diff's renames before
+		// comparing, so it correctly recognises the rename alone already gets
+		// the schema and the live guard into agreement — nothing left to
+		// restate. So the guard here also widens to a second column (`note`)
+		// that is not part of the rename, which the mapped-forward set does not
+		// already satisfy, keeping this test's drop+create (and the batch-atomicity
+		// concern it exists to pin) genuine.
+		const before = sqliteTable('ledger', {
+			id: text('id').primaryKey(),
+			amount: integer('amount'),
+			note: integer('note'),
+		});
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['amount'] }]])),
+		);
+		await DB.prepare(`insert into ledger (id, amount, note) values ('a', 5, 1)`).run();
+
+		const after = sqliteTable('ledger', {
+			id: text('id').primaryKey(),
+			cents: integer('cents'),
+			note: integer('note'),
+		});
+		const diff = diffSnapshots(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['amount'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['cents', 'note'] }]])),
+			{ renamedColumns: { 'ledger.amount': 'cents' } },
+		);
+		expect(diff.errors).toEqual([]);
+		const sqls = diff.statements.map((s) => s.sql);
+		expect(sqls.some((s) => /drop trigger/i.test(s))).toBe(true);
+		expect(sqls.some((s) => /create trigger/i.test(s))).toBe(true);
+
+		// One leading unrelated statement, so a limit of 3 puts a boundary
+		// between the drop and the re-create for as long as they are separate
+		// groups, and cannot for as long as they are one.
+		const lead = 'create table "unrelated" ("id" integer)';
+		const statements = [lead, ...sqls];
+
+		// Probe between every batch: is the guard in force right now?
+		const unguardedWindows: number[] = [];
+		let batchCount = 0;
+		const probingRunner: SqlRunner = {
+			all: runner.all,
+			batch: async (batch) => {
+				await runner.batch(batch);
+				batchCount++;
+				try {
+					await DB.prepare(`update ledger set "cents" = 99 where id = 'a'`).run();
+					unguardedWindows.push(batchCount);
+				} catch {
+					// blocked — the guard is in force, which is the point
+				}
+				try {
+					await DB.prepare(`update ledger set "amount" = 99 where id = 'a'`).run();
+					unguardedWindows.push(batchCount);
+				} catch {
+					// blocked, or the column no longer exists under that name
+				}
+			},
+			atomicLimit: () => 3,
+		};
+
+		await applyMigrations(probingRunner, [{ tag: 'guard_swap', sql: statements.map((s) => `${s};`).join('\n') }]);
+
+		expect(batchCount).toBeGreaterThan(1);
+		expect(unguardedWindows).toEqual([]);
+		const row = await runner.all<{ cents: number }>(`select cents from ledger where id = 'a'`);
+		expect(row[0]!.cents).toBe(5);
+	});
+});
+
+describe('a table rename beside a new append-only column', () => {
+	it('guards the new column too, not just the renamed one', async () => {
+		// `events(id, a, b)`, `appendOnly: ['a', 'b']` -> `audit(id, alpha, b, note)`,
+		// `appendOnly: ['alpha', 'note']`: a table rename, a column rename
+		// (a -> alpha), and a brand-new guarded column (`note`) that does not
+		// exist on the pre-rename live table at all.
+		//
+		// Step 1's guard re-create used to filter `after`'s declared append-only
+		// list down to columns present on the pre-rename snapshot, dropping
+		// `note` entirely — and `carriedAppendOnly` was set to `after`'s FULL
+		// list regardless, so step 4 saw `previousGuard === nextGuard` and never
+		// corrected the narrowed guard. The result: `note` was never guarded, for
+		// good.
+		const before = sqliteTable('events', {
+			id: integer('id').primaryKey(),
+			a: integer('a'),
+			b: integer('b'),
+		});
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['a', 'b'] }]])),
+		);
+		await DB.prepare(`insert into events (id, a, b) values (1, 10, 20)`).run();
+
+		const after = sqliteTable('audit', {
+			id: integer('id').primaryKey(),
+			alpha: integer('alpha'),
+			b: integer('b'),
+			note: text('note'),
+		});
+		await migrateTo(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['a', 'b'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['alpha', 'note'] }]])),
+			{ renamedTables: { events: 'audit' }, renamedColumns: { 'audit.a': 'alpha' } },
+		);
+		const live = await introspect(runner);
+		expect(live.tables.audit?.appendOnly).toEqual(['alpha', 'note']);
+
+		// The new column is guarded.
+		await expect(DB.prepare(`update audit set note = 'x' where id = 1`).run()).rejects.toThrow();
+		// The renamed column is still guarded too.
+		await expect(DB.prepare(`update audit set alpha = 99 where id = 1`).run()).rejects.toThrow();
+	});
+});
+
+describe('a rename that reuses a live column name loses no guard', () => {
+	it('guards both final columns when a rename collides two guarded columns onto one live name', async () => {
+		// `payments(id, amount)`, `appendOnly: ['amount']` -> `ledger(id,
+		// amount_cents, amount)`, `appendOnly: ['amount_cents', 'amount']`, with
+		// `ledger.amount_cents` renamed FROM `payments.amount`.
+		//
+		// Step 1 builds the re-created guard from each guarded column's
+		// PRE-rename (live) name: `amount_cents`'s live name is `amount`
+		// (that's what is being renamed), and the brand-new `amount` column's
+		// live name is also `amount` (nothing renames onto it, so
+		// `preRenameColumnName` returns it unchanged). `appendOnlyTrigger`
+		// de-duplicates its column list by name, so the trigger step 1 created
+		// named `"amount"` only once — covering just one of the two final
+		// columns — and `carriedAppendOnly` used to claim `after`'s full list
+		// regardless, so step 4 never noticed and never restated it. One of the
+		// two columns was permanently unguarded.
+		const before = sqliteTable('payments', {
+			id: integer('id').primaryKey(),
+			amount: integer('amount'),
+		});
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['amount'] }]])),
+		);
+		await DB.prepare(`insert into payments (id, amount) values (1, 500)`).run();
+
+		const after = sqliteTable('ledger', {
+			id: integer('id').primaryKey(),
+			amount_cents: integer('amount_cents'),
+			amount: text('amount'),
+		});
+		const diff = diffSnapshots(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['amount'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['amount_cents', 'amount'] }]])),
+			{ renamedTables: { payments: 'ledger' }, renamedColumns: { 'ledger.amount': 'amount_cents' } },
+		);
+		expect(diff.errors).toEqual([]);
+
+		await applyMigrations(runner, [
+			{ tag: 'm_collision', sql: renderMigration(diff) },
+		]);
+
+		const live = await introspect(runner);
+		const liveAppendOnly = live.tables.ledger?.appendOnly;
+		expect(Array.isArray(liveAppendOnly)).toBe(true);
+		expect(new Set(liveAppendOnly as readonly string[])).toEqual(new Set(['amount_cents', 'amount']));
+
+		// The pre-existing column, now renamed to `amount_cents`, is guarded.
+		await expect(
+			DB.prepare(`update ledger set amount_cents = 999 where id = 1`).run(),
+		).rejects.toThrow();
+		// The brand-new `amount` column (added by this migration) is guarded too.
+		await expect(DB.prepare(`update ledger set amount = 'x' where id = 1`).run()).rejects.toThrow();
+
+		const row = await runner.all<{ amount_cents: number }>(`select amount_cents from ledger where id = 1`);
+		expect(row[0]!.amount_cents).toBe(500);
+	});
+});
+
+describe('a rename whose after-guarded name is the SOURCE of another rename', () => {
+	it('guards the final column, not the one renamed away from it', async () => {
+		// `t(id, x integer)`, `appendOnly: ['x']` -> `u(id, y integer, x text)`,
+		// `appendOnly: ['x']`, with `u.y` renamed FROM `t.x` (the expand/contract
+		// pattern: rename the old column aside, add a fresh column back under
+		// its original name).
+		//
+		// The collision check in step 1 only caught the OTHER direction (two
+		// `after` names collapsing onto one live name). Here it is the live name
+		// itself that collides with a rename's source: `finalGuarded` is
+		// `['x']`, and `preRenameColumnName` maps it back to the live column
+		// `"x"` unchanged (nothing in `renamedColumns` has `'x'` as its target —
+		// `'u.x'` maps TO `'y'`, not the reverse), so step 1 names the guard
+		// `before update of "x" on "u"` — the column about to be renamed AWAY —
+		// and SQLite's own auto-repointing then carries that guard onto `"y"`
+		// when the rename lands, leaving the fresh `"x"` (which is what
+		// `after`'s `appendOnly: ['x']` actually means) completely unguarded.
+		const before = sqliteTable('t', { id: text('id').primaryKey(), x: integer('x') });
+		await migrateTo(
+			emptySnapshot(),
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['x'] }]])),
+		);
+		await DB.prepare(`insert into t (id, x) values ('a', 7)`).run();
+
+		const after = sqliteTable('u', {
+			id: text('id').primaryKey(),
+			y: integer('y'),
+			x: text('x'),
+		});
+		const diff = diffSnapshots(
+			snapshotFromSchema([before], '', tableOptions([[before, { appendOnly: ['x'] }]])),
+			snapshotFromSchema([after], '', tableOptions([[after, { appendOnly: ['x'] }]])),
+			{ renamedTables: { t: 'u' }, renamedColumns: { 'u.x': 'y' } },
+		);
+		expect(diff.errors).toEqual([]);
+
+		await applyMigrations(runner, [{ tag: 'm_source_collision', sql: renderMigration(diff) }]);
+
+		const live = await introspect(runner);
+		expect(new Set((live.tables.u?.appendOnly ?? []) as readonly string[])).toEqual(new Set(['x']));
+
+		// The fresh `x` column (what the schema actually asks to guard) is
+		// protected.
+		await expect(DB.prepare(`update u set x = 'blocked' where id = 'a'`).run()).rejects.toThrow();
+		// `y` (the renamed-away original column) is NOT guarded by the schema
+		// any more — the migration must not leave it protected instead.
+		await expect(DB.prepare(`update u set y = 99 where id = 'a'`).run()).resolves.toBeDefined();
+
+		const row = await runner.all<{ y: number }>(`select y from u where id = 'a'`);
+		expect(row[0]!.y).toBe(99);
 	});
 });

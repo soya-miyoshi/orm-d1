@@ -20,7 +20,7 @@ import { importModule } from './import.js';
 import type { Journal } from '../core/journal.js';
 import { emptyJournal } from '../core/journal.js';
 import type { Snapshot } from '../core/snapshot.js';
-import { emptySnapshot } from '../core/snapshot.js';
+import { emptySnapshot, reviveSnapshot } from '../core/snapshot.js';
 
 export const metaDir = (out: string): string => join(out, 'meta');
 export const journalPath = (out: string): string => join(metaDir(out), '_journal.json');
@@ -46,14 +46,14 @@ export async function readLatestSnapshot(out: string): Promise<Snapshot> {
 		.sort();
 	const last = files.at(-1);
 	if (!last) return emptySnapshot();
-	return JSON.parse(await readFile(join(metaDir(out), last), 'utf8')) as Snapshot;
+	return reviveSnapshot(JSON.parse(await readFile(join(metaDir(out), last), 'utf8')) as Snapshot);
 }
 
 /** One specific snapshot, by journal index. `undefined` when it is missing. */
 export async function readSnapshot(out: string, index: number): Promise<Snapshot | undefined> {
 	const path = snapshotPath(out, index);
 	if (!existsSync(path)) return undefined;
-	return JSON.parse(await readFile(path, 'utf8')) as Snapshot;
+	return reviveSnapshot(JSON.parse(await readFile(path, 'utf8')) as Snapshot);
 }
 
 export async function writeSnapshot(out: string, index: number, snapshot: Snapshot): Promise<void> {

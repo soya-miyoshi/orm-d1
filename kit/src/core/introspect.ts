@@ -101,26 +101,35 @@ export interface IntrospectionInput {
 export const isInternalTable = (name: string): boolean =>
 	name.startsWith('sqlite_') || name.startsWith('_cf_') || name === 'd1_migrations';
 
-// Widened to all four identifier spellings for the same reason
-// `columnDefinitionStart` was (`[F-112]`): a name captured by a caller whose
-// own pattern now matches backtick/bracket forms (e.g. the constraint-name
-// regex in `parseTableUniqueConstraints`, `[F-115]`'s class) must still be
-// unquoted correctly, not merely left verbatim because only `"…"` was known.
-const unquote = (name: string): string =>
-	name.startsWith('"') && name.endsWith('"')
-		? name.slice(1, -1).replaceAll('""', '"')
-		: name.startsWith('`') && name.endsWith('`')
-		? name.slice(1, -1)
-		: name.startsWith('[') && name.endsWith(']')
-		? name.slice(1, -1)
-		// SQLite's grammar accepts a string literal wherever an `ids` (name) is
-		// expected — `ids ::= ID|STRING` — so `collate 'nocase'` is real and
-		// honoured, not just tolerated. Every `collate`-token reader in this file
-		// (`matchCollateToken`, `parseIndexCollations`) can hand this a `'…'`
-		// span, and this is the one place all of them unquote it.
-		: name.startsWith('\'') && name.endsWith('\'')
-		? name.slice(1, -1).replaceAll('\'\'', '\'')
-		: name;
+/**
+ * Strip one layer of SQLite identifier quoting, all four spellings SQLite
+ * accepts: `"…"` and `` `…` `` (each escapes an internal quote of its own
+ * kind by doubling it), `[…]` (no internal escape is possible — a `]` simply
+ * cannot appear inside a bracket-quoted name), and `'…'` (SQLite's
+ * compatibility spelling for a double-quoted identifier, same doubling
+ * escape). Anything not wrapped in one of these is returned unchanged — a
+ * bare, unquoted identifier.
+ *
+ * Read from `sqlite_master`'s stored `CREATE TRIGGER`/`CREATE TABLE` text,
+ * which keeps whatever spelling was written. A hand-written trigger's
+ * `UPDATE OF [amount]` or `` UPDATE OF `amount` `` used to come through this
+ * function with the brackets/backticks still attached — `[amount]` or
+ * `` `amount` `` instead of `amount` — which then failed to match the real
+ * column name anywhere downstream: `pull`'s appendOnly output silently
+ * dropped the column, and the "stale guard" comparison flagged a perfectly
+ * valid trigger as needing to be hand-corrected.
+ */
+const unquote = (name: string): string => {
+	if (name.length >= 2) {
+		const first = name[0];
+		const last = name[name.length - 1];
+		if ((first === '"' || first === '`' || first === '\'') && last === first) {
+			return name.slice(1, -1).replaceAll(first + first, first);
+		}
+		if (first === '[' && last === ']') return name.slice(1, -1);
+	}
+	return name;
+};
 
 /**
  * `check ( … )` clauses, which no pragma exposes.
@@ -266,7 +275,12 @@ export const parseChecks = (
 	sql: string,
 	tableName = 'table',
 ): Record<string, { name: string; value: string }> => {
-	const checks: Record<string, { name: string; value: string }> = {};
+	// `Object.create(null)`: a constraint name comes from the database, and
+	// `checks['__proto__'] = …` on a plain object invokes the inherited setter —
+	// the prototype is reassigned and *no own key is added*, so the constraint
+	// vanishes from the snapshot entirely and `check` reports no drift for a
+	// live CHECK the schema does not have.
+	const checks: Record<string, { name: string; value: string }> = Object.create(null);
 	const pattern = /(?:constraint\s+("(?:[^"]|"")+"|\w+)\s+)?\bcheck\s*\(/gi;
 	let unnamed = 0;
 
@@ -1084,7 +1098,12 @@ const matchUniqueClause = (
 };
 
 export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): Snapshot {
-	const tables: Record<string, TableSnapshot> = {};
+	// `Object.create(null)`, not `{}` — see `snapshot.ts`'s `snapshotFromSchema`
+	// for the same hazard one level up: a live table literally named
+	// `__proto__` would silently vanish from `Object.keys(tables)`, and one
+	// named `constructor` etc. would resolve to the built-in instead of
+	// `undefined`.
+	const tables: Record<string, TableSnapshot> = Object.create(null);
 	const indexSql = new Map<string, string | null>();
 	const appendOnly = new Map<string, boolean | string[]>();
 	for (const row of input.master) {
@@ -1099,7 +1118,12 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 		if (row.type !== 'table' || isInternalTable(row.name)) continue;
 		const createSql = row.sql ?? '';
 
-		const columns: Record<string, ColumnSnapshot> = {};
+		// `Object.create(null)`, not `{}` — see `snapshot.ts`'s `snapshotFromSchema`
+		// for the hazard: a live column literally named `__proto__` (SQLite
+		// accepts it as an identifier) assigned through a plain object sets the
+		// prototype instead of adding an entry, and the column silently vanishes
+		// from what introspection reports.
+		const columns: Record<string, ColumnSnapshot> = Object.create(null);
 		const info = input.tableInfo[row.name] ?? [];
 		const pkColumns = info.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk);
 		const compositePk = pkColumns.length > 1;
@@ -1129,7 +1153,7 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			else groupedFks.set(fk.id, [fk]);
 		}
 
-		const foreignKeys: Record<string, ForeignKeySnapshot> = {};
+		const foreignKeys: Record<string, ForeignKeySnapshot> = Object.create(null);
 		for (const [, group] of groupedFks) {
 			const ordered = [...group].sort((a, b) => a.seq - b.seq);
 			const name = `${row.name}_${ordered.map((f) => f.from).join('_')}_fk`;
@@ -1143,9 +1167,12 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			};
 		}
 
-		const indexes: Record<string, IndexSnapshot> = {};
+		// Same hazard as `checks` above, and the same reason `columns`/`tables` in
+		// this file are null-prototype: an index named `__proto__` would otherwise
+		// never reach the snapshot at all.
+		const indexes: Record<string, IndexSnapshot> = Object.create(null);
 		const uniqueConstraints: Record<string, { name: string; columns: readonly (string | UniqueColumnSnapshot)[] }> =
-			{};
+			Object.create(null);
 		// Parsed once per table: every table-level `[constraint <name>] unique (…)`
 		// clause in declaration order, for `[F-111]`'s per-member collation.
 		const uniqueClauses = parseTableUniqueConstraints(createSql);
@@ -1277,7 +1304,7 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 		}
 
 		const compositePrimaryKeys: Record<string, { name: string; columns: readonly (string | UniqueColumnSnapshot)[] }> =
-			{};
+			Object.create(null);
 		// A table-level `primary key (…)` clause whose members carry an explicit
 		// `collate` needs the arity-1 (single-column) case too, not only the
 		// `compositePk` (arity>=2) one below: SQLite scopes a member's own

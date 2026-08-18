@@ -310,6 +310,31 @@ describe('generate, end to end on disk', () => {
 		expect((await generate(ctx)).tag).toBeUndefined();
 	});
 
+	// [F-066]: `pull` used to write its baseline snapshot with no `prevId`,
+	// unlike `generate` — breaking the snapshot chain for a pulled baseline.
+	it('[F-066] chains a pulled snapshot to the previous one, like generate does', async () => {
+		const dir = await temp();
+		const { pull } = await import('../../src/node/commands.js');
+		const { readLatestSnapshot } = await import('../../src/node/store.js');
+		const out = join(dir, 'migrations');
+		const localFile = join(dir, 'local.sqlite');
+
+		const ctx = {
+			cwd: dir,
+			config: { schema: './schema.ts', out, d1: { localFile }, migrationsTable: 'd1_migrations' },
+			log: () => {},
+			now: () => 1,
+		};
+
+		await pull(ctx, { local: true });
+		const first = await readLatestSnapshot(out);
+		expect(first.prevId).toBe('00000000');
+
+		await pull(ctx, { local: true });
+		const second = await readLatestSnapshot(out);
+		expect(second.prevId).toBe(first.id);
+	});
+
 	it('tells the user why a constraint rename produced no migration', async () => {
 		const dir = await temp();
 		const { generate } = await import('../../src/node/commands.js');
@@ -539,6 +564,159 @@ describe('rendering a schema module from a snapshot', () => {
 		expect(warnings[0]).toContain('"memberships"');
 		expect(warnings[0]).toContain('"club_id"');
 		expect(warnings[0]).toContain('nocase');
+	});
+	// [F-110]: the warning has to name `config.tableOptions` — the mechanism
+	// that can actually preserve what is lost — not just describe the loss.
+	it('[F-110] the warning names config.tableOptions as the mechanism to preserve what is lost', async () => {
+		const { unexpressibleTableOptionWarnings } = await import('../../src/node/commands.js');
+		const snapshot = {
+			...snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }),
+			tables: {
+				reads: {
+					name: 'reads',
+					columns: { id: column('id', 'integer', { primaryKey: true }) },
+					indexes: {},
+					foreignKeys: {},
+					compositePrimaryKeys: {},
+					uniqueConstraints: {},
+					checkConstraints: {},
+					strict: true,
+				},
+			},
+		};
+
+		const warnings = unexpressibleTableOptionWarnings(snapshot as never);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain('config.tableOptions');
+	});
+
+	// [F-100]: `pull` now renders a `tableOptions([...])` sidecar naming every
+	// table's `strict`/`withoutRowid`/`appendOnly` and non-BINARY column
+	// `collate` — the mechanism the warning above points at.
+	describe('renderTableOptionsModule', () => {
+		it('renders strict, withoutRowid, appendOnly and collate, importing from the given schema specifier', async () => {
+			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
+			const snapshot = {
+				...snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }),
+				tables: {
+					reads: {
+						name: 'reads',
+						columns: {
+							id: column('id', 'integer', { primaryKey: true }),
+							email: column('email', 'text', { collate: 'nocase' }),
+						},
+						indexes: {},
+						foreignKeys: {},
+						compositePrimaryKeys: {},
+						uniqueConstraints: {},
+						checkConstraints: {},
+						strict: true,
+						withoutRowid: true,
+						appendOnly: true,
+					},
+				},
+			};
+
+			const rendered = renderTableOptionsModule(snapshot as never, './schema');
+			expect(rendered).toContain(`import { tableOptions } from 'orm-d1/ddl';`);
+			expect(rendered).toContain(`from "./schema";`);
+			expect(rendered).toContain('strict: true');
+			expect(rendered).toContain('withoutRowid: true');
+			expect(rendered).toContain('appendOnly: true');
+			expect(rendered).toContain(`collate: { "email": "nocase" }`);
+		});
+
+		// The sidecar imports `tableOptions` from `orm-d1/ddl` itself, so a table
+		// whose identifier is that exact name cannot be imported unaliased:
+		// `SyntaxError: Identifier 'tableOptions' has already been declared`, from
+		// a command whose whole job is to write a file that loads. The schema
+		// module's own `RESERVED` set knows only the schema module's imports, and
+		// has to keep only knowing them — so the disambiguation is an import alias.
+		it('aliases a table whose binding collides with its own `tableOptions` import', async () => {
+			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
+			const snapshot = {
+				...snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }),
+				tables: {
+					table_options: {
+						name: 'table_options',
+						columns: { id: column('id', 'integer', { primaryKey: true }) },
+						indexes: {},
+						foreignKeys: {},
+						compositePrimaryKeys: {},
+						uniqueConstraints: {},
+						checkConstraints: {},
+						strict: true,
+					},
+				},
+			};
+
+			const rendered = renderTableOptionsModule(snapshot as never, './schema.js')!;
+			expect(rendered).toContain(`import { tableOptions } from 'orm-d1/ddl';`);
+			expect(rendered).toContain('import { tableOptions as tableOptions_ } from "./schema.js";');
+			expect(rendered).toContain('[tableOptions_, { strict: true }],');
+			// The schema module still exports it under its own name, so the import
+			// must name that and only alias the local binding.
+			expect(rendered).not.toMatch(/import \{ tableOptions_ \}/);
+		});
+
+		// `pull --force` overwriting a hand-maintained sidecar used to drop every
+		// option introspection cannot reproduce. The merge rule this pins: live
+		// wins whenever it is capable of stating the option at all — `collate:
+		// null` is the one deliberate exception, because "stop carrying a
+		// collation forward" is the one thing introspection structurally cannot
+		// say. A declared `appendOnly` (or `strict`/`withoutRowid`) the live
+		// table no longer has is exactly as introspectable as a `true` would be,
+		// so it does not get the same exception — it is dropped, not kept.
+		it('keeps a declared collate: null retirement, but drops other stale declared options', async () => {
+			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
+			const snapshot = {
+				...snapshotOf({
+					id: column('id', 'integer', { primaryKey: true }),
+					email: column('email', 'text', { collate: 'nocase' }),
+					legacy_id: column('legacy_id', 'text'),
+				}),
+			};
+
+			const rendered = renderTableOptionsModule(snapshot as never, './schema.js', {
+				things: { collate: { legacy_id: null, email: 'rtrim' }, appendOnly: ['id'] },
+			})!;
+			// Declared and unintrospectable: the one spelling that survives even
+			// though the live database has no way to back it.
+			expect(rendered).toContain('"legacy_id": null');
+			// Declared, live-introspectable, and the live table does not have it:
+			// stale, dropped rather than resurrected.
+			expect(rendered).not.toContain('appendOnly');
+			// Declared and contradicted by the live column: the live value wins.
+			expect(rendered).toContain('"email": "nocase"');
+			expect(rendered).not.toContain('"rtrim"');
+		});
+
+		// The mirror case: a live `collate: null` retirement that the live
+		// database still actively contradicts (the migration to drop it hasn't
+		// been applied to *this* database yet) still keeps the declared `null` —
+		// the whole point of the spelling is to survive exactly that window.
+		it('keeps collate: null even when the live column still has a real collation', async () => {
+			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
+			const snapshot = snapshotOf({
+				id: column('id', 'integer', { primaryKey: true }),
+				email: column('email', 'text', { collate: 'nocase' }),
+			});
+
+			const rendered = renderTableOptionsModule(snapshot as never, './schema.js', {
+				things: { collate: { email: null } },
+			})!;
+			expect(rendered).toContain('"email": null');
+			expect(rendered).not.toContain('"nocase"');
+		});
+
+		it('returns undefined when nothing needs the sidecar', async () => {
+			const { renderTableOptionsModule } = await import('../../src/node/commands.js');
+			const rendered = renderTableOptionsModule(
+				snapshotOf({ id: column('id', 'integer', { primaryKey: true }) }) as never,
+				'./schema',
+			);
+			expect(rendered).toBeUndefined();
+		});
 	});
 
 	it('imports every factory it uses, blob included', async () => {
@@ -1090,6 +1268,93 @@ describe('verify', () => {
 		// The trigger is not in the schema's table options, so it is extra —
 		// but it must at least have applied without a syntax error.
 		expect(result.differences.join('\n')).not.toMatch(/failed to apply/);
+	});
+
+	// [F-065]: `migrate` (via `pendingMigrations`, `core/journal.ts`) always
+	// replays in `idx` order — the authoritative one. `verify` used to iterate
+	// `journal.entries` in whatever order the array happened to be in on disk,
+	// which is the ordinary result of resolving a git conflict between two
+	// branches that each generated a migration. A second migration that
+	// depends on the first (adds a column to a table the first one creates)
+	// makes the two orders observably different: applied out of order, the
+	// second migration fails outright.
+	it('[F-065] replays in idx order, matching migrate, even when the journal array is out of order', async () => {
+		const dir = await temp();
+		const out = join(dir, 'migrations');
+		// Two files, not one edited in place: Node caches ES modules by URL, so
+		// re-importing the same path after editing it on disk would just return
+		// the first import's cached export — see the identical pattern in
+		// "refuses to drop a column without --accept-data-loss" above.
+		const write = (file: string, columns: string) =>
+			writeFile(
+				join(dir, file),
+				`import { integer, sqliteTable, text } from '${schemaImport()}';\n`
+					+ `export const users = sqliteTable('users', { ${columns} });\n`,
+			);
+		const ctx = (schema: string) => ({
+			cwd: dir,
+			config: { schema, out, d1: {}, migrationsTable: 'd1_migrations' },
+			log: () => {},
+			now: () => 1,
+		});
+		const { generate, verify } = await import('../../src/node/commands.js');
+
+		await write('before.ts', `id: integer('id').primaryKey()`);
+		await generate(ctx('./before.ts'));
+		await write('after.ts', `id: integer('id').primaryKey(), email: text('email')`);
+		await generate(ctx('./after.ts'));
+
+		const journalFile = join(out, 'meta', '_journal.json');
+		const journal = JSON.parse(await readFile(journalFile, 'utf8')) as { entries: { idx: number }[] };
+		expect(journal.entries.map((e) => e.idx)).toEqual([0, 1]);
+		// Swap the array order on disk without touching `idx` — the shape a git
+		// conflict resolution leaves behind.
+		journal.entries.reverse();
+		await writeFile(journalFile, JSON.stringify(journal, null, '\t'));
+
+		const result = await verify(ctx('./after.ts'));
+		expect(result.ok).toBe(true);
+		expect(result.applied).toBe(2);
+	});
+});
+
+describe('push', () => {
+	// [F-116-cli]: `push` used to pack at the hardcoded `MAX_STATEMENTS_PER_BATCH`
+	// (100) regardless of what the runner it is about to call can actually
+	// handle. The local runner's own `atomicLimit` is `Infinity` — `node:sqlite`
+	// wraps a whole batch in one real transaction, so splitting it away for no
+	// reason loses atomicity across a rebuild group for nothing. More than 100
+	// statements pushed against a local database is the case that tells the two
+	// implementations apart: hardcoded, it splits (and logs a warning saying
+	// so); asking the runner, it does not.
+	it('[F-116-cli] asks the runner for its atomicLimit instead of hardcoding MAX_STATEMENTS_PER_BATCH', async () => {
+		const dir = await temp();
+		const out = join(dir, 'migrations');
+		const localFile = join(dir, 'local.sqlite');
+
+		// 150 tables — comfortably over the 100-statement constant.
+		const tables = Array.from({ length: 150 }, (_, i) =>
+			`export const t${i} = sqliteTable('t${i}', { id: integer('id').primaryKey() });`).join('\n');
+		await writeFile(
+			join(dir, 'schema.ts'),
+			`import { integer, sqliteTable } from '${schemaImport()}';\n${tables}\n`,
+		);
+
+		const logged: string[] = [];
+		const ctx = {
+			cwd: dir,
+			config: { schema: './schema.ts', out, d1: { localFile }, migrationsTable: 'd1_migrations' },
+			log: (message: string) => logged.push(message),
+			now: () => 1,
+		};
+
+		const { push } = await import('../../src/node/commands.js');
+		const statements = await push(ctx, { local: true });
+
+		expect(statements.length).toBeGreaterThan(100);
+		// The local runner's `atomicLimit` is `Infinity`, so everything fits in
+		// one batch and no split warning is logged.
+		expect(logged.some((line) => line.includes('must be split'))).toBe(false);
 	});
 });
 

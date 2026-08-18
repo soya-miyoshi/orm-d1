@@ -73,6 +73,17 @@ export interface ColumnSnapshot {
 	 * (e.g. `nocase`) is a real, reportable difference — see `canonicalTable`.
 	 */
 	readonly collate?: string | undefined;
+	/**
+	 * True when `collate` (or its absence) is an explicit statement of intent —
+	 * from the `tableOptions()` sidecar's `collate` map (`orm-d1/ddl`) — rather
+	 * than structurally forced by the schema DSL having no `.collate()`
+	 * spelling. Only a schema-derived snapshot ever sets this; an introspected
+	 * one always reads the live `COLLATE` clause directly and has no need for
+	 * it. Lets `generate`'s collation carry-forward (`[F-115]`) and
+	 * `columnDifference`'s "unexpressible" exemption both tell "the schema
+	 * cannot say this" apart from "the operator said so, including 'gone'".
+	 */
+	readonly collateStated?: boolean | undefined;
 }
 
 /**
@@ -257,12 +268,57 @@ export interface Snapshot {
 	readonly origin?: 'schema' | 'introspection';
 }
 
+/**
+ * Null-proto a `Snapshot`'s `tables` map after `JSON.parse`.
+ *
+ * `JSON.parse` always builds plain objects — there is no way to ask it for
+ * `Object.create(null)` — so a persisted `meta/*.json` snapshot (`generate`'s
+ * baseline, or `check`'s `after` via `readLatestSnapshot`) with a table
+ * literally named `constructor` reads back with `tables['constructor']`
+ * resolving the inherited `Object` function instead of `undefined`. That is
+ * truthy, so every `!after.tables[name]` "is this table gone" check silently
+ * says no. Every reader of a parsed snapshot must go through this.
+ *
+ * The revive is **deep** for exactly the maps keyed by a database-chosen name:
+ * a snapshot is otherwise plain data, so nothing below those needs it.
+ */
+export const reviveSnapshot = (snapshot: Snapshot): Snapshot => {
+	const tables: Record<string, TableSnapshot> = Object.create(null);
+	for (const [name, table] of Object.entries(snapshot.tables)) {
+		// Every one of these is keyed by a name the *database* chose — a column,
+		// index, constraint or primary-key name — and every one is read with
+		// bracket indexing in `diff.ts` (`next.columns[target]`,
+		// `after.indexes[name]`, …). Reviving only `tables` leaves each of them
+		// one level below the fix: `after.indexes['constructor']` still resolves
+		// the inherited `Object`, so `canonicalIndex` reads `.columns.map` off a
+		// function and `check` dies with a `TypeError`, while a live column named
+		// `constructor` that the baseline lacks is reported as no drift at all.
+		tables[name] = {
+			...table,
+			columns: Object.assign(Object.create(null), table.columns),
+			indexes: Object.assign(Object.create(null), table.indexes),
+			foreignKeys: Object.assign(Object.create(null), table.foreignKeys),
+			compositePrimaryKeys: Object.assign(Object.create(null), table.compositePrimaryKeys),
+			uniqueConstraints: Object.assign(Object.create(null), table.uniqueConstraints),
+			checkConstraints: Object.assign(Object.create(null), table.checkConstraints),
+		};
+	}
+	return { ...snapshot, tables };
+};
+
 export const emptySnapshot = (id = '0'.repeat(8), prevId = ''): Snapshot => ({
 	version: SNAPSHOT_VERSION,
 	dialect: 'sqlite',
 	id,
 	prevId,
-	tables: {},
+	// `Object.create(null)`, not `{}` — this is `check`'s `after` when nothing
+	// has ever been generated, diffed table-for-table against a live/baseline
+	// `before` keyed by table name. A table literally named `constructor` (or
+	// `__proto__`, etc.) reads `after.tables['constructor']` as the inherited
+	// `Object` function on a plain object — truthy, so a dropped-table check
+	// like `!after.tables[name]` never fires and the table is reported as
+	// still present when it is not.
+	tables: Object.create(null),
 	// It has no constraints to have names for, so it agrees with either side.
 	origin: 'schema',
 });
@@ -316,13 +372,55 @@ export function snapshotFromSchema(
 		? (schema as readonly Table[])
 		: Object.values(schema as Record<string, unknown>).filter(isTableLike);
 
-	const result: Record<string, TableSnapshot> = {};
+	// `Object.create(null)`, not `{}` — same hazard as the column/constraint
+	// maps below, one level up: a table literally named `__proto__` (legal SQL)
+	// assigned through a plain object sets the object's *prototype* instead of
+	// adding an entry, so it silently vanishes from `Object.keys(result)` and
+	// everything downstream (diff, generate) never sees it. A table named
+	// `constructor`/`toString`/etc. would also resolve to the built-in instead
+	// of `undefined`, corrupting lookups that use `result[name]`.
+	const result: Record<string, TableSnapshot> = Object.create(null);
 
 	for (const t of tables) {
 		const name = getTableName(t);
-		const columns: Record<string, ColumnSnapshot> = {};
+		// `Object.create(null)`, not `{}` — same hazard as `indexes`/`foreignKeys`/
+		// etc. below, just for the column name itself instead of a constraint
+		// name. A column literally named `__proto__` (legal SQL, legal in the
+		// schema DSL: `sqliteTable('t', { p: text('__proto__') })`) assigned
+		// through a plain object sets the object's *prototype* instead of adding
+		// an entry — the column silently vanishes from the snapshot, with no
+		// error, and `createTableFromSnapshot`/`diffSnapshots` both read the same
+		// dropped snapshot back, so a rebuild for any unrelated reason silently
+		// drops the column and its data.
+		const columns: Record<string, ColumnSnapshot> = Object.create(null);
 		for (const column of Object.values(getTableColumns(t)) as Column<any>[]) {
 			columns[column.name] = columnSnapshot(column);
+		}
+
+		// `[F-115]`: apply the sidecar's stated collation intent, if any, before
+		// this snapshot is handed anywhere else. A `null` states "no collation" —
+		// as distinct from the DSL's structural inability to say anything at
+		// all — so `collateStated` is set either way.
+		const collateOptions = options?.byTable[name]?.collate;
+		if (collateOptions) {
+			for (const [columnName, value] of Object.entries(collateOptions)) {
+				// `Object.hasOwn`, not a bracket-and-truthiness read: `collateOptions`
+				// is a plain object the sidecar file supplies, so a stated column
+				// name of `toString` (or `constructor`, `valueOf`, …) that the table
+				// does not actually have resolves `columns[columnName]` to an
+				// inherited `Object.prototype` member instead of `undefined` — the
+				// `if (!existing) continue` guard below then never fires, and
+				// spreading that function into a "column snapshot" injects a bogus
+				// entry with none of `ColumnSnapshot`'s required fields.
+				if (!Object.hasOwn(columns, columnName)) continue;
+				const existing = columns[columnName];
+				if (!existing) continue;
+				columns[columnName] = {
+					...existing,
+					collate: value === null || value.toLowerCase() === 'binary' ? undefined : value.toLowerCase(),
+					collateStated: true,
+				};
+			}
 		}
 
 		// `Object.create(null)`, not `{}`: a constraint's derived or explicit name
@@ -663,6 +761,8 @@ export interface CanonicalColumn {
 	 * reportable collation.
 	 */
 	readonly collate: string | undefined;
+	/** Carried from `ColumnSnapshot.collateStated` — see there. */
+	readonly collateStated: boolean;
 }
 
 /**
@@ -751,7 +851,15 @@ export const columnDifference = (
 	// incapable of stating one; everything else — schema-to-schema,
 	// introspection-to-introspection, or a schema stating one where the live
 	// db states another — still needs to be caught.
-	if (!(bIsSchemaDerived && a.collate !== undefined && b.collate === undefined) && a.collate !== b.collate) {
+	// `[F-115]`: the exemption below only applies while `b.collate` is
+	// *structurally* forced to `undefined` — the DSL has no `.collate()`. Once
+	// the `tableOptions()` sidecar states a column's collation (`b.collateStated`),
+	// even as an explicit "none", that is a real statement of intent and a
+	// live divergence from it is genuine, reportable drift.
+	if (
+		!(bIsSchemaDerived && !b.collateStated && a.collate !== undefined && b.collate === undefined)
+		&& a.collate !== b.collate
+	) {
 		return 'changes its collation';
 	}
 	return undefined;
@@ -896,7 +1004,12 @@ export const typeAffinity = (declared: string): 'integer' | 'text' | 'blob' | 'r
 };
 
 export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
-	const columns: Record<string, CanonicalColumn> = {};
+	// `Object.create(null)`, not `{}` — same hazard as `snapshotFromSchema`'s
+	// own column map: a column literally named `__proto__` assigned through a
+	// plain object sets the prototype instead of adding an entry, dropping it
+	// from the canonical comparison `requiresRecreate` (`diff.ts`) uses to
+	// decide whether a table needs rebuilding.
+	const columns: Record<string, CanonicalColumn> = Object.create(null);
 	const uniques: (readonly CanonicalUniqueMember[])[] = [];
 	const foreignKeys: string[] = [];
 	// Same member shape `uniques` uses ({ name, collate? }), in declared
@@ -943,6 +1056,7 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 			collate: column.collate && column.collate.toLowerCase() !== 'binary'
 				? column.collate.toLowerCase()
 				: undefined,
+			collateStated: column.collateStated ?? false,
 		};
 		// A single-column table-level PK clause with an explicit member
 		// `collate` is recorded in `table.compositePrimaryKeys` even at arity 1

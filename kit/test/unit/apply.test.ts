@@ -61,6 +61,51 @@ describe('statementGroups', () => {
 		// PRAGMA through the trailing index create share one id.
 		expect(new Set(groups.slice(1, 7)).size).toBe(1);
 	});
+
+	// A rename of an append-only table is not a rebuild — no `create table
+	// "__new_X"` in sight — but `diffSnapshots` (`diff.ts`) still emits three
+	// statements that depend on landing in the same batch: the rename itself,
+	// a `drop trigger if exists` for the guard under its *old* name (SQLite
+	// keeps a trigger's name across `RENAME TO`), and — when the table stays
+	// append-only — a `create trigger` restoring the guard under the *new*
+	// name, right after the drop. Split across a batch boundary, the table is
+	// genuinely unprotected between the drop and the re-create, and
+	// unprotected for good if the batch carrying the re-create then fails.
+	describe('a renamed append-only table\'s guard drop-and-restore is one atomic unit', () => {
+		it('groups the rename, the old-name drop and the new-name re-create together', () => {
+			const statements = [
+				'create table "before" ("id" integer)',
+				'alter table "events" rename to "audit"',
+				'drop trigger if exists "events_no_update"',
+				'create trigger "audit_no_update"\nbefore update on "audit"\nbegin\n\tselect raise(abort, \'x\');\nend',
+				'create table "after" ("id" integer)',
+			];
+			const groups = statementGroups(statements);
+
+			expect(groups[0]).not.toBe(groups[1]);
+			expect(groups[2]).toBe(groups[1]);
+			expect(groups[3]).toBe(groups[1]);
+			expect(groups[4]).not.toBe(groups[1]);
+		});
+
+		it('groups just the rename and the drop when the table does not stay append-only', () => {
+			const statements = [
+				'alter table "events" rename to "audit"',
+				'drop trigger if exists "events_no_update"',
+				'create table "after" ("id" integer)',
+			];
+			const groups = statementGroups(statements);
+
+			expect(groups[1]).toBe(groups[0]);
+			expect(groups[2]).not.toBe(groups[0]);
+		});
+
+		it('leaves an ordinary rename with no append-only guard as a singleton', () => {
+			const statements = ['alter table "events" rename to "audit"', 'create table "after" ("id" integer)'];
+			const groups = statementGroups(statements);
+			expect(groups[0]).not.toBe(groups[1]);
+		});
+	});
 });
 
 describe('packIntoBatches', () => {

@@ -232,6 +232,11 @@ export async function appliedMigrations(
  * Apply one migration as a single `batch()` — which D1 executes atomically.
  * This is a real correctness improvement over emitting BEGIN/COMMIT, which D1
  * will not honour.
+ *
+ * [F-047] Unlike {@link applyMigrations}, this does **not** run
+ * `checkForeignTriggerConflicts` — there is no migration list here to check
+ * renames across, only one migration's own SQL. Prefer `applyMigrations`,
+ * even for a single migration, unless the guard is genuinely unwanted.
  */
 export async function applyMigration(
 	runner: SqlRunner,
@@ -531,6 +536,39 @@ export async function checkForeignTriggerConflicts(
 
 /**
  * Apply a whole set of pending migrations, in order.
+ *
+ * [F-047] Two changes landed together under one export, and only one of them
+ * is safe to wave through as "purely additive":
+ *
+ * - The `onWarning` parameter is additive and optional — no existing caller's
+ *   call shape or return type changes.
+ * - The **behaviour** is not additive: every call now also runs
+ *   {@link checkForeignTriggerConflicts}, which issues an extra
+ *   `sqlite_master` read and can **throw** on a migration that would have
+ *   applied cleanly before this guard existed (a pending rebuild of a table
+ *   carrying a trigger orm-d1 did not author). A caller relying on
+ *   "`applyMigrations` either applies everything or leaves nothing applied"
+ *   still gets that — the guard runs *before* the loop below touches the
+ *   database — but a caller relying on "this migration always applies" does
+ *   not.
+ *
+ * Whether that is the *right* contract for a published function is an open
+ * question, not one this comment settles — `[F-047]` in this repo's `AUDIT.md`
+ * is `needs-human` for exactly it: may `applyMigrations` refuse input it used
+ * to apply, or does the guard belong behind an opt-in parameter (defaulting to
+ * the old behaviour) or in the CLI commands instead? Until that is answered the
+ * behaviour described above is what the code does, and a caller that must not
+ * throw here has to catch the specific refusal.
+ *
+ * **Inconsistency with the singular {@link applyMigration}**: that function
+ * is also exported from `orm-d1-kit/core` and does **not** run this guard —
+ * it applies whatever it is given. A caller that switches from calling
+ * `applyMigrations` with one migration to calling `applyMigration` directly
+ * silently loses the foreign-trigger protection. This is not a proposal to
+ * change `applyMigration`'s signature (it has no `migrations` list to check
+ * renames across, and `checkForeignTriggerConflicts` is built for exactly
+ * that list) — just a documented gap: prefer `applyMigrations`, even for one
+ * migration, unless the guard is genuinely unwanted.
  *
  * @param onWarning Called with each split-batch warning as `applyMigration`
  * produces it, in addition to it being collected into the returned

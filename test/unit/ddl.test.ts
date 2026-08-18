@@ -1,7 +1,7 @@
 import { and as dAnd, eq as dEq, gt as dGt, inArray as dInArray, notInArray as dNotInArray, sql as dSql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { asDrizzleTable } from '../../src/drizzle.js';
-import { createIndexes, createSchema, createTable, dropTable, literal } from '../../src/ddl.js';
+import { createIndexes, createSchema, createTable, dropTable, literal, tableOptions } from '../../src/ddl.js';
 import { blob, check, customType, integer, numeric, real, sql, sqliteTable, text, uniqueIndex } from '../../src/index.js';
 import { inArray, notInArray } from '../../src/sql/expressions.js';
 import type { SQLChunk } from '../../src/sql/sql.js';
@@ -425,6 +425,48 @@ describe('ddl generation', () => {
 		expect(statements).toHaveLength(6);
 		expect(statements.slice(0, 3).every((s) => s.startsWith('create table'))).toBe(true);
 		expect(statements.slice(3).every((s) => s.includes('index'))).toBe(true);
+	});
+
+	it('renders a per-column collate from tableOptions, matching the kit\'s snapshot-based DDL', () => {
+		// `TableOptions.collate` (`src/ddl.ts`) had no branch in `createSchema`'s
+		// `optionsFor`, so a column-level `COLLATE` stated through the
+		// `tableOptions()` sidecar rendered here (`create table`) but not through
+		// `createTableFromSnapshot` (`kit/src/core/snapshot.ts`) for the very same
+		// input — the two producers disagreed for identical `TableOptions`.
+		const t = sqliteTable('people', { id: integer('id').primaryKey(), email: text('email') });
+		const [ddl] = createSchema([t], {}, tableOptions([[t, { collate: { email: 'nocase' } }]]));
+		expect(ddl).toContain('"email" text collate nocase');
+
+		// The kit's `TableOptions.collate` doc states `null` retires a carried
+		// collation and any casing/`binary` normalises away to no clause at all —
+		// `createSchema` has to agree on that normalisation too, not just on the
+		// stated-collation case.
+		const [none] = createSchema([t], {}, tableOptions([[t, { collate: { email: 'BINARY' } }]]));
+		expect(none).not.toContain('collate');
+	});
+
+	it('does not resolve an inherited Object.prototype member for a column named like one', () => {
+		// `options.collate` is a plain `{}` a caller passes in directly. A
+		// bracket lookup (`options.collate?.[column.name]`) on a column literally
+		// named `constructor`, `toString`, `valueOf` or `hasOwnProperty` resolves
+		// an inherited `Object.prototype` function instead of `undefined` — which
+		// is truthy, so it used to get template-stringified straight into the
+		// DDL: `"constructor" text collate function Object() { [native code] }`.
+		const t = sqliteTable('weird', {
+			id: integer('id').primaryKey(),
+			constructor: text('constructor'),
+			toString: text('toString'),
+			valueOf: text('valueOf'),
+			hasOwnProperty: text('hasOwnProperty'),
+		});
+		const ddl = createTable(t, { collate: {} });
+		expect(ddl).toContain('"constructor" text');
+		expect(ddl).toContain('"toString" text');
+		expect(ddl).toContain('"valueOf" text');
+		expect(ddl).toContain('"hasOwnProperty" text');
+		expect(ddl).not.toContain('native code');
+		expect(ddl).not.toContain('function Object');
+		expect(ddl).not.toContain('collate');
 	});
 
 	it('derives an index name when none is given', () => {

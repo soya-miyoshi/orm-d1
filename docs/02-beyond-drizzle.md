@@ -1,7 +1,7 @@
 # Beyond Drizzle
 
 [01-differences](./01-differences.md) covers the same call behaving differently. This
-covers what has no spelling in `drizzle-orm` or `drizzle-kit`: seven features. Each is
+covers what has no spelling in `drizzle-orm` or `drizzle-kit`: eight features. Each is
 specific to D1 or to SQLite, which is why a library targeting several databases has no
 place to put it.
 
@@ -10,6 +10,7 @@ place to put it.
 - [Append-only tables, and append-only columns](#append-only-tables-and-append-only-columns)
 - [`latestPerGroup`](#latestpergroup)
 - [`STRICT` and `WITHOUT ROWID`](#strict-and-without-rowid)
+- [`collate`: a column's collation intent](#collate-a-columns-collation-intent)
 - [`impact`](#impact)
 - [`backfill`](#backfill)
 - [`generate --emit-roundtrip`](#generate---emit-roundtrip)
@@ -139,6 +140,41 @@ behaviour confirmed on D1. `WITHOUT ROWID` on a table with no primary key fails 
 that renders outside that set, but `customType()` can declare any string at all
 (`varchar(10)`, a misspelling, …), so it is checked too. The alternative to checking is a
 migration that applies to production halfway and then fails.
+
+## `collate`: a column's collation intent
+
+`COLLATE` is per column, and Drizzle's column builder has no `.collate()` — so the schema
+DSL cannot state one either (`docs/04` keeps it a strict subset). A live collation is
+introspected correctly, which leaves the kit with a question it cannot answer from the
+schema: is a column that says nothing about collation a column that wants `BINARY`, or a
+column whose schema simply cannot say what it has? Guessing "wants BINARY" would drop a
+live collation on the next rebuild — bug class #1. So `generate` guesses the other way and
+*carries a live collation forward*: once recorded in `meta/`, it keeps being re-emitted.
+
+That carry-forward is self-perpetuating, and it has one failure mode: a team that
+deliberately rebuilds a column back to `BINARY` has no way to say so, and `check` stays red
+for good. `collate`, the fourth option in the same `tableOptions` sidecar as `strict`,
+`withoutRowid` and `appendOnly`, is how the schema states the intent explicitly:
+
+```ts
+export default tableOptions([
+  // Authoritative: `generate`/`check` treat this as the column's real collation
+  // and stop guessing from the live database.
+  [users, { collate: { email: 'nocase' } }],
+  // `null` is the opposite — "no collation, and stop carrying one forward" — the
+  // only way to retire a collation the kit once recorded.
+  [accounts, { collate: { legacy_id: null } }],
+]);
+```
+
+A column not named here keeps the carry-forward behaviour. What `generate` checks: the name
+has to be a real column of that table (a typo is a refusal, not a silent no-op), and a
+collation change is a rebuild — SQLite cannot alter a column's collation in place — so it
+goes through the same recreate path as a type change, with the same refusal when the table
+has children. Comparison folds case, because D1 hands back a `COLLATE`'s original spelling
+verbatim and `NOCASE` and `nocase` are the same collation. `orm-d1-kit pull` renders every
+non-`BINARY` collation it finds into the sidecar for you, since the schema module it writes
+alongside cannot state them.
 
 ## `impact`
 
