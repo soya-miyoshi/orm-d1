@@ -467,50 +467,12 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 - **Fix**: at `diff.ts:334`, mark it `destructive: true` with the reason from line 512 unless the guard is re-created under the new name in the same diff — non-destructive only when `after.tables[renamed]?.appendOnly === true`.
 - **Prove it**: `kit/test/unit/diff.test.ts` — the pair above, asserting `diff.statements.some(s => s.destructive)` in *both* the in-place and the renamed case, and that renaming an append-only table that *stays* append-only emits `drop trigger` + `create trigger` with neither marked destructive.
 
-### [F-037] `AUDIT.md` names a private product and its schema shape, in a repo that is published to npm — status: **needs-human** — severity: med — area: privacy
-- **Where**: this file — the `[F-001]` block and the fixture note near the end
-- **What it discloses**: the downstream project's private product name, its container
-  mount paths, and structural facts about its schema — 64 tables, `strict: true` on all
-  64, `withoutRowid` and `appendOnly` drawn from a `hardening.ts` roster. No table or
-  column names leak, and `AUDIT.md` is excluded from the npm tarball (`files` does not
-  list it), so this is disclosure of a private product name and coarse schema shape
-  rather than of the schema itself.
-- **Already published — this is not a hypothetical, it already happened**: the earlier
-  version of this entry claimed `AUDIT.md` "is on no remote branch" and would only
-  "become a disclosure … if … pushed". That claim is **false** and was not re-verified
-  before being written down. `c9aabd7` (the commit that first added the un-scrubbed
-  content to this file) is an ancestor of `origin/main` —
-  `git merge-base --is-ancestor c9aabd7 origin/main` exits `0` — and is inside the
-  pushed tag `v0.1.6` (and every tag since). `git show origin/main:AUDIT.md | grep -c
-  acme` returns `4`. The private product name, its container mount paths, and the
-  `hardening.ts`-derived roster of which tables are `strict`/`withoutRowid`/`appendOnly`
-  are on `origin/main` right now and inside a tag anyone who fetched it already has.
-- **Scrubbing the working tree does not undo this.** Editing this file going forward
-  (done, below) only stops the *next* push from repeating the disclosure — it cannot
-  retract what `origin/main` and `v0.1.6`+ already carry. Only rewriting the published
-  history (force-pushing a rewritten `main`, deleting/re-cutting the affected tags) would
-  do that, and that is not a decision this sweep will make unilaterally: it breaks
-  anyone who has already fetched, and re-tagging a released version has consequences
-  beyond this repo.
-- **Question for the human**: the disclosure already happened on `origin/main` and in
-  `v0.1.6` onward. Options: (a) accept it as already-public and just stop repeating it
-  going forward — the name and paths are not credentials; (b) rewrite and force-push the
-  affected history and re-cut the affected tags, accepting the fallout for anyone who
-  already pulled; (c) something narrower, e.g. treat only the product name as sensitive
-  and decide whether that alone is worth a history rewrite. The sweep will not decide
-  this on its own.
-- **Scrubbed this file going forward** (does not address the already-published copies
-  above): the downstream project's real name and its container mount paths (the
-  `[F-001]` block's "Where the path points" and "Fixture shape" notes, and the
-  fixture-privacy note near the end of this file) are replaced with generic
-  descriptions — "a downstream project", "that project's schema directory" — while every
-  finding's technical content (the bug, the mechanism, the table/constraint counts)
-  stays intact. `[F-001]` itself is now superseded by a synthetic in-repo harness (see
-  its own entry), so the scrubbed recipe is kept only as a record of the approach that
-  was tried and rejected, not as a live plan that still needs the name to be useful.
-  Packaging was re-verified rather than assumed — see the `npm pack --dry-run` figures
-  recorded in this batch's fixes; `AUDIT.md` is absent from both tarballs.
+### [F-037] A private product name and its schema shape, in a repo published to npm — status: **done** (2026-08-18, history rewritten and republished) — severity: med — area: privacy
 
+- **What it was**: the customer name, its container mount paths and coarse schema facts (64 tables, `strict: true` on all, a `hardening.ts` roster — no table or column names) in `AUDIT.md`; the name in `.claude/agents/reviewer.md`; and, the operationally sensitive part, the Worker name plus all three D1 database names including the production one, in `kit/test/unit/config-env.test.ts` (15 occurrences) and `kit/README.md`. The `kit/README.md` copy shipped inside the published `orm-d1-kit` tarball, because `files` lists `README.md`.
+- **Why the first resolution was wrong**: it was closed on the claim that the introducing commit was on no remote branch. That was false — it was an ancestor of `origin/main` and inside every pushed tag from `v0.1.6`. A working-tree scrub does not retract a public disclosure, and the entry had been moved off `needs-human`, deleting the one question that would have surfaced it.
+- **What was actually done**: the working tree was scrubbed, the dead `ORM_D1_FIXTURE_SCHEMA` mount config was removed from `docker-compose.yml`, and the human then authorised a history rewrite. Every commit reachable from every branch and tag was rewritten, verified at **0 of 153 commits** containing it, with a tree-diff against the pre-rewrite tip confirming the substitution was the only change. `main` and all 11 tags were force-pushed; `origin/main` and tags `v0.1.5`-`v0.2.1` all verify clean. `0.2.2` was published from the rewritten history and its tarball is clean.
+- **Residual, accepted**: the rewrite moved every tag from `v0.1.5`, so npm provenance attestations for versions published before `0.2.2` reference commits that no longer exist on GitHub. `0.2.1` is deprecated. Anyone holding an older clone has a diverged history. `refs/original/` in the local repo is the only path back.
 ### [F-038] `importModule` writes a copy of the user's schema into their source tree — status: done (pending commit) — severity: low — area: kit/node
 - **Where**: `kit/src/node/import.ts:79-85`
 - **Defect**: writes a `.orm-d1-<pid>-<n>.mts` copy of a schema module *inside the user's source tree* and removes it in a `finally`. A crash or `SIGKILL` between the two leaves an importable duplicate of the schema next to the original, which a `**/*.mts` glob in a build or test config will pick up.
