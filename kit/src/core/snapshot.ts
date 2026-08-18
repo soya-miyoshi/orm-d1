@@ -268,12 +268,35 @@ export interface Snapshot {
 	readonly origin?: 'schema' | 'introspection';
 }
 
+/**
+ * Null-proto a `Snapshot`'s `tables` map after `JSON.parse`.
+ *
+ * `JSON.parse` always builds plain objects — there is no way to ask it for
+ * `Object.create(null)` — so a persisted `meta/*.json` snapshot (`generate`'s
+ * baseline, or `check`'s `after` via `readLatestSnapshot`) with a table
+ * literally named `constructor` reads back with `tables['constructor']`
+ * resolving the inherited `Object` function instead of `undefined`. That is
+ * truthy, so every `!after.tables[name]` "is this table gone" check silently
+ * says no. Every reader of a parsed snapshot must go through this.
+ */
+export const reviveSnapshot = (snapshot: Snapshot): Snapshot => ({
+	...snapshot,
+	tables: Object.assign(Object.create(null), snapshot.tables),
+});
+
 export const emptySnapshot = (id = '0'.repeat(8), prevId = ''): Snapshot => ({
 	version: SNAPSHOT_VERSION,
 	dialect: 'sqlite',
 	id,
 	prevId,
-	tables: {},
+	// `Object.create(null)`, not `{}` — this is `check`'s `after` when nothing
+	// has ever been generated, diffed table-for-table against a live/baseline
+	// `before` keyed by table name. A table literally named `constructor` (or
+	// `__proto__`, etc.) reads `after.tables['constructor']` as the inherited
+	// `Object` function on a plain object — truthy, so a dropped-table check
+	// like `!after.tables[name]` never fires and the table is reported as
+	// still present when it is not.
+	tables: Object.create(null),
 	// It has no constraints to have names for, so it agrees with either side.
 	origin: 'schema',
 });

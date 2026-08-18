@@ -469,8 +469,15 @@ const carryForwardPrimaryKeyCollation = (
  * errors, a real downgrade of the constraint's semantics.
  */
 export const carryForwardCollations = (before: Snapshot, after: Snapshot, options: DiffOptions = {}): Snapshot => {
-	const renamedTables = options.renamedTables ?? {};
-	const renamedColumns = options.renamedColumns ?? {};
+	// `Object.create(null)`, not `{}`: a table literally named `__proto__`
+	// resolved through `renamedTables[beforeName]` on a plain object reads the
+	// inherited `Object.prototype.__proto__` accessor instead of `undefined`,
+	// which is truthy and so is taken as a real target name — corrupting the
+	// carry-forward for exactly the table this fix exists to protect. Same
+	// hazard, same fix, as `columnRenames` just below.
+	const renamedTables: Record<string, string> = Object.create(null);
+	Object.assign(renamedTables, options.renamedTables);
+	const renamedColumns: Record<string, string> = options.renamedColumns ?? Object.create(null);
 	let tables = after.tables;
 
 	for (const [beforeName, beforeTable] of Object.entries(before.tables)) {
@@ -791,7 +798,14 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 	// `options.foreignTriggers` is populated by `introspect()` keyed by the
 	// live `tbl_name`, before any rename in this diff is applied, so a lookup
 	// keyed by the post-rename identity misses it entirely.
-	const liveTableNames: Record<string, string> = {};
+	// `Object.create(null)`, not `{}` — same hazard as `renamedTables` above,
+	// and it feeds `lookupCaseInsensitive(options.foreignTriggers, liveTableNames[name] ?? name)`
+	// below: a table renamed *to* `constructor` (or `__proto__`, etc.) would
+	// otherwise make `liveTableNames['constructor']` resolve the inherited
+	// `Object` function — truthy, so the `?? name` fallback never fires — and
+	// that gets handed to `foldAsciiCase`, which calls `.replace` on it and
+	// throws `TypeError: value.replace is not a function`.
+	const liveTableNames: Record<string, string> = Object.create(null);
 	for (const [before, after] of Object.entries(renamedTables)) liveTableNames[after] = before;
 
 	const beforeNames = Object.keys(before.tables);
@@ -1296,8 +1310,20 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		// Only reached when the table survives in place; a rebuild carries the
 		// rename itself. Must precede the index and column ALTERs below, which
 		// are expressed against the new names.
+		//
+		// Track which entries actually got a `rename column` statement — the
+		// `guardChanged` check below forward-maps `previous.appendOnly` through
+		// `columnRenames` on the assumption that every entry it names was
+		// emitted here. `columnRenames` can name a rename this loop skips (e.g.
+		// a stale `--rename-column` for a live guard naming a column the table
+		// does not actually have — see `kit/src/node/commands.ts`'s
+		// `sidecarDisagreementWarnings`), and crediting an unemitted rename would
+		// make `guardChanged` conclude the guard is already reconciled when the
+		// live trigger never moved.
+		const emittedColumnRenames: Record<string, string> = Object.create(null);
 		for (const [from, to] of Object.entries(columnRenames)) {
 			if (!previous.columns[from] || !next.columns[to]) continue;
+			emittedColumnRenames[from] = to;
 			statements.push({
 				sql: `alter table ${quote(name)} rename column ${quote(from)} to ${quote(to)}`,
 				destructive: false,
@@ -1355,7 +1381,7 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 			if (previousGuard === '' || nextGuard === '' || previousGuard === '*' || nextGuard === '*') {
 				return previousGuard !== nextGuard;
 			}
-			const mapped = new Set(appendOnlyColumns(previous.appendOnly)!.map((c) => columnRenames[c] ?? c));
+			const mapped = new Set(appendOnlyColumns(previous.appendOnly)!.map((c) => emittedColumnRenames[c] ?? c));
 			const wanted = new Set(appendOnlyColumns(next.appendOnly)!);
 			return mapped.size !== wanted.size || [...mapped].some((c) => !wanted.has(c));
 		})();

@@ -152,8 +152,14 @@ const asList = (value: FlagValue | undefined): string[] =>
  * also makes a rename reviewable in a shell history and usable from CI.
  */
 const asRenames = (flags: Record<string, FlagValue>): DiffOptions | undefined => {
-	const renamedTables: Record<string, string> = {};
-	const renamedColumns: Record<string, string> = {};
+	// `Object.create(null)`, not `{}` — these flow straight into `diffSnapshots`
+	// as `options.renamedTables`/`renamedColumns`, keyed by a table/column name
+	// an operator can spell as `constructor`, `__proto__`, etc. Passing a plain
+	// object here defeats `diffSnapshots`'s own `?? Object.create(null)`
+	// fallback (a plain `{}` is truthy, so the fallback never fires) and
+	// reintroduces the prototype hazard one call up.
+	const renamedTables: Record<string, string> = Object.create(null);
+	const renamedColumns: Record<string, string> = Object.create(null);
 
 	for (const entry of asList(flags['rename-table'])) {
 		const [from, to] = splitPair(entry, '--rename-table', 'old_table=new_table');
