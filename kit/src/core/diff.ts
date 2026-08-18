@@ -333,7 +333,7 @@ const carryForwardCollation = (
 		// this column. Without this check a deliberately-removed collation could
 		// never leave `meta/`: the very next `generate` would just re-carry it.
 		if (afterColumn && !afterColumn.collate && !afterColumn.collateStated) {
-			if (result === afterColumns) result = { ...afterColumns };
+			if (result === afterColumns) result = Object.assign(Object.create(null), afterColumns);
 			result[target] = { ...afterColumn, collate: beforeColumn.collate };
 		}
 	}
@@ -524,7 +524,7 @@ export const carryForwardCollations = (before: Snapshot, after: Snapshot, option
 		}
 
 		if (nextAfterTable !== afterTable) {
-			if (tables === after.tables) tables = { ...after.tables };
+			if (tables === after.tables) tables = Object.assign(Object.create(null), after.tables);
 			tables[targetName] = nextAfterTable;
 		}
 	}
@@ -604,7 +604,7 @@ const recreateTable = (
 	after: TableSnapshot,
 	columnRenames: Record<string, string>,
 	reason: string,
-	dependents: Record<string, TableSnapshot> = {},
+	dependents: Record<string, TableSnapshot> = Object.create(null),
 	foreignTriggers: readonly string[] = [],
 	/**
 	 * Whether `after` is schema-derived — the same reading `columnDifference`
@@ -1054,14 +1054,18 @@ export function diffSnapshots(before: Snapshot, after: Snapshot, options: DiffOp
 		for (const name of Object.keys(effectiveBefore)) {
 			const t = effectiveBefore[name]!;
 			let changed = false;
-			const columns: Record<string, ColumnSnapshot> = { ...t.columns };
+			// `Object.assign(Object.create(null), …)`, not a spread: a spread rebuilds a
+			// *plain* object and throws away the null prototype `reviveSnapshot` just
+			// established, so `previous.columns['constructor']` starts resolving the
+			// inherited `Object` again — one `--rename-table` away from every fix below.
+			const columns: Record<string, ColumnSnapshot> = Object.assign(Object.create(null), t.columns);
 			for (const [colName, col] of Object.entries(columns)) {
 				if (col.references && renamedTables[col.references.tableTo]) {
 					columns[colName] = { ...col, references: { ...col.references, tableTo: repoint(col.references.tableTo) } };
 					changed = true;
 				}
 			}
-			const foreignKeys: Record<string, ForeignKeySnapshot> = { ...t.foreignKeys };
+			const foreignKeys: Record<string, ForeignKeySnapshot> = Object.assign(Object.create(null), t.foreignKeys);
 			for (const [fkName, fk] of Object.entries(foreignKeys)) {
 				if (renamedTables[fk.tableTo]) {
 					foreignKeys[fkName] = { ...fk, tableTo: repoint(fk.tableTo) };

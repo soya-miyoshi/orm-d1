@@ -58,7 +58,8 @@ export interface RoundtripPlan {
 
 /** A copy of `snapshot` with every foreign key pointing into `targets` removed. */
 const withoutReferencesTo = (snapshot: Snapshot, targets: ReadonlySet<string>): Snapshot => {
-	const tables: Record<string, TableSnapshot> = {};
+	// Keyed by table name, which the database chose — see `reviveSnapshot`.
+	const tables: Record<string, TableSnapshot> = Object.create(null);
 	for (const [name, table] of Object.entries(snapshot.tables)) {
 		const foreignKeys = Object.fromEntries(
 			Object.entries(table.foreignKeys).filter(([, fk]) => !targets.has(fk.tableTo)),

@@ -275,7 +275,12 @@ export const parseChecks = (
 	sql: string,
 	tableName = 'table',
 ): Record<string, { name: string; value: string }> => {
-	const checks: Record<string, { name: string; value: string }> = {};
+	// `Object.create(null)`: a constraint name comes from the database, and
+	// `checks['__proto__'] = …` on a plain object invokes the inherited setter —
+	// the prototype is reassigned and *no own key is added*, so the constraint
+	// vanishes from the snapshot entirely and `check` reports no drift for a
+	// live CHECK the schema does not have.
+	const checks: Record<string, { name: string; value: string }> = Object.create(null);
 	const pattern = /(?:constraint\s+("(?:[^"]|"")+"|\w+)\s+)?\bcheck\s*\(/gi;
 	let unnamed = 0;
 
@@ -1148,7 +1153,7 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			else groupedFks.set(fk.id, [fk]);
 		}
 
-		const foreignKeys: Record<string, ForeignKeySnapshot> = {};
+		const foreignKeys: Record<string, ForeignKeySnapshot> = Object.create(null);
 		for (const [, group] of groupedFks) {
 			const ordered = [...group].sort((a, b) => a.seq - b.seq);
 			const name = `${row.name}_${ordered.map((f) => f.from).join('_')}_fk`;
@@ -1162,9 +1167,12 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			};
 		}
 
-		const indexes: Record<string, IndexSnapshot> = {};
+		// Same hazard as `checks` above, and the same reason `columns`/`tables` in
+		// this file are null-prototype: an index named `__proto__` would otherwise
+		// never reach the snapshot at all.
+		const indexes: Record<string, IndexSnapshot> = Object.create(null);
 		const uniqueConstraints: Record<string, { name: string; columns: readonly (string | UniqueColumnSnapshot)[] }> =
-			{};
+			Object.create(null);
 		// Parsed once per table: every table-level `[constraint <name>] unique (…)`
 		// clause in declaration order, for `[F-111]`'s per-member collation.
 		const uniqueClauses = parseTableUniqueConstraints(createSql);
@@ -1296,7 +1304,7 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 		}
 
 		const compositePrimaryKeys: Record<string, { name: string; columns: readonly (string | UniqueColumnSnapshot)[] }> =
-			{};
+			Object.create(null);
 		// A table-level `primary key (…)` clause whose members carry an explicit
 		// `collate` needs the arity-1 (single-column) case too, not only the
 		// `compositePk` (arity>=2) one below: SQLite scopes a member's own
