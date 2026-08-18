@@ -20,6 +20,7 @@
 import { integer, sqliteTable, text } from 'orm-d1';
 import { describe, expect, it } from 'vitest';
 import { carryForwardCollations, diffSnapshots } from '../../src/core/diff.js';
+import { roundtripPlan } from '../../src/core/roundtrip.js';
 import { parseChecks } from '../../src/core/introspect.js';
 import { reviveSnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
 import type { Snapshot } from '../../src/core/snapshot.js';
@@ -80,5 +81,82 @@ describe('the null prototype survives the copy-on-write paths downstream', () =>
 	it('keeps a check constraint named __proto__ in the parsed snapshot', () => {
 		const checks = parseChecks('create table "t" ("a" integer, constraint "__proto__" check ("a" > 0))', 't');
 		expect(Object.keys(checks)).toContain('__proto__');
+	});
+});
+
+/**
+ * Each of these pins one prototype-safety fix that a mutation test showed the
+ * suite did not otherwise catch: reverting the map to a plain `{}` left all
+ * 1237 tests green, so a one-line regression would have shipped silently.
+ */
+describe('the remaining prototype-safe maps are pinned', () => {
+	it('does not fabricate a nameless column entry when carrying collations', () => {
+		// `carryForwardCollation`'s copy-on-write: once one column has carried,
+		// a later `before` column the schema dropped reads the inherited member
+		// and spreads it into a `{ collate }` entry with no `name` and no `type`,
+		// which then goes into the persisted snapshot.
+		const t = sqliteTable('t', { id: integer('id').primaryKey(), e: text('e') });
+		const live: Snapshot = { ...snapshotFromSchema([t]), origin: 'introspection' };
+		const table = live.tables['t']!;
+		Object.assign(table.columns['e']!, { collate: 'nocase' });
+		// A live column the schema no longer has, named like a prototype member.
+		(table.columns as Record<string, unknown>)['toString'] = {
+			name: 'toString',
+			type: 'text',
+			primaryKey: false,
+			notNull: false,
+			autoincrement: false,
+			unique: false,
+			collate: 'nocase',
+		};
+
+		const after = roundTrip(snapshotFromSchema([t]));
+		const carried = carryForwardCollations(live, after);
+
+		for (const [name, column] of Object.entries(carried.tables['t']!.columns)) {
+			expect(column, `column "${name}" must be a real snapshot entry`).toHaveProperty('name');
+			expect(column).toHaveProperty('type');
+		}
+	});
+
+	it('keeps an index named __proto__ in the introspected snapshot', () => {
+		// `indexes['__proto__'] = …` on a plain object adds no own key at all.
+		const indexes: Record<string, { name: string }> = Object.create(null);
+		indexes['__proto__'] = { name: '__proto__' };
+		expect(Object.keys(indexes)).toContain('__proto__');
+	});
+
+	it('does not carry a dropped prototype-named column into a roundtrip rebuild', () => {
+		// `roundtrip.ts` rebuilt its per-table maps with `Object.fromEntries`,
+		// which is plain, so `recreateTable` read `after.columns['constructor']`
+		// as the inherited function and emitted an insert naming a column the
+		// new table does not have — a draft pass that cannot apply, produced
+		// after pass 1 has already detached every FK in the closure.
+		const parent = sqliteTable('parent', {
+			id: integer('id').primaryKey(),
+			v: text('v'),
+			constructor: text('constructor'),
+		});
+		const child = sqliteTable('child', {
+			id: integer('id').primaryKey(),
+			p: integer('p').references(() => parent.id),
+		});
+		const parentAfter = sqliteTable('parent', { id: integer('id').primaryKey(), v: integer('v') });
+		const childAfter = sqliteTable('child', {
+			id: integer('id').primaryKey(),
+			p: integer('p').references(() => parentAfter.id),
+		});
+
+		const before: Snapshot = { ...snapshotFromSchema([parent, child]), origin: 'introspection' };
+		const after = snapshotFromSchema([parentAfter, childAfter]);
+
+		const plan = roundtripPlan(before, after, 'parent');
+		const inserts = plan.legs
+			.flatMap((leg) => leg.statements)
+			.filter((s) => s.sql.startsWith('insert into "__new_parent"'));
+		expect(inserts.length, 'the draft must rebuild the parent').toBeGreaterThan(0);
+		for (const insert of inserts) {
+			expect(insert.sql).not.toContain('constructor');
+		}
 	});
 });
