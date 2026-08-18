@@ -375,26 +375,31 @@ export function snapshotFromSchema(
 					}
 					indexes[derivedName] = {
 						name: derivedName,
-						columns: extra.meta.columns.map((c) =>
-							isColumn(c)
-								? { expression: c.name, isExpression: false }
-								: decorateIndexColumn(renderInline(c as never))
+						// Wrapped through `withDDLContext`, the same as the `where` render
+						// just below and the `check` branch further down: a refusal this can
+						// throw (the empty-array DDL refusal, `src/ddl.ts`'s
+						// `onEmptyArrayPredicate`/`onForeignFragment`) comes back anonymous
+						// otherwise — no table or constraint name — because this runs before
+						// `checkDDL` would normally attach that context. A refactor once
+						// called `createIndex(extra.meta, name)` here purely to get its
+						// `withDDLContext(name, indexName(...))` wrapper "for free"; removing
+						// that call for `[F-028]` (this index's own name is now derived
+						// directly via `indexName` above) also removed the wrapper. The
+						// `where` render below was re-wrapped, but this column-expression
+						// render was left bare — a sibling regression: an expression-column
+						// index with an empty-array predicate (`index(...).on(inArray(c, []))`)
+						// still threw an anonymous refusal.
+						columns: withDDLContext(
+							name,
+							derivedName,
+							() =>
+								extra.meta.columns.map((c) =>
+									isColumn(c)
+										? { expression: c.name, isExpression: false }
+										: decorateIndexColumn(renderInline(c as never))
+								),
 						),
 						isUnique: extra.meta.unique,
-						// Wrapped through `withDDLContext`, the same as the `check` branch
-						// below does for its own `renderInline` call: a refusal this can
-						// throw (the empty-array DDL refusal, `src/ddl.ts`'s
-						// `onEmptyArrayPredicate`/`onForeignFragment`) comes back
-						// anonymous otherwise — no table or constraint name — because
-						// this runs before `checkDDL` would normally attach that context.
-						// A refactor once called `createIndex(extra.meta, name)` here
-						// purely to get its `withDDLContext(name, indexName(...))`
-						// wrapper "for free"; removing that call for `[F-028]` (this
-						// index's own name is now derived directly via `indexName` above)
-						// also removed the wrapper, leaving this `renderInline` bare and
-						// the refusal's error message without the
-						// `(table "…", constraint "…")` suffix `check`/`generate` users
-						// rely on to find the offending index.
 						where: extra.meta.where
 							? withDDLContext(name, derivedName, () => renderInline(extra.meta.where!, true))
 							: undefined,
@@ -539,10 +544,22 @@ export function createTableFromSnapshot(t: TableSnapshot): string {
 		// rebuild does not silently loosen a case-insensitive (or otherwise
 		// non-binary) primary key back down to plain BINARY comparison.
 		const members = pk.columns.map(normalizeUniqueColumn);
+		// An arity-1 clause (only reachable when its lone member states a
+		// non-`binary` collate — see `introspect.ts`) is still this table's
+		// *only* primary key: `hasCompositePk` above suppressed the column's
+		// own inline `primary key`/`autoincrement`, and this is the only other
+		// place that PK gets rendered, so a rowid-alias column's
+		// `AUTOINCREMENT` has to be carried across here or the rebuild loses it
+		// (`introspect → rebuild → introspect` then disagrees on
+		// `autoincrement`, and SQLite starts reusing deleted rowids).
+		const autoincrement = members.length === 1 && t.columns[members[0]!.name]?.autoincrement === true;
+		// `AUTOINCREMENT` sits *inside* the parens, after the indexed-column
+		// list — `primary key ("id" collate nocase autoincrement)` — not after
+		// the closing paren (that is a syntax error SQLite refuses outright).
 		parts.push(
 			`constraint ${quote(pk.name)} primary key (${
 				members.map((c) => `${quote(c.name)}${c.collate ? ` collate ${c.collate}` : ''}`).join(', ')
-			})`,
+			}${autoincrement ? ' autoincrement' : ''})`,
 		);
 	}
 

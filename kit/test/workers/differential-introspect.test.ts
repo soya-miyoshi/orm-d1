@@ -367,6 +367,52 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 			},
 		},
 		{
+			// The exact shape the differential harness caught (seeds 324, 355,
+			// 472, 865): a table-level PK clause whose lone member states
+			// `collate binary` — the SQLite default, semantically inert — *and*
+			// `autoincrement`. Folding the arity-1 case into `compositePrimaryKeys`
+			// purely because a `collate` was present (even an inert `binary` one)
+			// suppressed the column-level `primary key`/`autoincrement` render
+			// without the PK-clause render ever re-emitting `autoincrement`, so a
+			// rebuild silently dropped AUTOINCREMENT.
+			label: '[Finding 5] a lone PK clause member\'s inert `collate binary` must not swallow AUTOINCREMENT on rebuild',
+			ddl: [
+				'create table "t29" ("id" integer, "v" text, constraint "t29_pkc" primary key ("id" collate binary autoincrement))',
+			],
+			table: 't29',
+			assert: (s) => {
+				const id = s.tables['t29']!.columns['id']!;
+				expect(id.primaryKey).toBe(true);
+				expect(id.autoincrement).toBe(true);
+				// `binary` is inert — it must not force an arity-1 `compositePrimaryKeys`
+				// entry; the column-level render (`single && column.primaryKey`) is the
+				// simpler, faithful round-trip for this case.
+				expect(Object.keys(s.tables['t29']!.compositePrimaryKeys)).toHaveLength(0);
+			},
+		},
+		{
+			// A genuinely non-default collation on the lone PK member *does* still
+			// need the table-level clause (to avoid folding the collation onto the
+			// column itself, `[Finding 2]`) — and when that member is also the
+			// table's AUTOINCREMENT column, the PK-clause render has to carry
+			// `autoincrement` itself, since `hasCompositePk` suppresses the
+			// column-level one.
+			label: '[Finding 5 sibling] a lone PK clause member\'s non-default COLLATE keeps the clause, and AUTOINCREMENT must still round-trip',
+			ddl: [
+				'create table "t30" ("id" integer, "v" text, constraint "t30_pkc" primary key ("id" collate nocase autoincrement))',
+			],
+			table: 't30',
+			assert: (s) => {
+				const id = s.tables['t30']!.columns['id']!;
+				expect(id.primaryKey).toBe(true);
+				expect(id.autoincrement).toBe(true);
+				const pk = Object.values(s.tables['t30']!.compositePrimaryKeys)[0]!;
+				const member = normalizeUniqueColumn(pk.columns[0]!);
+				expect(member.name).toBe('id');
+				expect(member.collate).toBe('nocase');
+			},
+		},
+		{
 			label: '[Finding 4] an index member whose own name literally contains the word "collate" must not fabricate a collation',
 			ddl: [
 				'create table "t27" ("collate nocase" text, "b" text)',
@@ -437,6 +483,33 @@ describe('differential corpus: introspect vs a rebuild, against real D1', () => 
 		await expect(
 			DB.prepare(`insert into "${rebuiltName}" ("a", "b") values ('X', 'y')`).run(),
 		).rejects.toThrow();
+	});
+
+	it('[Finding 5] a rebuilt lone PK clause with `collate binary autoincrement` still never reuses a deleted rowid', async () => {
+		await DB.prepare(
+			'create table "t31" ("id" integer, "v" text, constraint "t31_pkc" primary key ("id" collate binary autoincrement))',
+		).run();
+
+		const snapshot = await introspect(runner);
+		const table = snapshot.tables['t31']!;
+		expect(table.columns['id']!.autoincrement).toBe(true);
+
+		// Rebuild under a fresh name and prove AUTOINCREMENT is behaviourally
+		// present, not just spelled correctly: insert a, insert b, delete b,
+		// insert c. A real AUTOINCREMENT table never reuses "b"'s rowid — c gets
+		// 3, not 2. Losing AUTOINCREMENT on rebuild (this finding, "worse than
+		// `main`") makes SQLite fall back to plain rowid assignment, which
+		// reuses the highest deleted rowid and gives c id 2 instead.
+		const rebuiltName = 't31__rebuilt';
+		await DB.prepare(`drop table if exists "${rebuiltName}"`).run();
+		await DB.prepare(createTableFromSnapshot({ ...table, name: rebuiltName })).run();
+		await DB.prepare(`insert into "${rebuiltName}" ("v") values ('a')`).run();
+		await DB.prepare(`insert into "${rebuiltName}" ("v") values ('b')`).run();
+		await DB.prepare(`delete from "${rebuiltName}" where "v" = 'b'`).run();
+		await DB.prepare(`insert into "${rebuiltName}" ("v") values ('c')`).run();
+
+		const ids = await runner.all<{ id: number }>(`select "id" from "${rebuiltName}" order by "id"`);
+		expect(ids.map((r) => r.id)).toEqual([1, 3]);
 	});
 
 	it('a keyword-like table and column name round-trips', async () => {

@@ -1291,7 +1291,13 @@ export function snapshotFromIntrospection(input: IntrospectionInput, id = ''): S
 			// `collate`; otherwise leave the column-level rendering (`single &&
 			// column.primaryKey`, `createTableFromSnapshot`) as the faithful,
 			// simpler round-trip it already was.
-			if (compositePk || members.some((m) => typeof m !== 'string')) {
+			// `collate binary` is SQLite's default and semantically inert — folding
+			// it into an arity-1 entry here would suppress the column-level
+			// `primary key`/`autoincrement` rendering below for no behavioural gain
+			// (and previously dropped `autoincrement` outright, since the PK-clause
+			// render never re-emitted it). Only a genuinely non-default collation
+			// justifies the table-level clause for a single-column PK.
+			if (compositePk || members.some((m) => typeof m !== 'string' && m.collate !== 'binary')) {
 				compositePrimaryKeys[name] = { name, columns: members };
 			}
 		}
