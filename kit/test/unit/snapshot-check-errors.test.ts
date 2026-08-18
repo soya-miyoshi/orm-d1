@@ -73,7 +73,7 @@ describe('snapshotting a schema with a failing check constraint', () => {
 		expect(() => snapshotFromSchema({ users })).toThrow(/empty array/);
 	});
 
-	it('refuses one in a partial index predicate', () => {
+	it('refuses one in a partial index predicate, naming the table and index', () => {
 		const roles: string[] = [];
 		const users = sqliteTable('users', {
 			id: integer('id').primaryKey(),
@@ -82,7 +82,38 @@ describe('snapshotting a schema with a failing check constraint', () => {
 			index('users_role_idx').on(c.role).where(notInArray(c.role as never, roles) as never),
 		]);
 
+		// The bare `/empty array/` assertion alone does not catch a regression
+		// that drops the `(table "…", constraint "…")` context suffix — a
+		// refactor removed the `withDDLContext` wrapper around this exact
+		// `renderInline` call while leaving the message's own "empty array"
+		// text untouched, so only asserting on the context suffix as well
+		// actually exercises the fix.
 		expect(() => snapshotFromSchema({ users })).toThrow(/empty array/);
+		expect(() => snapshotFromSchema({ users })).toThrow(/\(table "users", constraint "users_role_idx"\)/);
+	});
+
+	it('refuses one in an index EXPRESSION COLUMN, naming the table and index', () => {
+		// Same shape as the previous test, but the empty-array refusal comes
+		// from the column expression itself (`.on(sql\`... in ${roles}\`)`)
+		// rather than from `.where(...)` — a sibling of the `[F-028]` fix that
+		// the `withDDLContext` restoration missed: `snapshot.ts` re-wrapped the
+		// `where` render but left the `columns` render bare, so this exact
+		// shape still threw an anonymous error. (Drizzle's `inArray()` helper
+		// itself short-circuits an empty array to `sql\`false\`` before any of
+		// this code sees an array chunk — see the block comment on
+		// `hasEmptyArrayChunk` in `src/ddl.ts` — so, unlike the earlier check()
+		// tests, this has to use a raw `sql` template to actually reach the
+		// array-chunk detection on a non-predicate render path.)
+		const roles: string[] = [];
+		const users2 = sqliteTable('users2', {
+			id: integer('id').primaryKey(),
+			role: text('role'),
+		}, (c) => [
+			index('users2_role_idx').on(sql`${c.role} in ${roles}` as never),
+		]);
+
+		expect(() => snapshotFromSchema({ users2 })).toThrow(/empty array/);
+		expect(() => snapshotFromSchema({ users2 })).toThrow(/\(table "users2", constraint "users2_role_idx"\)/);
 	});
 
 	it('still snapshots a legitimate check and a legitimate partial index', () => {

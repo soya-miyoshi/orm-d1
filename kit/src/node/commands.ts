@@ -23,7 +23,7 @@ import type { BackfillResult } from '../core/backfill.js';
 import { carryForwardCollations, diffSnapshots, renderMigration } from '../core/diff.js';
 import type { DiffOptions } from '../core/diff.js';
 import { appendEntry, migrationName, migrationTag, nextIndex, pendingMigrations } from '../core/journal.js';
-import { normalizeIndexColumn, snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
+import { normalizeIndexColumn, normalizeUniqueColumn, snapshotFromSchema, SNAPSHOT_VERSION, typeAffinity } from '../core/snapshot.js';
 import type { Snapshot } from '../core/snapshot.js';
 import { describeResolution } from './config.js';
 import type { Config } from './config.js';
@@ -415,6 +415,33 @@ export function unexpressibleTableOptionWarnings(snapshot: Snapshot): string[] {
 					+ `DSL has no way to express a column collation — the rendered schema module will not state it.`,
 			);
 		}
+		// Same gap as a column's own collation (F-101), one level down: a
+		// table-level `unique (col collate x)` member's collation (`[F-111]`) is
+		// introspected correctly but has no `.collate()` spelling either, so the
+		// rendered `unique()` call states the member names without it.
+		for (const uq of Object.values(table.uniqueConstraints)) {
+			for (const member of uq.columns.map(normalizeUniqueColumn)) {
+				if (!member.collate || member.collate.toLowerCase() === 'binary') continue;
+				warnings.push(
+					`"${table.name}"."${uq.name}" has a member "${member.name}" collate ${member.collate} in the live `
+						+ `database, but the schema DSL has no way to express a unique constraint member's collation — `
+						+ `the rendered schema module will not state it.`,
+				);
+			}
+		}
+		// Same gap, one more constraint kind down: a composite primary key
+		// member's own collation is introspected correctly but has no
+		// `.collate()` spelling either.
+		for (const pk of Object.values(table.compositePrimaryKeys)) {
+			for (const member of pk.columns.map(normalizeUniqueColumn)) {
+				if (!member.collate || member.collate.toLowerCase() === 'binary') continue;
+				warnings.push(
+					`"${table.name}"."${pk.name}" has a member "${member.name}" collate ${member.collate} in the live `
+						+ `database, but the schema DSL has no way to express a primary key member's collation — `
+						+ `the rendered schema module will not state it.`,
+				);
+			}
+		}
 	}
 	return warnings;
 }
@@ -544,12 +571,27 @@ export function renderSchemaModule(snapshot: Snapshot): string {
 
 		for (const pk of Object.values(table.compositePrimaryKeys)) {
 			imports.add('primaryKey');
-			extras.push(`primaryKey({ columns: [${pk.columns.map((c) => `t.${columnId(c)}`).join(', ')}] })`);
+			// Same loss as a unique constraint member's `collate` just below
+			// (`[F-111]`'s note): `primaryKey({ columns: [...] })` has no
+			// per-member `COLLATE` spelling in Drizzle either (`docs/04`), so a
+			// member's own collation (`[F-115]`) is left off the rendered schema
+			// module — the snapshot's `columns` is what round-trips it.
+			const names = pk.columns.map(normalizeUniqueColumn).map((c) => c.name);
+			extras.push(`primaryKey({ columns: [${names.map((n) => `t.${columnId(n)}`).join(', ')}] })`);
 		}
 
 		for (const u of Object.values(table.uniqueConstraints)) {
 			imports.add('unique');
-			extras.push(`unique(${JSON.stringify(u.name)}).on(${u.columns.map((c) => `t.${columnId(c)}`).join(', ')})`);
+			// `unique().on(...)` (`src/schema/constraints.ts:82`) only accepts plain
+			// columns — Drizzle's own `.unique()` builder has no per-member `COLLATE`
+			// spelling, and this ORM cannot add one that Drizzle lacks (`docs/04`).
+			// A member's collation ([F-111]) therefore has no schema-module spelling
+			// here and is left off the rendered `unique()`, the same loss the
+			// column-level DESC/COLLATE family already has (`[F-061]`'s "no snapshot
+			// representation at all" case) — `check`/`generate` still see it via the
+			// snapshot's `columns`, which is what round-trips it, not this text.
+			const names = u.columns.map(normalizeUniqueColumn).map((c) => c.name);
+			extras.push(`unique(${JSON.stringify(u.name)}).on(${names.map((n) => `t.${columnId(n)}`).join(', ')})`);
 		}
 
 		for (const fk of Object.values(table.foreignKeys)) {

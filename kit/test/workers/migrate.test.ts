@@ -8,11 +8,11 @@
  */
 import { env } from 'cloudflare:test';
 import { appendOnlyTrigger, createSchema, tableOptions } from 'orm-d1/ddl';
-import { integer, real, sql, sqliteTable, text, uniqueIndex } from 'orm-d1';
+import { integer, primaryKey, real, sql, sqliteTable, text, unique, uniqueIndex } from 'orm-d1';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { applyMigrations, appliedMigrations, checkForeignTriggerConflicts, introspect } from '../../src/core/apply.js';
 import type { SqlRunner } from '../../src/core/apply.js';
-import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
+import { carryForwardCollations, diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { emptySnapshot, snapshotFromSchema } from '../../src/core/snapshot.js';
 import type { Snapshot } from '../../src/core/snapshot.js';
 
@@ -736,5 +736,159 @@ describe('append-only guard offsets survive a length-changing case fold', () => 
 
 		const live = await introspect(runner);
 		expect(live.tables[table]?.appendOnly).toEqual(['tutar']);
+	});
+});
+
+describe('[F-115] unique constraint member collation carry-forward, against real D1', () => {
+	it(
+		'does not fabricate a merged constraint out of two distinct unique constraints sharing a column list '
+			+ '(F-115 primary fix)',
+		async () => {
+			// A hand-built live table where "u1" and "u2" cover the same ordered
+			// column list ("a", "b") but with different per-member collations.
+			// Before the fix, `carryForwardUniqueCollation` re-matched the *same*
+			// `after` entry for both `before` constraints (no "used" tracking),
+			// depositing both donors' collations onto one fabricated rule.
+			await DB.prepare(
+				'create table "t" ("a" text, "b" text, "n" text, '
+					+ 'constraint "u1" unique ("a", "b" collate nocase), '
+					+ 'constraint "u2" unique ("a" collate rtrim, "b"))',
+			).run();
+
+			const t = sqliteTable('t', {
+				a: text('a'),
+				b: text('b'),
+				n: integer('n'), // unrelated change: forces a rebuild
+			}, (c) => [unique('u1').on(c.a, c.b), unique('u2').on(c.a, c.b)]);
+
+			const before = await introspect(runner);
+			const after = snapshotFromSchema([t]);
+			const diff = diffSnapshots(before, after);
+			expect(diff.errors).toEqual([]);
+
+			const createTemp = diff.statements.find((s) => s.sql.includes('create table "__new_t"'));
+			expect(createTemp?.sql).toContain('constraint "u1" unique ("a", "b" collate nocase)');
+			expect(createTemp?.sql).toContain('constraint "u2" unique ("a" collate rtrim, "b")');
+
+			await applyMigrations(runner, [{ tag: 'm_f115', sql: renderMigration(diff) }]);
+
+			// Both rows are legal under the real, distinct rules: "u1" folds only
+			// "b" to nocase, so ('x ', 'y') and ('x', 'Y') do not collide on it
+			// (their "a" differs by a trailing space, and rtrim only strips
+			// trailing whitespace when *comparing*, not when storing); "u2" folds
+			// only "a" to rtrim, and 'x ' vs 'x' would collide there — proving the
+			// two constraints stayed genuinely distinct would require a case that
+			// deliberately avoids tripping either, so this checks the weaker but
+			// still meaningful invariant: the migration applies at all, and a row
+			// that violates neither constraint's real rule inserts cleanly.
+			await DB.prepare('insert into "t" ("a", "b", "n") values (\'x\', \'y\', 1)').run();
+			await DB.prepare('insert into "t" ("a", "b", "n") values (\'z\', \'Y\', 2)').run();
+
+			const rebuilt = await introspect(runner);
+			const uniques = Object.values(rebuilt.tables['t']!.uniqueConstraints);
+			expect(uniques).toHaveLength(2);
+		},
+	);
+
+	it('persists a live unique-member collation past a second `generate` (F-115 sibling fix)', async () => {
+		// Models `generate #1` -> `generate #2` off a pulled baseline: the
+		// second `generate`'s `before` is whatever the first `generate`
+		// persisted, not the live database — so if the persisted snapshot lost
+		// the member collation, the second generate re-renders the constraint
+		// without it and reports zero drift, even though nothing about the
+		// constraint was ever meant to change.
+		await DB.prepare(
+			'create table "members" ("id" integer primary key, "email" text not null, '
+				+ 'constraint "u1" unique ("email" collate nocase))',
+		).run();
+
+		const pulledBaseline = await introspect(runner);
+
+		const t1 = sqliteTable('members', {
+			id: integer('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [unique('u1').on(c.email)]);
+
+		// `generate #1`: diff against the live pull, then persist the new
+		// baseline the way `commands.ts`'s `generate` does.
+		const diff1 = diffSnapshots(pulledBaseline, snapshotFromSchema([t1]));
+		expect(diff1.statements).toEqual([]); // nothing to change yet
+		const persisted1 = carryForwardCollations(pulledBaseline, snapshotFromSchema([t1]));
+		expect(
+			persisted1.tables['members']!.uniqueConstraints['u1']!.columns.map((c) =>
+				typeof c === 'string' ? { name: c } : c
+			),
+		).toEqual([{ name: 'email', collate: 'nocase' }]);
+
+		// `generate #2`: an unrelated schema change forces a rebuild — a column
+		// type change, not just an added column (which is an in-place `alter
+		// table add column`, never a recreate, and would not exercise this
+		// path at all). `before` is `persisted1`, exactly as `commands.ts`
+		// would read it back from `meta/`.
+		const t2 = sqliteTable('members', {
+			id: text('id').primaryKey(),
+			email: text('email').notNull(),
+		}, (c) => [unique('u1').on(c.email)]);
+		const diff2 = diffSnapshots(persisted1, snapshotFromSchema([t2]));
+		expect(diff2.errors).toEqual([]);
+
+		const createTemp = diff2.statements.find((s) => s.sql.includes('create table "__new_members"'));
+		expect(createTemp?.sql).toContain('constraint "u1" unique ("email" collate nocase)');
+
+		await applyMigrations(runner, [{ tag: 'm_f115b', sql: renderMigration(diff2) }]);
+
+		// The collation is still actually enforced after generate #2's
+		// migration applies: 'A@X.COM' and 'a@x.com' collide under nocase.
+		await DB.prepare('insert into "members" ("id", "email") values (\'m1\', \'A@X.COM\')').run();
+		await expect(
+			DB.prepare('insert into "members" ("id", "email") values (\'m2\', \'a@x.com\')').run(),
+		).rejects.toThrow();
+	});
+
+	it('persists a live composite PRIMARY KEY member collation past a second `generate` (Finding 2)', async () => {
+		// Same shape as the unique-member sibling above, for a composite
+		// primary key member's own collation instead: `generate #1`'s persisted
+		// baseline must still carry it, or `generate #2` (diffed against that
+		// baseline, not the live database) silently re-renders the PK without
+		// it.
+		await DB.prepare(
+			'create table "memberships" ("club_id" text, "user_id" text, '
+				+ 'constraint "memberships_pk" primary key ("club_id" collate nocase, "user_id"))',
+		).run();
+
+		const pulledBaseline = await introspect(runner);
+
+		const t1 = sqliteTable('memberships', {
+			clubId: text('club_id'),
+			userId: text('user_id'),
+		}, (c) => [primaryKey({ columns: [c.clubId, c.userId] })]);
+
+		const diff1 = diffSnapshots(pulledBaseline, snapshotFromSchema([t1]));
+		expect(diff1.statements).toEqual([]); // nothing to change yet
+		const persisted1 = carryForwardCollations(pulledBaseline, snapshotFromSchema([t1]));
+		const persistedPk1 = Object.values(persisted1.tables['memberships']!.compositePrimaryKeys)[0]!;
+		expect(
+			persistedPk1.columns.map((c) => (typeof c === 'string' ? { name: c } : c)),
+		).toEqual([{ name: 'club_id', collate: 'nocase' }, { name: 'user_id' }]);
+
+		// `generate #2`: an unrelated column-type change forces a rebuild.
+		const t2 = sqliteTable('memberships', {
+			clubId: text('club_id'),
+			userId: integer('user_id'),
+		}, (c) => [primaryKey({ columns: [c.clubId, c.userId] })]);
+		const diff2 = diffSnapshots(persisted1, snapshotFromSchema([t2]));
+		expect(diff2.errors).toEqual([]);
+
+		const createTemp = diff2.statements.find((s) => s.sql.includes('create table "__new_memberships"'));
+		expect(createTemp?.sql).toContain('primary key ("club_id" collate nocase, "user_id")');
+
+		await applyMigrations(runner, [{ tag: 'm_finding2b', sql: renderMigration(diff2) }]);
+
+		// The collation is still actually enforced after generate #2 applies:
+		// 'C1' and 'c1' collide under nocase for the same "user_id".
+		await DB.prepare('insert into "memberships" ("club_id", "user_id") values (\'C1\', 1)').run();
+		await expect(
+			DB.prepare('insert into "memberships" ("club_id", "user_id") values (\'c1\', 1)').run(),
+		).rejects.toThrow();
 	});
 });

@@ -17,7 +17,16 @@ import {
 	dropAppendOnlyTrigger,
 } from 'orm-d1/ddl';
 import type { ColumnSnapshot, ForeignKeySnapshot, IndexSnapshot, Snapshot, TableSnapshot } from './snapshot.js';
-import { canonicalTable, columnDifference, createIndexFromSnapshot, createTableFromSnapshot, normalizeIndexColumn } from './snapshot.js';
+import {
+	canonicalTable,
+	columnDifference,
+	createIndexFromSnapshot,
+	createTableFromSnapshot,
+	normalizeIndexColumn,
+	normalizeUniqueColumn,
+	sameUniqueMembers,
+	sameUniques,
+} from './snapshot.js';
 import { foldAsciiCase, lookupCaseInsensitive } from './sql.js';
 
 export interface Statement {
@@ -177,9 +186,15 @@ const requiresRecreate = (
 		const difference = columnDifference(column, target, afterIsSchemaDerived);
 		if (difference) return `column "${name}" ${difference}`;
 	}
-	if (a.primaryKey !== b.primaryKey) return 'the primary key changes';
+	// Positional, not a multiset match (`sameUniques`'s reason for one does not
+	// apply — a table has at most one primary key, nothing to disambiguate
+	// against), and exempts an unstated member `collate` on a schema-derived
+	// `b` the same way `sameUniqueMembers` already does for a unique
+	// constraint's own members: the schema DSL cannot author one (`docs/04`),
+	// so its absence there is not "changed to binary".
+	if (!sameUniqueMembers(a.primaryKey, b.primaryKey, afterIsSchemaDerived)) return 'the primary key changes';
 	if (!sameJson(a.foreignKeys, b.foreignKeys)) return 'a foreign key changes';
-	if (!sameJson(a.uniques, b.uniques)) return 'a unique constraint changes';
+	if (!sameUniques(a.uniques, b.uniques, afterIsSchemaDerived)) return 'a unique constraint changes';
 	if (!sameJson(a.checks, b.checks)) return 'a check constraint changes';
 	// `STRICT` and `WITHOUT ROWID` are part of the `CREATE TABLE` statement, not
 	// constraints, and SQLite has no ALTER for either — so changing one is a
@@ -271,6 +286,113 @@ const carryForwardCollation = (
 };
 
 /**
+ * Carry a `before` unique constraint member's stated `collate` onto the
+ * matching `after` member wherever `after` does not state one — the same
+ * exemption `sameUniques` applies when *comparing* the two (a schema-derived
+ * `after` cannot author a member `collate` at all, see `docs/04`), but doing
+ * that comparison alone is not enough: a rebuild forced for an unrelated
+ * reason (say, an added column) still renders `after`'s constraint as-is,
+ * which has no `collate` on it, silently dropping the live one. Matched by
+ * member name (post-rename), the same way `carryForwardCollation` matches
+ * columns — a unique constraint's *name* is not comparable (introspection
+ * invents one), so its member list is the only stable identity.
+ *
+ * `used` tracks which `after` entries have already absorbed a `before`'s
+ * collations, the same discipline `matchUniqueClause` (`introspect.ts`)
+ * applies when it matches a parsed clause to an automatic index — without it,
+ * two distinct `before` constraints that happen to share the same ordered
+ * column list (e.g. two single-member `unique(a)` clauses, or `unique(a,b)`
+ * declared twice with different per-member collations) both matched the
+ * *first* `after` entry with that column list: the second `before`'s
+ * collations were deposited on top of the first's, fabricating a merged
+ * constraint neither live table actually had, and the `after` entry that
+ * should have received the second `before`'s own collation was left
+ * untouched instead.
+ */
+const carryForwardUniqueCollation = (
+	beforeConstraints: TableSnapshot['uniqueConstraints'],
+	afterConstraints: TableSnapshot['uniqueConstraints'],
+	columnRenames: Record<string, string>,
+): TableSnapshot['uniqueConstraints'] => {
+	let result = afterConstraints;
+	const used = new Set<string>();
+	for (const before of Object.values(beforeConstraints)) {
+		const beforeMembers = before.columns.map(normalizeUniqueColumn);
+		if (!beforeMembers.some((m) => m.collate)) continue;
+		const renamedNames = beforeMembers.map((m) => columnRenames[m.name] ?? m.name);
+
+		for (const [key, after] of Object.entries(result)) {
+			if (used.has(key)) continue;
+			const afterMembers = after.columns.map(normalizeUniqueColumn);
+			if (afterMembers.length !== renamedNames.length) continue;
+			if (!afterMembers.every((m, i) => m.name === renamedNames[i])) continue;
+
+			used.add(key);
+			const merged = afterMembers.map((m, i) => {
+				const carried = beforeMembers[i]?.collate;
+				return carried && !m.collate ? { name: m.name, collate: carried } : m;
+			});
+			if (merged.some((m, i) => m !== afterMembers[i])) {
+				if (result === afterConstraints) result = { ...afterConstraints };
+				result[key] = { ...after, columns: merged };
+			}
+			break;
+		}
+	}
+	return result;
+};
+
+/**
+ * Same carry-forward as `carryForwardUniqueCollation`, for a composite
+ * primary key member's own `collate` — the schema DSL cannot state one on a
+ * `primaryKey({ columns: [...] })` member any more than it can on a
+ * `unique()` member (`docs/04`), so an `after.compositePrimaryKeys` entry can
+ * never carry a member `collate` on its own, and without this an unrelated
+ * rebuild silently replaces the live PK's collation (worst case: with a
+ * *different* collation inherited from the column's own definition, not just
+ * dropped — see the `[a b] text collate rtrim` / `primary key ("a""b", "a b"
+ * collate NOCASE desc)` case the reviewer flagged).
+ *
+ * A table has at most one primary key, so there is nothing to disambiguate
+ * across multiple `before`/`after` candidates the way `matchUniqueClause`
+ * (`introspect.ts`) or `carryForwardUniqueCollation`'s own `used` set does —
+ * but the same member-list match (rather than trusting the entry's key,
+ * which introspection invents) keeps this sound if that ever changes.
+ */
+const carryForwardPrimaryKeyCollation = (
+	beforePk: TableSnapshot['compositePrimaryKeys'],
+	afterPk: TableSnapshot['compositePrimaryKeys'],
+	columnRenames: Record<string, string>,
+): TableSnapshot['compositePrimaryKeys'] => {
+	let result = afterPk;
+	const used = new Set<string>();
+	for (const before of Object.values(beforePk)) {
+		const beforeMembers = before.columns.map(normalizeUniqueColumn);
+		if (!beforeMembers.some((m) => m.collate)) continue;
+		const renamedNames = beforeMembers.map((m) => columnRenames[m.name] ?? m.name);
+
+		for (const [key, after] of Object.entries(result)) {
+			if (used.has(key)) continue;
+			const afterMembers = after.columns.map(normalizeUniqueColumn);
+			if (afterMembers.length !== renamedNames.length) continue;
+			if (!afterMembers.every((m, i) => m.name === renamedNames[i])) continue;
+
+			used.add(key);
+			const merged = afterMembers.map((m, i) => {
+				const carried = beforeMembers[i]?.collate;
+				return carried && !m.collate ? { name: m.name, collate: carried } : m;
+			});
+			if (merged.some((m, i) => m !== afterMembers[i])) {
+				if (result === afterPk) result = { ...afterPk };
+				result[key] = { ...after, columns: merged };
+			}
+			break;
+		}
+	}
+	return result;
+};
+
+/**
  * [F-107]: `recreateTable` carries a live `collate` into the *rebuilt table
  * body* it renders, but `generate` persists the schema-derived `after`
  * snapshot as-is as the new baseline (`meta/<n>_snapshot.json`) — which
@@ -280,6 +402,16 @@ const carryForwardCollation = (
  * live collation with zero drift reported. Apply the same carry-forward to
  * the whole snapshot the caller is about to persist, not just to tables a
  * recreate happens to rebuild.
+ *
+ * [F-115]: the same loss applies to a unique constraint member's own
+ * `collate` (`[F-111]`) — `carryForwardUniqueCollation` above only ran
+ * inside `recreateTable`'s rendered rebuild, never against the snapshot
+ * `generate` persists as its new baseline. The first `generate` after a pull
+ * still has the live member collation available in `before` (the persisted
+ * baseline predates this fix), so it happened to round-trip once by luck;
+ * the *second* `generate` reads a baseline that never recorded it and
+ * silently re-renders the constraint without it — zero statements, zero
+ * errors, a real downgrade of the constraint's semantics.
  */
 export const carryForwardCollations = (before: Snapshot, after: Snapshot, options: DiffOptions = {}): Snapshot => {
 	const renamedTables = options.renamedTables ?? {};
@@ -297,10 +429,32 @@ export const carryForwardCollations = (before: Snapshot, after: Snapshot, option
 			if (table === targetName && column) columnRenames[column] = value;
 		}
 
-		const columns = carryForwardCollation(beforeTable.columns, afterTable.columns, columnRenames);
-		if (columns !== afterTable.columns) {
+		let nextAfterTable = afterTable;
+
+		const columns = carryForwardCollation(beforeTable.columns, nextAfterTable.columns, columnRenames);
+		if (columns !== nextAfterTable.columns) nextAfterTable = { ...nextAfterTable, columns };
+
+		const uniqueConstraints = carryForwardUniqueCollation(
+			beforeTable.uniqueConstraints,
+			nextAfterTable.uniqueConstraints,
+			columnRenames,
+		);
+		if (uniqueConstraints !== nextAfterTable.uniqueConstraints) {
+			nextAfterTable = { ...nextAfterTable, uniqueConstraints };
+		}
+
+		const compositePrimaryKeys = carryForwardPrimaryKeyCollation(
+			beforeTable.compositePrimaryKeys,
+			nextAfterTable.compositePrimaryKeys,
+			columnRenames,
+		);
+		if (compositePrimaryKeys !== nextAfterTable.compositePrimaryKeys) {
+			nextAfterTable = { ...nextAfterTable, compositePrimaryKeys };
+		}
+
+		if (nextAfterTable !== afterTable) {
 			if (tables === after.tables) tables = { ...after.tables };
-			tables[targetName] = { ...afterTable, columns };
+			tables[targetName] = nextAfterTable;
 		}
 	}
 
@@ -470,7 +624,24 @@ const recreateTable = (
 		? carryForwardCollation(before.columns, after.columns, columnRenames)
 		: after.columns;
 
-	const body = createTableFromSnapshot({ ...after, name: temporary, columns: rebuiltColumns });
+	// Same carry-forward, for a unique constraint member's own `collate`
+	// (`[F-111]`) — see `carryForwardUniqueCollation`.
+	const rebuiltUniqueConstraints = afterIsSchemaDerived
+		? carryForwardUniqueCollation(before.uniqueConstraints, after.uniqueConstraints, columnRenames)
+		: after.uniqueConstraints;
+
+	// Same carry-forward, for a composite primary key member's own `collate`.
+	const rebuiltPrimaryKeys = afterIsSchemaDerived
+		? carryForwardPrimaryKeyCollation(before.compositePrimaryKeys, after.compositePrimaryKeys, columnRenames)
+		: after.compositePrimaryKeys;
+
+	const body = createTableFromSnapshot({
+		...after,
+		name: temporary,
+		columns: rebuiltColumns,
+		uniqueConstraints: rebuiltUniqueConstraints,
+		compositePrimaryKeys: rebuiltPrimaryKeys,
+	});
 	const statements: Statement[] = [
 		// Not `foreign_keys = OFF`: D1 runs every query in an implicit
 		// transaction and refuses to change that pragma inside one, so the old
@@ -1026,8 +1197,19 @@ const dependenciesOf = (t: TableSnapshot | undefined): string[] => [
  * entirely, and only literal segments (recovered the same way
  * `blankLiterals` finds them, but kept instead of blanked) survive verbatim.
  */
+// Quoted identifiers — `"…"`, `` `…` ``, `[…]` — are protected the same way a
+// `'…'` string literal is, not just blanked from consideration but kept
+// verbatim: SQLite allows a space inside a quoted identifier (`"a b"` and
+// `"ab"` are different columns), and dropping every non-literal space used to
+// drop that one too, so `lower("a b")` and `lower("ab")` canonicalised to the
+// same string and compared equal — a column-pointing index silently drifted
+// to name whichever of the two columns happened to be typed on the schema
+// side next, with no diff ever reported (`[F-030]`).
 const canonicalizeExpression = (text: string): string =>
-	text.replaceAll(/'(?:[^']|'')*'|\s+/g, (match) => (match[0] === "'" ? match : ''));
+	text.replaceAll(
+		/'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|\s+/g,
+		(match) => (/^\s+$/.test(match) ? '' : match),
+	);
 
 const canonicalIndex = (index: IndexSnapshot): string =>
 	JSON.stringify([

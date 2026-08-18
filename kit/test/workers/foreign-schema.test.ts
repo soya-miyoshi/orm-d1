@@ -20,7 +20,7 @@ import { applyMigrations, checkForeignTriggerConflicts, introspect } from '../..
 import type { SqlRunner } from '../../src/core/apply.js';
 import { diffSnapshots, renderMigration } from '../../src/core/diff.js';
 import { appendOnlyTriggerGuard } from '../../src/core/introspect.js';
-import { createTableFromSnapshot, typeAffinity } from '../../src/core/snapshot.js';
+import { createTableFromSnapshot, normalizeUniqueColumn, typeAffinity } from '../../src/core/snapshot.js';
 
 const DB = (env as { DB: D1Database }).DB;
 
@@ -181,6 +181,55 @@ describe('introspecting a database orm-d1 did not write', () => {
 		// makes 'active' and 'ACTIVE' collide.
 		const sql = renderMigration({ statements, errors, warnings: [] });
 		await expect(applyMigrations(runner, [{ tag: 'm_q_rebuild', sql }])).resolves.toBeDefined();
+	});
+
+	it('[Finding 2] a composite PRIMARY KEY member COLLATE survives an unrelated rebuild through diffSnapshots', async () => {
+		// The schema DSL has no `.collate()` spelling for a primary key member
+		// any more than it does for a unique constraint member (`docs/04`), so a
+		// schema-derived `after.compositePrimaryKeys` can never state one. This
+		// proves the carry-forward machinery (`carryForwardPrimaryKeyCollation`
+		// in `diff.ts`) actually reaches a live PK member's collation when
+		// `diffSnapshots` forces a rebuild for a completely unrelated reason —
+		// not just when `createTableFromSnapshot` is called directly on an
+		// already-collation-bearing table (that path never lost it in the
+		// first place).
+		await DB.prepare('drop table if exists "t24"').run();
+		await DB.prepare(
+			'create table "t24" ("a" text, "b" text, constraint "t24_pk" primary key ("a" collate nocase, "b"))',
+		).run();
+		await DB.prepare('insert into "t24" ("a", "b") values (\'x\', \'y\')').run();
+
+		const live = await introspect(runner);
+		const livePk = Object.values(live.tables['t24']!.compositePrimaryKeys)[0]!;
+		expect(normalizeUniqueColumn(livePk.columns[0]!)).toEqual({ name: 'a', collate: 'nocase' });
+
+		// A schema-derived `after`: same PK members, but the member's collation
+		// is structurally absent (as `snapshotFromSchema` would leave it), and
+		// the table is marked STRICT — a real, unrelated reason to force a full
+		// rebuild that has nothing to do with the primary key.
+		const after = structuredClone(live) as typeof live;
+		(after as { origin: string }).origin = 'schema';
+		const afterTable = after.tables['t24']!;
+		(afterTable as { strict: boolean }).strict = true;
+		const afterPk = Object.values(afterTable.compositePrimaryKeys)[0]!;
+		afterPk.columns = afterPk.columns.map((c) => normalizeUniqueColumn(c).name);
+
+		const { statements, errors } = diffSnapshots(live, after);
+		expect(errors).toEqual([]);
+		expect(statements.some((s) => s.sql.includes('__new_t24'))).toBe(true);
+
+		const sql = renderMigration({ statements, errors, warnings: [] });
+		await applyMigrations(runner, [{ tag: 'm_t24_rebuild', sql }]);
+
+		const rebuilt = await introspect(runner);
+		const rebuiltPk = Object.values(rebuilt.tables['t24']!.compositePrimaryKeys)[0]!;
+		expect(normalizeUniqueColumn(rebuiltPk.columns[0]!)).toEqual({ name: 'a', collate: 'nocase' });
+
+		// Prove it actually enforces the constraint, not just that the snapshot
+		// says so: a case-differing "a" with the same "b" must still collide.
+		await expect(
+			DB.prepare('insert into "t24" ("a", "b") values (\'X\', \'y\')').run(),
+		).rejects.toThrow();
 	});
 
 	it('does not mistake a hand-written conditional guard for the append-only trigger', async () => {

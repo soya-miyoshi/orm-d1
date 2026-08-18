@@ -374,7 +374,7 @@ columns). They stay `todo` and the next efficiency + bugs iteration owns them.
 - **Where**: `kit/src/node/commands.ts:335,339,391`
 - **Defect**: `.default(sql\`${column.default}\`)`, `check('${c.name}', sql\`${c.value}\`)` and `sqliteTable('${table.name}'` interpolate live database text into generated source. A backtick or `${` in a check expression, a default, or a table name produces a schema module that does not parse. Contrived to hit, but `uniqueIdentifier` right below it exists precisely because "files that do not compile, from a command whose whole job is to write one" is treated as a bug class here.
 
-### [F-028] Index name recovered by regexing the rendered `CREATE INDEX` — status: todo — severity: low — area: kit/diff
+### [F-028] Index name recovered by regexing the rendered `CREATE INDEX` — status: **done** (this batch) — severity: low — area: kit/diff
 - **Where**: `kit/src/core/snapshot.ts:184-186`
 - **Defect**: recovers an index's name by rendering the full statement (including `renderInline` of the partial-index predicate) and regexing the name back out, when `indexName(extra.meta, name)` is exported from `src/schema/constraints.ts` and already imported by its two siblings (`foreignKeyName`, `uniqueConstraintName`) in the same import statement. Not a live defect; a fragile derivation next to two direct ones.
 
@@ -407,7 +407,7 @@ destructive rebuild instead, since a loud wrong answer beats a silent one here.
 - **`verify` is hit by the same hole** (`kit/src/node/commands.ts:596`) — and its own docstring says it exists precisely because "the renderer drops a constraint, both artifacts are self-consistent, and CI stays green". That is now true of column types.
 - **Fix**: the hatch needs a signal that actually means "written before `declaredType` existed" (`Snapshot.version`, or `origin` — neither of which `canonicalTable`/`columnDifference` currently sees), or it must be restricted to pairs where the side carrying `declaredType` is a `customType` column. Stamping `declaredType` on introspected snapshots (`introspect.ts:384`) is fine on its own — the reviewer confirmed byte-identical `pull` round trips and that everything else reading it only emits DDL from the *target* side — but it fixes only one of the two sides.
 
-### [F-030] `canonicalizeExpression` strips whitespace inside quoted identifiers, so two different columns compare equal — status: todo — severity: med — area: kit/diff
+### [F-030] `canonicalizeExpression` strips whitespace inside quoted identifiers, so two different columns compare equal — status: **done** (this batch) — severity: med — area: kit/diff
 - **Where**: `kit/src/core/diff.ts:584`
 - **Defect**: the regex `/'(?:[^']|'')*'|\s+/g` protects single-quoted literals but not quoted identifiers, and SQLite allows a space in a column name.
 - **Failure scenario**: with columns `"a b"` and `"ab"` both on the table, `index('t_idx').on(sql\`lower("a b")\`)` → `index('t_idx').on(sql\`lower("ab")\`)` gives `statements === []`. The control (`lower("x")` → `lower("y")`) correctly emits a drop and a create. The index keeps pointing at the wrong column forever, with no diff.
@@ -751,7 +751,7 @@ regression against `main` that re-opens the project's own reason to exist — a 
 stays green while describing an index it can never converge on — and `[F-069]` can emit
 unparseable DDL and interpolate an unescaped collation name.
 
-### [F-068] An expression index member carrying `DESC` or `COLLATE` now drifts forever — status: todo — severity: **high** — area: kit/introspect — REGRESSION vs `main`
+### [F-068] An expression index member carrying `DESC` or `COLLATE` now drifts forever — status: **done** (this batch) — severity: **high** — area: kit/introspect — REGRESSION vs `main`
 - **Where**: `kit/src/core/introspect.ts:385-394`
 - **Defect**: `sortedMembers.map(...)` attaches `desc`/`collate` to **every** member, including expression members (`cid: -2`) whose `expression` text — recovered by `parseIndexColumns` — *already contains* the suffix. The schema side (`decorateIndexColumn`, which only matches a bare quoted identifier) attaches neither, so the two sides can never agree.
 - **Failure scenario**: `index('t_a_idx').on(sql\`lower("a") desc\`)` against live `create index t_a_idx on t (lower("a") desc)`. `main` records `{"expression":"lower(\"a\") desc","isExpression":true}` and diffs `[]` — converged. HEAD records the same plus `"desc":true` and diffs `drop index` + `create index`, and **never converges**: applying the statements and re-diffing gives a byte-identical round 1. `check` exits 1 forever on an in-sync database, `verify` reports a permanent mismatch, `push` recreates the index every run, `generate` emits a fresh no-op migration every run. Same for `sql\`substr("a", 1, 3) collate nocase\``.
@@ -759,7 +759,7 @@ unparseable DDL and interpolate an unescaped collation name.
 - **Why no test caught it**: every added `roundtrip.test.ts` case (`sql\`"weight" desc\``, `sql\`"name" collate NOCASE\``) is a bare quoted identifier. No test in the diff puts a modifier on an expression member.
 - **Fix**: skip `desc`/`collate` decoration when `isExpression` — the expression text already carries them.
 
-### [F-069] `parseIndexCollations` scans raw member text, not `blankLiterals(...)` — status: todo — severity: **high** — area: kit/introspect
+### [F-069] `parseIndexCollations` scans raw member text, not `blankLiterals(...)` — status: **done** (this batch) — severity: **high** — area: kit/introspect
 - **Where**: `kit/src/core/introspect.ts:253-271`
 - **Defect**: `parseIndexColumns` slices its members from the **original** `sql` deliberately, so string literals survive; `collateRe.exec(member)` then runs over that unblanked text. This is the exact hazard its sibling was fixed for one iteration ago.
 - **Failure scenario**: `create index t_a_idx on t (replace("a", ' collate frobnicate ', ''))` snapshots as `{"collate":"frobnicate"}` and renders `… replace("a", ' collate frobnicate ', '') collate frobnicate` → `D1_ERROR: no such collation sequence: frobnicate`. The same root cause reaches quoted identifiers: a column named `my collate col` yields `{"collate":"col"}`, and `createIndexFromSnapshot` interpolates the collation name **raw** (`\` collate ${c.collate}\``, `snapshot.ts:390`) — the one place in that function that is neither quoted nor escaped.
@@ -1124,7 +1124,7 @@ Lens: **efficiency + bugs**, branch `sweep/efficiency-bugs-20260817-125622`.
 - **Fix**: memoize on the instance — `#resolvedName: string | undefined; get name() { return this.#resolvedName ??= this.config.explicitName ?? applyCasing(this.config.fieldName); }`. `withTable` builds a fresh `Column` from the same config, so an alias re-resolves once and no stale value leaks. `resetCasing` is `@internal` test-only and must clear the cached names (or the affected tests rebuild their tables, which `test/unit/casing.test.ts` already does).
 - **Prove it**: `test/unit/casing.test.ts` — instrument the getter with a counting wrapper and assert one `compileSelect` over an N-column table performs at most N `applyCasing` calls, keeping the existing byte-identical-to-`drizzle-orm/casing` assertions.
 
-### [F-103] `assertRoundTrip`'s invariant is weaker than it reads — constraint order differs between the two renderers — status: todo — severity: low — area: kit/render — OFF-LENS from efficiency + bugs
+### [F-103] `assertRoundTrip`'s invariant is weaker than it reads — constraint order differs between the two renderers — status: **done** (this batch) — severity: low — area: kit/render — OFF-LENS from efficiency + bugs
 - **Where**: `kit/src/core/diff.ts:53` (`columnDefinition`), `kit/src/core/snapshot.ts:410` (`createTableFromSnapshot`) vs `orm-d1/ddl`'s `createTable`
 - The snapshot path groups all uniques → all FKs → all checks; `createTable` walks `extras` in declaration order. Semantically irrelevant to SQLite, but `assertRoundTrip` only passes for schemas that happen to declare extras in the grouped order.
 
@@ -1183,22 +1183,22 @@ quote-aware for `"` only, the `collate` keyword lost its left word boundary, and
 comments moved the table-option boundary so a comment could invent `STRICT`. The items below
 are what the final differential review left standing.
 
-### [F-111] A table-level `UNIQUE (col COLLATE …)` member collation is captured nowhere, so a rebuild converts case-insensitive uniqueness into case-sensitive — status: todo — severity: **high** — area: kit/introspect
+### [F-111] A table-level `UNIQUE (col COLLATE …)` member collation is captured nowhere, so a rebuild converts case-insensitive uniqueness into case-sensitive — status: **done** (this batch) — severity: **high** — area: kit/introspect
 - **Where**: `kit/src/core/introspect.ts:659-661`, `kit/src/core/snapshot.ts:442-443` (`UniqueConstraintSnapshot` has only `columns: string[]`)
 - **Failure scenario**: live `create table "t" ("id" integer primary key, "email" text not null, constraint "u1" unique ("email" collate nocase))`. The original refuses `('A@X.com')` after `('a@x.com')`; every rebuild emits `constraint "u1" unique ("email")` and the rebuilt table **accepts** the duplicate. `sqlite_autoindex_*` has no `sql` row, so the collation can only come from the `CREATE TABLE` text, which nothing reads. Column-level collation is now preserved, so `email text collate nocase … unique` survives — it is specifically the table-level idiom that is lost.
 - **Fix**: give `UniqueConstraintSnapshot` per-member `{ name, collate? }` (as `IndexColumnSnapshot` already has), parse it from the constraint text, and render it back.
 
-### [F-112] `columnDefinitionStart` only knows `"…"` and bare names, so a backtick- or bracket-quoted column loses its collation, and the anchor takes the first match — status: todo — severity: med — area: kit/introspect
+### [F-112] `columnDefinitionStart` only knows `"…"` and bare names, so a backtick- or bracket-quoted column loses its collation, and the anchor takes the first match — status: **done** (this batch) — severity: med — area: kit/introspect
 - **Where**: `kit/src/core/introspect.ts:202-203`
 - **Failure scenario**: `` `email` text collate nocase `` and `[email] text collate nocase` introspect as no collation and the rebuild emits `"email" TEXT not null`; so does `collate"NOCASE"` with no space (`parseColumnCollation`'s `\s+`). And the anchor takes the *first* match: `create table "t" ("author_id" text references "u"("id"), "id" text collate nocase not null)` → `id.collate === undefined`. Shared with `hasAutoincrement` / `parseGenerated`.
 - **Fix**: accept all four quoting forms (`parseIndexColumns` at `:300` already does), make the `collate` token separator optional before a quote, and anchor on a top-level match rather than the first one.
 
-### [F-113] A trailing `--` comment inside a captured expression re-renders as invalid SQL — status: todo — severity: med — area: kit/introspect
+### [F-113] A trailing `--` comment inside a captured expression re-renders as invalid SQL — status: **done** (this batch) — severity: med — area: kit/introspect
 - **Where**: `kit/src/core/introspect.ts:184`, and the equivalent slices in `parseGenerated` / `parseIndexColumns`
 - **Failure scenario**: `check ("a" > 0 -- positive\n)` is captured with the comment, and `.trim()` removes the newline that made it harmless, so the rebuild renders `check ("a" > 0 -- positive)` → `D1_ERROR: incomplete input`. Present on `main` too. (Block comments and `--` followed by more expression are now handled *better* than `main`.)
 - **Fix**: strip comments from a captured expression value, or normalise the newline back in.
 
-### [F-114] A nullable non-INTEGER primary key is rendered `not null`, and the rebuild fails — status: todo — severity: med — area: kit/introspect
+### [F-114] A nullable non-INTEGER primary key is rendered `not null`, and the rebuild fails — status: **done** (this batch) — severity: med — area: kit/introspect
 - **Where**: `kit/src/core/introspect.ts:701` (`notNull: column.notnull === 1 || single`)
 - **Failure scenario**: a nullable `TEXT PRIMARY KEY` holding NULL is legal in SQLite (only `INTEGER PRIMARY KEY` implies `NOT NULL`). Both branches render `"id" TEXT primary key not null` and the rebuild fails with `NOT NULL constraint failed: __new_t.id`. Pre-existing.
 - **Fix**: derive `notNull` from `column.notnull` alone unless the column is an `INTEGER PRIMARY KEY` rowid alias.
@@ -1227,6 +1227,46 @@ Recorded during the round-2 fix pass on the foreign-trigger guard batch (`[F-041
 - **Failure scenario**: a migration that renames a live append-only `events` to `audit` (dropping `events_no_update`) and, elsewhere in the same file, rebuilds `audit` for an unrelated reason (restoring `audit_no_update` after the rename, per the "guard across a table rename" logic in `diff.ts`) — if a large migration puts enough statements between the drop and the rebuild's trailing `create trigger` to land a batch boundary between them, a batch-2 failure leaves `audit` renamed, unguarded, and UPDATE-able, with no error and nothing in `sqlite_master` naming what happened. Same shape as `[F-041]`, one step earlier in the statement list, and not covered by `[F-041]`'s fix (which only extends the rebuild group's own tail, not the separate rename-and-drop pair that precedes it).
 - **Not yet reproduced against real D1** — recorded from reading `diffSnapshots`'s renamed-table step against `statementGroups`'s grouping rules, not from an observed failure.
 - **Fix**: extend `statementGroups` (or an equivalent later pass) to recognise a rename-and-own-guard-drop pair and keep it in the same indivisible group as whichever statement re-creates the guard under the new name, when the diff's `after` snapshot says the renamed table stays (or becomes) append-only.
+
+## Findings closed: `[F-068]`, `[F-069]`, `[F-111]`–`[F-114]`, `[F-030]`, `[F-028]`, `[F-103]`
+
+Implemented directly on `main` (no new branch requested for this batch). Every fix is in
+`kit/src/core/introspect.ts` except `[F-030]` (`kit/src/core/diff.ts`'s `canonicalizeExpression`),
+`[F-028]`/`[F-103]`/`[F-111]` (`kit/src/core/snapshot.ts` — `IndexSnapshot`'s sibling
+`UniqueColumnSnapshot`/`normalizeUniqueColumn`, `declarationOrder` on
+unique/foreign-key/check entries, `createTableFromSnapshot`'s interleaved emission, the
+`indexName(extra.meta, name)` swap), and `kit/src/node/commands.ts` (`pull`'s
+`unique().on(...)` renderer, updated for the new per-member shape — Drizzle's
+`.unique().on()` has no per-member `COLLATE` spelling, so that specific loss is
+unavoidable without widening the schema-facing API, same class as the column-level
+DESC/COLLATE family `[F-061]` already accepted).
+
+`hasAutoincrement`, `parseGenerated` and `parseColumnCollation` now share one anchor —
+`findColumnDefinitionAnchor` — that accepts all four SQLite quoting forms and requires a
+*top-level* match (via a shared `computeDepths` paren-depth scan), instead of each
+re-deriving `columnDefinitionStart` and taking whichever match came first in the text.
+`blankComments` (space-fills comments only, literals untouched) closes `[F-113]` at every
+site that stores a captured expression for later re-rendering: `parseChecks`,
+`parseGenerated`, `parseIndexColumns`'s members, and the new
+`parseTableUniqueConstraints`.
+
+**Differential harness**: `kit/test/workers/differential-introspect.test.ts`, 16 cases
+against a real D1 binding (never a Node-shaped SQLite) — one per finding plus general
+adversarial DDL (embedded parens/quotes/commas in identifiers, a partial+expression+
+collated index together, a block comment inside a generated column expression, CRLF
+inside a check, keyword-like names). Each case creates the DDL live, introspects with
+this branch's code, asserts the specific fixed behaviour, then **renders the rebuild DDL
+from the resulting snapshot and actually applies it** under a fresh name, re-introspects,
+and asserts the columns converge — proving (a) the snapshot, (b) the rendered DDL, and
+(c) applicability, per case. Every case that documents a `main`-vs-broken-HEAD contrast in
+this file (`[F-068]`, `[F-069]`) is asserted to match `main`'s (converging) behaviour, not
+the regressed one. All 16 pass; full gate (`npm run check`) is green — 1012 tests passed,
+7 skipped (pre-existing, unrelated), typecheck → build → test → typecheck:kit → build:kit
+all clean.
+
+Left open, out of this batch's scope: `[F-115]` (`generate`'s collation carry-forward has
+no way to state "this collation is deliberately gone" without the `config.tableOptions`
+sidecar `[F-100]`/`[F-110]` propose) and everything else still marked `todo` in this file.
 
 ## Standing authorization from the human — 2026-08-18
 
@@ -1336,3 +1376,44 @@ _(nothing yet)_
 ### [F-118] Two facts verified this round, recorded but deliberately not fixed — status: todo — severity: low/med — area: sql/render, kit/apply
 - **A NUL byte inside a value makes the statement unparseable.** Pre-existing in `literal()` (`src/ddl.ts`) — it string-interpolates a value with only `'`-escaping, and a NUL survives that unescaped. D1 rejects the resulting statement with `D1_ERROR: unrecognized token` at apply time — loud, not silent, but with no indication the cause was a NUL rather than any other malformed literal. Not fixed: out of this round's scope, and the failure is loud rather than a silently-wrong constraint, which is this codebase's actual severity bar (see "この ORM で「バグ」が出る場所" in `CLAUDE.md`).
 - **`MAX_STATEMENT_BYTES` is enforced only in `compilePlan`'s `sealed` path (`src/limits.ts`/`src/plan/compile.ts:401-403`), never for DDL.** DDL rendering sets `maxParams: Number.POSITIVE_INFINITY` (`src/ddl.ts`'s `ddlContext`, see the comment at its definition) specifically to remove the accidental ~100-value cap that used to stop a large `inArray()`/`notInArray()` from rendering inside a `check()`/partial index `where()` at all. That was the correct fix for the false-positive `CompileError` it used to throw on nothing-is-bound DDL, but it also removes the only thing that was accidentally capping statement size in that path: a `check()` built from an `inArray()` over on the order of 10,000 values would now render past `MAX_STATEMENT_BYTES` (100 KB) without `createTable`/`createIndex` ever checking, and fail only when D1 rejects the oversized statement at apply. Not fixed: no DDL-side statement-size check exists to reuse, and adding one is a new mechanism outside this round's one-defect scope.
+
+## Findings recorded from the `[F-111]` rebase follow-up (unique-member collation, comment-blanking) — not fixed, out of scope
+
+### [F-119] `isRowidAlias` (`kit/src/core/introspect.ts`) tests only the declared type, so `INTEGER PRIMARY KEY DESC` is snapshotted `notNull: true` incorrectly — status: todo — severity: low — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts` (`isRowidAlias`, ~line 983).
+- **Defect**: `isRowidAlias` is `single && column.type.trim().toLowerCase() === 'integer'` — it never checks whether the column is actually the table's rowid alias, only whether it is a lone `INTEGER` primary key. `INTEGER PRIMARY KEY DESC` is *not* a rowid alias in SQLite (the `DESC` on a single-column primary key suppresses the alias), and such a column is legally nullable — but nothing in `pragma table_info`/`table_xinfo` distinguishes it from `INTEGER PRIMARY KEY` (ascending) at the row level; only the verbatim `CREATE TABLE` text says `desc`. `isRowidAlias` never looks at that text, so it forces `notNull: true` on a column the live database allows `NULL` in, the same class of bug `[F-114]` fixed for `TEXT PRIMARY KEY` — just not caught for this narrower case.
+- **Not fixed**: out of scope for this task (three named fixes only); recorded per instruction.
+
+### [F-120] `parseGenerated` requires the literal string `generated always as` and cannot cross a comma boundary — status: todo — severity: med — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts` (`parseGenerated`, ~line 452).
+- **Defect**: two independent spellings both defeat it: (1) `"b" text as (upper("a"))` — SQLite's short `AS (...)` form, without the `GENERATED ALWAYS` keywords `parseGenerated`'s regex requires — and (2) `"b" numeric(10,2) generated always as ("a"*2) virtual`, where the declared type's own parenthesised `(10,2)` sits between the column name and `generated always as`, which `parseGenerated`'s anchor (built for a bare declared type) does not skip over correctly. Both cases snapshot `as: ''`, and `createTableFromSnapshot` then renders `generated always as () virtual` — a D1 syntax error, so the very next `generate`/`push`/`check` against a table introspected this way fails outright.
+- **Not fixed**: out of scope for this task; recorded per instruction.
+
+### [F-121] `unique ("a") on conflict replace` loses the `on conflict` clause on rebuild — status: todo — severity: med — area: kit/introspect, kit/diff
+- **Where**: `kit/src/core/introspect.ts` (`parseTableUniqueConstraints`/`UniqueColumnSnapshot`), `kit/src/core/snapshot.ts` (`createTableFromSnapshot`'s unique-constraint rendering).
+- **Defect**: SQLite's `unique (...) on conflict replace` (and `ignore`/`abort`/`fail`/`rollback`) changes what happens on a conflicting insert — `replace` silently overwrites the existing row instead of aborting the statement. Nothing in the snapshot shape captures a unique constraint's conflict clause, so it is dropped on introspection and never re-emitted by a rebuild: a table recreated for any unrelated reason (a column type change, say) silently changes its own INSERT semantics from REPLACE to the default ABORT, with no error, warning, or diff reported anywhere.
+- **Not fixed**: out of scope for this task; recorded per instruction.
+
+## Findings — collation string-literal spelling follow-up (fresh 1200-seed corpus, real D1 vs `main`)
+
+### [F-122] Collation spelled as a `'…'` string literal was dropped on an index member, a table-level `unique(…)` member, and a table-level `primary key(…)` member — status: **done** (this batch) — severity: **high**, one shape a **regression vs `main`** — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts` — `parseIndexCollations` (round 6's `[F-069]` fix), `parseTablePrimaryKeyClause`, `parseTableUniqueConstraints`. All three read a member's own text through `blankLiterals`, whose replacement alternation already had a `'(?:[^']|'')+'` branch but blanked that branch's *contents* to spaces along with every other literal in the text — so a real `collate 'nocase'` member came back with its collation captured as `'      '` (six spaces) or, for the PK/unique paths, dropped entirely (`collateMatch`'s alternation had no `'…'` branch at all).
+- **Regression scope**: only the index-member path (`parseIndexCollations`) is worse than `main` — `main` never introduced the `[F-069]` blanking fix that broke it, so it kept the pre-fix (unrelated) behavior on this exact input. A rebuild forced by any unrelated change then re-emitted `collate       )`, which D1 rejects outright (`syntax error`), and the whole migration's `batch()` rolls back — unappliable, not just wrong. The PK/unique-member holes are `[F-111]`/`[F-115]`'s own unclosed gap, present on `main` too, not a regression.
+- **Fix**: a shared `matchCollateToken(raw, searchStart)` (`kit/src/core/introspect.ts`, right after `unquote`) locates the `collate` keyword's position in `blankLiterals(raw)` (so a literal *elsewhere* in the text still can't fake the keyword — the original `[F-069]` hazard) but reads the matched token's actual text back out of `raw` at the same offset (lengths are preserved by `blankLiterals`, so the offsets still align) — the only way a `'…'`-spelled token's real contents survive. `unquote` (line ~109) grew a `'…'`/`''`-escape branch so every caller unquotes it the same way as the other three spellings. All four call sites (`parseColumnCollation`, `parseIndexCollations`, `parseTablePrimaryKeyClause`, `parseTableUniqueConstraints`) now go through this one path. The discriminator that keeps this from re-opening `[F-069]`'s original defect is position (immediately after a `collate` keyword that itself survived the blanking, since a keyword can never hide inside a blanked literal), not spelling — a stray `'…'` literal elsewhere in the same member is still inert.
+- **Tests**: `kit/test/unit/diff.test.ts` (`parseColumnCollation` with a `collate 'nocase'` column, and a sibling proving a string-literal *default value* containing the word "collate" is not misread); `kit/test/workers/collation-string-literal-and-pk-binary.test.ts` (real D1: an index member, a table-level `unique` member, both introspected, forced through a real rebuild, and behaviorally verified — a NOCASE query/insert collision after rebuild). Reverting `matchCollateToken`'s `'…'` handling (checked by reverting the whole `introspect.ts` change and re-running) turns all three new workers-suite assertions red, confirming they are load-bearing.
+
+### [F-123] The `binary`-collate exclusion on a single-column PK-clause member silently tightened the rebuilt primary key — status: **done** (this batch, exclusion removed) — severity: **high** — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts`, the arity-1 branch building `compositePrimaryKeys` (~line 1310, previously `members.some((m) => typeof m !== 'string' && m.collate !== 'binary')`).
+- **Defect**: unlike a plain column's `collate binary` (SQLite's default, genuinely inert there), a table-level PK-clause member's own `collate binary` is **not** a no-op when the column itself declares a different collation — SQLite scopes that member's collation to the primary key's own automatic index, so `"a" text collate nocase, constraint … primary key ("a" collate binary)` builds a BINARY-collated PK index over a NOCASE column, and the two really do disagree. Excluding this case (added to fix round 5's AUTOINCREMENT-loss bug) folded the member back into the column-level `"a" text collate nocase primary key` rendering, which has no way to say "the PK's own index overrides the column" — silently loosening the rebuilt PK from BINARY to NOCASE, and (on a table already holding rows that only differ by case) making the rebuild's `insert … select` fail outright with `UNIQUE constraint failed`, an unappliable migration.
+- **Fix**: the exclusion is removed outright — any arity-1 PK-clause member that states a `collate` at all (`binary` included) keeps the table-level clause. This is safe because the AUTOINCREMENT-loss bug the exclusion was working around is independently closed by round 6's `createTableFromSnapshot` render fix (`kit/src/core/snapshot.ts:555`, `autoincrement = members.length === 1 && …`), which already re-emits `autoincrement` on the PK-clause render regardless of why the arity-1 entry exists — so there is no longer a rendering reason to special-case `binary`.
+- **Tests**: `kit/test/workers/differential-introspect.test.ts`'s pre-existing `[Finding 5]` case (`create table "t29" (… constraint "t29_pkc" primary key ("id" collate binary autoincrement))`) asserted the *old*, now-incorrect behavior (`compositePrimaryKeys` empty) — updated to assert the member is recorded with `collate: 'binary'` and `autoincrement` still survives, which is what the case was actually written to protect. `kit/test/workers/collation-string-literal-and-pk-binary.test.ts` adds a real-D1 behavioral proof: introspect a hand-written `collate nocase` column with a `collate binary` PK member, re-render via `createTableFromSnapshot`, apply, and confirm the rebuilt table accepts both `'x'` and `'X'` under the PK (BINARY behavior) rather than colliding (NOCASE behavior, the silent-loosening failure mode).
+
+### [F-124] `matchUniqueClause` can attribute the wrong collation when a `unique` clause duplicates the PK's column set — status: todo — severity: med — area: kit/introspect
+- **Where**: `kit/src/core/introspect.ts` (`matchUniqueClause`).
+- **Defect**: when a table's `unique(...)` clause states exactly the same column set as its primary key, SQLite recognizes the redundancy and skips creating the automatic index for the (now-redundant) unique clause — only the PK's own index survives at the pragma level. `matchUniqueClause` then attributes the *unique clause's own* `CREATE TABLE`-text collation to the surviving PK index purely by column-list match, with no check that the two clauses' declared collations actually agree — so a differently-collated `unique(...)` clause that SQLite silently dropped can still overwrite the PK member's real collation in the snapshot. Verified against a fresh 1200-seed differential corpus: `main` fails 328 of these seeds, this batch's HEAD fails 8 (not zero — the underlying ambiguity is structural, not something this batch's fix touches).
+- **Not fixed**: out of scope for this task (three named fixes only, all closed by `[F-122]`/`[F-123]` above); recorded per instruction, per the reviewer's explicit "do NOT fix, record only" note.
+
+### [F-125] A pulled arity-1 primary-key clause module renders without `autoincrement` — status: todo — severity: low — area: kit/node (pull), orm-d1/ddl
+- **Where**: `createTable` in `orm-d1/ddl` (schema-module DDL renderer, distinct from `kit/src/core/snapshot.ts`'s `createTableFromSnapshot`), consulted by `pull`'s generated schema module.
+- **Defect**: when `pull` renders a schema module for a table whose lone PK member needed the table-level clause shape (a non-default `collate`, or now `[F-123]`'s `binary`-override case), the module's `primaryKey({...})` call does not restate `autoincrement`, where `main` would keep it on the column builder instead. Narrow — the *snapshot* (and so every migration built from it) is unaffected, since `snapshotFromSchema` re-derives `autoincrement` from the column's own definition regardless of how the schema module spells the PK — but the generated module is colder proof of the table's real DDL than it should be for a human reading it after a `pull`.
+- **Not fixed**: out of scope for this task; recorded per instruction.

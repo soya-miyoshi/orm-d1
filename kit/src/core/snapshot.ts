@@ -6,7 +6,7 @@
  * drizzle-kit's shape — it is a reasonable design, and matching it is what
  * makes importing an existing migration history possible.
  */
-import { createIndex, createTable, defaultExpression, foreignKeyName, literal, renderInline, uniqueConstraintName, withDDLContext } from 'orm-d1/ddl';
+import { createTable, defaultExpression, foreignKeyName, indexName, literal, renderInline, uniqueConstraintName, withDDLContext } from 'orm-d1/ddl';
 import type { TableOptionsMap } from 'orm-d1/ddl';
 import { appendOnlyKey, assertAppendOnlyColumns } from 'orm-d1/ddl';
 import type { Column, Table } from 'orm-d1';
@@ -146,6 +146,28 @@ const decorateIndexColumn = (raw: string): IndexColumnSnapshot => {
 	};
 };
 
+/**
+ * One member of a table-level `UNIQUE (…)` constraint.
+ *
+ * SQLite allows a member to carry its own `COLLATE`, e.g.
+ * `constraint "u1" unique ("email" collate nocase)` — distinct from a
+ * `.unique()` column's *own* `collate`, which is already carried on
+ * `ColumnSnapshot.collate`. Column-level `unique` (whether combined with a
+ * column-level `collate` or not) never produces a member here at all — it is
+ * reported as `{ expression: [column.name] }` via `columns.push([...])` on
+ * the column loop, never through this table-level shape. A snapshot written
+ * before this shape existed has plain strings instead, normalised by
+ * {@link normalizeUniqueColumn} the same way `normalizeIndexColumn` does for
+ * an index member (`[F-111]`).
+ */
+export interface UniqueColumnSnapshot {
+	readonly name: string;
+	readonly collate?: string;
+}
+
+export const normalizeUniqueColumn = (entry: string | UniqueColumnSnapshot): UniqueColumnSnapshot =>
+	typeof entry === 'string' ? { name: entry } : entry;
+
 export interface IndexSnapshot {
 	readonly name: string;
 	readonly columns: readonly (string | IndexColumnSnapshot)[];
@@ -160,6 +182,8 @@ export interface ForeignKeySnapshot {
 	readonly columnsTo: readonly string[];
 	readonly onDelete?: string | undefined;
 	readonly onUpdate?: string | undefined;
+	/** See `TableSnapshot.uniqueConstraints`'s note on `declarationOrder`. */
+	readonly declarationOrder?: number;
 }
 
 export interface TableSnapshot {
@@ -167,9 +191,35 @@ export interface TableSnapshot {
 	readonly columns: Record<string, ColumnSnapshot>;
 	readonly indexes: Record<string, IndexSnapshot>;
 	readonly foreignKeys: Record<string, ForeignKeySnapshot>;
-	readonly compositePrimaryKeys: Record<string, { name: string; columns: readonly string[] }>;
-	readonly uniqueConstraints: Record<string, { name: string; columns: readonly string[] }>;
-	readonly checkConstraints: Record<string, { name: string; value: string }>;
+	/**
+	 * `columns` holds either a bare member name or an `{ name, collate }` pair,
+	 * same shape and same reason as `uniqueConstraints.columns` just below
+	 * (`[F-115]`: a composite primary key member can carry its own `COLLATE`
+	 * exactly like a unique constraint member can — `docs/04` gives the schema
+	 * DSL no spelling for it either, so a schema-derived snapshot only ever
+	 * has bare names here).
+	 */
+	readonly compositePrimaryKeys: Record<string, { name: string; columns: readonly (string | UniqueColumnSnapshot)[] }>;
+	/**
+	 * `columns` holds either a bare member name or an `{ name, collate }` pair —
+	 * see {@link UniqueColumnSnapshot} and {@link normalizeUniqueColumn}.
+	 *
+	 * `declarationOrder`, on this and on `foreignKeys`/`checkConstraints`, is
+	 * schema-origin only: `snapshotFromSchema` stamps it with each extra's
+	 * position among *all* table-level extras (interleaved across kinds, the
+	 * order `createTable` walks them in). `createTableFromSnapshot` uses it to
+	 * emit unique/foreign-key/check constraints interleaved the same way,
+	 * instead of grouped by kind — grouping made `assertRoundTrip`'s invariant
+	 * hold only for a schema that happened to declare its extras in that
+	 * grouped order (`[F-103]`). An introspected snapshot has no such concept
+	 * and leaves it `undefined`; `createTableFromSnapshot` falls back to
+	 * declaration order within each `Record`, which is what it already did.
+	 */
+	readonly uniqueConstraints: Record<
+		string,
+		{ name: string; columns: readonly (string | UniqueColumnSnapshot)[]; declarationOrder?: number }
+	>;
+	readonly checkConstraints: Record<string, { name: string; value: string; declarationOrder?: number }>;
 	/**
 	 * Physical-storage options and the append-only guard, from the sidecar
 	 * `tableOptions()` module (see `orm-d1/ddl`). Optional so a version-1
@@ -288,37 +338,71 @@ export function snapshotFromSchema(
 		const indexes: Record<string, IndexSnapshot> = Object.create(null);
 		const foreignKeys: Record<string, ForeignKeySnapshot> = Object.create(null);
 		const compositePrimaryKeys: Record<string, { name: string; columns: readonly string[] }> = Object.create(null);
-		const uniqueConstraints: Record<string, { name: string; columns: readonly string[] }> = Object.create(null);
-		const checkConstraints: Record<string, { name: string; value: string }> = Object.create(null);
+		const uniqueConstraints: TableSnapshot['uniqueConstraints'] = Object.create(null);
+		const checkConstraints: TableSnapshot['checkConstraints'] = Object.create(null);
+
+		// `createTable` (`orm-d1/ddl`) walks `extras` in declaration order and
+		// emits a unique/foreign-key/check constraint inline as it reaches it;
+		// this snapshot instead buckets them by kind. Stamping each one with its
+		// position among only these three kinds — the same three `createTable`
+		// interleaves — lets `createTableFromSnapshot` reproduce that interleaving
+		// (`[F-103]`) instead of grouping all uniques, then all foreign keys, then
+		// all checks, which only reproduced `createTable`'s output for a schema
+		// that happened to declare its extras in that grouped order.
+		let tailOrder = 0;
 
 		for (const extra of getTableExtras(t)) {
 			switch (extra.kind) {
 				case 'index': {
-					// Reuse the DDL generator's naming, so a generated migration
-					// and a `createSchema()` call cannot disagree.
-					const statement = createIndex(extra.meta, name);
-					const indexName = statement.match(/index (?:if not exists )?"((?:[^"]|"")+)"/)?.[1]
-						?.replaceAll('""', '"') ?? '';
-					if (Object.hasOwn(indexes, indexName)) {
+					// Reuse the DDL generator's own name derivation directly — it is
+					// already exported alongside `foreignKeyName`/`uniqueConstraintName`
+					// (same import statement above) and used by both of those siblings.
+					// The previous approach rendered the whole `CREATE INDEX` statement
+					// just to regex the name back out of it, including `renderInline`
+					// of the partial-index predicate — fragile and unnecessary next to
+					// two direct derivations right beside it (`[F-028]`).
+					const derivedName = indexName(extra.meta, name);
+					if (Object.hasOwn(indexes, derivedName)) {
 						const columns = extra.meta.columns.map((c) =>
 							isColumn(c) ? c.name : renderInline(c as never)
 						).join(', ');
 						throw new Error(
-							`"${name}" declares two indexes that both derive the name "${indexName}" `
+							`"${name}" declares two indexes that both derive the name "${derivedName}" `
 								+ `(the second is on "${columns}"). `
 								+ 'Give at least one an explicit name — an unnamed expression index is named "expr" '
 								+ 'whatever the expression is, so the second would silently replace the first.',
 						);
 					}
-					indexes[indexName] = {
-						name: indexName,
-						columns: extra.meta.columns.map((c) =>
-							isColumn(c)
-								? { expression: c.name, isExpression: false }
-								: decorateIndexColumn(renderInline(c as never))
+					indexes[derivedName] = {
+						name: derivedName,
+						// Wrapped through `withDDLContext`, the same as the `where` render
+						// just below and the `check` branch further down: a refusal this can
+						// throw (the empty-array DDL refusal, `src/ddl.ts`'s
+						// `onEmptyArrayPredicate`/`onForeignFragment`) comes back anonymous
+						// otherwise — no table or constraint name — because this runs before
+						// `checkDDL` would normally attach that context. A refactor once
+						// called `createIndex(extra.meta, name)` here purely to get its
+						// `withDDLContext(name, indexName(...))` wrapper "for free"; removing
+						// that call for `[F-028]` (this index's own name is now derived
+						// directly via `indexName` above) also removed the wrapper. The
+						// `where` render below was re-wrapped, but this column-expression
+						// render was left bare — a sibling regression: an expression-column
+						// index with an empty-array predicate (`index(...).on(inArray(c, []))`)
+						// still threw an anonymous refusal.
+						columns: withDDLContext(
+							name,
+							derivedName,
+							() =>
+								extra.meta.columns.map((c) =>
+									isColumn(c)
+										? { expression: c.name, isExpression: false }
+										: decorateIndexColumn(renderInline(c as never))
+								),
 						),
 						isUnique: extra.meta.unique,
-						where: extra.meta.where ? renderInline(extra.meta.where, true) : undefined,
+						where: extra.meta.where
+							? withDDLContext(name, derivedName, () => renderInline(extra.meta.where!, true))
+							: undefined,
 					};
 					break;
 				}
@@ -348,7 +432,11 @@ export function snapshotFromSchema(
 								+ 'Give at least one an explicit name.',
 						);
 					}
-					uniqueConstraints[uqName] = { name: uqName, columns: extra.meta.columns.map((c) => c.name) };
+					uniqueConstraints[uqName] = {
+						name: uqName,
+						columns: extra.meta.columns.map((c) => c.name),
+						declarationOrder: tailOrder++,
+					};
 					break;
 				}
 				case 'foreignKey': {
@@ -372,6 +460,7 @@ export function snapshotFromSchema(
 						columnsTo: extra.meta.foreignColumns.map((c) => c.name),
 						onDelete: extra.meta.onDelete,
 						onUpdate: extra.meta.onUpdate,
+						declarationOrder: tailOrder++,
 					};
 					break;
 				}
@@ -399,6 +488,7 @@ export function snapshotFromSchema(
 					checkConstraints[extra.meta.name] = {
 						name: extra.meta.name,
 						value,
+						declarationOrder: tailOrder++,
 					};
 					break;
 				}
@@ -449,22 +539,61 @@ export function createTableFromSnapshot(t: TableSnapshot): string {
 	}
 
 	for (const pk of Object.values(t.compositePrimaryKeys)) {
-		parts.push(`constraint ${quote(pk.name)} primary key (${pk.columns.map(quote).join(', ')})`);
-	}
-	for (const uq of Object.values(t.uniqueConstraints)) {
-		parts.push(`constraint ${quote(uq.name)} unique (${uq.columns.map(quote).join(', ')})`);
-	}
-	for (const fk of Object.values(t.foreignKeys)) {
+		// A member's own `collate` (`[F-115]`), same rendering as a unique
+		// constraint member's just below — re-emitting it is the only way a
+		// rebuild does not silently loosen a case-insensitive (or otherwise
+		// non-binary) primary key back down to plain BINARY comparison.
+		const members = pk.columns.map(normalizeUniqueColumn);
+		// An arity-1 clause (only reachable when its lone member states a
+		// non-`binary` collate — see `introspect.ts`) is still this table's
+		// *only* primary key: `hasCompositePk` above suppressed the column's
+		// own inline `primary key`/`autoincrement`, and this is the only other
+		// place that PK gets rendered, so a rowid-alias column's
+		// `AUTOINCREMENT` has to be carried across here or the rebuild loses it
+		// (`introspect → rebuild → introspect` then disagrees on
+		// `autoincrement`, and SQLite starts reusing deleted rowids).
+		const autoincrement = members.length === 1 && t.columns[members[0]!.name]?.autoincrement === true;
+		// `AUTOINCREMENT` sits *inside* the parens, after the indexed-column
+		// list — `primary key ("id" collate nocase autoincrement)` — not after
+		// the closing paren (that is a syntax error SQLite refuses outright).
 		parts.push(
-			`constraint ${quote(fk.name)} foreign key (${fk.columns.map(quote).join(', ')})`
+			`constraint ${quote(pk.name)} primary key (${
+				members.map((c) => `${quote(c.name)}${c.collate ? ` collate ${c.collate}` : ''}`).join(', ')
+			}${autoincrement ? ' autoincrement' : ''})`,
+		);
+	}
+
+	// Unique / foreign-key / check constraints are interleaved in `declarationOrder`
+	// (schema-origin snapshots have it on every entry; an introspected snapshot
+	// leaves it `undefined` on all of them, and `??` falls each group back to its
+	// own `Record`'s insertion order, exactly as before). Grouping all uniques,
+	// then all foreign keys, then all checks — regardless of how they were
+	// declared — only reproduced `createTable`'s interleaved output for a schema
+	// that happened to declare its extras in that grouped order (`[F-103]`).
+	const tail: { order: number; ddl: string }[] = [];
+	Object.values(t.uniqueConstraints).forEach((uq, i) => {
+		const members = uq.columns.map(normalizeUniqueColumn);
+		tail.push({
+			order: uq.declarationOrder ?? i,
+			ddl: `constraint ${quote(uq.name)} unique (${
+				members.map((c) => `${quote(c.name)}${c.collate ? ` collate ${c.collate}` : ''}`).join(', ')
+			})`,
+		});
+	});
+	Object.values(t.foreignKeys).forEach((fk, i) => {
+		tail.push({
+			order: fk.declarationOrder ?? i,
+			ddl: `constraint ${quote(fk.name)} foreign key (${fk.columns.map(quote).join(', ')})`
 				+ ` references ${quote(fk.tableTo)}(${fk.columnsTo.map(quote).join(', ')})`
 				+ (fk.onDelete ? ` on delete ${fk.onDelete}` : '')
 				+ (fk.onUpdate ? ` on update ${fk.onUpdate}` : ''),
-		);
-	}
-	for (const check of Object.values(t.checkConstraints)) {
-		parts.push(`constraint ${quote(check.name)} check (${check.value})`);
-	}
+		});
+	});
+	Object.values(t.checkConstraints).forEach((check, i) => {
+		tail.push({ order: check.declarationOrder ?? i, ddl: `constraint ${quote(check.name)} check (${check.value})` });
+	});
+	tail.sort((a, b) => a.order - b.order);
+	for (const item of tail) parts.push(item.ddl);
 
 	// Same order as `createTable` in `orm-d1/ddl`, and the same order
 	// `sqlite_master` reports back — which is what lets an introspected snapshot
@@ -547,10 +676,30 @@ const legacyAffinity = (declared: string): string => {
 	return ['integer', 'text', 'real', 'blob', 'numeric'].find((candidate) => lower.includes(candidate)) ?? 'text';
 };
 
+/** One member of a canonicalised unique constraint — see `CanonicalTable.uniques`. */
+export interface CanonicalUniqueMember {
+	readonly name: string;
+	readonly collate?: string;
+}
+
 export interface CanonicalTable {
 	readonly columns: Record<string, CanonicalColumn>;
-	readonly primaryKey: string;
-	readonly uniques: readonly string[];
+	/**
+	 * The primary key's columns, in declared order, each with its own
+	 * `collate` when it states one — a lone column-level PK never does (SQLite
+	 * has no syntax for that), only a table-level `primary key (…)` clause's
+	 * member can (`[F-115]`). Compared with `samePrimaryKeyMembers`, which
+	 * (like `sameUniqueMembers`) exempts an unstated member collation on a
+	 * schema-derived side, since the schema DSL has no way to author one.
+	 */
+	readonly primaryKey: readonly CanonicalUniqueMember[];
+	/**
+	 * One entry per table-level unique constraint, each a member list rather
+	 * than a pre-serialised string — `sameUniques` needs the structure to apply
+	 * the same "unexpressible in the schema DSL" exemption to a member's
+	 * `collate` that `columnDifference` already applies to a column's.
+	 */
+	readonly uniques: readonly (readonly CanonicalUniqueMember[])[];
 	readonly foreignKeys: readonly string[];
 	readonly checks: readonly string[];
 	/** Part of the `CREATE TABLE`, so a change here means a rebuild. */
@@ -606,6 +755,57 @@ export const columnDifference = (
 		return 'changes its collation';
 	}
 	return undefined;
+};
+
+/**
+ * Whether two ordered member lists are the same, member for member —
+ * shared by a table-level unique constraint's members (`sameUniques`, which
+ * still needs the multiset match around this for constraint-to-constraint
+ * matching) and a primary key's own members (`requiresRecreate` in
+ * `diff.ts`, positionally: a table has at most one primary key, so there is
+ * no set of candidates to match against, only the one list to compare).
+ */
+export const sameUniqueMembers = (
+	a: readonly CanonicalUniqueMember[],
+	b: readonly CanonicalUniqueMember[],
+	/** Same reading as `columnDifference`'s parameter of the same name. */
+	bIsSchemaDerived: boolean,
+): boolean => {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i]!.name !== b[i]!.name) return false;
+		// The same "unexpressible in the schema DSL" exemption `columnDifference`
+		// applies to a column's own `collate`: the schema DSL has no `.collate()`
+		// spelling at all (`docs/04`), so a unique member's collation is exactly
+		// as unstateable there as a column's — a schema-derived `b` can never
+		// carry one, so its absence is not "changed to binary".
+		if (bIsSchemaDerived && a[i]!.collate !== undefined && b[i]!.collate === undefined) continue;
+		if (a[i]!.collate !== b[i]!.collate) return false;
+	}
+	return true;
+};
+
+/**
+ * Whether two tables' unique constraints are the same set, ignoring the
+ * unexpressible-collation gap `sameUniqueMembers` already carves out.
+ *
+ * Constraint names are not comparable (see `canonicalFk`'s note), so this
+ * matches by content — a multiset of member lists — rather than by position:
+ * `a`'s constraint order has no relationship to `b`'s.
+ */
+export const sameUniques = (
+	a: readonly (readonly CanonicalUniqueMember[])[],
+	b: readonly (readonly CanonicalUniqueMember[])[],
+	bIsSchemaDerived: boolean,
+): boolean => {
+	if (a.length !== b.length) return false;
+	const remaining = b.map((members) => members);
+	for (const members of a) {
+		const index = remaining.findIndex((candidate) => sameUniqueMembers(members, candidate, bIsSchemaDerived));
+		if (index === -1) return false;
+		remaining.splice(index, 1);
+	}
+	return true;
 };
 
 /**
@@ -697,9 +897,18 @@ export const typeAffinity = (declared: string): 'integer' | 'text' | 'blob' | 'r
 
 export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 	const columns: Record<string, CanonicalColumn> = {};
-	const uniques: string[] = [];
+	const uniques: (readonly CanonicalUniqueMember[])[] = [];
 	const foreignKeys: string[] = [];
-	const primaryKeyColumns: string[] = [];
+	// Same member shape `uniques` uses ({ name, collate? }), in declared
+	// (positional) order — a table has at most one primary key, so unlike
+	// `uniques` this never needs multiset matching, only a member-for-member
+	// compare. Keeping a member's `collate` here (rather than the bare name
+	// `compositeColumns` below uses for the NOT-NULL identity check) is what
+	// lets `requiresRecreate`'s `samePrimaryKeyMembers` notice two
+	// otherwise-identical composite PKs that differ only in a member's
+	// collation — before this, that difference diffed to zero statements, the
+	// same gap `[F-111]` closed for `uniques`.
+	const primaryKeyColumns: CanonicalUniqueMember[] = [];
 
 	// A single-column primary key is NOT NULL whether or not anyone wrote it:
 	// SQLite reports it that way, and introspection records it. Spelling the
@@ -707,7 +916,12 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 	// side saying nullable, so the table rebuilt on every run.
 	const lonePrimaryKey = new Set<string>();
 	const composite = Object.values(table.compositePrimaryKeys);
-	const compositeColumns = composite.flatMap((pk) => [...pk.columns]);
+	// Normalised to plain names here (`[F-115]` added an optional member
+	// `collate`, same shape as a unique constraint member): this identity
+	// check only cares which column is the lone primary key, not how it
+	// compares — a member's own `collate` is compared, if at all, where
+	// `sameUniques` already knows which side is schema-derived.
+	const compositeColumns = composite.flatMap((pk) => pk.columns.map(normalizeUniqueColumn)).map((c) => c.name);
 	if (compositeColumns.length === 1) lonePrimaryKey.add(compositeColumns[0]!);
 	for (const column of Object.values(table.columns)) {
 		if (column.primaryKey) lonePrimaryKey.add(column.name);
@@ -730,19 +944,71 @@ export const canonicalTable = (table: TableSnapshot): CanonicalTable => {
 				? column.collate.toLowerCase()
 				: undefined,
 		};
-		if (column.primaryKey) primaryKeyColumns.push(column.name);
-		if (column.unique) uniques.push(JSON.stringify([column.name]));
+		// A single-column table-level PK clause with an explicit member
+		// `collate` is recorded in `table.compositePrimaryKeys` even at arity 1
+		// (`[F-115]`'s introspection side — see `introspect.ts`), so it is
+		// already in `compositeColumns` and pushed with its collation by the
+		// loop below; pushing the bare name here too would duplicate it.
+		if (column.primaryKey && !compositeColumns.includes(column.name)) {
+			primaryKeyColumns.push({ name: column.name });
+		}
+		// Same shape the table-level branch below now uses ({ name, collate? }) —
+		// `JSON.stringify` drops an `undefined` `collate`, so this still reads
+		// identically to a plain `[{"name":"email"}]` when there is none. A
+		// single-column `unique` (this branch) is reported by introspection as a
+		// `uniqueConstraints` entry, not as `column.unique` (see the comment on
+		// that field) — mismatched shapes here used to make an in-sync, unique
+		// single column compare unequal against itself the moment the table-level
+		// branch below started reporting `collate` (`[F-111]`'s own regression risk).
+		if (column.unique) uniques.push([{ name: column.name }]);
 		if (column.references) foreignKeys.push(canonicalFk(column.references));
 	}
 
-	for (const pk of Object.values(table.compositePrimaryKeys)) primaryKeyColumns.push(...pk.columns);
-	for (const u of Object.values(table.uniqueConstraints)) uniques.push(JSON.stringify([...u.columns]));
+	for (const pk of Object.values(table.compositePrimaryKeys)) {
+		primaryKeyColumns.push(
+			...pk.columns.map(normalizeUniqueColumn).map((c) => (
+				c.collate && c.collate.toLowerCase() !== 'binary'
+					? { name: c.name, collate: c.collate.toLowerCase() }
+					: { name: c.name }
+			)),
+		);
+	}
+	for (const u of Object.values(table.uniqueConstraints)) {
+		// A member's own `collate` is part of the constraint's identity: two
+		// otherwise-identical `unique (email)` clauses that differ only in
+		// whether `email` carries `collate nocase` enforce different things, and
+		// must diff (`[F-111]`) — the same `undefined`/`binary` fold `canonicalTable`
+		// already applies to a column's own collation, so the schema side (which
+		// never states one) and a `BINARY`-declared live one still compare equal.
+		// Whether an *unstated* member collation is exempted from the comparison
+		// entirely (schema DSL cannot author one, same as a column's own
+		// `collate`) is `sameUniques`'s call, not this function's — it needs to
+		// know which *side* is schema-derived, which a single table's snapshot
+		// does not know about itself.
+		uniques.push(
+			u.columns.map(normalizeUniqueColumn).map((c) => ({
+				name: c.name,
+				...(c.collate && c.collate.toLowerCase() !== 'binary' ? { collate: c.collate.toLowerCase() } : {}),
+			})),
+		);
+	}
 	for (const fk of Object.values(table.foreignKeys)) foreignKeys.push(canonicalFk(fk));
 
 	return {
 		columns,
-		primaryKey: JSON.stringify(primaryKeyColumns),
-		uniques: uniques.sort(),
+		primaryKey: primaryKeyColumns,
+		// `pragma index_list` reports SQLite's *automatic* unique indexes (one
+		// per column-level `.unique()`/table-level `unique(...)`) in reverse
+		// creation order, so two semantically-identical tables — one built from
+		// the schema, one introspected live, or the same live table introspected
+		// twice after an unrelated rebuild — can disagree on this array's order
+		// with no difference in what they actually enforce. `sameUniques` already
+		// does a multiset match so it never cared, but any order-sensitive deep
+		// comparison of the *whole* canonical table (`kit/test/workers/fuzz.test.ts`'s
+		// `comparable()`) did. Sorting on each member list's own serialised form
+		// gives a deterministic order independent of either side's constraint
+		// declaration/introspection order.
+		uniques: uniques.slice().sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
 		foreignKeys: foreignKeys.sort(),
 		// SQLite keeps the check's text but not reliably its whitespace.
 		checks: Object.values(table.checkConstraints)
