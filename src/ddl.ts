@@ -53,6 +53,28 @@ const refuseEmptyArrayPredicate = (): never => {
 };
 
 /**
+ * A bound value in DDL that is a non-primitive object (not string, number,
+ * boolean, null, bigint, ArrayBuffer or ArrayBufferView) would stringify as
+ * `[object Object]` when inlined. This happens when an orm-d1 SQL fragment
+ * (e.g. `inArray`/`notInArray`) is passed through a Drizzle combinator
+ * (`and`/`or`/`eq`/…) that does not recognise it as SQL — Drizzle wraps it as
+ * a plain bound value instead of rendering it as a nested fragment. The
+ * resulting CHECK/DEFAULT/partial-index DDL silently contains the literal text
+ * `'[object Object]'`, which SQLite coerces to 0/false and makes the
+ * constraint reject every row.
+ */
+const refuseUnrenderedObject = (): never => {
+	throw new Error(
+		'A DDL expression (CHECK, DEFAULT, partial-index WHERE, or generated column) '
+			+ 'contains a bound value that is a non-primitive object — it would stringify '
+			+ 'as "[object Object]" in the rendered SQL. This usually means an orm-d1 SQL '
+			+ 'fragment (such as inArray or notInArray) was passed to a Drizzle combinator '
+			+ '(and/or/eq/…) that did not recognise it as SQL and interpolated it as a '
+			+ 'plain value. Use orm-d1\'s own combinators when mixing with orm-d1 expressions.',
+	);
+};
+
+/**
  * Structurally walk a Drizzle `SQL` fragment's own `queryChunks`, looking for
  * a bare `[]` interpolated directly into the template (`sql\`... in
  * ${arr}\``) — Drizzle's `SQL.toQuery` renders that as `()`, which is exactly
@@ -442,6 +464,10 @@ export const renderInline = (chunk: SQLChunk | string, isPredicate = false): str
 	return sql.replaceAll(PARAM_TOKEN, () => {
 		const slot = params[index++];
 		if (!slot || slot.k !== 'const') return 'null';
+		const v = slot.v;
+		if (typeof v === 'object' && v !== null && !(v instanceof ArrayBuffer) && !ArrayBuffer.isView(v)) {
+			refuseUnrenderedObject();
+		}
 		return literal(slot.v);
 	});
 };
@@ -582,11 +608,11 @@ export const foreignKeyDDL = (meta: ForeignKeyMeta, tableName: string): string =
 };
 
 /**
- * `renderInline` throws through `ddlContext.onEmptyArrayPredicate`, which is a
- * `RenderContext` hook with no access to which table/constraint it is
- * rendering for — the error it throws is anonymous. Every call site here
- * *does* have that context, so it is added on the way back out rather than
- * threaded down into the render.
+ * `renderInline` throws through `ddlContext.onEmptyArrayPredicate` or
+ * `refuseUnrenderedObject`, neither of which has access to which
+ * table/constraint it is rendering for — the error is anonymous. Every call
+ * site here *does* have that context, so it is added on the way back out
+ * rather than threaded down into the render.
  */
 export const withDDLContext = <T>(tableName: string, constraint: string, render: () => T): T => {
 	try {
@@ -594,7 +620,8 @@ export const withDDLContext = <T>(tableName: string, constraint: string, render:
 	} catch (error) {
 		if (
 			error instanceof Error
-			&& error.message.startsWith('An empty array was interpolated')
+			&& (error.message.startsWith('An empty array was interpolated')
+				|| error.message.startsWith('A DDL expression'))
 			// Already wrapped by an outer `withDDLContext` call (e.g. `checkDDL`
 			// calling `renderInline` on a value that was already rendered once
 			// through this same helper elsewhere) — appending a second `(table

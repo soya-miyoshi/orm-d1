@@ -164,6 +164,21 @@ describe('parsing a CREATE TABLE', () => {
 			+ '"email" text not null, unique ("email" collate nocase)) virtual';
 		expect(parseGenerated(sql, 'b')).toEqual({ as: '"a(" || \'x\'', mode: 'virtual' });
 	});
+
+	it('[F-128] the last COLLATE wins, matching SQLite semantics', () => {
+		const sql = 'create table "t" ("a" text collate nocase collate rtrim)';
+		expect(parseColumnCollation(sql, 'a')).toBe('rtrim');
+	});
+
+	it('[F-128] a single COLLATE still works', () => {
+		const sql = 'create table "t" ("a" text collate nocase)';
+		expect(parseColumnCollation(sql, 'a')).toBe('nocase');
+	});
+
+	it('[F-128] three COLLATE clauses — the last one wins', () => {
+		const sql = 'create table "t" ("a" text collate nocase collate rtrim collate binary)';
+		expect(parseColumnCollation(sql, 'a')).toBe('binary');
+	});
 });
 
 describe('diffing snapshots', () => {
@@ -1807,6 +1822,25 @@ describe('column-definition anchoring', () => {
 		const sql = 'create table "t_779" ("autoincrement" ANY primary key unique '
 			+ 'check ("autoincrement" is not null), unique ("autoincrement"))';
 		expect(hasAutoincrement(sql, 'autoincrement')).toBe(false);
+	});
+
+	// [F-127]: a `'…'`-quoted column name in a table-level PK clause is a
+	// string literal in SQLite's grammar (`ids ::= ID|STRING`).
+	// `blankLiterals` erases its contents, so the PK-clause fallback's name
+	// reader must recover the real name from the raw text.
+	it('finds autoincrement via the PK-clause fallback when the member name is single-quoted', () => {
+		const sql = 'create table "t" ("a" integer, "v" text, primary key (\'a\' autoincrement))';
+		expect(hasAutoincrement(sql, 'a')).toBe(true);
+	});
+
+	it('[F-129] finds autoincrement past a nested comma in a CHECK constraint', () => {
+		const sql = 'create table "t" ("id" integer check ("id" in (1, 2)) primary key autoincrement)';
+		expect(hasAutoincrement(sql, 'id')).toBe(true);
+	});
+
+	it('[F-129] still returns false when autoincrement is absent despite nested commas', () => {
+		const sql = 'create table "t" ("id" integer check ("id" in (1, 2)) primary key)';
+		expect(hasAutoincrement(sql, 'id')).toBe(false);
 	});
 });
 

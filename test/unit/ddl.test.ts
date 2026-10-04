@@ -327,6 +327,58 @@ describe('ddl generation', () => {
 		expect(() => createTable(t)).toThrow(/empty array/);
 	});
 
+	// [F-136]: Drizzle's `and()`/`eq()` wrapping an orm-d1 `InArray` does not
+	// recognise it as SQL (no `getSQL()`/entity-kind). Drizzle interpolates it
+	// as a plain bound value, and `literal()` falls through to `String(value)`
+	// → `'[object Object]'`. The rendered check text is permanently false, so
+	// every INSERT/UPDATE is rejected. The fix refuses non-primitive objects at
+	// DDL render time instead of silently emitting them.
+	it('refuses a check built with Drizzle and()/eq() wrapping orm-d1 inArray()', () => {
+		const t = sqliteTable('t_f136', { id: integer('id'), role: text('role') });
+		const dt = asDrizzleTable(t);
+		const withCheck = sqliteTable('t_f136', {
+			id: integer('id'),
+			role: text('role'),
+		}, (c) => [
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- the cast simulates a JS caller or a Pothos adapter bypassing types
+			check('t_f136_check', dAnd(dEq(dt.id, 1), inArray(c.role, ['admin', 'member']) as any) as unknown as SQLChunk),
+		]);
+
+		expect(() => createTable(withCheck)).toThrow(/non-primitive object/);
+		expect(() => createTable(withCheck)).toThrow(/\[object Object\]/);
+		expect(() => createTable(withCheck)).toThrow(/table "t_f136"/);
+		expect(() => createTable(withCheck)).toThrow(/constraint "t_f136_check"/);
+	});
+
+	it('refuses a check built with Drizzle and()/eq() wrapping orm-d1 notInArray()', () => {
+		const t = sqliteTable('t_f136b', { id: integer('id'), role: text('role') });
+		const dt = asDrizzleTable(t);
+		const withCheck = sqliteTable('t_f136b', {
+			id: integer('id'),
+			role: text('role'),
+		}, (c) => [
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+			check('t_f136b_check', dAnd(dEq(dt.id, 1), notInArray(c.role, ['admin']) as any) as unknown as SQLChunk),
+		]);
+
+		expect(() => createTable(withCheck)).toThrow(/non-primitive object/);
+	});
+
+	it('does not refuse Drizzle and()/eq() wrapping Drizzle inArray() (non-empty)', () => {
+		const t = sqliteTable('t_f136c', { id: integer('id'), role: text('role') });
+		const dt = asDrizzleTable(t);
+		const withCheck = sqliteTable('t_f136c', {
+			id: integer('id'),
+			role: text('role'),
+		}, () => [
+			check('t_f136c_check', dAnd(dEq(dt.id, 1), dInArray(dt.role, ['admin', 'member'])) as unknown as SQLChunk),
+		]);
+
+		let ddl = '';
+		expect(() => (ddl = createTable(withCheck))).not.toThrow();
+		expect(ddl).toContain('check');
+	});
+
 	// DDL binds nothing — every value is inlined as a literal (`renderInline`)
 	// — so the real D1 bound-parameter limits (`jsonEachThreshold: 30`,
 	// `maxParams: 100`) do not apply here. Left at their query-path defaults, a

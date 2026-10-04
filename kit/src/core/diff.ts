@@ -388,7 +388,11 @@ const carryForwardUniqueCollation = (
 				return carried && !m.collate ? { name: m.name, collate: carried } : m;
 			});
 			if (merged.some((m, i) => m !== afterMembers[i])) {
-				if (result === afterConstraints) result = { ...afterConstraints };
+				// `Object.assign(Object.create(null), …)`, not `{ ...afterConstraints }`:
+				// a spread rebuilds a *plain* object, and `result[name]` for a constraint
+				// named `__proto__` then invokes the inherited setter instead of adding an
+				// own entry — silently losing the constraint ([F-078]).
+				if (result === afterConstraints) result = Object.assign(Object.create(null), afterConstraints);
 				result[key] = { ...after, columns: merged };
 			}
 			break;
@@ -438,7 +442,8 @@ const carryForwardPrimaryKeyCollation = (
 				return carried && !m.collate ? { name: m.name, collate: carried } : m;
 			});
 			if (merged.some((m, i) => m !== afterMembers[i])) {
-				if (result === afterPk) result = { ...afterPk };
+				// Same hazard as `carryForwardUniqueCollation` above ([F-078]).
+				if (result === afterPk) result = Object.assign(Object.create(null), afterPk);
 				result[key] = { ...after, columns: merged };
 			}
 			break;
@@ -1563,13 +1568,19 @@ const diffIndexes = (
 	const creates: Statement[] = [];
 
 	for (const [name, index] of Object.entries(before.indexes)) {
-		const next = after.indexes[name];
+		// `Object.hasOwn`, not a bare bracket read: `after` may be a plain object
+		// (from `JSON.parse` of a stored snapshot that was not passed through
+		// `reviveSnapshot`), and a name like `constructor` resolves the inherited
+		// `Object` function — truthy, so `canonicalIndex` reads `.columns.map` off
+		// a function and throws `TypeError` ([F-077]).
+		const next = Object.hasOwn(after.indexes, name) ? after.indexes[name] : undefined;
 		if (!next || canonicalIndex(index) !== canonicalIndex(next)) {
 			drops.push({ sql: `drop index ${quote(name)}`, destructive: false });
 		}
 	}
 	for (const [name, index] of Object.entries(after.indexes)) {
-		const previous = before.indexes[name];
+		// Same guard as the loop above ([F-077]).
+		const previous = Object.hasOwn(before.indexes, name) ? before.indexes[name] : undefined;
 		if (!previous || canonicalIndex(previous) !== canonicalIndex(index)) {
 			creates.push({ sql: createIndexFromSnapshot(index, tableName), destructive: false });
 		}

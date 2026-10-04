@@ -417,9 +417,20 @@ export const hasAutoincrement = (
 	const anchor = findColumnDefinitionAnchor(scan, columnName, depths);
 	if (anchor) {
 		const spanStart = anchor.index + anchor[0].length;
-		const rest = scan.slice(spanStart);
-		const commaIdx = rest.indexOf(',');
-		const span = commaIdx === -1 ? rest : rest.slice(0, commaIdx);
+		// Depth-aware scan: find the first comma at depth 1 (the column
+		// definition's own top level) rather than the first raw comma, which
+		// may be nested inside `check (... in (1, 2))` or similar.
+		let spanEnd = scan.length;
+		for (let si = spanStart; si < scan.length; si++) {
+			const sch = scan[si];
+			if (sch === '"' || sch === '`' || sch === '[') {
+				si = skipQuotedIdentifier(scan, si) - 1;
+				continue;
+			}
+			if (sch === ',' && depths[si] === 1) { spanEnd = si; break; }
+			if (sch === ')' && depths[si] === 1) { spanEnd = si; break; }
+		}
+		const span = scan.slice(spanStart, spanEnd);
 		// The bare `/autoincrement/i.test(span)` this replaced matched the word
 		// appearing *anywhere* in the span — including inside a quoted
 		// identifier verbatim (a column literally named `autoincrement`, a
@@ -558,7 +569,7 @@ export const parseColumnCollation = (
 		}
 		if (ch === ',' && depth === 0) break;
 		if (
-			depth === 0 && collate === undefined
+			depth === 0
 			// `collate` must start a new word here, not appear mid-identifier: a
 			// constraint named `b_collate` — `constraint b_collate check (...)` —
 			// otherwise matched at its own `collate` suffix and the *next* token
@@ -939,8 +950,13 @@ const parseTablePrimaryKeyClause = (sql: string): readonly RawUniqueMember[] | u
 			// class for a string literal, the quoted-identifier note for a name
 			// that literally contains the word "collate").
 			const blanked = blankLiterals(raw);
-			const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)/.exec(blanked);
-			const rawName = nameMatch ? nameMatch[1]! : blanked.trim();
+			// `[F-127]`: SQLite's `ids ::= ID|STRING` accepts `'…'`-quoted names
+			// — `primary key ('a' autoincrement)` is legal. `blankLiterals`
+			// erases the literal's contents, so the `read-from-raw` technique
+			// `matchCollateToken` uses recovers the real name.
+			const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|'(?:[^']|'')*'|\w+)/.exec(blanked);
+			const tokenStart = nameMatch ? nameMatch[0].length - nameMatch[1]!.length : 0;
+			const rawName = nameMatch ? raw.slice(tokenStart, tokenStart + nameMatch[1]!.length) : blanked.trim();
 			const searchStart = nameMatch ? nameMatch[0].length : 0;
 			// `raw` (not `blanked`) so a `collate 'nocase'` member's real text
 			// survives — see `matchCollateToken`.
@@ -1041,8 +1057,13 @@ const parseTableUniqueConstraints = (sql: string): RawUniqueClause[] => {
 			// `blankLiterals` passes them through verbatim — so the name/collation
 			// captured below is still the real text.
 			const blanked = blankLiterals(raw);
-			const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|\w+)/.exec(blanked);
-			const rawName = nameMatch ? nameMatch[1]! : blanked.trim();
+			// `[F-126]`: SQLite's `ids ::= ID|STRING` accepts `'…'`-quoted names
+			// — `unique ('email' collate nocase)` is legal. `blankLiterals`
+			// erases the literal's contents, so the `read-from-raw` technique
+			// `matchCollateToken` uses recovers the real name.
+			const nameMatch = /^\s*("(?:[^"]|"")+"|`[^`]*`|\[[^\]]*\]|'(?:[^']|'')*'|\w+)/.exec(blanked);
+			const tokenStart = nameMatch ? nameMatch[0].length - nameMatch[1]!.length : 0;
+			const rawName = nameMatch ? raw.slice(tokenStart, tokenStart + nameMatch[1]!.length) : blanked.trim();
 			const name = unquote(rawName);
 			// Scanned from *after* the matched name, not the whole member: a quoted
 			// identifier that literally contains the word "collate" (e.g. a column
