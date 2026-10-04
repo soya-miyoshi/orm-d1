@@ -639,8 +639,11 @@ export class RelationalQueryBuilder {
 
 		const nested = new RelationalQueryBuilder(this.db, this.schema, targetConfig, this.strategy);
 
-		const runFor = (subset: readonly unknown[][]): Promise<Record<string, unknown>[]> =>
-			nested.#run(entry.config, childFieldNames, true, {
+		const runFor = (
+			subset: readonly unknown[][],
+			via: RelationalQueryBuilder = nested,
+		): Promise<Record<string, unknown>[]> =>
+			via.#run(entry.config, childFieldNames, true, {
 				matcher: matcherFor(subset),
 				declared,
 				partitionBy: matchColumns,
@@ -710,9 +713,24 @@ export class RelationalQueryBuilder {
 		const budget = Math.max(1, this.db.$maxParams - reserved);
 		const maxKeys = collapses ? keys.length : Math.max(1, Math.floor(budget / perKey));
 
-		const childRows = maxKeys >= keys.length
-			? await runFor(keys)
-			: (await Promise.all(chunk(keys, maxKeys).map((subset) => runFor(subset)))).flat();
+		let childRows: Record<string, unknown>[];
+		if (maxKeys >= keys.length) {
+			childRows = await runFor(keys);
+		} else {
+			// The chunks are one logical read, so only the first counts as an
+			// execution of its SQL shape for `budget.repeatsPerShape` and
+			// `usage().repeats`; the rest, and everything nested under them, run
+			// on a continuation. Every chunk still counts as a statement.
+			const continued = new RelationalQueryBuilder(
+				this.db.$continuation(),
+				this.schema,
+				targetConfig,
+				this.strategy,
+			);
+			childRows = (await Promise.all(
+				chunk(keys, maxKeys).map((subset, i) => runFor(subset, i === 0 ? nested : continued)),
+			)).flat();
+		}
 
 		const grouped = new Map<string, Record<string, unknown>[]>();
 		for (const row of childRows) {

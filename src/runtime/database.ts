@@ -16,6 +16,8 @@ import { defaultRenderContext, resolveParamBudget } from '../sql/sql.js';
 import type { QueryEvent } from './result.js';
 import type { D1Target, ResolvedOptions } from './session.js';
 import { Executor } from './session.js';
+import type { BudgetOptions, UsageSnapshot } from './usage.js';
+import { UsageMeter } from './usage.js';
 
 /**
  * Spelled here rather than imported from `relations/`: that module imports this
@@ -122,6 +124,25 @@ export interface OrmD1Options {
 	 * on a paid database or stay silent on a free one.
 	 */
 	plan?: D1Plan;
+	/**
+	 * Count what this database sends, readable with `db.usage()`.
+	 *
+	 * Independent of `onQuery` in both directions: `onQuery` reports one
+	 * statement at a time, this reports the totals an invocation ran up —
+	 * including `rowsRead`, which is what D1 bills and what explains a slow
+	 * request. Off by default, and while off nothing is allocated or counted.
+	 */
+	usage?: boolean;
+	/**
+	 * The caller's own ceilings, checked *before* each statement is sent.
+	 *
+	 * Distinct from `plan`, which describes the platform's limit and stays a
+	 * warning. A budget is a number you chose, usually well below D1's, and
+	 * `onExceeded: 'throw'` is the only thing in the stack that can tell a
+	 * database object it has done enough — the failure mode where a client
+	 * re-issues the same read in a loop and every individual request looks fine.
+	 */
+	budget?: BudgetOptions;
 }
 
 /**
@@ -138,8 +159,20 @@ export class OrmD1Database {
 	/** @internal */
 	readonly executor: Executor;
 
-	constructor(readonly $client: D1Target, readonly options: ResolvedOptions) {
-		this.executor = new Executor($client, options);
+	constructor(readonly $client: D1Target, readonly options: ResolvedOptions, countsRepeats = true) {
+		this.executor = new Executor($client, options, countsRepeats);
+	}
+
+	/**
+	 * @internal The same database, except that its statements do not count as
+	 * another execution of their SQL shape. For a relational read's chunks
+	 * after the first: one `with:` over many parents is split to fit the
+	 * parameter budget, and counting each chunk as a repeat made
+	 * `repeatsPerShape` refuse a query for having many parents. Without a
+	 * meter there is nothing to exempt, so this is the database itself.
+	 */
+	$continuation(): OrmD1Database {
+		return this.options.meter ? new OrmD1Database(this.$client, this.options, false) : this;
 	}
 
 	/** @internal The configured bound-parameter budget, for callers that chunk. */
@@ -177,6 +210,27 @@ export class OrmD1Database {
 		return deleteFrom(t, this.executor);
 	}
 
+	/**
+	 * Totals for every statement this database has sent, `usage: true` or a
+	 * `budget` having asked for them to be counted.
+	 *
+	 * A plain copy, safe to pass to a structured logger, and reading it does not
+	 * stop the counting. There is no `reset()`: the intended shape is one
+	 * database per request, which is what `drizzle()` being a cheap synchronous
+	 * wrapper is for.
+	 */
+	usage(): UsageSnapshot {
+		// Not an empty snapshot: all-zero totals read as "no queries ran", which
+		// is exactly how `logger` misled people while it was accepted and
+		// ignored. A missing option should say so.
+		if (!this.options.meter) {
+			throw new Error(
+				'db.usage() needs `usage: true` (or a `budget`) on drizzle()/ormD1(); nothing was counted.',
+			);
+		}
+		return this.options.meter.snapshot();
+	}
+
 	/** Run a query compiled elsewhere — the hoisted, module-scope hot path. */
 	async all<TRow>(query: CompiledQuery<TRow>, input?: Record<string, unknown>): Promise<TRow[]> {
 		return this.executor.executeRows(query, input);
@@ -211,16 +265,24 @@ export class OrmD1Database {
 			const result = await stmt.run();
 			// Counts like any other statement: D1 does not care that we did not
 			// build this one.
-			this.options.budget?.record(result.meta?.size_after);
-			this.options.onQuery?.({
-				kind: 'raw',
-				sql,
-				tables: [],
-				durationMs: Date.now() - started,
-				rowsRead: Number(result.meta?.rows_read ?? 0),
-				rowsWritten: Number(result.meta?.rows_written ?? 0),
-				...(isDev() ? { params: params as D1Param[] } : {}),
-			});
+			this.options.planBudget?.record(result.meta?.size_after);
+			// One event for both listeners, built only if there is one: `usage`
+			// needs the same three numbers `onQuery` is handed.
+			const onQuery = this.options.onQuery;
+			const meter = this.options.meter;
+			if (onQuery || meter) {
+				const event: QueryEvent = {
+					kind: 'raw',
+					sql,
+					tables: [],
+					durationMs: Date.now() - started,
+					rowsRead: Number(result.meta?.rows_read ?? 0),
+					rowsWritten: Number(result.meta?.rows_written ?? 0),
+					...(isDev() ? { params: params as D1Param[] } : {}),
+				};
+				meter?.record(event);
+				onQuery?.(event);
+			}
 			return result;
 		} catch (cause) {
 			throw wrapQueryError(cause, sql, params as D1Param[]);
@@ -291,7 +353,10 @@ export function ormD1(binding: D1Database, options: OrmD1Options = {}): OrmD1Dat
 		logger: resolveLogger(options.logger),
 		// Created here rather than per Executor so that the databases
 		// `withSession()` derives share the count — they are the same invocation.
-		budget: options.plan ? new InvocationBudget(options.plan, PLAN_LIMITS[options.plan]) : undefined,
+		planBudget: options.plan ? new InvocationBudget(options.plan, PLAN_LIMITS[options.plan]) : undefined,
+		// One meter for both options: a `budget` has to count the same things
+		// `usage` reports, so splitting them would mean counting twice.
+		meter: options.usage || options.budget ? new UsageMeter(options.budget) : undefined,
 	};
 	return new OrmD1Database(binding, resolved);
 }

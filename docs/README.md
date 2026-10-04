@@ -12,6 +12,7 @@ code with `drizzle-orm` and does not depend on it.
 | [05-adapters.md](./05-adapters.md) | `@pothos/plugin-drizzle`, and the Better Auth adapter |
 | [06-entry-points.md](./06-entry-points.md) | The seven import paths, and which optional peer each one needs |
 | [07-security.md](./07-security.md) | What the compiler guarantees, the three APIs that opt out of it, and why the filter DSL is a trust boundary rather than an input format |
+| [08-observability.md](./08-observability.md) | What a caller can learn about the statements that were sent (`logger`, `onQuery`, `usage`), and the budgets that stop a database object before D1 is read again |
 | [../kit/README.md](../kit/README.md) | `orm-d1-kit`: configuration, environment resolution, commands, and what it does differently from `drizzle-kit` |
 
 Tests run in two projects: Node for the layers above the runtime, and workerd with a real

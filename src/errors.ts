@@ -20,7 +20,44 @@ export class OrmD1QueryError extends Error {
 	}
 }
 
-export const wrapQueryError = (cause: unknown, sql: string, params?: readonly D1Param[]): OrmD1QueryError => {
+/** Which ceiling a `budget` refusal hit. See `runtime/usage.ts`. */
+export type BudgetReason = 'statements' | 'rowsRead' | 'repeats';
+
+/**
+ * A statement the caller's own `budget` refused to send.
+ *
+ * Deliberately not an `OrmD1QueryError` subclass: nothing failed in D1 — the
+ * statement was never sent — so a caller mapping errors to responses can tell
+ * "I set a ceiling and we hit it" from "the database rejected a query" by type
+ * rather than by matching on a message.
+ */
+export class D1BudgetExceededError extends Error {
+	constructor(
+		message: string,
+		readonly reason: BudgetReason,
+		readonly limit: number,
+		/**
+		 * The count that crossed the limit: for `statements` and `repeats` the
+		 * count the refused send would have made, for `rowsRead` the total so far.
+		 */
+		readonly observed: number,
+		/** The parameterised SQL of the refused statement; `repeats` only. */
+		readonly sql?: string,
+	) {
+		super(message);
+		this.name = 'D1BudgetExceededError';
+	}
+}
+
+export const wrapQueryError = (
+	cause: unknown,
+	sql: string,
+	params?: readonly D1Param[],
+): OrmD1QueryError | D1BudgetExceededError => {
+	// A budget refusal travels through here because the budget is checked inside
+	// `Executor#prepare`, which `executeRows`/`executeRun` call inside their try.
+	// Wrapping it would bury the one error a caller is meant to catch by type.
+	if (cause instanceof D1BudgetExceededError) return cause;
 	const detail = cause instanceof Error ? cause.message : String(cause);
 	return new OrmD1QueryError(`${detail}\n  in: ${sql}`, sql, cause, params);
 };

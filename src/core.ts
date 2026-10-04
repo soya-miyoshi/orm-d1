@@ -111,7 +111,7 @@ export { bindParams, MissingPlaceholderError } from './plan/params.js';
 export type { Selection, SelectPlan } from './plan/plan.js';
 
 // builders
-export type { BatchResult, Runnable } from './builders/types.js';
+export type { BatchResult, BatchStatement, Runnable } from './builders/types.js';
 export { SelectBuilder } from './builders/select.js';
 export { InsertBuilder } from './builders/insert.js';
 export { UpdateBuilder } from './builders/update.js';
@@ -124,7 +124,9 @@ export { latestPerGroup } from './builders/window.js';
 export type { Logger, OrmD1Options, OrmD1Session } from './runtime/database.js';
 export { OrmD1Database, ormD1 } from './runtime/database.js';
 export type { QueryEvent } from './runtime/result.js';
-export { OrmD1QueryError, NoTransactionsError } from './errors.js';
+export type { BudgetOptions, TableUsage, UsageSnapshot } from './runtime/usage.js';
+export type { BudgetReason } from './errors.js';
+export { D1BudgetExceededError, OrmD1QueryError, NoTransactionsError } from './errors.js';
 export type { D1Plan, PlanLimits } from './limits.js';
 export {
 	MAX_COLUMNS_PER_TABLE,

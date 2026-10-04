@@ -33,6 +33,19 @@ export const warn = (message: string): void => {
 };
 
 /**
+ * Report through the same sink as `warn`, but in production builds too.
+ *
+ * `warn`'s callers are diagnostics nobody asked for — the plan caps, the scan
+ * detector — so they are dropped with `__DEV__`. A `budget` is a number the
+ * caller passed, and its default `onExceeded: 'warn'` would be a no-op in
+ * production if it went through that gate: a ceiling that is silent exactly
+ * where it was set to protect you.
+ */
+export const warnAlways = (message: string): void => {
+	warnFn(message);
+};
+
+/**
  * Assert that the header D1 returned matches the projection we compiled.
  * Catches aliasing and index drift during development at zero production cost.
  */

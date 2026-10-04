@@ -18,6 +18,15 @@ export interface Runnable<TResult = unknown> {
 	readonly __result?: TResult;
 }
 
+/**
+ * The element type of `db.batch([...])`, under the name the call site uses.
+ *
+ * The same thing as `Runnable`, exported because a caller that builds
+ * statements in one function and batches them in another otherwise has to
+ * spell it `Parameters<Database['batch']>[0][number]`.
+ */
+export type BatchStatement<TResult = unknown> = Runnable<TResult>;
+
 export type BatchResult<T extends readonly Runnable[]> = {
 	[K in keyof T]: T[K] extends Runnable<infer R> ? R : never;
 };

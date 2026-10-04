@@ -119,10 +119,14 @@ describe.skipIf(!ready)('the zero-diff migration recipe', () => {
 		const redirected = bundle(tsconfig('js', true));
 		const fallenThrough = bundle(tsconfig('dts', true));
 
+		// The marker is the signal: orm-d1's own symbol is absent, so what was
+		// bundled is not orm-d1.
 		expect(fallenThrough.ormD1).toBe(false);
-		// Roughly 80 kb against 172 kb when this was written. The ratio is the
-		// robust part; the absolute numbers are not pinned.
-		expect(fallenThrough.bytes).toBeGreaterThan(redirected.bytes * 1.5);
+		// Direction only. This used to demand 1.5×, but it measures the
+		// unminified full entry, which grew from ~80 KB to ~120 KB across many
+		// changes and eroded the ratio until an unrelated feature tripped it.
+		// Size is bounded by the minified `bundle-size ceiling` below, not here.
+		expect(fallenThrough.bytes).toBeGreaterThan(redirected.bytes);
 	});
 
 	it('redirects all three entry points, not just the bare specifier', () => {

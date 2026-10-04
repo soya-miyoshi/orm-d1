@@ -7,6 +7,7 @@ import { bindParams } from '../plan/params.js';
 import type { D1Param } from '../sql/sql.js';
 import type { QueryEvent } from './result.js';
 import { buildEvent } from './result.js';
+import type { Shape, UsageMeter } from './usage.js';
 
 /**
  * `D1Database` and `D1DatabaseSession` both expose `prepare()` and `batch()`
@@ -27,8 +28,17 @@ export interface ResolvedOptions {
 	 * Present only when `plan` was supplied. Shared by every database derived
 	 * from the one that was opened — `withSession()` reuses these options — so
 	 * a session's statements count toward the same invocation.
+	 *
+	 * Named for the plan to keep it apart from the caller's own `budget` option,
+	 * which is the `BudgetOptions` inside {@link meter}: D1's documented limit
+	 * and the caller's chosen ceiling are different numbers doing different jobs.
 	 */
-	readonly budget: InvocationBudget | undefined;
+	readonly planBudget: InvocationBudget | undefined;
+	/**
+	 * Present when `usage` or `budget` was supplied. Shared with derived
+	 * databases for the same reason `planBudget` is.
+	 */
+	readonly meter: UsageMeter | undefined;
 }
 
 const now = (): number => Date.now();
@@ -90,7 +100,16 @@ const mergeResults = (results: readonly D1Result[]): D1Result => {
 };
 
 export class Executor implements QueryExecutor {
-	constructor(readonly target: D1Target, readonly options: ResolvedOptions) {}
+	/**
+	 * `countsRepeats` is false only for a relational read's continuation chunks
+	 * (`OrmD1Database.$continuation`): the statements still count, their shape
+	 * does not, because the chunks are one logical read.
+	 */
+	constructor(
+		readonly target: D1Target,
+		readonly options: ResolvedOptions,
+		readonly countsRepeats = true,
+	) {}
 
 	get compileOptions(): CompileOptions {
 		return this.options.compileOptions;
@@ -107,41 +126,77 @@ export class Executor implements QueryExecutor {
 		// Reached for every statement, batch members included, because `isDev()`
 		// forces the keyed read path — which is the same reason `onQuery` sees
 		// them all. Outside dev, `warn()` is inert and this is a counter bump.
-		// Unconditional, and first: the budget counts statements whether or not
-		// anyone is listening to them.
-		this.options.budget?.record(meta?.size_after);
+		// Unconditional, and first: the plan budget counts statements whether or
+		// not anyone is listening to them.
+		this.options.planBudget?.record(meta?.size_after);
 
 		// `executeRows` already gates its keyed path on this pair, but
 		// `executeRun` and `batch` call `#emit` unconditionally — so every
 		// insert, update, delete and batch member built a `QueryEvent`, with up
 		// to six conditional spreads, and dropped it unread. Nothing below has
 		// an effect when no one is listening, so the whole tail is skipped.
+		//
+		// `usage`/`budget` keep the tail alive on their own terms: the meter's
+		// row, duration and per-table totals come off the same response
+		// `onQuery` reads, and there is nowhere else to take them from.
 		const onQuery = this.options.onQuery;
-		if (!onQuery && !isDev()) return;
+		const meter = this.options.meter;
+		if (!onQuery && !meter && !isDev()) return;
 
 		const event = buildEvent(query, sql, meta, now() - started, isDev() ? params : undefined);
 		if (isDev()) assertScan(event.rowsRead, rowsReturned, sql);
+		meter?.record(event);
 		onQuery?.(event);
 	}
 
-	#prepare(sql: string, params: readonly D1Param[]): D1PreparedStatement {
-		// Every statement actually sent to D1 passes through here — each chunk
-		// of a chunked write, each member of a `batch()`, and `db.execute()`'s
-		// raw escape hatch via `prepareRaw` below — which is what makes this
-		// the one place to log rather than the call sites above it.
-		this.options.logger?.logQuery(sql, [...params]);
+	#bind(sql: string, params: readonly D1Param[]): D1PreparedStatement {
 		const stmt = this.target.prepare(sql);
 		return params.length > 0 ? stmt.bind(...params) : stmt;
 	}
 
 	/**
+	 * Every statement actually sent to D1 passes through here or through
+	 * `#prepareAll` — each chunk of a chunked write, each member of a `batch()`,
+	 * and `db.execute()` via `prepareRaw` — which is what makes these the place
+	 * to log and to meter rather than the call sites above them.
+	 *
+	 * The order is bind, admit, log. Binding first means a statement that fails
+	 * to bind is neither counted nor logged; admitting before logging means a
+	 * statement the `budget` refused is not logged as if it had run.
+	 * `shape` is the logical statement; `undefined` is `db.execute()`.
+	 */
+	#prepare(sql: string, params: readonly D1Param[], shape: Shape | undefined): D1PreparedStatement {
+		const stmt = this.#bind(sql, params);
+		this.options.meter?.admit(1, this.countsRepeats ? shape ?? { sql, kind: 'raw' } : undefined);
+		this.options.logger?.logQuery(sql, [...params]);
+		return stmt;
+	}
+
+	/**
+	 * Several statements sent as one `batch()`: all bound, then admitted as one
+	 * send, then logged. Admitting member by member counted — and logged — the
+	 * members ahead of a refusal, which were then never sent.
+	 */
+	#prepareAll(
+		sqls: readonly string[],
+		bound: readonly (readonly D1Param[])[],
+		shapes: readonly Shape[],
+	): D1PreparedStatement[] {
+		const statements = sqls.map((sql, i) => this.#bind(sql, bound[i]!));
+		this.options.meter?.admit(statements.length, this.countsRepeats ? shapes : undefined);
+		const logger = this.options.logger;
+		if (logger) for (const [i, sql] of sqls.entries()) logger.logQuery(sql, [...bound[i]!]);
+		return statements;
+	}
+
+	/**
 	 * The public seam for `db.execute()` — Database's raw escape hatch — so
-	 * that path observes `logger`/`onQuery` the same as every built statement,
-	 * instead of calling `$client.prepare()` directly and skipping this class
-	 * entirely.
+	 * that path observes `logger`/`onQuery`/`budget` the same as every built
+	 * statement, instead of calling `$client.prepare()` directly and skipping
+	 * this class entirely.
 	 */
 	prepareRaw(sql: string, params: readonly D1Param[]): D1PreparedStatement {
-		return this.#prepare(sql, params);
+		return this.#prepare(sql, params, undefined);
 	}
 
 	async executeRows<T>(query: CompiledQuery<T>, input: Record<string, unknown> = {}): Promise<T[]> {
@@ -152,8 +207,13 @@ export class Executor implements QueryExecutor {
 		try {
 			// The keyed path is only taken when someone is listening: `.raw()`
 			// gives no D1Meta, so observability costs the object allocation.
-			if (this.options.onQuery || isDev()) {
-				const result = await this.#prepare(query.sql, params).all<Record<string, unknown>>();
+			//
+			// The meter is one of those listeners. Without it here a select read
+			// through `.raw()` and carried no `rows_read`, so `usage().rowsRead`
+			// — the number D1 bills — stayed 0 for every read, and `maxRowsRead`
+			// guarded nothing. `usage`/`budget` cost what `onQuery` costs.
+			if (this.options.onQuery || this.options.meter || isDev()) {
+				const result = await this.#prepare(query.sql, params, query).all<Record<string, unknown>>();
 				const rows = query.mapKeyed(result.results);
 				if (isDev() && result.results.length > 0) {
 					assertHeader(query.columnNames, Object.keys(result.results[0]!));
@@ -162,7 +222,7 @@ export class Executor implements QueryExecutor {
 				return rows;
 			}
 
-			const raw = await this.#prepare(query.sql, params).raw<unknown[]>();
+			const raw = await this.#prepare(query.sql, params, query).raw<unknown[]>();
 			return query.map(raw);
 		} catch (cause) {
 			throw wrapQueryError(cause, query.sql, params);
@@ -177,7 +237,7 @@ export class Executor implements QueryExecutor {
 		const params = bindParams(query.params, input);
 		const started = now();
 		try {
-			const result = await this.#prepare(query.sql, params).run();
+			const result = await this.#prepare(query.sql, params, query).run();
 			this.#emit(query, query.sql, result.meta, started, params, result.results?.length ?? 0);
 			return result;
 		} catch (cause) {
@@ -195,7 +255,9 @@ export class Executor implements QueryExecutor {
 		// used to see an empty parameter list for anything batched, which is
 		// every chunked insert — exactly the case worth inspecting.
 		const bound = query.parts.map((part) => bindParams(part.params, input));
-		const prepared = query.parts.map((part, i) => this.#prepare(part.sql, bound[i]!));
+		// One shape for all the parts: they are one statement split to fit the
+		// parameter budget. Each part is still a statement D1 runs and counts.
+		const prepared = this.#prepareAll(query.parts.map((part) => part.sql), bound, [query]);
 		const started = now();
 		try {
 			const results = await this.target.batch(prepared);
@@ -235,7 +297,6 @@ export class Executor implements QueryExecutor {
 		if (items.length === 0) return [];
 
 		const compiled = items.map((item) => ({ query: item.compile(), input: item.input ?? {} }));
-		const statements: D1PreparedStatement[] = [];
 		/** Which statement indices belong to which input item. */
 		const spans: number[][] = [];
 
@@ -247,14 +308,17 @@ export class Executor implements QueryExecutor {
 		for (const { query, input } of compiled) {
 			const span: number[] = [];
 			for (const part of query.parts) {
-				span.push(statements.length);
-				const params = bindParams(part.params, input);
-				bound.push(params);
+				span.push(sqls.length);
+				bound.push(bindParams(part.params, input));
 				sqls.push(part.sql);
-				statements.push(this.#prepare(part.sql, params));
 			}
 			spans.push(span);
 		}
+
+		// Bound in full before anything is admitted: a member whose
+		// placeholders are missing used to leave the members ahead of it
+		// counted. One shape per item, however many parts it compiled to.
+		const statements = this.#prepareAll(sqls, bound, compiled.map(({ query }) => query));
 
 		const started = now();
 		let results: D1Result<Record<string, unknown>>[];
