@@ -1239,7 +1239,9 @@ sidecar `[F-100]`/`[F-110]` propose) and everything else still marked `todo` in 
 
 ## Standing authorization from the human — 2026-08-18
 
-> audit.md に書いてある、improvement も含めて全てやっておいてください。
+> Do everything written in audit.md, including the improvements.
+
+*(Translated from the original instruction.)*
 
 Every open item in this file is authorized, **including the `needs-human` ones and the
 `NEW-SURFACE` proposals**. That overrides the sweep skill's "park API-surface changes as
@@ -1388,7 +1390,7 @@ _(nothing yet)_
 - **Prove it**: not yet reduced to a test; a minimal repro would build `and(dEq(dt.id, 1), inArray(c.role, ['a']))` (Drizzle's `and`/`eq`, orm-d1's `inArray`) inside a `check()`, assert the rendered DDL contains `[object Object]`, and (in `test/workers`) assert that a subsequent `insert` against a table created from it always throws `CHECK constraint failed` regardless of the row's values.
 
 ### [F-118] Two facts verified this round, recorded but deliberately not fixed — status: todo — severity: low/med — area: sql/render, kit/apply
-- **A NUL byte inside a value makes the statement unparseable.** Pre-existing in `literal()` (`src/ddl.ts`) — it string-interpolates a value with only `'`-escaping, and a NUL survives that unescaped. D1 rejects the resulting statement with `D1_ERROR: unrecognized token` at apply time — loud, not silent, but with no indication the cause was a NUL rather than any other malformed literal. Not fixed: out of this round's scope, and the failure is loud rather than a silently-wrong constraint, which is this codebase's actual severity bar (see "この ORM で「バグ」が出る場所" in `CLAUDE.md`).
+- **A NUL byte inside a value makes the statement unparseable.** Pre-existing in `literal()` (`src/ddl.ts`) — it string-interpolates a value with only `'`-escaping, and a NUL survives that unescaped. D1 rejects the resulting statement with `D1_ERROR: unrecognized token` at apply time — loud, not silent, but with no indication the cause was a NUL rather than any other malformed literal. Not fixed: out of this round's scope, and the failure is loud rather than a silently-wrong constraint, which is this codebase's actual severity bar (see the section of `CLAUDE.md` that ranks where bugs show up in this ORM, silent-constraint-loss first).
 - **`MAX_STATEMENT_BYTES` is enforced only in `compilePlan`'s `sealed` path (`src/limits.ts`/`src/plan/compile.ts:401-403`), never for DDL.** DDL rendering sets `maxParams: Number.POSITIVE_INFINITY` (`src/ddl.ts`'s `ddlContext`, see the comment at its definition) specifically to remove the accidental ~100-value cap that used to stop a large `inArray()`/`notInArray()` from rendering inside a `check()`/partial index `where()` at all. That was the correct fix for the false-positive `CompileError` it used to throw on nothing-is-bound DDL, but it also removes the only thing that was accidentally capping statement size in that path: a `check()` built from an `inArray()` over on the order of 10,000 values would now render past `MAX_STATEMENT_BYTES` (100 KB) without `createTable`/`createIndex` ever checking, and fail only when D1 rejects the oversized statement at apply. Not fixed: no DDL-side statement-size check exists to reuse, and adding one is a new mechanism outside this round's one-defect scope.
 
 ## Findings recorded from the `[F-111]` rebase follow-up (unique-member collation, comment-blanking) — not fixed, out of scope
@@ -1469,3 +1471,174 @@ _(nothing yet)_
 - **Scope verified by the reviewer**: with the meter forced on for every database, the full workers suite (397 tests: relations, `latestPerGroup`, joins, aggregates, better-auth, pothos) passed unchanged. Duplicate names across joined tables are already safe — `assignKeys` (`src/plan/compile.ts:258`) aliases the whole projection to `c0..cN` on any collision. Case drift is the only reproduced divergence.
 - **Fix direction**: alias every projected column (`as "<key>"`) whenever the keyed path can be taken, or have `mapKeyed` read `Object.values(row)` in projection order. Either changes query compilation, which is why it was split off from the `usage` / `budget` change rather than folded into it.
 - **Not fixed**: deliberately held out of the `usage` / `budget` batch (owner's decision, 2026-10-04) so a compiler change does not ride along with a runtime feature. Recorded here instead.
+
+## Findings — `inArray` row values, found while evaluating a `drizzle-orm` alias (2026-10-05)
+
+Recorded from an investigation into whether `drizzle-orm` could be resolved **to orm-d1**
+in a project's bundler, so that `@pothos/plugin-drizzle`'s own `instanceof Many` lands on
+our classes and `asPothosRelations` / `asDrizzleRelations` / `assertSameDrizzle` become
+unnecessary. The investigation went all the way through a real consuming application — a Workers +
+Hono + Pothos API on orm-d1, its full CI (5,339 tests across four suites) plus a
+`wrangler deploy --dry-run` — and **the recipe works**.
+
+**Only `[F-143]` was taken.** The owner's decision (2026-10-05) was to fix the bug the
+investigation uncovered and record the rest rather than adopt the recipe, so everything
+below `[F-143]` is a note, not a change: `getColumns`, the `docs/05` recipe, the
+`workers-alias` vitest project, the two alias tests and `src/drizzle-compat.ts` were all
+written, verified, and then reverted. This entry exists so none of it has to be
+re-derived.
+
+### [F-143] `inArray` renders a row-value (tuple) list as a flat parameter list and binds each row as one array — status: **done** (this batch) — severity: **high** — area: `src/sql/expressions.ts`
+- **Where**: `src/sql/expressions.ts`, `InArray.toQuery`.
+- **Defect**: with array values — the row-value form, `(a, b) in ((?, ?), (?, ?))` — the
+  final `this.values.map((v) => bindValue(this.operand, v))` bound each inner array as a
+  **single** parameter, emitting `in (?, ?)`. Measured against real `drizzle-orm@1.0.0-rc.4`
+  through our own bridge (`fromDrizzleSQL`):
+
+  ```
+  drizzle: ("posts"."id", "posts"."author_id") in ((?, ?), (?, ?))   params: 10, 1, 11, 1
+  ours   : ("posts"."id", "posts"."author_id") in (?, ?)             params: [10,1], [11,1]
+  ```
+
+  Drizzle gets it right because its SQL builder renders a nested array chunk as a
+  parenthesised list. D1 refuses the array outright — `Type 'object' not supported for
+  value '01M45…,01M45…'` — so this fails loudly at execution rather than returning wrong
+  rows. The SQL text was wrong independently of the binding.
+- **Who hits it**: anything that batches by a composite key. `@pothos/plugin-drizzle`'s
+  model loader does exactly this (`esm/model-loader.js:112`,
+  `inArray(this.selectSQL(table), …)`, where `selectSQL` builds `(c1, c2)` for a
+  composite primary key), so **every composite-keyed Relay node** breaks — 8 end-to-end
+  tests in the application this was verified against, which uses composite primary keys
+  throughout. Reachable today only through *Drizzle's* `inArray` (which is correct),
+  which is why nothing had exercised ours on this shape.
+- **Why the suite was green**: `test/unit/drizzle-sql.test.ts` pinned the tuple
+  *fragment* (`("users"."id", "users"."email")`) but never the `inArray` wrapping it, and
+  `test/workers/drizzle-sql.test.ts` ran **Drizzle's** tuple `inArray` against D1 without
+  ever running ours. Both halves are now comparative.
+- **Fix**: `tupleWidth()` detects the row-value form; each row renders as
+  `(${join(members)})`, the parameter budget counts `values.length × width`, the
+  json_each collapse is skipped (a tuple has no json_each spelling), and a ragged or
+  half-scalar list is refused with a `CompileError` naming the call instead of producing
+  SQL SQLite rejects.
+- **Tests** (6 new, every one verified load-bearing by reverting the production change
+  alone and confirming it goes red):
+  - `test/unit/compile-select.test.ts` — rendering, and the four refusals (ragged,
+    scalar-first, array-first, empty row value);
+  - `test/unit/drizzle-sql.test.ts` — text *and* flattened bindings identical to real
+    Drizzle's for the same call, which is the assertion that would have caught this;
+  - `test/unit/param-budget.test.ts` — the budget counted as `rows × columns` (60 pairs
+    = 120 parameters against a limit of 100, which the old per-element count read as 60
+    and compiled), plus `notInArray`'s own name and its `not in` rendering;
+  - `test/workers/drizzle-sql.test.ts` — ours executes on real D1 and returns the same
+    rows as Drizzle's.
+- Documented for users in `docs/01-differences.md`'s `inArray` section.
+
+### [F-144] `getColumns` is missing from the public surface — status: **not fixed** (written, then reverted with the recipe) — severity: low — area: `src/schema/table.ts`, `src/core.ts`
+- Drizzle v1 exports both `getTableColumns` and `getColumns`; orm-d1 has only the former.
+  `@pothos/plugin-drizzle` reads columns through `getColumns` in three modules
+  (`utils/config.js`, `utils/cursors.js`, `model-loader.js`).
+- Harmless as a one-line alias (`export const getColumns = getTableColumns`), but its only
+  consumer is the alias recipe, so it was reverted with it rather than left as speculative
+  public API. Re-add it if the recipe is ever adopted — nothing else is needed for the
+  build to succeed.
+
+### [F-145] The alias recipe works, and these are the facts it cost to establish — status: **verified, not adopted** — severity: n/a — area: adoption note
+Measured, not assumed. All of it was reverted; none of it is in the tree.
+
+- **It works.** With `drizzle-orm` aliased to `orm-d1` in esbuild, a raw `defineRelations`
+  result (no `asPothosRelations`) produces `User.posts: [Post!]` instead of `Post`, and
+  the schema executes correctly against a real D1 binding — including the two-statement
+  batching and the column narrowing.
+- **`drizzle-orm` leaves the bundle entirely**: 24 files / 103,953 bytes of it in the
+  control build, **0 files** with the alias (esbuild `--metafile`). The deployed Worker
+  measured went 3,398.82 → 3,366.92 KiB (gzip 700.23 → 694.05).
+- **Export gaps fail the build, not the runtime.** The plugin's imports of `drizzle-orm`
+  are static ESM, so esbuild checks every named one against orm-d1 on every build.
+  `getColumns` (`[F-144]`) was the single miss and surfaced as three
+  `No matching export` errors. A future plugin version reaching for a symbol we lack
+  fails the build; it does not fail silently.
+- **The alias is prefix-based**, so all three specifiers need their own mapping
+  (`drizzle-orm`, `drizzle-orm/sqlite-core`, `drizzle-orm/d1`). A missing one is a
+  resolution error — also loud.
+- **The real hazard is per-module-resolver coverage, and a miss is silent.** Three
+  separate mechanisms must agree, and each one missed reintroduces the original bug for
+  whatever it resolves. Both failure modes were hit while verifying:
+  - the alias in only the default `vitest.config.ts` left a second Vitest project (the
+    end-to-end one) on real Drizzle — `<field>.map is not a function`, i.e. a `many`
+    resolving as one object;
+  - the SDL exporter runs under `tsx`, where **TypeScript `paths` does not apply to a
+    `.js` inside `node_modules`**, so the plugin's own import went unredirected and
+    the CI run silently rewrote the committed `schema.graphql`, degrading six list
+    fields from `[X!]` to `X`. Fixing that needed a Node `module.register` resolve hook;
+    `docs/04`'s `paths` recipe redirects *your* source, which is a different job.
+  - Vitest additionally needs `server.deps.inline` for the plugin: a dependency is
+    externalised by default and its *internal* imports then bypass `resolve.alias`
+    entirely.
+- **It does not remove the version pin.** The pin stops being load-bearing for orm-d1's
+  own resolution, but any tool left unaliased still resolves the real package.
+
+### [F-146] Types cannot follow the runtime alias without restating Drizzle's internal representation — status: **prototyped, measured, rejected** — severity: n/a (design) — area: `src/schema/table.ts`, `src/relations/define.ts` / public API
+Written as `src/drizzle-compat.ts` (since deleted) and tried for real: `paths` pointing
+`drizzle-orm`/`drizzle-orm/sqlite-core`/`drizzle-orm/d1` at orm-d1's `.d.ts`, a Pothos
+schema over an orm-d1 schema, the plugin's own `.d.ts` in the program.
+
+**The surface**: the plugin type-imports 14 names from `drizzle-orm`. Eight already exist
+under the same spelling in orm-d1 — `Column`, `Many`, `One`, `Relation`, `Table`,
+`InferSelectModel`, `RelationsFilter`, `TableRelationalConfig`. Seven were missing:
+`AnyRelations`, `AnyTable`, `BuildQueryResult`, `DBQueryConfig`, `SQL`, `SQLWrapper`,
+`TablesRelationalConfig`. Five are one-line aliases (`SQL`/`SQLWrapper` → `SQLChunk`,
+`TablesRelationalConfig`/`AnyRelations` → a per-table record, `AnyTable` → `Table`); the
+other two are not renames — Drizzle keys `DBQueryConfig<TRelationType, TSchema,
+TTableConfig>` and `BuildQueryResult` on a table *config*, ours (`TypedFindConfig`,
+`FindResult`) on a table *name*.
+
+**Error count as the surface grew: 57 → 9 → 0** (the last step is `skipLibCheck: true`,
+which virtually every real project sets, so three of the nine were a probe artefact).
+Two findings from that climb are worth keeping:
+
+- **`orm-d1/drizzle` cannot be used in this setup at all.** `src/drizzle.ts` type-imports
+  `SQLiteColumn` / `SQLiteTableWithColumns` from `drizzle-orm/sqlite-core` in order to
+  *convert* our tables to Drizzle's spelling, so under a `paths` redirect those resolve
+  back to orm-d1 and the conversion collapses. It is also pointless there — the adapter
+  reads these types from orm-d1 already, so the shape it wants is ours, unconverted. A
+  replacement for `PothosRelations` has to be written (the prototype's
+  `TablesRelationalConfigOf`, building `{ table, name: K, relations, columns }` from the
+  `defineRelations` phantoms).
+- **Zero errors is not the question; whether the types still *check* is.** Eight negative
+  controls, each of which must fail to compile:
+
+  | control | real `drizzle-orm` | the prototype |
+  |---|---|---|
+  | unknown column in `columns` | rejected | rejected |
+  | unknown relation in `with` | rejected | rejected |
+  | unknown column in `where` | rejected | rejected |
+  | resolver returns the wrong type | rejected | rejected |
+  | unknown relation name in `t.relation()` | rejected | rejected |
+  | unknown table name in `drizzleObject()` | rejected | rejected |
+  | **`t.exposeInt('nope')` — no such column** | rejected | **ACCEPTED** |
+  | **`t.exposeString('id')` — wrong GraphQL type** | rejected | **ACCEPTED** |
+
+  So the prototype loses two checks and says nothing about it.
+
+**Why those two cannot be closed cheaply.** Both read the column shape off
+`TableConfig['table']['_']` — Drizzle's **internal** config holder, which an orm-d1
+`Table` has no equivalent of (our config lives behind symbol keys). Closing them needs:
+
+1. a `_` phantom on `Table` (`src/schema/table.ts`) carrying Drizzle's internal
+   `{ columns, name, … }` shape — orm-d1 publishing a restatement of the part of
+   Drizzle's types that moves between rcs;
+2. `Many`/`One` re-parameterised by **table name** rather than target table. The plugin
+   decides list-vs-object at the type level with
+   `T['relations'][K] extends Many<string>` (`dts/types.d.ts:145`, `ListRelation`). Ours
+   is `Many<TTarget extends Table>`, so `Many<string>` is not a legal instantiation — and
+   widening the constraint does **not** help: `Many<SomeTable>` still does not extend
+   `Many<string>`, so `ListRelation` resolves every list to `never`, silently. This is a
+   **breaking change to `orm-d1/relations`' public types**;
+3. cheap by comparison: `SchemaEntry` (`Table | View` — orm-d1 has no `View`), and a
+   three-generic `RelationsFilter` keyed on a table config rather than a table name.
+
+**Rejected** (owner, 2026-10-05): the payoff is removing one *type-only* devDependency;
+the price is a breaking change to the relations types, a permanent obligation to track
+Drizzle's internal type representation, and drift that does not error. Keeping
+`drizzle-orm` as a type-only devDependency and `PothosRelations` for the generic costs
+nothing at runtime and keeps all eight checks.
