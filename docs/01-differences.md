@@ -70,6 +70,21 @@ individually as before. If that would exceed the budget, compilation fails with 
 naming the call and the reason it could not collapse, rather than leaving you with
 `too many SQL variables` and no indication of which `inArray` produced it.
 
+**Row values.** Giving `inArray` a list of arrays is a tuple comparison, and it renders
+the same way Drizzle renders it:
+
+```ts
+inArray(sql`(${users.id}, ${users.email})`, [[1, 'a@b.c'], [2, 'd@e.f']]);
+// ("users"."id", "users"."email") in ((?, ?), (?, ?))
+```
+
+This is the shape an adapter batching by a composite primary key emits. A tuple has no
+json_each spelling, so these always bind `rows × columns` parameters and the budget is
+checked against that product; a ragged or half-scalar list is refused by name rather than
+compiled. Matching Drizzle here was a fix, not a given — orm-d1 ≤ 0.2.3 bound each row as
+a single parameter and emitted `in (?, ?)`, which D1 rejects with
+`Type 'object' not supported`. See `[F-143]` in `AUDIT.md`.
+
 ## Grouping writes so that they all succeed or all fail
 
 **Drizzle** exposes `db.transaction()` on its D1 driver, implemented by running `begin`,

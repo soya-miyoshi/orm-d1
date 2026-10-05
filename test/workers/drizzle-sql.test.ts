@@ -82,6 +82,21 @@ describe('a Drizzle fragment in an orm-d1 where clause', () => {
 			.orderBy(schema.posts.id)
 			.all();
 		expect(ids(tuple)).toEqual([10, 12]);
+
+		// And the same call written with *our* `inArray`. This half was
+		// missing — the suite only ever ran Drizzle's tuple `inArray` against
+		// D1 — and ours bound each pair as a single array parameter, which D1
+		// refuses outright with `Type 'object' not supported`. See `[F-143]`.
+		const ourTuple = await db.select({ id: schema.posts.id }).from(schema.posts)
+			.where(
+				inArray(
+					sql`(${sql.join([schema.posts.id, schema.posts.authorId], ', ')})` as never,
+					[[10, 1], [12, 2]] as never,
+				),
+			)
+			.orderBy(schema.posts.id)
+			.all();
+		expect(ids(ourTuple)).toEqual(ids(tuple));
 	});
 
 	it('composes with our own operators in one predicate', async () => {

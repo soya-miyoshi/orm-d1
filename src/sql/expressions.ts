@@ -113,11 +113,50 @@ export const exists = (subquery: SQLChunk): Condition => sql<boolean>`exists (${
 export const notExists = (subquery: SQLChunk): Condition => sql<boolean>`not exists (${subquery})`;
 
 /**
+ * The column count of a row-value list, or `undefined` for a plain scalar list.
+ *
+ * A half-array list — `[1, [2, 3]]` — and a ragged one are refused rather than
+ * rendered. Either produces SQL SQLite rejects anyway, and saying which call
+ * built it beats a bare parse error from the driver.
+ */
+const tupleWidth = (values: readonly unknown[], keyword: string): number | undefined => {
+	if (!values.some(Array.isArray)) return undefined;
+
+	const name = keyword === 'in' ? 'inArray' : 'notInArray';
+	const first = values[0];
+	if (!Array.isArray(first)) {
+		throw new CompileError(`${name}() mixes row values with scalars; every value must be an array or none.`);
+	}
+	if (first.length === 0) {
+		throw new CompileError(`${name}() was given an empty row value; a tuple comparison needs at least one column.`);
+	}
+	for (const value of values) {
+		if (!Array.isArray(value)) {
+			throw new CompileError(`${name}() mixes row values with scalars; every value must be an array or none.`);
+		}
+		if (value.length !== first.length) {
+			throw new CompileError(
+				`${name}() was given row values of differing widths (${first.length} and ${value.length}).`,
+			);
+		}
+	}
+	return first.length;
+};
+
+/**
  * `in (…)`.
  *
  * A long list would blow D1's ~100 bound-parameter budget, so above a
  * threshold this renders as `json_each` over a single JSON parameter. The SQL
  * text stays stable regardless of array length, so it still memoizes.
+ *
+ * **Row values.** When the values are arrays, this is a tuple comparison —
+ * `(a, b) in ((?, ?), (?, ?))` — and each element's members bind separately.
+ * Drizzle renders the same shape, because its SQL builder turns a nested array
+ * chunk into a parenthesised list; ours used to bind each inner array as one
+ * parameter, producing `in (?, ?)` and a `Type 'object' not supported` from D1
+ * at execution. `@pothos/plugin-drizzle`'s model loader batches by primary key
+ * through exactly this call, so every composite-keyed Relay node hit it.
  */
 class InArray implements SQLChunk<boolean> {
 	constructor(
@@ -146,6 +185,25 @@ class InArray implements SQLChunk<boolean> {
 			// no-op call in production.
 			if (ctx.bareColumns) ctx.onEmptyArrayPredicate?.();
 			return { sql: this.negated ? '1 = 1' : '1 = 0', params: [] };
+		}
+
+		// A tuple list binds `width` parameters per element and has no json_each
+		// spelling, so it takes its own path before either of those decisions.
+		const width = tupleWidth(this.values, keyword);
+		if (width !== undefined) {
+			const slots = this.values.length * width;
+			if (slots > ctx.maxParams) {
+				throw new CompileError(
+					`${keyword === 'in' ? 'inArray' : 'notInArray'}() was given ${this.values.length} `
+						+ `${width}-column row values, which bind ${slots} parameters and exceed the `
+						+ `bound-parameter limit of ${ctx.maxParams}. Split the call, or match against a `
+						+ 'subquery instead of a literal list.',
+				);
+			}
+			const rows = (this.values as readonly (readonly unknown[])[]).map((row) =>
+				sql`(${sql.join(row.map((v) => bindValue(this.operand, v)), ', ')})`
+			);
+			return sql<boolean>`${this.operand} ${sql.raw(keyword)} (${sql.join(rows, ', ')})`.toQuery(ctx);
 		}
 
 		const encode = encoderOf(this.operand);

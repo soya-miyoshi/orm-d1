@@ -88,6 +88,31 @@ describe('rendering matches the equivalent orm-d1 expression', () => {
 		expect(rendered(fragment as never).sql).toBe('("users"."id", "users"."email")');
 	});
 
+	it('renders a row-value inArray over that tuple the same way Drizzle does', () => {
+		// The gap this test was added for. The fragment above was pinned, but
+		// never the `inArray` the loader wraps it in — and ours bound each pair
+		// as one array parameter, which D1 rejects with `Type 'object' not
+		// supported`. Drizzle gets the tuple list right because its SQL builder
+		// renders a nested array chunk as a parenthesised list; this asserts the
+		// two now agree on both the text and the flattened bindings.
+		const dTuple = dSql`(${dSql.join([dUsers.id, dUsers.email], dSql`, `)})`;
+		const oTuple = dSql`(${dSql.join([users.id, users.email] as never, dSql`, `)})`;
+		const pairs = [[1, 'a@b.c'], [2, 'd@e.f']];
+
+		const theirs = rendered(dInArray(dTuple as never, pairs as never) as never);
+		expect(theirs.sql).toBe('("users"."id", "users"."email") in ((?, ?), (?, ?))');
+		expect(theirs.params).toEqual([
+			{ k: 'const', v: 1 },
+			{ k: 'const', v: 'a@b.c' },
+			{ k: 'const', v: 2 },
+			{ k: 'const', v: 'd@e.f' },
+		]);
+
+		const ours = rendered(inArray(oTuple as never, pairs as never));
+		expect(ours.sql).toBe(theirs.sql);
+		expect(ours.params).toEqual(theirs.params);
+	});
+
 	it('defers a Drizzle placeholder to execution time rather than binding a value', () => {
 		const { params } = rendered(dEq(dUsers.id, dSql.placeholder('wanted')) as never);
 		expect(params).toEqual([{ k: 'ph', name: 'wanted' }]);

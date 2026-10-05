@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { blob, CompileError, compilePlan, ormD1, inArray, integer, notInArray, sqliteTable } from '../../src/index.js';
+import { blob, CompileError, compilePlan, ormD1, inArray, integer, notInArray, sql, sqliteTable } from '../../src/index.js';
 import type { SelectPlan } from '../../src/index.js';
 
 // `orm-d1()` distinguishes a binding from a config by `prepare`; nothing runs.
@@ -93,6 +93,35 @@ describe('inArray against the budget', () => {
 
 		expect(compiled.sql).not.toContain('json_each');
 		expect(compiled.params).toHaveLength(5);
+	});
+
+	it('counts a row-value list as rows × columns, not rows', () => {
+		// A tuple has no json_each spelling to collapse into, so the budget is
+		// the only thing standing between a wide batch and SQLite's
+		// `too many SQL variables`. 60 pairs is 120 parameters against a limit
+		// of 100 — under the old per-element count it read as 60 and compiled.
+		const tuple = sql`(${sql.join([keys.id, keys.uuid], ', ')})`;
+		const pairs = Array.from({ length: 60 }, (_, i) => [i + 1, new Uint8Array([i, 0xaa])]);
+
+		expect(() => compilePlan(planOf(inArray(tuple as never, pairs as never)))).toThrow(CompileError);
+		expect(() => compilePlan(planOf(inArray(tuple as never, pairs as never))))
+			.toThrow(/inArray\(\) was given 60 2-column row values, which bind 120 parameters.*limit of 100/s);
+
+		// And one that fits binds every member.
+		const compiled = compilePlan(planOf(inArray(tuple as never, pairs.slice(0, 4) as never)));
+		expect(compiled.sql).toContain('in ((?, ?), (?, ?), (?, ?), (?, ?))');
+		expect(compiled.params).toHaveLength(8);
+	});
+
+	it('reports a row-value overflow under notInArray’s own name, and renders `not in`', () => {
+		const tuple = sql`(${sql.join([keys.id, keys.uuid], ', ')})`;
+		const pairs = Array.from({ length: 60 }, (_, i) => [i + 1, new Uint8Array([i, 0xaa])]);
+
+		expect(() => compilePlan(planOf(notInArray(tuple as never, pairs as never))))
+			.toThrow(/notInArray\(\) was given 60 2-column row values/);
+
+		expect(compilePlan(planOf(notInArray(tuple as never, pairs.slice(0, 2) as never))).sql)
+			.toContain('not in ((?, ?), (?, ?))');
 	});
 
 	it('explains a collapsible array that only overflows because of a low threshold', () => {

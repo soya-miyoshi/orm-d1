@@ -93,6 +93,33 @@ describe('select compilation', () => {
 		expect(JSON.parse(String((compiled.params[0] as { v: string }).v))).toHaveLength(200);
 	});
 
+	it('renders a row-value inArray as a tuple list, one parameter per member', () => {
+		// `(a, b) in ((?, ?), (?, ?))`, not `(a, b) in (?, ?)` with the pairs
+		// bound as arrays — D1 rejects an array parameter outright
+		// (`Type 'object' not supported`). `test/unit/drizzle-sql.test.ts` pins
+		// this against Drizzle's own rendering of the same call.
+		const tuple = sql`(${sql.join([posts.id, posts.authorId], ', ')})`;
+		const compiled = query.select({ id: posts.id }).from(posts)
+			.where(inArray(tuple as never, [[10, 1], [11, 1]] as never))
+			.compile();
+
+		expect(compiled.sql).toBe(
+			'select "posts"."id" from "posts" where ("posts"."id", "posts"."author_id") in ((?, ?), (?, ?))',
+		);
+		expect(compiled.params).toHaveLength(4);
+	});
+
+	it('refuses a ragged or half-scalar row-value list rather than rendering it', () => {
+		const tuple = sql`(${sql.join([posts.id, posts.authorId], ', ')})`;
+		const compile = (values: unknown[]) =>
+			() => query.select({ id: posts.id }).from(posts).where(inArray(tuple as never, values as never)).compile();
+
+		expect(compile([[10, 1], [11]])).toThrow(/differing widths \(2 and 1\)/);
+		expect(compile([[10, 1], 11])).toThrow(/mixes row values with scalars/);
+		expect(compile([11, [10, 1]])).toThrow(/mixes row values with scalars/);
+		expect(compile([[], []])).toThrow(/empty row value/);
+	});
+
 	it('handles an empty inArray without emitting invalid SQL', () => {
 		expect(query.select({ id: users.id }).from(users).where(inArray(users.id, [])).compile().sql)
 			.toBe('select "users"."id" from "users" where 1 = 0');
